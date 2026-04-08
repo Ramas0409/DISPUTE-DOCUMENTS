@@ -1,0 +1,264 @@
+You are my senior architecture partner for WDP
+(Worldpay Dispute Platform).
+
+Read these project documents before responding:
+WDP-HANDOVER.md, WDP-COMP-INDEX.md,
+WDP-COMP-TEMPLATE.md, WDP-COMPONENTS.md,
+WDP-ARCHITECTURE.md, WDP-DECISIONS.md,
+WDP-KAFKA.md, WDP-DB.md
+
+Today's component: 17 — CaseExpiryUpdateConsumer
+
+━━━ PHASE 1 — Generate Copilot research prompt ━━━
+
+Before I go to Copilot CLI, do the following:
+
+1. STATE what you already know about this component
+   from the project documents — type, responsibility,
+   what is confirmed, what is flagged as uncertain
+   or DRAFT, and what open questions exist.
+
+2. GENERATE a tailored Copilot CLI research prompt
+   for this specific component.
+
+   The prompt must cover these areas. Include only
+   the sections that apply to this component's type
+   — omit what does not apply.
+
+   ── SECTION: PROCESSING FLOW ──────────────────────
+   This section is MANDATORY for every component
+   regardless of type. Its purpose is to capture
+   everything needed to draw a Mermaid flowchart of
+   the component's internal processing logic.
+
+   Ask Copilot to describe the complete processing
+   flow as a numbered sequence. For each step:
+
+   a) STEPS IN ORDER
+      List every processing step from trigger to
+      final output in sequence. For each step name
+      what happens, which service or table is called,
+      and what the output of that step is.
+
+   b) DECISION POINTS
+      For every branch in the flow, name the
+      condition being evaluated and list every
+      possible outcome with the path it leads to.
+      Examples: event type classification,
+      platform routing, duplicate detection result,
+      enrichment success vs failure.
+
+   c) SKIP AND BYPASS CONDITIONS
+      Any condition that causes a message, record,
+      or request to be silently skipped or short-
+      circuited before full processing completes.
+      What is checked, what value triggers the skip,
+      and where does control go after the skip.
+
+   d) FAILURE PATH PER STEP
+      For each step that calls an external dependency
+      — what specifically happens if that call fails.
+      Does the component retry that step, skip the
+      record, halt the entire consumer/job, or write
+      to a dead letter store. State this per step,
+      not just once globally.
+
+   e) MULTIPLE ENTRY PATHS
+      If the component has more than one inbound
+      trigger or endpoint, draw the flow for each
+      path separately. State where they converge
+      if they do, or confirm they are fully
+      independent paths.
+
+   f) STATE AT EACH STEP
+      For stateful processing — what is the status
+      or state of the record or case at each step.
+      What transitions happen and what triggers them.
+
+   ── SECTION: FUNCTIONAL BEHAVIOUR ────────────────
+   Ask Copilot to describe:
+
+   a) CLASSIFICATION AND ROUTING LOGIC
+      How the component determines which processing
+      path to take from the inbound data — which
+      field, which value, which branch. Include
+      every routing condition and its outcome.
+
+   b) BUSINESS RULES APPLIED
+      Any validation, eligibility check, or business
+      rule applied inside this component — not in
+      a downstream service. What is checked, what
+      value is expected, what happens on failure.
+
+   c) DATA TRANSFORMATIONS
+      What data is mapped, enriched, or transformed
+      during processing. Which fields are derived
+      from other fields. Which fields are copied
+      from inbound to outbound. Which fields are
+      conditionally populated.
+
+   d) IDEMPOTENCY MECHANISM
+      Exact detection mechanism for duplicate or
+      redelivered events. Which fields form the key.
+      What happens on detection. Any gaps — crash
+      windows, replica races, or scenarios where
+      duplicates can still occur.
+
+   ── SECTION: CONTRACTS ────────────────────────────
+   Include only the sub-sections that apply:
+
+   For REST API components:
+   — Every endpoint: method, path, request fields,
+     response fields, every HTTP status code and
+     what triggers each, auth model per endpoint,
+     known callers, error body structure
+
+   For Kafka Consumer components:
+   — Exact topic name, consumer group ID, AckMode,
+     offset commit timing relative to every write,
+     concurrency, max poll records, max poll interval,
+     deserializer, behaviour on bad payload
+
+   For Kafka Producer components:
+   — Every topic published to, message key field,
+     publish mode (sync/async), idempotence setting,
+     what triggers each publish, behaviour if publish
+     fails
+
+   For Batch/Scheduler components:
+   — Trigger mechanism, cron expression or config
+     key, input source query and filters, chunk
+     size, pagination mechanism, job uniqueness
+
+   ── SECTION: DEPENDENCIES ─────────────────────────
+   For every outbound call this component makes:
+   — Service name and URL or config key
+   — Protocol and auth method
+   — Purpose — at which step in the flow
+   — Timeout values — connection and read
+   — Retry — count, delay, backoff type
+   — Circuit breaker — Resilience4j configured?
+     If yes: failure rate threshold, wait duration,
+     half-open permitted calls. If no: state that.
+   — Behaviour if unavailable: halt, skip, or degrade
+
+   ── SECTION: DATABASE ─────────────────────────────
+   For every table read or written:
+   — Schema and exact table name
+   — Read or write (distinguish clearly)
+   — Purpose — at which step in the flow
+   — Key columns used in queries or writes
+   — Whether writes are in the same transaction
+     as other writes at that step
+
+   ── SECTION: PLATFORM STANDARD DEVIATIONS ─────────
+   Ask Copilot to check this component against each
+   platform standard and explicitly confirm whether
+   it complies or deviates:
+
+   — DEC-001: Does this component use the
+     transactional outbox pattern? If yes, which
+     table, what status lifecycle, is the outbox
+     write in the same transaction as other writes?
+
+   — DEC-003: Is the Kafka partition key merchantId?
+     If not, what is it and why?
+
+   — DEC-004: Is PAN encrypted before any write to
+     any persistent store? Is clear PAN ever written
+     anywhere? Which service handles encryption?
+
+   — DEC-005: Is the Kafka offset committed manually
+     after all processing completes? Or is it auto-
+     committed, or committed before processing
+     (at-most-once)? State exactly when relative
+     to each downstream write.
+
+   — DEC-014: Is Resilience4j configured on any
+     outbound call? For each external dependency,
+     confirm circuit breaker present or absent.
+
+   ── SECTION: SCALING AND DEPLOYMENT ───────────────
+   — Kubernetes resource type
+   — Replica count — exact value or XL Deploy
+     placeholder, and which secret or variable
+   — Memory limit and request
+   — CPU limit and request
+   — HPA — present or absent
+   — Rolling update strategy
+   — PodDisruptionBudget — present or absent
+   — Topology spread — configured and functional,
+     or label mismatch present
+   — Observability — OTel agent, Actuator, Logstash
+
+   ── SECTION: PLANNED AND INCOMPLETE WORK ──────────
+   — Commented-out code — what it did and why
+   — Unused pom.xml dependencies
+   — Feature flags or migration flags active in
+     production — exact flag names and behaviour
+   — TODO / FIXME / user-story references in source
+   — Configured properties never called at runtime
+   — Stub implementations returning fixed responses
+
+   ── SECTION: CONFIDENCE ASSESSMENT ───────────────
+   For every section above:
+   — Confidence: High / Medium / Low
+   — Basis: direct source evidence / inferred /
+     not determinable from source alone
+
+   Additional rules for the generated prompt:
+   — For anything already confirmed in project docs,
+     ask Copilot to confirm or correct — not
+     rediscover from scratch.
+   — Target what is missing or uncertain first.
+   — Write it so I can paste it directly into
+     Copilot CLI without any editing.
+
+Do not produce the component file yet.
+Wait for me to paste the Copilot report.
+
+━━━ PHASE 2 — Build component file ━━━
+
+After I paste the Copilot report, produce:
+
+1. COMPLETE COMPONENT FILE
+   Using WDP-COMP-TEMPLATE.md as the structure.
+   Apply only the type blocks that apply — omit
+   the rest entirely.
+
+   For the Internal Processing Flow section:
+   Draw the Mermaid flowchart using the step
+   sequence, decision points, branch conditions,
+   skip paths, and failure paths from the Copilot
+   report. Every decision node must show all
+   branch outcomes. Every failure path must be
+   shown as a distinct path — not described in
+   prose below the diagram.
+
+   Architecture level only — no code, classes,
+   or config values. Where Copilot says something
+   is not visible or not implemented, state that
+   explicitly — do not fill gaps with assumptions.
+
+2. WDP-KAFKA.md UPDATE
+   Exact rows to add or update in sections 3 and 4.
+   State explicitly if no Kafka involvement.
+
+3. WDP-DB.md UPDATE
+   Exact rows to add or update in section 2.
+   Flag any new shared table risk immediately.
+
+4. DEVIATION FLAGS
+   Call out every confirmed deviation from
+   DEC-001, 003, 004, 005, 014 with the DEC
+   reference and severity rating.
+
+5. REMAINING GAPS
+   Anything Copilot could not determine that
+   leaves a section incomplete. For each gap,
+   state whether it needs:
+   — A follow-up Copilot question (and give me
+     the exact question to ask)
+   — An architect decision
+   — Confirmation from environment config or
+     a team member

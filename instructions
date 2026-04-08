@@ -1,0 +1,36 @@
+How Claude project knowledge works:
+Every document you upload to the project folder is automatically available to every new chat in this project. Claude searches the project knowledge at the start of every conversation. So:
+Documents in project folder:
+✅ WDP-ARCHITECTURE.md
+✅ WDP-COMPONENTS.md  
+✅ WDP-HANDOVER.md
+✅ WDP-DECISIONS.md
+✅ WDP-INTEGRATIONS.md
+✅ WDP-NFRS.md
+
+All of these are available to EVERY
+new chat automatically — you don't
+need to paste or upload them again.
+So the answer is:
+No — you don't need to paste the handover document each time.
+You just need to say at the start of each new chat:
+"You are my senior architecture partner
+for WDP. We are continuing to fill
+WDP-COMPONENTS.md using Copilot CLI.
+Next component is [component name].
+Here is the Copilot output:"
+[paste Copilot response]
+Claude will automatically read WDP-HANDOVER.md and WDP-COMPONENTS.md from the project knowledge and know exactly where you are.
+The one thing you DO need to do between sessions:
+When you finish a component in one chat
+↓
+Update that section in WDP-COMPONENTS.md
+(change 📝 DRAFT to ✅ COMPLETE,
+fill in the confirmed content)
+↓
+Re-upload the updated WDP-COMPONENTS.md
+to the project folder
+↓
+Next chat automatically sees the
+updated version with progress saved
+That's the only maintenance step — keep WDP-COMPONENTS.md updated in the project folder as you complete each component. Everything else is automatic.

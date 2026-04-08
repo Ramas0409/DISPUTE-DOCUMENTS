@@ -1,0 +1,676 @@
+Research Report: gcp-core-hierarchy-authorization-service
+Executive Summary
+The core-hierarchy-authorization-service is a Spring Boot REST service (Java 17, v1.0.7) within Worldpay's WDP (Worldpay Dispute Platform). Its primary job is JWT-based authorization: it checks whether a caller's JWT token grants them access to a specific merchant, chain, or hierarchy entity by cross-referencing token claims against two backend databases. Secondarily, it acts as a merchant data read API, exposing merchant hierarchy structures, entity-type searches, and product entitlement lookups. The service does not issue tokens, process disputes, or modify any data. All database access is read-only.
+
+Architecture Overview
+Callers (WDP dispute apps)
+[platform: CORE / PIN / VAP / LATAM / NAP]
+        | OAuth2 JWT Bearer Token
+        | HTTP REST
+        ▼
+core-hierarchy-authorization-service
+(Spring Boot, port 8082)
+
+  AuthorizationController
+  MerchantController
+  ProductEntitlementController
+
+        |               |
+        ▼               ▼
+WDP/US DB           Core DB (DB2)
+(PostgreSQL         MD.TMD_ENTY
+AWS RDS)            MD.TMD_ENTY_REL
+USCase              DC.TDC_VIQ_ORG_ENTY
+
+1. Primary Responsibility — What It Does and Does Not Do
+What It Does
+A. JWT Authorization (Core Purpose)
+The service validates that a caller's JWT token grants access to a given merchant entity or entity hierarchy. 1 Two authorization flows exist:
+
+Simple authorization (POST /authorize): Given a platform, a case number (or merchantId/level4Entity), the service extracts iqorgid and iqentities claims from the JWT and confirms the requested entity (chain or merchant) is within the caller's organizational scope by querying the Core DB. 2
+Entity hierarchy authorization (POST /entity-authorize): Given an explicit hierarchy structure of parent/child entities (chains, super-chains, merchants), the service verifies every entity value in the hierarchy belongs to the caller's scope. 3
+
+Special bypass: if the JWT iss claim contains us_worldpay_fis_int, the caller is treated as an internal firm and authorization is automatically granted without database lookups. 4
+B. Merchant Hierarchy Data API
+The service provides read-only lookups from the Core DB:
+
+Retrieve the full merchant entity hierarchy for a given Org ID. 5
+Retrieve entities filtered by type (MT/CH/SC/ST/PT/DV) scoped to the JWT caller's entity set. 6
+Retrieve merchant details for a given merchant ID. 7
+
+C. Product Entitlement Lookup
+Returns RDR/Defender product entitlement data (opt-in/opt-out dates, product names, pre-note indicator) for a merchant by chain and/or MID. 8
+What It Does NOT Do
+
+Does not issue JWT tokens — it is an OAuth2 Resource Server only. 9
+Does not process or manage disputes — it has no dispute creation or mutation logic.
+Does not write to any database — all DB access is read-only (JPA queries, no save/delete calls).
+Does not serve NAP platform for the simple authorization path — NAP requests are explicitly rejected with a 400 BadRequest. 10
+Does not expose Swagger UI in production — the Swagger endpoints are whitelisted only in non-prod environments. 11
+
+
+2. Inbound Interfaces
+Protocol and Security
+All inbound communication is HTTP REST secured by OAuth2 JWT Bearer tokens. The service is configured as a Spring Security OAuth2 Resource Server. 9 It validates tokens against a configured list of trusted JWT issuers (jwt.trustedIssuers from application.yaml). 12
+All endpoints (except actuator health probes and, in non-prod, Swagger docs) require a valid Bearer token. 11
+An optional v-correlation-id request header is accepted for tracing. 13
+Who Calls This Service
+The callers are WDP dispute management applications operating on one of the supported source platforms, identified by the platform path or request field:
+Platform CodeDescriptionCORECore dispute platformPINPIN platform (the only platform supported for merchant hierarchy GET endpoints)VAPVAP platformLATAMLATAM platformNAPNAP platform (rejected for simple authorization; not supported for merchant hierarchy endpoints)
+14
+The merchant hierarchy (GET /{platform}/merchant/...) and entity-type endpoints explicitly validate that platform == PIN and reject others with 400. 15
+
+3. Outbound Interfaces
+The service makes no outbound HTTP calls. Its only outbound communication is to two relational databases via JPA/JDBC.
+Database 1 — WDP PostgreSQL Database (wdp datasource)
+
+Purpose: Look up case entities by case number during authorization.
+Technology: PostgreSQL (AWS RDS). Dev connection: wdp-disputes-dev-postgres-cluster-cql8rsklwshz.us-east-2.rds.amazonaws.com:5432/globaldisputedatabase. 16
+Entities: USCaseEntity (case number, level1Entity/merchantId, level4Entity/chainId). 17
+Repository: USCaseRepository — single query: findByCaseNumber. 18
+
+Database 2 — Core DB2 Database (core datasource)
+
+Purpose: Validate that entity IDs in the JWT claims have a relationship to the requested merchants/chains. Also provides all merchant hierarchy and entity data for the read APIs.
+Technology: IBM DB2 (com.ibm.db2.jcc.DB2Driver). Connection configured via environment variables (core_datasource_jdbc_url). 19
+Key tables queried:
+
+MD.TMD_ENTY — entity master table
+MD.TMD_ENTY_REL — entity relationship table (parent/child links)
+DC.TDC_VIQ_ORG_ENTY — org-to-entity mapping
+
+
+Repositories: OrgEntityRepository, MerchantRepository, EntityRelationRepository, DisplayCodeRepository, ChainRepository, MerchantWomplyRepository, ProductEntitlementRepository. 20 21
+
+
+4. REST Endpoints
+The service runs on port 8082. 22 All paths are relative to the root /.
+#MethodPathPurpose1POST/authorizeAuthorize user access by platform + case number (or merchantId/level4Entity). Validates the JWT's iqorgid/iqentities claims against the chain or merchant in the Core DB. Returns 200 OK (no body) on success, 401 on failure, 400 on bad input.2POST/entity-authorizeAuthorize user access with entity hierarchy. Accepts a structured hierarchy of parent/child entity objects. Validates each entity type (CH, SC, MT) against the JWT caller's scope. Returns 200 OK on success.3GET/{platform}/merchant/orgentity/{orgId}Get merchant hierarchy by Org ID. Returns entity hierarchy metadata, entity type descriptions, and local entities for the given Org. platform must be PIN.4POST/{platform}/merchant/entitytypeGet entities by type, scoped to the JWT caller's org/entities. Accepts entityType (MT/CH/SC/ST/PT/DV), optional localEntityId list, and optional orgId. Returns columnar entity data. platform must be PIN.5POST/merchantGet merchant details for a given merchantId. Accepts a body with a numeric merchantId (max 16 digits). Returns structured merchant detail data.6GET/productentitlementGet product entitlements for a merchant. Query params: chain (optional), mid (optional). Returns RDR/Defender (DEFRDR/CHGBD) product names, opt-in/opt-out dates, and pre-note indicator.
+Management/Ops Endpoints (not business APIs)
+PathPurposeGET /actuator/healthSpring Boot health checkGET /livezKubernetes liveness probeGET /readyzKubernetes readiness probeGET /actuator/prometheusPrometheus metrics scrapeGET /hierarchy-authorization-service-documentationSwagger UI (non-prod only)GET /hierarchy-authorization-service-api-docsOpenAPI spec JSON (non-prod only)
+23 24
+
+Key Repositories Summary
+ComponentTechnologyKey FilesAuthorization logicJava / Springsrc/main/java/.../service/impl/AuthorizationServiceImpl.javaMerchant hierarchy logicJava / Springsrc/main/java/.../service/impl/MerchantServiceImpl.javaProduct entitlement logicJava / Springsrc/main/java/.../service/impl/ProductEntitlementServiceImpl.javaControllersJava / Spring MVCsrc/main/java/.../controller/Core DB (DB2) configSpring JPAsrc/main/java/.../dbconfig/CoreDataSourceConfig.javaWDP DB (PostgreSQL) configSpring JPAsrc/main/java/.../dbconfig/USDataSourceConfig.javaSecurity (OAuth2 JWT)Spring Securitysrc/main/java/.../config/SecurityConfig.javaApplication configYAMLsrc/main/resources/application.yaml
+
+Confidence Assessment
+FindingConfidenceBasisPrimary authorization responsibilityHighDirectly implemented in AuthorizationServiceImpl.javaNo outbound HTTP callsHighNo RestTemplate, WebClient, or HttpClient found in any source fileTwo datasources (PostgreSQL + DB2)HighCoreDataSourceConfig.java, USDataSourceConfig.java, application-dev.yamlSupported platformsHighSourceSystemName enum and RequestValidatorInternal firm bypassHighAuthorizationServiceImpl.java:45-49All 6 REST endpointsHighController source files examined directlyCallers are WDP dispute appsMediumInferred from service name, USCaseEntity, and platform naming; no explicit caller list in codeProduction DB2 URLLowOnly env-var placeholders in prod config; dev URL visible in application-dev.yaml
+
+Footnotes
+
+Architecture note: This research report provides significantly more detail on CoreHierarchyAuthorizationService than currently exists in WDP-COMPONENTS.md. The section for component 1.3 in that document is marked as DRAFT and incomplete. This should be used to update it. Shall I draft the updated component entry?
+Footnotes
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:37-61 — authorizeEntity method dispatches to authorizeToken or authorizeTokenWithEntityHierarchy. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:63-116 — authorizeToken extracts iqorgid/iqentities from JWT and queries Core DB. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:149-208 — authorizeTokenWithEntityHierarchy iterates hierarchy list and validates each entity type. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:45-49 — if (StringUtils.containsAnyIgnoreCase((String) jwt.getClaims().get("iss"), ApplicationConstants.INTERNAL_FIRM)) returns true immediately. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/MerchantServiceImpl.java:56-72 — getMerchantHierarchyByOrgId. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/MerchantServiceImpl.java:127-157 — getEntitiesByType. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/MerchantDaoImpl.java — merchant details DAO (read-only queries). ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/ProductEntitlementServiceImpl.java:36-77 — getProductEntitlementDetails looks up DEFRDR and CHGBD products from MerchantWomplyRepository. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/config/SecurityConfig.java:38-43 — .oauth2ResourceServer((oauth2) -> oauth2.authenticationManagerResolver(...)). ↩ ↩2
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:55-59 — throw new BadRequestException("Platform is not supported", "platform : " + request.getPlatform()) when platform is NAP. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/config/SecurityConfig.java:31-36 — Swagger whitelist only added for non-prod environments. ↩ ↩2
+
+
+src/main/resources/application.yaml:37-38 — jwt.trustedIssuers: ${jwt_trusted_issuer_urls}. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/controller/MerchantController.java:46 — @RequestHeader(value = "v-correlation-id", required = false). ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/enums/SourceSystemName.java — enum values: CORE, NAP, VAP, LATAM, PIN. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/util/RequestValidator.java:18-22 — validatePlatform checks platform == PIN only. ↩
+
+
+src/main/resources/application-dev.yaml:6 — jdbc:postgresql://wdp-disputes-dev-postgres-cluster-cql8rsklwshz.us-east-2.rds.amazonaws.com:5432/globaldisputedatabase. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/us/entity/USCaseEntity.java. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/us/repository/USCaseRepository.java:14-15 — findByCaseNumber JPQL query. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/dbconfig/CoreDataSourceConfig.java:39 — org.hibernate.dialect.DB2Dialect; application-dev.yaml:8-12 — core datasource config via env vars. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/core/repository/OrgEntityRepository.java:21-27 — native SQL against MD.TMD_ENTY, MD.TMD_ENTY_REL, DC.TDC_VIQ_ORG_ENTY. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/core/repository/ — full list of Core DB repositories. ↩
+
+
+src/main/resources/application.yaml:2 — server.port: 8082. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/controller/AuthorizationController.java, MerchantController.java, ProductEntitlementController.java. ↩
+
+
+src/main/resources/application.yaml:13-25 — actuator endpoints: info, health, prometheus; liveness at /livez, readiness at /readyz. ↩
+
+Research Report: Access Control, /authorize Contract, CRUD vs Auth-Only, and Data Ownership
+Executive Summary
+core-hierarchy-authorization-service enforces a two-layer access control model: first, every request must carry a valid OAuth2 JWT from a trusted issuer (network layer, enforced by Spring Security); second, for business authorization calls, the service validates the JWT's embedded entity claims (iqorgid/iqentities) against the merchant hierarchy stored in the Core DB2 database. The /authorize endpoint accepts a platform, case number, merchant ID, and/or chain ID; resolves the target merchant through the WDP PostgreSQL case store if a case number is given; then verifies the token's entities match in the Core DB. The service is strictly authorization + read-only — it owns no data, performs no writes, and exposes no CRUD operations. All data it queries belongs to either the Core merchant hierarchy system (DB2) or the WDP dispute platform (PostgreSQL).
+
+1. How Access Control Is Enforced
+Access control is applied in three sequential layers. A request must pass all layers to succeed.
+Layer 1 — Transport-Level JWT Validation (Spring Security)
+All endpoints except health probes (/actuator/health, /livez, /readyz) and, in non-prod, Swagger docs require a valid Authorization: Bearer <token> header. 1
+The service is configured as an OAuth2 Resource Server using Spring Security's multi-issuer JWT support: 2
+javaJwtIssuerAuthenticationManagerResolver authenticationManagerResolver =
+    JwtIssuerAuthenticationManagerResolver.fromTrustedIssuers(trustedIssuers);
+http.authorizeHttpRequests(authorize ->
+    authorize.requestMatchers(authWhiteList).permitAll().anyRequest().authenticated())
+    .oauth2ResourceServer((oauth2) ->
+        oauth2.authenticationManagerResolver(authenticationManagerResolver));
+The trusted issuers list comes from the jwt.trustedIssuers config property (${jwt_trusted_issuer_urls}). 3 If the token is missing, expired, or signed by an untrusted issuer, Spring returns 401 Unauthorized before the application code is ever reached.
+Layer 2 — Internal Firm Bypass
+Within the business authorization logic, before any database query, the service checks the JWT iss (issuer) claim for the value us_worldpay_fis_int: 4
+javaif (StringUtils.containsAnyIgnoreCase(
+    (String) jwt.getClaims().get("iss"),
+    ApplicationConstants.INTERNAL_FIRM)) { // "us_worldpay_fis_int"
+    log.info("Authorizing token as internal firm");
+    return true;
+}
+If matched, authorization is unconditionally granted. This is the "internal service account" bypass, allowing Worldpay-internal systems to call the service without entity-level scoping.
+Layer 3 — Entity-Scope Check Against Core DB
+For all non-internal callers, the service reads two JWT claims:
+ClaimMeaningiqorgidThe caller's org ID (integer). Used when iqentities is absent.iqentitiesSemicolon/comma-delimited list of entity IDs the caller has access to. Takes priority over iqorgid.
+5
+The service then runs one of two Core DB queries to confirm the requested entity falls within the caller's scope:
+When iqentities is present: 6
+sqlSELECT TRIM(en.I_LCL_ENTY)
+FROM MD.TMD_ENTY en, MD.TMD_ENTY_REL re
+WHERE re.I_CHILD_ENTY = en.I_ENTY
+AND re.C_CHILD_TYPE = :entityType        -- 'CH' or 'MT'
+AND re.I_PARNT_ENTY IN :parentEntities   -- the iqentities list
+AND en.I_LCL_ENTY IN :localEntities      -- the requested entity value(s)
+When only iqorgid is present: 7
+sqlSELECT TRIM(en.I_LCL_ENTY)
+FROM MD.TMD_ENTY en, MD.TMD_ENTY_REL re
+WHERE re.I_CHILD_ENTY = en.I_ENTY
+AND re.C_CHILD_TYPE = :entityType
+AND re.I_PARNT_ENTY IN (
+    SELECT og.I_ENTY FROM DC.TDC_VIQ_ORG_ENTY og WHERE og.I_ORG_ID = :orgId
+)
+AND en.I_LCL_ENTY IN :localEntities
+The logic is: "Does the Core DB's entity relationship tree confirm that the requested entity (merchant/chain) is a descendant of the entities the caller's token is scoped to?"
+If the DB returns no matching rows, or if the returned set does not contain the requested entity value, a 403 FORBIDDEN is returned. 8
+Entity Type Priority Logic
+Within authorizeToken, the service first attempts to validate via the chain (level4Entity / CH type). Only if that is unavailable does it fall back to the merchant (levelEntity / MT type): 9
+javaif (StringUtils.isNotBlank(level4Entity)) {
+    // Try chain first (ENTITY_CHAIN_TYPE = "CH")
+    isAuthorized = getFromCoreEntityRelations(..., "CH", ...);
+} else {
+    throw new Exception(); // triggers catch block — fall through to merchant
+}
+// catch block:
+if (StringUtils.isNotBlank(levelEntity)) {
+    // Fall back to merchant (ENTITY_MERCHANT_TYPE = "MT")
+    isAuthorized = getFromCoreEntityRelations(..., "MT", ...);
+}
+Summary: Access Control Decision Tree
+Request arrives
+        ↓
+[JWT missing / invalid / untrusted issuer?] —YES—→ 401 Unauthorized
+        | NO
+        ↓
+[iss contains "us_worldpay_fis_int"?] —YES—→ 200 OK (internal bypass)
+        | NO
+        ↓
+[platform == NAP and no entityHierarchy?] —YES—→ 400 Bad Request
+        | NO
+        ↓
+[caseNumber provided?]
+    |—YES—→ Look up WDP.CASE table — extract levelEntity + level4Entity
+    |—NO—→ Use merchantId + level4Entity from request directly
+        |
+        ↓
+[level4Entity present?]
+    |—YES—→ Query Core DB: does CH entity match caller's iqentities/iqorgid scope?
+    |—NO—→ Query Core DB: does MT entity match caller's iqentities/iqorgid scope?
+        |
+        ↓
+    |—MATCH FOUND—→ 200 OK (no body)
+    |—NO MATCH——→ 403 Forbidden (StandardErrorResponse body)
+
+2. The /authorize Endpoint — Complete Contract
+Request
+Method: POST
+Path: /authorize
+Authentication: OAuth2 Bearer JWT (required)
+Content-Type: application/json
+Request Body (AuthorizationRequest): 10
+json{
+  "platform":     "PIN",          // Required. One of: CORE, NAP, VAP, LATAM, PIN
+  "caseNumber":   "P123456789",   // Optional. Dispute case number.
+  "merchantId":   "123456789",    // Optional. Level-1 entity / merchant ID.
+  "level4Entity": "070111"        // Optional. Chain ID (level-4 entity).
+}
+Validation Rules: 11
+
+platform is @NotBlank — must be present and non-empty.
+platform must be one of the SourceSystemName enum values (CORE, NAP, VAP, LATAM, PIN). Invalid → 400.
+If platform != NAP: at least one of caseNumber, merchantId, or level4Entity must be provided. All three missing → 400.
+platform == NAP → always 400 (NAP is not supported for this flow).
+
+Internal Processing Steps
+
+Map to internal request: AuthorizationMapper.formatAuthorizationRequest() copies the request to an EntityAuthorizationRequest object (same fields plus entityHierarchy which is null here). 12
+Check JWT existence: If jwt == null or jwt.getClaims() == null → 400 Bad Request. 13
+Internal bypass check: If iss contains us_worldpay_fis_int → return 200 OK immediately.
+Resolve case if caseNumber provided: Query USCaseRepository.findByCaseNumber(caseNumber) against WDP.CASE (PostgreSQL). Extracts C_LEVEL1_ENTITY and C_LEVEL4_ENTITY from the case row. 14
+
+Case not found → 403 Forbidden ("Case number not found").
+Case found but both entities are blank → 403 Forbidden.
+
+
+Determine entity to validate: Uses level4Entity from case or request (preference: level4 = chain). Falls back to levelEntity/merchantId if level4 is blank.
+Core DB entity relation query: See SQL above. Validates entity is in caller's scope using iqentities (list) or iqorgid (single org).
+Authorization decision: If DB returns the requested entity value in its result set → authorized. If empty or not containing the value → 403.
+
+Response Contracts
+Success:
+HTTP 200 OK
+(no body)
+Failure — 400 Bad Request (invalid input):
+json{
+  "errors": [
+    {
+      "message": "Either case number or merchant id or chain is required.",
+      "target": "platform : PIN"
+    }
+  ]
+}
+Failure — 403 Forbidden (authorization failed):
+json{
+  "errors": [
+    {
+      "message": "level4Entity or chainId doesnt have relation",
+      "target": "level4Entity : 070111"
+    }
+  ]
+}
+The StandardErrorResponse always has an errors array of StandardDisplayError objects with message and target fields. 15
+
+3. Authorization Only vs. CRUD — Is Any Data Modified?
+The service is authorization and read-only queries only. It performs zero writes.
+Evidence
+
+No save, delete, or update calls anywhere in the codebase. All repository methods used are query-only:
+
+USCaseRepository.findByCaseNumber() — SELECT 16
+OrgEntityRepository.getLocalEntitiesByOrgId() / getLocalEntitiesByParentEntity() — SELECT 6
+MerchantRepository.findByMerchantId() — SELECT 17
+All MerchantDaoImpl methods — native SELECT queries with with ur (Uncommitted Read, DB2 read-only hint) 18
+ChainRepository.findTopByChain() — SELECT 19
+MerchantWomplyRepository.findFirstByProductAndMid() — SELECT 20
+
+
+DB2 dialect configured with spring.jpa.hibernate.ddl-auto: false — Hibernate will not attempt to create or alter any schema. 21
+No controller methods use HTTP PUT, PATCH, or DELETE — the three controllers expose only POST (for queries that require body) and GET. 22
+No JPA entity has @GeneratedValue strategy used for inserts (the USCaseEntity has one but it is never invoked — the entity is only fetched, never constructed for saving). 23
+
+What the Service Does Do (Read-Only)
+
+Reads merchant hierarchy data from the Core DB2 (MD.*, DC.*, BC.* schemas)
+Reads dispute case data from the WDP PostgreSQL DB (WDP.CASE table)
+Returns JSON responses derived from those reads
+
+
+4. Data Ownership and Persistence Scope
+What This Service Owns: Nothing
+The service owns no database tables and persists no data. It is a pure read-through service.
+Data It Reads From (Not Owns)
+Source 1: WDP PostgreSQL Database — Dispute Case Data
+TableSchemaEntity ClassDataCASEWDPUSCaseEntityCase number — levelEntity (merchant ID) + level4Entity (chain ID)
+The WDP PostgreSQL database (globaldisputedatabase) is the dispute platform's own database. This service reads only one table from it (WDP.CASE) to look up which merchant/chain a dispute case belongs to. 14 The case data is written and owned by a different WDP service.
+Source 2: Core DB2 Database — Merchant Hierarchy Master Data
+The Core DB2 database is Worldpay's central merchant master data store. This service reads from several schemas:
+SchemaTable / ViewEntity ClassDataDCTDC_VIQ_ORG_ENTYOrgEntityOrg-to-entity mapping (which entities belong to which org)MDTMD_ENTY(native query)Entity master (entity ID — local entity ID)MDTMD_ENTY_REL(native query)Entity parent-child relationshipsMDTMD_CHAIN_ANALYProductEntitlementEntityChain-level product entitlements (opt-in/opt-out)MDTMD_MRCHNT_WOMPLYMerchantWomplyEntityMerchant-level DEFRDR/CHGBD product entitlementsBCTBC_MRCHNT_MAST_BOMerchantEntityMerchant master (ISO, ISC, chain, division, store, name, location)BCTMD_CHAINChainEntityChain status and pre-note indicator
+24 25
+The MD, DC, and BC schemas belong to the Core hierarchy/master data system. This service has no authority to modify them — it only queries them to serve authorization decisions and merchant data lookups.
+No Cache, No Session State, No Event Publishing
+There is no Redis, no in-memory cache abstraction, no Kafka producer, and no messaging framework in the dependency list. 26 The service is completely stateless between requests.
+
+Key File Reference
+FileRolesrc/main/java/.../service/impl/AuthorizationServiceImpl.javaAll authorization logic (layers 2-3, all decision paths)src/main/java/.../controller/AuthorizationController.java/authorize and /entity-authorize endpoint definitionssrc/main/java/.../config/SecurityConfig.javaLayer 1: JWT validation, whitelist, OAuth2 resource server configsrc/main/java/.../model/request/AuthorizationRequest.java/authorize request contractsrc/main/java/.../mapper/AuthorizationMapper.javaMaps AuthorizationRequest → EntityAuthorizationRequestsrc/main/java/.../us/repository/USCaseRepository.javaCase number lookup in WDP PostgreSQLsrc/main/java/.../core/repository/OrgEntityRepository.javaCore DB entity-scope verification queriessrc/main/java/.../exception/GlobalExceptionHandler.javaAll HTTP error response shapes (400, 403, 404, 500)src/main/java/.../util/ApplicationConstants.javaEntity type constants (CH, MT, SC, etc.) and INTERNAL_FIRM value
+
+Confidence Assessment
+FindingConfidenceBasisThree-layer access control modelHighSecurityConfig.java, AuthorizationServiceImpl.java:41-61Internal firm bypass on iss = us_worldpay_fis_intHighAuthorizationServiceImpl.java:45-49, ApplicationConstants.java:13JWT claims iqorgid and iqentities are the authorization scopeHighAuthorizationServiceImpl.java:68-75, test data in AuthorizationServiceImplTest.java/authorize request contract (fields, validation)HighAuthorizationRequest.java, RequestValidator.java, AuthorizationController.java200 OK with no body on successHighAuthorizationController.java:49 — ResponseEntity.status(HttpStatus.OK).build()403 FORBIDDEN on entity mismatchHighGlobalExceptionHandler.java:184-194 — UnauthorizedException → 403No writes to any databaseHighFull source scan — no save, delete, update, merge, or persist in any service/DAODB2 with ur hint confirms read-only intentHighMerchantDaoImpl.java:50, 61Service owns no database tablesHighAll JPA entities map to existing tables in MD, DC, BC, WDP schemas; no schema migrations or DDLNAP always rejectedHighAuthorizationServiceImpl.java:55-59, RequestValidator.java:32-37
+
+Footnotes
+
+Good. Now that I have both research reports fully extracted, here is my architecture-level read of what they mean for WDP-COMPONENTS.md section 1.3.
+Key findings to incorporate:
+The component is significantly more detailed than the current DRAFT stub. Specifically:
+
+Three-layer auth model — not just "hierarchy-based auth" as currently described. It's JWT validation → internal bypass → Core DB entity scope check.
+Dual database dependency — PostgreSQL (WDP.CASE read-only) + IBM DB2 (Core merchant master). The DB2 dependency is architecturally significant and not currently captured.
+NAP is explicitly rejected — the service is PIN/CORE/VAP/LATAM only for /authorize. This directly affects the API Gateway's routing logic documented in 1.1.
+Zero writes, zero ownership — pure read-through. No cache, no events, no state.
+Internal firm bypass — same pattern as UAMS, consistent platform-wide.
+
+Confirm before I draft: Should I now produce the full replacement section 1.3 for WDP-COMPONENTS.md based on this research?
+Footnotes
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/config/SecurityConfig.java:31-36 — auth whitelist for prod vs non-prod. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/config/SecurityConfig.java:38-43 — JwtIssuerAuthenticationManagerResolver and .oauth2ResourceServer() config. ↩
+
+
+src/main/resources/application.yaml:37-38 — jwt.trustedIssuers: ${jwt_trusted_issuer_urls}. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:45-49 — internal firm bypass. ApplicationConstants.java:13 — INTERNAL_FIRM = "us_worldpay_fis_int". ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:68-75 — JWT claim extraction: iqorgid and iqentities. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/core/repository/OrgEntityRepository.java:25-27 — getLocalEntitiesByParentEntity query using iqentities. ↩ ↩2
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/core/repository/OrgEntityRepository.java:21-23 — getLocalEntitiesByOrgId query using iqorgid. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:130-146 — getFromCoreEntityRelations throws UnauthorizedException when entity not found. GlobalExceptionHandler.java:184-194 — maps to 403. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:96-113 — chain-first, merchant-fallback logic. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/model/request/AuthorizationRequest.java — full request model with @NotBlank on platform. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/util/RequestValidator.java:24-38 — platform and presence validation. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/mapper/AuthorizationMapper.java:9-12 — BeanUtils.copyProperties mapping. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:41-43 — null JWT check. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/us/entity/USCaseEntity.java:18-41 — WDP.CASE table mapping: I_CASE, C_LEVEL1_ENTITY, C_LEVEL4_ENTITY. ↩ ↩2
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/exception/GlobalExceptionHandler.java:148-193 — BadRequestException → 400, UnauthorizedException → 403, both producing StandardErrorResponse. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/us/repository/USCaseRepository.java:14-15 — SELECT-only JPQL. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/core/repository/MerchantRepository.java:12 — findByMerchantId derived query = SELECT. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/dao/impl/MerchantDaoImpl.java:50-61 — all native queries include with ur (DB2 Uncommitted Read, read-only intent). ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/core/repository/ChainRepository.java — findTopByChain = SELECT. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/ProductEntitlementServiceImpl.java:39-41 — findFirstByProductAndMid = SELECT. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/dbconfig/CoreDataSourceConfig.java:38 — spring.jpa.hibernate.ddl-auto: false. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/controller/AuthorizationController.java, MerchantController.java, ProductEntitlementController.java — only @GetMapping and @PostMapping present. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/us/entity/USCaseEntity.java:22-25 — @GeneratedValue exists but the entity is only ever fetched via findByCaseNumber; no save call exists in the service. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/core/entity/ — all Core JPA entities: OrgEntity, MerchantEntity, ChainEntity, ProductEntitlementEntity, MerchantWomplyEntity, EntityDetails, EntityRelDetails, DisplayCode. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/dao/impl/MerchantDaoImpl.java:46-61 — native SQL shows exact table names: MD.TMD_ENTY, MD.TMD_ENTY_REL, MD.TMD_CHAIN, MD.TMD_SUPR_CHAIN, MD.TMD_STORE, MD.TMD_DIVISION, MD.TMD_MRCHNT, MD.TMD_ADDRESS, BC.TBC_MRCHNT_MAST_BO. ↩
+
+
+pom.xml — dependency list contains only Spring Boot, JPA, PostgreSQL driver, DB2 driver, Lombok, logstash, springdoc. No Kafka, Redis, RabbitMQ, or similar. ↩
+Research Report: Pod Scaling, Memory Configuration, and Architectural Risks
+Executive Summary
+The service's replica count is a deploy-time template variable ({{ replicas-core-hierarchy-authorization-service }}); the exact value is not stored in this repository and varies by environment. Memory is explicitly bounded at 2048Mi limit / 1024Mi request, but no CPU limits or requests are configured, and there is no Horizontal Pod Autoscaler. The codebase contains several architectural concerns: a label mismatch that silently disables the topology spread constraint, no connection pool tuning across two databases, no circuit breaker on the external Core DB2 dependency, use of exception-throwing for control flow in the authorization path, dead injected beans, and no caching on hot authorization paths.
+
+1. Pod Count and Scaling Configuration
+Replica Count
+The number of pods is not hardcoded in this repository. The resources.yaml Kubernetes Deployment spec uses a placeholder:
+yamlspec:
+  replicas: {{ replicas-core-hierarchy-authorization-service }}
+1
+This value is resolved at deploy time by XL Deploy (the CI/CD tool referenced in deployit-manifest.xml 2 and Jenkinsfile 3). The actual replica count per environment is stored in XL Deploy configuration external to the repo. This codebase alone cannot tell you how many pods run in production.
+Rolling Update Strategy
+yamlstrategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+  type: RollingUpdate
+1
+
+maxUnavailable: 0 — No pod is taken down before a new one is ready. Zero-downtime deployments.
+maxSurge: 1 — At most one extra pod is created above the desired count during a rollout.
+minReadySeconds: 30 — A new pod must be running without crashing for 30 seconds before being considered available. 1
+
+Memory Configuration
+ParameterValueMemory request1024MiMemory limit2048MiCPU requestNot configuredCPU limitNot configured
+1
+The JVM process (Spring Boot fat JAR) has no JAVA_OPTS or -Xmx/-Xms flags set anywhere in the deployment manifest. The JVM will auto-tune its heap based on available container memory, which defaults to approximately 25% of the container memory limit for the initial heap and up to ~75% for max heap under Java 17's container-awareness. With a 2048Mi limit, the JVM may allocate up to ~1.5GB for heap at peak — approaching the pod's memory limit when combined with metaspace and off-heap buffers.
+Health and Readiness Probes
+yamlreadinessProbe:
+  initialDelaySeconds: 20
+  timeoutSeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+  httpGet:
+    path: /merchant/gcp/hierarchy-authorization/readyz
+    port: 8082
+
+livenessProbe:
+  initialDelaySeconds: 30
+  timeoutSeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+  httpGet:
+    path: /merchant/gcp/hierarchy-authorization/livez
+    port: 8082
+1
+These map to Spring Boot actuator groups with additional-path: server:/livez and server:/readyz in application.yaml 4, served on the application port (8082) under the configured servlet context path /merchant/gcp/hierarchy-authorization 1.
+Auto-Scaling
+There is no Horizontal Pod Autoscaler (HPA) resource defined. The resources.yaml contains only a Deployment, a Service, and an Ingress — no HorizontalPodAutoscaler. Scaling is entirely manual, driven by changing the {{ replicas-core-hierarchy-authorization-service }} template variable.
+Observability / Tracing
+The pod is annotated for OpenTelemetry auto-instrumentation via the operator:
+yamlannotations:
+  instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default
+1
+This injects a Java OTel agent at pod startup, which adds memory and CPU overhead.
+Ingress / Network
+The service is exposed via NGINX Ingress on six hostnames (external, internal, WDP-external, WDP-internal, WDP-reverse-proxy, and one generic hostname) all routing to the same ClusterIP service on path /merchant/gcp/hierarchy-authorization. 1 The Kubernetes Service type is ClusterIP, so it is not directly externally accessible without the ingress.
+Environment-Specific Database Endpoints
+EnvironmentPostgreSQL Clusterdevwdp-disputes-dev-postgres-cluster.cluster-cql8rsklwshz.us-east-2.rds.amazonaws.comtestwdp-disputes-test-postgres-cluster.cluster-cql8rsklwshz.us-east-2.rds.amazonaws.comstgwdp-disputes-load-postgres-cluster.cluster-cql8rsklwshz.us-east-2.rds.amazonaws.comuatwdp-disputes-uat-postgres-cluster.cluster-cql8rsklwshz.us-east-2.rds.amazonaws.comcertwdp-cert-rds-cluster.cluster-coyckei g0jhm.us-east-1.rds.amazonaws.com (us-east-1)prodprod-wdp-rds-cluster.cluster-c7fbxiwwqen9.us-east-2.rds.amazonaws.com
+5 6 7 8 9
+All Core DB2 connections use environment variable placeholders (${core_datasource_jdbc_url}) — the actual DB2 host is not visible in this repository.
+
+2. Architectural Risks and Concerns
+Risk 1 — Topology Spread Constraint Label Mismatch (Bug)
+Severity: Medium — The topology spread constraint in resources.yaml uses a labelSelector with a different label value than the pods it is supposed to spread:
+yaml# Deployment and pod labels use:
+app: core-hierarchy-authorization-service${BRANCH_NAME_PLACEHOLDER}
+
+# Topology spread constraint labelSelector uses:
+app: gcp-core-hierarchy-authorization-service${BRANCH_NAME_PLACEHOLDER}
+#    ^^^^ extra "gcp-" prefix
+1
+The gcp- prefix appears in the topology spread constraint but not in the deployment's matchLabels or pod template labels. As a result, the spread constraint's labelSelector will never match any pods, rendering the constraint inoperative. Pods can be scheduled on the same Kubernetes node without any enforcement of spread. In a cluster with limited nodes, this could result in all replicas landing on the same node — a single-node failure would take down all instances simultaneously.
+Risk 2 — No CPU Requests or Limits
+Severity: Medium — The pod spec sets only memory requests/limits. No CPU request or limit is defined: 1
+yamlresources:
+  limits:
+    memory: 2048Mi
+  requests:
+    memory: 1024Mi
+    # CPU: not set
+Without CPU requests, the Kubernetes scheduler has no signal for bin-packing CPU workloads. Without CPU limits, a pod can consume all CPU on its node, causing noisy-neighbor effects on other workloads. Additionally, the OpenTelemetry Java agent adds non-trivial CPU overhead that is entirely unconstrained.
+Risk 3 — No Connection Pool Configuration (Both Datasources)
+Severity: Medium — Neither the application.yaml nor any of the environment-specific YAML files configure HikariCP pool settings for either datasource. 5 The service connects to two separate databases (PostgreSQL for WDP cases, DB2 for Core hierarchy) using default Hikari parameters:
+
+Default maximum pool size: 10 connections per datasource
+Default connection timeout: 30 seconds
+No minimumIdle, maxLifetime, or connectionTimeout tuning
+
+Under load, if authorization requests arrive faster than 10 concurrent DB queries can complete, requests will queue waiting for a connection. This is compounded by the fact that a single /authorize request may touch both databases (case lookup on PostgreSQL + entity check on DB2), effectively consuming connections from two pools simultaneously.
+Risk 4 — No Circuit Breaker on Core DB2 Dependency
+Severity: High — Every business authorization call depends on the Core DB2 being available and responsive. There is no circuit breaker (Resilience4j, Hystrix, or similar), no retry, and no fallback path. 10 If the Core DB2 becomes slow or unreachable:
+
+All connections in the DB2 Hikari pool will be held waiting.
+New requests will queue at the pool, timing out after 30 seconds.
+The service will return 500 Internal Server Error (or eventually 503) to all callers until DB2 recovers.
+The liveness probe (which checks /livez — a Spring Boot actuator endpoint, not a DB connectivity check) will continue to return 200, so the pod will not be restarted.
+
+There is no graceful degradation.
+Risk 5 — Exception Used for Flow Control in Authorization Path
+Severity: Low-Medium — In AuthorizationServiceImpl.authorizeToken(), a bare throw new Exception() is used to trigger the fallback from chain-based to merchant-based entity lookup: 11
+javatry {
+    if (StringUtils.isNotBlank(level4Entity)) {
+        // ...
+        isAuthorized = getFromCoreEntityRelations(..., "CH", ...);
+    } else {
+        throw new Exception(); // signals "no level4Entity, fall through"
+    }
+} catch (Exception e) {
+    if (StringUtils.isNotBlank(levelEntity)) {
+        isAuthorized = getFromCoreEntityRelations(..., "MT", ...);
+    }
+}
+This pattern:
+
+Swallows any genuine exception from the getFromCoreEntityRelations call on the chain path (e.g., a DB timeout would silently fall through to trying the merchant path rather than propagating the error)
+Makes it impossible to distinguish between "level4Entity was blank" and "the DB call threw an error"
+Reduces stack trace visibility in logs
+
+Risk 6 — Dead Beans / Dead Code
+Severity: Low
+RestTemplate bean declared but never used:
+CommonConfig defines a RestTemplate Spring bean: 12
+java@Bean
+public RestTemplate getRestTemplate() {
+    return new RestTemplate();
+}
+No service class, repository, or controller injects or uses RestTemplate anywhere in the codebase. This is dead infrastructure code, likely left over from a previous integration that was removed or never completed.
+ProductEntitlementRepository injected but never called:
+ProductEntitlementServiceImpl autowires ProductEntitlementRepository, 13 but never calls any of its methods. The actual product entitlement data is fetched via MerchantWomplyRepository and ChainRepository. The ProductEntitlementServiceImpl.findFirstByChainAndProduct() method is a dead path.
+Risk 7 — No Caching on Hot Authorization Paths
+Severity: Medium — Every call to /authorize or /entity-authorize results in at least one (usually two) synchronous database queries:
+
+USCaseRepository.findByCaseNumber() — PostgreSQL query (if case number provided)
+OrgEntityRepository.getLocalEntitiesByParentEntity() or getLocalEntitiesByOrgId() — DB2 native SQL query
+
+For WDP dispute UIs that call /authorize on every page load or action, this means N uncached DB round-trips per user action. There is no @Cacheable, no Redis, and no in-process cache (Caffeine, etc.) anywhere in the codebase. 14 High-frequency callers will generate proportionally high DB load.
+Risk 8 — Logstash TCP Appender Without Fallback
+Severity: Low — The logback-spring.xml configures a LogstashTcpSocketAppender that writes logs directly to a TCP Logstash endpoint: 15
+xml<appender name="awselk" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+    <destination>${LOGSTASH_SERVER_HOST}:${LOGSTASH_SERVER_PORT}</destination>
+    <keepAliveDuration>5 minutes</keepAliveDuration>
+</appender>
+All loggers — including the root logger — send to both console and this TCP appender. If the Logstash endpoint is unavailable:
+
+Log messages will back up in the TCP socket buffer
+Application threads can block waiting for the socket buffer to drain
+There is no ringBuffer size limit or neverBlock configuration to prevent this
+There is no fallback-only-to-console configuration
+
+Risk 9 — Snyk Security Scanning Not Enforced
+Severity: Low — The Jenkinsfile explicitly sets snykFailOnIssues: 'false': 3
+groovysnykFailOnIssues: 'false',
+snykSeverity: 'low',
+This means Snyk will scan for vulnerabilities down to low severity but will never fail the build regardless of what it finds. The dependency scan result is informational only and does not gate deployment.
+Risk 10 — MerchantEntityDetailsHierarchy Is an @Entity Without @Table
+Severity: Low — MerchantEntityDetailsHierarchy is annotated @Entity but has no @Table annotation: 16
+java@Entity
+public class MerchantEntityDetailsHierarchy implements Serializable { ... }
+It is used purely as a result mapping target for native SQL queries in MerchantDaoImpl. Without @Table, Hibernate derives the table name from the class name (merchant_entity_details_hierarchy), which does not exist in the DB2 schema. This works in practice only because Hibernate DDL auto-creation is set to false and the entity is never queried through JPQL — but it is fragile. If ddl-auto were ever changed, Hibernate would attempt to create/validate a table that doesn't exist, causing startup failure.
+Summary Table
+#RiskSeverityLocation1Topology spread constraint label mismatch (ineffective spread)Mediumresources.yaml:28-312No CPU requests or limitsMediumresources.yaml:55-593No connection pool configuration (both datasources)MediumAll application-*.yaml files4No circuit breaker on Core DB2HighAuthorizationServiceImpl.java, MerchantDaoImpl.java5Exception used for flow control in auth fallbackLow-MedAuthorizationServiceImpl.java:96-1146Dead RestTemplate bean; dead ProductEntitlementRepositoryLowCommonConfig.java, ProductEntitlementServiceImpl.java7No caching on hot authorization DB queriesMediumAuthorizationServiceImpl.java, ProductEntitlementServiceImpl.java8Logstash TCP appender without neverBlock or fallbackLowlogback-spring.xml9Snyk vulnerability scan non-blockingLowJenkinsfile:1710@Entity without @Table on result-mapping classLowMerchantEntityDetailsHierarchy.java
+
+Confidence Assessment
+FindingConfidenceBasisReplica count is a template variable (unknown exact value)Highresources.yaml:8 — {{ replicas-core-hierarchy-authorization-service }}Memory: 2048Mi limit / 1024Mi requestHighresources.yaml:56-59No CPU limits/requestsHighresources.yaml:55-59 — only memory keys presentNo HPAHighresources.yaml — only Deployment, Service, Ingress resourcesTopology spread label mismatchHighresources.yaml:28-31 vs resources.yaml:6,16 — gcp-core-hierarchy-authorization-service vs core-hierarchy-authorization-serviceNo connection pool configHighAll application-*.yaml files — no spring.datasource.*.hikari.* keysNo circuit breakerHighNo Resilience4j or similar dependency in pom.xml; no @CircuitBreaker in codeException-as-flow-controlHighAuthorizationServiceImpl.java:96-114Dead RestTemplate beanHighCommonConfig.java:11-13; grep across codebase finds no injection/usageDead ProductEntitlementRepositoryHighProductEntitlementServiceImpl.java:27 — injected but no method calledLogstash TCP riskMediumlogback-spring.xml:16-24; standard logstash-logback-encoder behavior without neverBlockJVM heap sizing concernMediumInferred from Java 17 container-awareness defaults + 2048Mi limit; no JAVA_OPTS in manifest
+
+Footnotes
+
+All three research reports are now fully extracted. I now have everything needed to write the complete WDP-COMPONENTS.md section 1.3. Shall I proceed?
+Footnotes
+
+
+resources.yaml:1-167 — full Kubernetes deployment, service, and ingress specification. Replica count at line 8, rolling update strategy at lines 9-13, memory at lines 56-59, probes at lines 35-52, topology spread at lines 25-31. ↩ ↩2 ↩3 ↩4 ↩5 ↩6 ↩7 ↩8 ↩9 ↩10
+
+
+deployit-manifest.xml — XL Deploy packaging descriptor; confirms deploy-time variable resolution. ↩
+
+
+JenkinsFile:1-19 — Pipeline definition; snykFailOnIssues: 'false' at line 17; team frauddispute, namespace gcp-ff. ↩ ↩2
+
+
+src/main/resources/application.yaml:18-24 — management.endpoint.health.group.liveness.additional-path: server:/livez. ↩
+
+
+src/main/resources/application-dev.yaml — dev PostgreSQL: wdp-disputes-dev-postgres-cluster; no Hikari pool settings in any env YAML. ↩ ↩2
+
+
+src/main/resources/application-test.yaml — test environment datasource. ↩
+
+
+src/main/resources/application-stg.yaml — staging (load) environment datasource. ↩
+
+
+src/main/resources/application-uat.yaml — UAT datasource. ↩
+
+
+src/main/resources/application-prod.yaml — prod PostgreSQL: prod-wdp-rds-cluster.cluster-c7fbxiwwqen9.us-east-2.rds.amazonaws.com. ↩
+
+
+pom.xml — dependency list contains no resilience/circuit-breaker library (no resilience4j, hystrix, spring-cloud-circuit-breaker). ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/AuthorizationServiceImpl.java:96-114 — throw new Exception() used to branch to fallback path. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/config/CommonConfig.java:11-13 — unused RestTemplate bean. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/service/impl/ProductEntitlementServiceImpl.java:27 — @Autowired ProductEntitlementRepository productEntitlementRepository — injected but never used in method body. ↩
+
+
+pom.xml — no spring-boot-starter-cache, caffeine, or spring-data-redis in dependencies. ↩
+
+
+src/main/resources/logback-spring.xml:16-24 — LogstashTcpSocketAppender without neverBlock or ringBuffer configuration. ↩
+
+
+src/main/java/com/wp/wdp/hierarchy/authorization/core/entity/MerchantEntityDetailsHierarchy.java:21 — @Entity with no @Table annotation. ↩

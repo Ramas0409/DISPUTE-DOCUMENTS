@@ -1,0 +1,507 @@
+Image 1 (Lines 1–43):
+# Deep Technical Research Report: `wdp-chargeback-evidence-event-scheduler`
+
+> **Repository:** `Worldpay/wdp-chargeback-evidence-event-scheduler`
+> **Artifact:** `com.wp.gcp:chargeback-evidence-event-schedulerr:1.0.5`
+> **Stack:** Java 17 · Spring Boot 3.5.7 · Spring Data JPA · Spring Kafka · AWS MSK · PostgreSQL
+> **Report Date:** 2026-04-05
+
+---
+
+## Executive Summary
+
+`wdp-chargeback-evidence-event-scheduler` is a **Spring Boot long-running service** (Kubernetes `Deployment`, not a `CronJob`) that acts as the **outbox relay layer** for the WDP chargeback and evidence domain. It owns five independent `@Scheduled` cron jobs (and other upstream writers) have already committed, it does not call FileProcessor, and its relationship to FileProcessor is purely through the shared database. The most critical scheduler (Scheduler1) enforces a sequencing dependency: `EVIDENCE_ATTACH` rows are held in `BLOCKED` status until their paired `CHARGEBACK_PROCESS` row reaches `SUCCESS`, preventing out-of-order evidence publication.
+
+---
+
+## 1. Primary Responsibility
+
+### What It Does
+
+The service is the **transactional outbox relay** for the WDP chargeback/evidence pipeline. Its five schedulers collectively:
+
+1. **Scheduler1 (`ChargebackEvidenceEventScheduler`)** – polls `wdp.chbk_outbox_row`, publishes `CHARGEBACK_PROCESS` events to the `new-case-events` topic and `EVIDENCE_ATTACH` events to the `case-evidence-events` topic, then unblocks or error-marks dependent evidence rows.[^1]
+2. **Scheduler2 (`FileJobStatusCompletionScheduler`)** – polls `wdp.file_job` for `PROCESSING` jobs, computes completion percentages from `wdp.chbk_outbox_row` counters, marks jobs `COMPLETED`, and archives old `SUCCESS` rows into `wdp.chbk_outbox_row_archive`.[^2]
+3. **Scheduler3 (`OutgoingEventScheduler`)** – polls `wdp.outgoing_event_outbox` and routes events to topic(s) determined by `channelType` (e.g., `EXPIRY_EVENTS`, `CORE_EVENTS`, `GP_EVENTS`, `SEN_EVENTS`).[^3]
+4. **Scheduler4 (`BreOrchestrationOutboxScheduler`)** – polls `wdp.bre_orchestration_outbox` and routes events to either the `business-rules` topic (`BUSINESS_RULES` component) or the `outgoing-events` topic (`NOTIFICATION_ORCHESTRATOR` component).[^4]
+5. **Scheduler5 (`EvidenceErrorEmailScheduler`)** – polls `wdp.file_evidence` for ERROR rows updated yesterday, generates S3 pre-signed URLs, renders a CSV report, and calls an external email notification REST endpoint.[^5]
+
+### What It Explicitly Does Not Do
+
+- Does **not** consume from Kafka (no `@KafkaListener`; no consumer configuration present).
+- Does **not** parse or validate incoming CSV/file uploads. File parsing is done by a separate FileProcessor component that writes to the outbox tables.
+- Does **not** call the Worldpay chargeback API or any card-scheme endpoint directly.
+- Does **not** perform schema migration (Hibernate DDL is set to `false`[^6]).
+- Does **not** implement any HTTP REST API endpoints for external callers (no `@RestController`).
+
+### Relationship to FileProcessor
+
+The scheduler is **downstream and independent** of FileProcessor. FileProcessor (or other upstream writers) populates `wdp.chbk_outbox_row` and `wdp.file_job`. The scheduler only reads those tables; it never calls FileProcessor. The coupling is entirely through the shared PostgreSQL schema. Scheduler2 monitors `file_job` rows that are set to `PROCESSING` by FileProcessor and transitions them to `COMPLETED` once all corresponding outbox rows are terminal.[^2]
+
+---
+
+## 2. Trigger and Schedule
+
+Image 2 (Lines 42–89):
+## 2. Trigger and Schedule
+
+### Trigger Mechanism
+
+All five schedulers use **Spring `@Scheduled(cron = ...)` annotation** – a simple time-based cron trigger running inside the Spring container's `ThreadPoolTaskScheduler`.[^7] There is no SQS trigger, no Kubernetes `CronJob`, and no event-driven mechanism.
+
+### Scheduling Infrastructure
+
+- `@EnableScheduling` is declared on the main application class.[^8]
+- A custom `SchedulerConfig` bean creates a `ThreadPoolTaskScheduler` with **pool size 5** and thread name prefix `ChargebackEvidence`.[^9] This is exactly enough threads for all five schedulers to run concurrently if their fire times overlap.
+
+### Cron Values
+
+All cron expressions are **externalized via environment variables injected through Kubernetes Secrets / Spring profiles**. No literal cron expressions appear in the checked-in code. Property keys and their injection source:
+
+| Scheduler | $Value Property Key | Env Variable |
+|---|---|---|
+| Scheduler1 | `app.scheduler.chargebackEvidenceCron` | `${chargeback_evidence_scheduler_cron}` |
+| Scheduler2 | `app.scheduler.fileJobCompletionCron` | `${job_completion_scheduler_cron}` |
+| Scheduler3 | `app.scheduler.outgoingEventCron` | `${outgoing_event_scheduler_cron}` |
+| Scheduler4 | `app.scheduler.breOrchestrationOutboxEventCron` | `${bre_outbox_event_scheduler_cron}` |
+| Scheduler5 | `app.scheduler.evidenceErrorEmailCron` | `${evidence_email_scheduler_cron}` |
+
+*Actual runtime cron values are not visible in source or any committed YAML config. They must be read from the Kubernetes secret `wdp-chargeback-evidence-event-scheduler-secrets`.*[^10]
+
+### Kubernetes Resource Type
+
+**`Deployment`**, as declared in `resources.yaml`.[^11] This is an always-running pod with a rolling-update strategy (`maxSurge: 1`, `maxUnavailable: 0`). It is **NOT** a Kubernetes `CronJob`.
+
+---
+
+## 3. Outbox Polling Logic
+
+### Scheduler1 – wdp.chbk_outbox_row
+
+**Table:** `wdp.chbk_outbox_row` (entity: `ChbkOutboxEntity`)[^12]
+
+**Schema (key columns):**
+
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | bigint (seq) | PK, used for sort/pagination |
+| `file_job_id` | bigint | Parent file batch |
+| `row_number` | int | Position within file |
+| `parent_row_number` | int | Links EVIDENCE_ATTACH → CHARGEBACK_PROCESS row |
+| `event_type` | varchar | `CHARGEBACK_PROCESS` or `EVIDENCE_ATTACH` |
+| `status` | varchar | `PENDING`, `PUBLISHED`, `FAILED`, `ERROR`, `SUCCESS`, `BLOCKED`, `PENDING_DEFERRED`, `SKIPPED` |
+| `retry_count` | int | 0-based retry counter |
+
+Image 3 (Lines 87–135):
+| `event_type` | varchar | `CHARGEBACK_PROCESS` or `EVIDENCE_ATTACH` |
+| `status` | varchar | `PENDING`, `PUBLISHED`, `FAILED`, `ERROR`, `SUCCESS`, `BLOCKED`, `PENDING_DEFERRED`, `SKIPPED` |
+| `retry_count` | int | 0-based retry counter |
+| `next_retry_at` | timestamp | Earliest eligible time for retry |
+| `payload` | jsonb | Full event payload stored as JSON |
+| `idempotency_id` | uuid | Idempotency key forwarded to Kafka header |
+| `kafka_topic/partition/offset` | varchar | Written back after successful publish |
+
+**Query:**[^13]
+```sql
+SELECT outbox FROM ChbkOutboxEntity outbox
+WHERE (outbox.status = 'PENDING')
+   OR (outbox.status = 'FAILED' AND outbox.retryCount < 3 AND outbox.nextRetryAt <= CURRENT_TIMESTAMP)
+   OR (outbox.status = 'PENDING_DEFERRED' AND outbox.nextRetryAt <= CURRENT_TIMESTAMP)
+```
+
+**Ordering and Page Size:**
+- Sorted by `id` ASC.[^13]
+- Page size from `app.scheduler.properties.pageSize` → env `${page_size}` (value not visible in committed config).[^14]
+- Always fetches page 0 (`PageRequest.of(0, pageSize, Sort.by("id"))`), then loops with `hasMoreRecords = page.hasNext()` until all eligible rows are consumed.[^1]
+
+**In-progress prevention:** The scheduler sets `status = 'PUBLISHED'` and **saves to the database before calling Kafka**.[^15] This optimistic lock-before-publish approach means: if the pod is killed after the save but before the Kafka send, the row remains in `PUBLISHED` status and is NOT requeued (it falls out of the `findEligibleOutboxRecords` filter). This is a deliberate design to prevent duplicate publish, at the cost of potential message loss on crash.
+
+---
+
+### Scheduler2 – `wdp.file_job`
+
+**Table:** `wdp.file_job` (entity: `FileJobEntity`)[^16]
+
+**Query:**[^17]
+```sql
+SELECT f FROM FileJobEntity f WHERE f.status = 'PROCESSING' ORDER BY id
+```
+
+No pagination – returns all `PROCESSING` jobs in a single `List`.[^17] No `FAILED`/retry logic at this level; each job's processing is attempted every time the scheduler fires until it reaches `COMPLETED`.
+
+---
+
+### Scheduler3 – `wdp.outgoing_event_outbox`
+
+**Table:** `wdp.outgoing_event_outbox` (entity: `OutgoingEventOutboxEntity`)[^18]
+
+**Query:**[^19]
+```sql
+SELECT outbox FROM OutgoingEventOutboxEntity outbox
+WHERE (outbox.status = 'FAILED' AND outbox.retryCount < 3 AND outbox.nextRetryAt <= CURRENT_TIMESTAMP)
+   OR (outbox.status = 'PENDING_DEFERRED' AND outbox.nextRetryAt <= CURRENT_TIMESTAMP)
+```
+
+---
+
+**Image 4 (Lines 133–182):**
+OR (outbox.status = 'PENDING_DEFERRED' AND outbox.nextRetryAt <= CURRENT_TIMESTAMP)
+Note: PENDING is NOT in this query (unlike Scheduler1). Scheduler3 only processes retries (FAILED) and deferred rows (PENDING_DEFERRED). The initial PENDING → PUBLISHED transition must be handled by a different component writing directly to Kafka for second-attempt delivery only.[^19]
+Same pagination pattern as Scheduler1 (page 0 loop).1
+
+Scheduler4 – wdp.bre_orchestration_outbox
+Table: wdp.bre_orchestration_outbox (entity: BreOrchestrationOutboxEntity)[^20]
+Query: Identical filter to Scheduler3 – FAILED (retryCount < 3) or PENDING_DEFERRED.[^21] Same PENDING-absent caveat.
+
+Scheduler5 – wdp.file_evidence
+Table: wdp.file_evidence (entity: FileEvidenceEntity)[^22]
+Query:[^23]
+sqlSELECT f.i_case AS caseNumber, f.c_ntwk_case_id AS networkCaseId,
+       f.failed_s3_key AS failedS3Key, j.source AS source
+FROM wdp.file_evidence f
+JOIN wdp.file_job j ON f.file_job_id = j.id
+WHERE f.attachment_status = 'ERROR'
+AND f.updated_at >= CURRENT_DATE - INTERVAL '1 day'
+AND f.updated_at < CURRENT_DATE
+This is a daily lookback query – it only picks up errors from yesterday, not cumulative errors. No pagination; result is a flat List.
+
+4. What It Publishes
+Scheduler1: Chargeback Events
+FieldValueTopic (prod)new-case-eventsTopic (dev/local)new-case-events-devConfig keyspring.kafka.chargebackEventTopicMessage typeChargebackEventPartition keynetworkCaseId + cardNetwork + platform (string concatenation)Kafka header: idempotency-keyentity.idempotencyId.toString()Kafka header: event-timestampnull (not set for chargeback events)
+
+---
+
+**Image 5 (Lines 180–232):**
+| Kafka header: idempotency-key | entity.idempotencyId.toString() |
+| Kafka header: event-timestamp | null (not set for chargeback events) |
+ChargebackEvent key fields:[^24]
+eventType, eventTimestamp, createdBy, sourceSystem, eventId (set to DB row id),
+correlationId, sourceSystemCaseId, sourceSystemUniqueId,
+disputeAmount, disputeCurrency, disputeCurrencyExponent,
+reasonCode, disputeStage, cpdDate, documentRequired, documentIndicator,
+networkDocInd, reversal, creditDebitIndicator, partialIndicator,
+destICA, sendICA, caseType, networkRuling, rejectDate, rejectReason,
+schemeRef(...), merchantDetail(...), originalTransIdentifier(...),
+originalTransDetail(...), historicalDeptDetail(...)
+
+Scheduler1: Evidence Events
+FieldValueTopic (prod)case-evidence-eventsConfig keyspring.kafka.evidenceEventTopicMessage typeEvidenceEventPartition keycaseNumber if not blank, else networkCaseIdKafka header: idempotency-keyentity.idempotencyId.toString()
+EvidenceEvent key fields:[^25]
+eventType, eventTimestamp, createdBy, sourceSystem, eventId,
+correlationId, caseNumber, arn, actionSequence, disputeStage,
+documentType, networkCaseId, cardNetwork, originalEvidenceDetail, sourceEvent
+
+Scheduler3: Outgoing Events
+FieldValueTopicDynamically resolved from channelTypeTopicMap by channelType column valueKnown channel-topic mappings (local/dev)EXPIRY_EVENTS→case-action-events-dev, CORE_EVENTS→core-request-events-dev, GP_EVENTS→external-request-events-dev, SEN_EVENTS→external-request-events-devPartition keyentity.getCaseNumber()Kafka header: event-timestampConverted from entity.eventTimeStamp via DateUtils.convertTimeStampToString()
+OutgoingEvent key fields:[^26]
+eventType, platform, caseNumber, actionSequence, previousActionSequence,
+disputeStage, type, startRuleGroup, source, documentNameList,
+correlationId, actionStatus, expirationDate, responseDueDate,
+
+---
+
+**Image 6 (Lines 226–275):**
+eventType, platform, caseNumber, actionSequence, previousActionSequence,
+disputeStage, type, startRuleGroup, source, documentNameList,
+correlationId, actionStatus, expirationDate, responseDueDate,
+updateType, migrationStatus, actionSeq, actionType, caseType,
+dateReceivedByAcquirer, level1/3/4/5Entity, caseNetwork,
+updateType, migrationStatus, actionSeq, actionType, caseType,
+actionCode, documentIndicator, networkCaseId, hybridMerchant,
+channelType (added at publish time), eventId (set to DB row id)
+
+Scheduler4: BRE / Notification Orchestrator Events
+ComponentTopic (prod)Message TypePartition KeyBUSINESS_RULESbusiness-rulesBREOutboxEvententity.getCaseNumber()NOTIFICATION_ORCHESTRATORoutgoing-eventsNotificationOrchestrationOutboxEvententity.getCaseNumber()
+BREOutboxEvent additionally carries targetAction and publishedAction lists.[^27]
+NotificationOrchestrationOutboxEvent adds fileType, targetAction, publishedAction.[^28]
+
+Scheduler5: No Kafka Publishing
+Scheduler5 does not publish to Kafka. It calls a REST endpoint (${app.email.notify.url}) with a multipart POST containing a CSV report and a MailNotificationRequest JSON body.[^29]
+
+5. Inbound Dependencies
+DependencyConfig Key / URLPurposePostgreSQL (WDP DB)spring.datasource.wdp.jdbc-url – prod: prod-wdp-rds-cluster.cluster-c7fbxiwwqen9.us-east-2.rds.amazonaws.com:5432/wdpdisputedatabaseAll five outbox/job tables. Single datasource, single transaction manager.[^30]AWS MSK (Kafka)spring.kafka.bootstrap-servers – prod: 3 brokers at b-{1-3}.wdpprodmsk.l8a3ly.c6.kafka.us-east-2.amazonaws.com:9098Target for all published events. IAM auth via MSK IAM plugin.[^31]AWS S3app.s3.bucketname – ${bucket_name}Scheduler5 only: pre-signs S3 object URLs for failed evidence documents.[^32]Email Notification REST Serviceapp.email.notify.url – ${email_notification_url}Scheduler5 only: HTTP POST to send the daily error CSV email.[^33]
+No other HTTP services are called by Schedulers 1–4. There are no inter-service REST calls for the core Kafka publish flow.
+
+6. Error Handling
+Retry Strategy on Kafka Publish Failure
+All four Kafka-publishing schedulers (1, 3, 4, and implicitly Scheduler1 for evidence) share the same error-handling pattern:2
+
+---
+
+**Image 7 (Lines 270–315):**
+6. Error Handling
+Retry Strategy on Kafka Publish Failure
+All four Kafka-publishing schedulers (1, 3, 4, and implicitly Scheduler1 for evidence) share the same error-handling pattern:2
+retryCount = entity.retryCount + 1
+if retryCount > 2: → status = ERROR  (terminal, no further pickup)
+else:              → status = FAILED, nextRetryAt = now + 3,600,000ms (1 hour)
+This gives up to 3 total attempts (initial + 2 retries, since retryCount starts at 0 and becomes ERROR when > 2). The 1-hour retry delay is hardcoded as ApplicationConstants.NEXT_RETRY = 3600000L.[^34]
+Producer-Level Retry (Kafka Client)
+The KafkaProducerConfig sets:
+
+RETRIES_CONFIG = ${spring.kafka.retry-count} (= 3 in all environments)[^35]
+ENABLE_IDEMPOTENCE_CONFIG = true
+ACKS_CONFIG = "all" (wait for all ISR replicas)
+MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION = 5[^36]
+
+So there are up to 3 Kafka-client-level retries per kafkaTemplate.send().get() call, before the application-level exception propagates upward.
+What Happens to a Row That Cannot Be Published
+After 3 application-level failures the row reaches status = ERROR. ERROR rows are not requeued by the scheduler queries (none of the findEligibleOutboxRecords queries include status = 'ERROR').3[^19][^21] The row persists in the table with errorMessage set. No automated DLQ or secondary retry mechanism exists in this codebase for ERROR rows.
+Dead Letter Mechanism
+
+No Kafka DLQ is configured or referenced anywhere in the codebase.
+No error archive table for ERROR rows (archive only moves SUCCESS rows after 30 days[^37]).
+Scheduler5 provides an indirect error visibility mechanism: it queries file_evidence.attachment_status = 'ERROR' and sends a daily email report with S3 pre-signed links to the failed documents, but this is alerting only – it does not reattempt publishing.
+
+One Row Failure vs. Continue Processing
+Each row is processed inside a for loop with a per-row try/catch. On exception, the catch block saves the updated error state and continues to the next row.415 One failing row does NOT stop the batch. The outer scheduler method also has a try/catch that logs the exception, so even an unexpected error in the outer loop does not crash the Spring context.
+
+7. Idempotency
+Idempotency Key
+Every ChbkOutboxEntity has an idempotency_id UUID column.6 Before calling kafkaService.publishEventToKafka(), this UUID is passed as a Kafka message header idempotency-key.[^38] The consumer side is responsible for deduplication using this header; the scheduler itself does not enforce consumer-side idempotency.
+
+---
+
+**Image 8 (Lines 301–345):**
+
+No error archive table for ERROR rows (archive only moves SUCCESS rows after 30 days[^37]).
+Scheduler5 provides an indirect error visibility mechanism: it queries file_evidence.attachment_status = 'ERROR' and sends a daily email report with S3 pre-signed links to the failed documents, but this is alerting only – it does not reattempt publishing.
+
+One Row Failure vs. Continue Processing
+Each row is processed inside a for loop with a per-row try/catch. On exception, the catch block saves the updated error state and continues to the next row.415 One failing row does NOT stop the batch. The outer scheduler method also has a try/catch that logs the exception, so even an unexpected error in the outer loop does not crash the Spring context.
+
+7. Idempotency
+Idempotency Key
+Every ChbkOutboxEntity has an idempotency_id UUID column.6 Before calling kafkaService.publishEventToKafka(), this UUID is passed as a Kafka message header idempotency-key.[^38] The consumer side is responsible for deduplication using this header; the scheduler itself does not enforce consumer-side idempotency.
+At-Least-Once vs. Exactly-Once
+The publisher has a mark-before-send pattern:
+
+Set status = PUBLISHED → save to DB.
+Call kafkaTemplate.send().get().
+
+If the process dies between step 1 and step 2, the row is left in PUBLISHED and will never be retried (PUBLISHED is not in any eligible-query filter). This means:
+
+If step 2 never executes: the message is lost (under-delivery).
+If step 2 succeeds but the status update afterwards fails: step 2's Kafka metadata is not written back to the DB, but the message was still delivered.
+
+The Kafka producer is configured with enable.idempotence=true and acks=all, which gives exactly-once delivery at the Kafka broker level for a single producer session.[^36] However, across pod restarts idempotency is not guaranteed because the producer sequence is re-initialized.
+Summary: The design is at-most-once for the scheduler-to-Kafka hop (mark-before-send prevents replay on crash). Consumer-side deduplication via the idempotency-key header is the stated mechanism for downstream protection, but implementation is not visible in this repository.
+
+8. Volume and Throughput
+Page Size
+Configured via app.scheduler.properties.pageSize → ${page_size}. The actual numeric value is not present in any committed YAML and must be read from the Kubernetes secret.7
+Records Per Run
+Unbounded per run – the scheduler loops until hasMoreRecords == false, fetching pages of pageSize rows at a time.4 The entire eligible set is drained in each invocation.
+Polling Frequency
+Driven by cron – exact intervals are not committed (all five cron expressions are environment variables). No throttling, no Thread.sleep(), and no rate-limiter between page iterations.
+Backpressure on Kafka
+
+---
+
+**Image 9 (Lines 341–388):**
+Polling Frequency
+Driven by cron – exact intervals are not committed (all five cron expressions are environment variables). No throttling, no Thread.sleep(), and no rate-limiter between page iterations.
+Backpressure on Kafka
+None implemented. The kafkaTemplate.send().get() is a synchronous blocking call – the next row is not processed until the current Kafka write completes (or times out). This provides implicit natural backpressure but no explicit rate limiting. The Kafka producer's built-in buffering (buffer.memory, batch.size) is left at default Spring Kafka values (not overridden in KafkaProducerConfig[^36]).
+
+9. Scaling and Deployment
+Kubernetes Resource Type
+Deployment (not a CronJob).8
+Replica Count
+yamlreplicas: {{ replicas-wdp-chargeback-evidence-event-scheduler }}
+This is a Helm/XLD template placeholder, not a literal value.8 Actual replica count is not visible in committed source; it is resolved at deployment time.
+Memory and CPU
+ResourceValueMemory limit2048MiMemory request1024MiCPU limitNot specifiedCPU requestNot specified
+No CPU limits or requests are configured.8
+HPA (Horizontal Pod Autoscaler)
+Not present. There is no HPA resource in resources.yaml or anywhere in the repository.8
+Concurrency Risk with Replicas >1
+This is the highest-risk architectural concern in the service. The scheduler uses optimistic mark-before-send – it sets status = PUBLISHED then publishes to Kafka. With N replicas all running the same cron, the same transaction row can be picked up by two concurrent pods if both execute the select query before either commits the PUBLISHED update.
+The findEligibleOutboxRecords JPQL query has no SELECT FOR UPDATE or SKIP LOCKED, meaning two pods can read the same row before either sets it to PUBLISHED. This creates a race window for duplicate Kafka publishing.
+The idempotency-key header is the mitigation, but relies entirely on the consumer.
+There is no database-level locking, advisory lock, or distributed coordination (e.g. ShedLock, Zookeeper) implemented in this codebase.
+
+---
+
+**Image 10 (Lines 384–435):**
+The findEligibleOutboxRecords JPQL query has no SELECT FOR UPDATE or SKIP LOCKED, meaning two pods can read the same row before either sets it to PUBLISHED. This creates a race window for duplicate Kafka publishing.
+The idempotency-key header is the mitigation, but relies entirely on the consumer.
+There is no database-level locking, advisory lock, or distributed coordination (e.g. ShedLock, Zookeeper) implemented in this codebase.
+
+10. Configuration
+All keys, their injection path, and known values:
+Property KeyEnv VariableDev ValueProd ValueSourcespring.datasource.wdp.jdbc-urlhardcoded in profile YAMLdev-postgres-cluster.../globaldisputedatabaseprod-wdp-rds-cluster.../wdpdisputedatabaseProfile YAML[^30]spring.datasource.wdp.username${wdp_datasource_username}wdpdisputedevwdpproddppProfile YAML[^30]spring.datasource.wdp.password${wdp_datasource_password}gcpffmonprod...:19098K8s SecretK8s Secret[^30]spring.kafka.bootstrap-servershardcoded in profile YAML9 brokers gcpffmonprod...:190983 brokers wdpprodmsk.l8a3ly.c6.kafka.us-east-2.amazonaws.com:9098Profile YAML[^31]spring.kafka.chargebackEventTopichardcodednew-case-events-devnew-case-eventsProfile YAML[^31]spring.kafka.evidenceEventTopichardcodedcase-evidence-events-devcase-evidence-eventsProfile YAML[^31]spring.kafka.breEventTopichardcodedbusiness-rules-devbusiness-rulesProfile YAML[^31]spring.kafka.notificationOrchestratorEventTopichardcodedoutgoing-events-devoutgoing-eventsProfile YAML[^31]spring.kafka.channelTypeTopicMap${channel_topic_map}{"EXPIRY_EVENTS":"case-action-events-dev","CORE_EVENTS":"core-request-events-dev","GP_EVENTS":"external-request-events-dev","SEN_EVENTS":"external-request-events-dev"}SecretK8s Secret / local default[^39]spring.kafka.retry-counthardcoded33Profile YAML[^35]app.scheduler.chargebackEvidenceCron${chargeback_evidence_scheduler_cron}UnknownUnknownK8s Secret9app.scheduler.fileJobCompletionCron${job_completion_scheduler_cron}UnknownUnknownK8s Secret9app.scheduler.outgoingEventCron${outgoing_event_scheduler_cron}UnknownUnknownK8s Secret9app.scheduler.breOrchestrationOutboxEventCron${bre_outbox_event_scheduler_cron}UnknownUnknownK8s Secret9app.scheduler.evidenceErrorEmailCron${evidence_email_scheduler_cron}UnknownUnknownK8s Secret9app.scheduler.properties.pageSize${page_size}UnknownUnknownK8s Secret7app.s3.bucketname${bucket_name}UnknownUnknownK8s Secret[^32]app.presignedUrlExpiryTime${presigned_url_expiry_time}UnknownUnknownK8s Secretapp.aws.accesskey${aws_access_key}UnknownUnknownK8s Secretapp.aws.secretkey${aws_secret_key}UnknownUnknownK8s Secretapp.email.notification.url${email_notification_url}UnknownUnknownK8s Secretapp.email.notification.render${sender}UnknownUnknownK8s Secretapp.email.notification.recipients.toAddress${toAddress}UnknownUnknownK8s Secretapp.email.notification.recipients.cc${cc}UnknownUnknownK8s Secret
+Active profile is injected via ${gcp_env} environment variable.[^40] Secrets are injected via envFrom.secretRef from wdp-chargeback-evidence-event-scheduler-secrets and wdp-common-secrets.8
+
+11. Planned Changes and In-Progress Work
+Commented-Out Code
+
+S3PresignerConfiguration.java:23-26 – An InstanceProfileCredentialsProvider approach is commented out in favor of StaticCredentialsProvider using explicit access/secret keys.[^41]
+
+java/*
+ * return S3Presigner.builder().region(Region.US_EAST_2)
+```
+
+---
+
+**Image 11 (Lines 430–475):**
+```
+```java
+/*
+ * return S3Presigner.builder().region(Region.US_EAST_2)
+ * .credentialsProvider(InstanceProfileCredentialsProvider.create()).build();
+ */
+```
+
+This suggests a migration from static credentials to IAM instance profiles was started but not completed (or intentionally deferred). Using static keys in production is a security concern.
+
+2. **`ChargebackServiceImpl.java:54`** – Commented-out `save()` call replaced by a custom `updateChbkOutboxEntity()` native query, with the comment `//chbkOutboxRepository.save(entity);`.[^42] A similar pattern exists in `EvidenceServiceImpl.java:59`.[^43] This appears to be a deliberate optimization to avoid re-writing the entire entity on Kafka metadata update.
+
+### Field-Level Observations
+
+- **`FileEvidenceEntity`** has `updated_by` absent from its `@Column` mapping — the entity does not track who updated it.[^22]
+- **`OutgoingEventOutboxRepository.findEligibleOutboxRecords`** does not include `PENDING` status. This is either intentional (initial delivery handled elsewhere) or a bug where PENDING rows in this table are never processed.[^19]
+- **`BreOrchestrationOutboxRepository.findEligibleOutboxRecords`** – same `PENDING`-absent issue.[^21]
+
+### TODO / Feature Flags
+
+- No `@TODO` comments visible in source.
+- No feature flags or conditional bean activation via profiles (beyond datasource/topic name switching).
+- The `commons-beanutils` and `json-path` dependencies in `pom.xml` are declared but **no usage is visible in source code** – potentially unused transitive dependencies.[^44]
+- `RestTemplate` is created as a `@Bean` in `CommonConfig` but is only used by `RestInvoker` for the email endpoint. No timeout, connection pool, or SSL configuration is applied to it.[^45]
+
+---
+
+## 12. Confidence Assessment
+
+| Section | Confidence | Basis |
+|---|---|---|
+| **1. Primary Responsibility** | **High** | All five scheduler classes and their service implementations were read directly. Relationship to FileProcessor inferred from absence of any FileProcessor call and shared-table coupling. |
+| **2. Trigger and Schedule** | **High (mechanism)** / **Low (actual cron values)** | Mechanism fully visible in `@Scheduled` annotations and `SchedulerConfig`. Actual cron expressions are not in any committed file – they're runtime secrets. |
+| **3. Outbox Polling Logic** | **High** | All repository interfaces and entity classes read in full. JPQL queries are literal strings in source. |
+| **4. What It Publishes** | **High** | All topics, keys, message structures read directly. `channelTypeTopicMap` in prod is a secret; local default visible in `application-local.yaml`. Message models fully read. |
+| **5. Inbound Dependencies** | **High** | DataSource config, Kafka config, S3 presigner config, RestInvoker all read in full. |
+| **6. Error Handling** | **High** | Error-handling logic in all four service `impl` classes is identical and clearly readable. No DLQ – absence is positive evidence. |
+| **7. Idempotency** | **High (mechanism)** / **Low (consumer enforcement)** | Producer side fully visible. Consumer-side deduplication not in this repository. |
+| **8. Volume and Throughput** | **Medium** | Pagination loop and blocking Kafka pattern visible; actual pageSize and cron frequency unknown. |
+| **9. Scaling and Deployment** | **High (type, resources)** / **Low (replica count, actual HPA)** | `resources.yaml` fully read; replica placeholder not resolved; HPA definitively absent. |
+| **10. Configuration** | **High (keys and injection method)** / **Low (secret values)** | All `$Value` annotations and profile YAMLs read. Production secret values not in source. |
+| **11. Planned Changes** | **Medium** | Visible via commented code and field-level observations. Intent of some decisions (PENDING absent from Scheduler3/4) is ambiguous – could be bug or design. |
+
+---
+
+## Architecture Diagram
+
+---
+
+**Image 12 (Lines 473–520):**
+Architecture Diagram
+                wdp-chargeback-evidence-event-scheduler (K8s Deployment)
+            ThreadPoolTaskScheduler (5 threads, prefix: "ChargebackEvidence")
+
+    ┌─────────────────────────────────────────────────────────┐
+    │ Scheduler1 ChargebackEvidenceEventScheduler             │
+    │   cron: ${chargeback_evidence_scheduler_cron}           │
+    │   ├─ poll wdp.chbk_outbox_row (PENDING|FAILED<3|PENDING_DEFERRED) │
+    │   ├─ CHARGEBACK_PROCESS → publish → new-case-events     │
+    │   ├─ EVIDENCE_ATTACH    → publish → case-evidence-events│
+    │   ├─ unblockEvidenceForChargebackSuccessEvents()        │
+    │   └─ updateEvidenceErrorStatusForChargebackErrorEvents()│
+    └─────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────┐
+    │ Scheduler2 FileJobStatusCompletionScheduler             │
+    │   cron: ${job_completion_scheduler_cron}                │
+    │   ├─ poll wdp.file_job (PROCESSING)                     │
+    │   ├─ update counts → mark COMPLETED                     │
+    │   └─ archive wdp.chbk_outbox_row SUCCESS→wdp.chbk_outbox_row_archive │
+    └─────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────┐
+    │ Scheduler3 OutgoingEventScheduler                       │
+    │   cron: ${outgoing_event_scheduler_cron}                │
+    │   ├─ poll wdp.outgoing_event_outbox (FAILED<3|PENDING_DEFERRED) │
+    │   └─ route by channelType → {case-action,core-request,external-req} │
+    └─────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────┐
+    │ Scheduler4 BreOrchestrationOutboxScheduler              │
+    │   cron: ${bre_outbox_event_scheduler_cron}              │
+    │   ├─ poll wdp.bre_orchestration_outbox (FAILED<3|PENDING_DEFERRED) │
+    │   ├─ BUSINESS_RULES          → business-rules           │
+    │   └─ NOTIFICATION_ORCHESTRATOR → outgoing-events        │
+    └─────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────┐
+    │ Scheduler5 EvidenceErrorEmailScheduler                  │
+    │   cron: ${evidence_email_scheduler_cron}                │
+    │   ├─ poll wdp.file_evidence (ERROR, yesterday)          │
+    │   ├─ generate S3 pre-signed URLs                        │
+    │   └─ POST CSV report → ${email_notification_url}        │
+    └─────────────────────────────────────────────────────────┘
+
+Image 13 (Lines 514–565):
+    │   cron: ${evidence_email_scheduler_cron}                │
+    │   ├─ poll wdp.file_evidence (ERROR, yesterday)          │
+    │   ├─ generate S3 pre-signed URLs                        │
+    │   └─ POST CSV report → ${email_notification_url}        │
+    └─────────────────────────────────────────────────────────┘
+
+                    │ JDBC (Spring Data JPA)
+                    ▼
+    ┌─────────────────────────────┐
+    │ PostgreSQL (AWS RDS Aurora) │
+    │   wdp.chbk_outbox_row       │
+    │   wdp.chbk_outbox_row_archive│
+    │   wdp.file_job              │
+    │   wdp.outgoing_event_outbox │
+    │   wdp.bre_orchestration_outbox│
+    │   wdp.file_evidence         │
+    └─────────────────────────────┘
+
+                    │ Kafka Producer (SASL/SSL/IAM)
+                    ▼
+    ┌─────────────────────────────┐
+    │ AWS MSK (Kafka)             │
+    │   new-case-events           │
+    │   case-evidence-events      │
+    │   business-rules            │
+    │   outgoing-events           │
+    │   case-action-events        │
+    │   core-request-events       │
+    │   external-request-events   │
+    └─────────────────────────────┘
+
+Footnotes
+
+---
+
+That completes all 13 pages of the document. The total extracted text covers the full deep technical research report on `wdp-chargeback-evidence-event-scheduler`, sections 1–12 plus the Architecture Diagram and Footnotes beginning. Would you like me to cross-reference any of this against the WDP architecture docs?
+Footnotes
+
+
+src/main/java/com/wp/wdp/chargeback/evidence/scheduler/task/OutgoingEventScheduler.java:45-87 ↩ ↩2 ↩3
+
+
+src/main/java/com/wp/wdp/chargeback/evidence/scheduler/service/impl/ChargebackServiceImpl.java:40-43 – save PUBLISHED before Kafka send ↩ ↩2
+
+
+src/main/java/com/wp/wdp/chargeback/evidence/scheduler/us/repository/ChbkOutboxRepository.java:20-21 ↩
+
+
+src/main/java/com/wp/wdp/chargeback/evidence/scheduler/task/ChargebackEvidenceEventScheduler.java:46-102 ↩ ↩2 ↩3
+
+
+src/main/java/com/wp/wdp/chargeback/evidence/scheduler/task/BreOrchestrationOutboxScheduler.java:43-86 ↩ ↩2
+
+
+src/main/java/com/wp/wdp/chargeback/evidence/scheduler/us/entity/ChbkOutboxEntity.java ↩ ↩2
+
+
+src/main/resources/application.yml:25 – pageSize: ${page_size} ↩ ↩2
+
+
+resources.yaml:1-43 – kind: Deployment, memory limits 2048Mi/1024Mi, no HPA, placeholder replicas ↩ ↩2 ↩3 ↩4 ↩5
+
+
+src/main/resources/application.yml:19-23 – all cron properties reference ${...} env vars; secrets named in resources.yaml:40 ↩ ↩2 ↩3 ↩4 ↩5

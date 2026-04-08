@@ -1,0 +1,1137 @@
+Good — I can see the WDP docs reference NAPDisputeEventProcessor (component 2.1.2) as a DRAFT entry. The images you've shared appear to be a deep technical research report on gcp-nap-dispute-event-consumer — which maps to that component. Let me transcribe all 11 images now.
+
+Transcription — gcp-nap-dispute-event-consumer Research Report
+
+IMAGE 1
+Technical Research Report: `gcp-nap-dispute-event-consumer`
+
+**Service:** `gcp-nap-dispute-event-consumer` (artifact ID: `gcp-nap-dispute-event-consumer`, version 1.6.5)
+**Package root:** com.wp.gcp.nap.event
+**Framework:** Spring Boot 3.5.7, Java 17, Spring Kafka, Spring Data JPA
+
+---
+
+## Executive Summary
+
+`gcp-nap-dispute-event-consumer` is a **stateful, event-driven Spring Boot microservice** that consumes
+dispute notification messages from an AWS MSK (Managed Streaming for Kafka) topic and translates them
+into actions on a downstream case-management platform (referred to internally as "NAP" – Network Acquirer
+Platform). It ingests a single unified `NotificationEvent` payload which encodes three logical event
+sub-types (SRV116, WIN/LOSS, SRV118), determines whether an existing dispute case exists, and either
+creates a new case or appends an action to an existing one. The service maintains a PostgreSQL error-
+tracking database (`NAP.DISPUTE_EVENT_CONSUMER_ERROR`) as a durable dead-letter store, with a companion
+REST endpoint that allows manual reprocessing of errored events. It does **not** produce to a Kafka topic;
+all outbound communication is HTTP REST to downstream services. Retry logic is implemented via Spring
+Retry on every downstream call.
+
+## Architecture / System Overview
+
+    AWS MSK (Kafka)
+    Topic: ${kafka_consumer_topic}
+    Group: ${kafka_group_id}
+            |
+            v
+    NotificationEvent (JSON)
+            |
+            v
+    KafkaConsumer (config.KafkaConsumer)
+    - manual ACK (MANUAL_IMMEDIATE, syncCommits=true)
+    - acknowledges BEFORE processing
+            |
+            v
+    CaseServiceImpl.processSrv116Notification()
+    Determines eventType: IN_SRV116 / IN_WIN_LOSS / IN_SRV118
+    Orchestrates the API pipeline via NapMessageEvent.apiName state machine
+            |                        |
+    DB queries           REST calls via RestInvoker
+            |                        |
+    PostgreSQL         Downstream REST APIs (JWT Bearer auth via IDP token)
+    NAP schema         1. Case Search (GET)
+                       2. Create Case (POST)
+    Tables:            3. Update Case / Add Action (POST)
+    DISPUTE_           4. Workflow Rule Lookup (POST)
+    EVENT_             5. New Case Action Rules Lookup (POST)
+    CONSUMER_          6. Case Action Search (GET)
+    ERROR              7. CBK Response Rules Lookup (GET)
+
+IMAGE 2
+    EVENT_             5. New Case Action Rules Lookup (POST)
+    CONSUMER_          6. Case Action Search (GET)
+    ERROR              7. CBK Response Rules Lookup (GET)
+    - mcm_queue        8. Pre-Action Status Rules (POST)
+      _data            9. Insert Notes (POST)
+    - timeframe        10. API Log Insert (POST)
+      _rules           11. IDP Token Service (GET)
+
+---
+
+## 1. Primary Responsibility – What It Does and Does NOT Do
+
+### What It Does
+
+- **Consumes** `NotificationEvent` JSON messages from a single AWS MSK Kafka topic using manual offset
+  acknowledgement[^1].
+- **Classifies** each incoming event into one of three sub-types: `IN_SRV116` (chargeback notification
+  from card network), `IN_WIN_LOSS` (arbitration win/loss outcome), or `IN_SRV118` (chargeback response,
+  e.g. representment/write-off)[^2].
+- **Normalises** the card network name (maps raw scheme names to canonical `CardSchemeName` enum values;
+  promotes MASTERCARD + GCMS identifier to MAESTRO)[^3].
+- **Orchestrates** a multi-step API pipeline** via a string-valued `apiName` state machine on the
+  `NapMessageEvent` wrapper, calling between 3 and 10 downstream REST APIs per event depending on event
+  type and case existence[^4].
+- **Creates or updates** dispute cases** in the downstream case management system[^5].
+- **Persists** error state** to a PostgreSQL table (`NAP.DISPUTE_EVENT_CONSUMER_ERROR`) when any step
+  fails, storing the full raw Kafka JSON payload for later reprocessing[^6].
+- **Exposes** a REST endpoint** (`POST /merchant/gcp/event-consumer/nap/event`) that allows manual
+  reprocessing of a previously-failed `ConsumerError` record[^7].
+- **Checks for previous unresolved errors** for the same ARN/NetworkCaseId before processing a new
+  event, and blocks or escalates the new event's status if prior errors exist in ERROR state[^8].
+
+### What It Does NOT Do
+
+- Does **not** produce any Kafka messages (there is no `KafkaProducer` or `KafkaTemplate` in the codebase).
+- Does **not** handle Visa FraudSwitch lookups (the `FRAUD_SWITCH_LOOKUP` step is commented out and
+  skipped).
+- Does **not** create the Kafka topics (auto-topic creation is explicitly disabled: 
+  `ALLOW_AUTO_CREATE_TOPICS_CONFIG = false`)[^10].
+- Does **not** hold any in-memory state between events; each `NotificationEvent` is processed
+  independently through the pipeline.
+- Does **not** do any inter-consumer coordination — there is no leader election, locking, or
+  distributed cache.
+
+### Stateful / Stateless / Persistence
+
+| Dimension | Value |
+|---|---|
+| Within-event processing | **Stateless** — `NapMessageEvent` is a per-invocation object; all state lives
+  in the call stack |
+| Across-event / error recovery | **Stateful** — failure state is persisted to PostgreSQL
+  (`NAP.DISPUTE_EVENT_CONSUMER_ERROR`) |
+| Token caching | **Thread-local stateful** — `KafkaTokenHolder` caches the IDP JWT per thread,
+  cleared in a `finally` block after each event[^11] |
+| Kafka consumer | **Stateful** — consumer group offset is committed after each message |
+
+### What It Produces / Writes
+
+| Output | Target | When |
+|---|---|---|
+| New dispute case | Downstream Case Management REST API | First occurrence of a dispute (IN_SRV116
+  event, no existing case found) |
+| Updated case action | Downstream Case Management REST API | Subsequent events for an existing case |
+| Case notes | Downstream Case Notes REST API | When `dataRecord` field is non-blank on success |
+| API log entry | Downstream API Log REST API | When field mismatch detected (reversalIndicator,
+  merchantId, transactionType) |
+
+IMAGE 3
+| Output | Target | When |
+|---|---|---|
+| New dispute case | Downstream Case Management REST API | First occurrence of a dispute (IN_SRV116
+  event, no existing case found) |
+| Updated case action | Downstream Case Management REST API | Subsequent events for an existing case |
+| Case notes | Downstream Case Notes REST API | When `dataRecord` field is non-blank on success |
+| API log entry | Downstream API Log REST API | When field mismatch detected (reversalIndicator,
+  merchantId, transactionType) |
+| Error record | PostgreSQL  NAP.DISPUTE_EVENT_CONSUMER_ERROR | On any downstream API failure or
+  business rule failure |
+| HTTP response body | REST caller (internal tooling only) | When `POST /event` is called for manual
+  reprocessing |
+
+---
+
+## 2. Event Types: Processing Paths
+
+### Event Type Identification
+
+All three event sub-types arrive on the **same Kafka topic** as the same `NotificationEvent` POJO. The
+sub-type is determined at runtime inside `CaseServiceImpl.updateEventType()`[^13]:
+
+| Sub-type constant | Identification condition |
+|---|---|
+| `IN_WIN_LOSS` | `outcome` field is non-blank |
+| `IN_SRV118` | Both `napResponseType` AND `napResponseCode` are non-blank (and `outcome` is blank) |
+| `IN_SRV116` | All other cases (default) |
+
+---
+
+### Event Type A: `IN_SRV116` – New Chargeback Notification
+
+**Processing path** (happy path)[^4]:
+
+Modify_Card_Network
+  → Check_And_Process_Previous_Error_Notification (check DB for prior errors)
+    → Case_Lookup (GET case search by ARN or NetworkCaseId)
+      ┌─ [Case NOT found] → Workflow_Rule_Lookup (POST)
+      │    → [MASTERCARD/MAESTRO] → Mcm_Queue_Lookup (DB query)
+      │         → New_Case_Action_Lookup (POST)
+      │              → TIME_FRAME_RULE (DB query)
+      │                   → Case_Insert (POST create case)
+      │                        → [dataRecord present] → Insert_Notes (POST)
+      │                             → API_LOG (POST)
+      │                                  → SEND_BUSINESS_RULES_INFO_TO_KAFKA (terminal)
+      │
+      └─ [Case FOUND] → Case_Action_Lookup (GET action search)
+           → New_Case_Action_Lookup (POST)
+                → TIME_FRAME_RULE (DB query)
+                     → Preaction_Status_Rules (POST)
+                          → Case_Action_Update (POST update case)
+                               → [dataRecord present] → Insert_Notes (POST)
+                                    → API_LOG (POST)
+                                         → SEND_BUSINESS_RULES_INFO_TO_KAFKA (terminal)
+
+IMAGE 4
+                     → Preaction_Status_Rules (POST)
+                          → Case_Action_Update (POST update case)
+                               → [dataRecord present] → Insert_Notes (POST)
+                                    → API_LOG (POST)
+                                         → SEND_BUSINESS_RULES_INFO_TO_KAFKA (terminal)
+
+**Key decisions**:
+- For VISA, case lookup uses `networkCaseId`; for all others, it uses `arn`[^13].
+- For MASTERCARD/MAESTRO, an MCM Queue lookup is performed against the local database before
+  `New_Case_Action_Lookup`[^14].
+- Duplicate detection: if existing action summaries already contain the same `acquirerCaseNumber` +
+  `uniqueId` + `stageCode` + `actionCode` + `creditDebitIndicator`, the event is marked SKIPPED[^15].
+
+**Outbound calls**: Case Search, Workflow Rule, MCM Queue (DB), New Case Action Rules, Timeframe Rules
+(DB), Create Case, Insert Notes, API Log.
+
+**Success**: case created or updated; offset committed; token cleared.
+**Failure**: error written to `NAP.DISPUTE_EVENT_CONSUMER_ERROR` with status `FAILED1`; pipeline halted
+(apiName set to blank); offset still committed (acknowledged before processing).
+
+---
+
+### Event Type B: `IN_WIN_LOSS` – Arbitration Win/Loss Outcome
+
+**Processing path**[^16]:
+
+Modify_Card_Network
+  → Check_And_Process_Previous_Error_Notification
+    → Case_Lookup (GET)
+      → Case_Action_Lookup (GET)   [case must exist; outcome present]
+        → processWinLossCase() – sets actionCode/stageCode/caseLiability/owner
+          WIN + ARB   → actionCode=IFAV, caseLiability=NLIAB, owner=NETWORK
+          WIN + other → actionCode=IACP, caseLiability=NLIAB, owner=NETWORK
+          LOSS + ARB  → actionCode=MFAV, caseLiability=MLIAB, owner=MERCHANT
+          LOSS + other → actionCode=EACP, caseLiability=MLIAB, owner=MERCHANT
+          NA/CLOSED   → SKIPPED (logged to error table)
+        → Preaction_Status_Rules (POST)
+          → Case_Action_Update (POST)
+            → Insert_Notes / API_LOG
+
+**Key decision**: if the max action has `migrationStatus = 'Y'` (WDP-only/migrated record), the event is
+silently skipped with a SKIPPED error entry[^17].
+
+**Outbound calls**: Case Search, Case Action Search, Pre-Action Status Rules, Update Case, (optionally)
+Insert Notes, API Log.
+
+---
+
+### Event Type C: `IN_SRV118` – Chargeback Response (Representment / Write-off / Merchant Charge)
+
+**Processing path**[^18]:
+
+Modify_Card_Network
+
+IMAGE 5
+### Event Type C: `IN_SRV118` – Chargeback Response (Representment / Write-off / Merchant Charge)
+
+**Processing path**[^18]:
+
+Modify_Card_Network
+  → Check_And_Process_Previous_Error_Notification
+    → Case_Lookup (GET)
+      → Case_Action_Lookup (GET)   [napResponseCode+napResponseType present]
+        → CBK_Response_Rules_Lookup (GET)
+          → constructs Actions list with amounts per rule.responseDesc:
+            "writeOff"       → notificationEvent.writeOffAmount
+            "representment"  → notificationEvent.representmentAmount
+            "merchantCharge" → notificationEvent.merchantChargeAmount
+            MACP action      → macpAmount (writeOff + merchantCharge)
+            MDCL action      → mdclAmount (writeOff + merchantCharge + representment + maxActionAmount)
+          → isCbkActionAlreadyExists() check
+          → Preaction_Status_Rules (POST) [for each action in list]
+            → Case_Action_Update (POST)
+              → Insert_Notes / API_LOG
+
+**Key decision**: A check `isCbkActionAlreadyExists()` prevents duplicate SRV118 actions. If the action
+already exists, the event is marked SKIPPED with error message "CBK 118 Action already exists."[^19]
+
+**Special case – response code 9952 + ARB stage**: forces action stage to ARB regardless of what the
+rules lookup returns[^20].
+
+**Outbound calls**: Case Search, Case Action Search, CBK Response Rules, Pre-Action Status Rules, Update
+Case, (optionally) Insert Notes, API Log.
+
+---
+
+### Error Reprocessing Path (Manual – REST trigger)
+
+When `POST /event` is called with a `ConsumerErrorId`[^7]:
+
+processConsumerErrorInformation()
+  → loads ConsumerError from DB
+  → re-hydrates NotificationEvent from stored JSON (kafkaEvent column)
+  → sets isErrorTopic=true [flags all error-path handling]
+  → determines apiName from errorReason field:
+       contains "Modify_Card_Network" → restart at Modify_Card_Network
+       else                           → restart at Case_Lookup
+  → processSrvNotification() [same pipeline, but error-topic mode]
+
+In error-topic mode, instead of writing a new DB record on failure, the service sets
+`napMessageEvent.errorMsg`, `errorStatus`, and `previousApi` for the caller to inspect in the
+response[^21].
+
+IMAGE 6
+  → processSrvNotification() [same pipeline, but error-topic mode]
+
+In error-topic mode, instead of writing a new DB record on failure, the service sets
+`napMessageEvent.errorMsg`, `errorStatus`, and `previousApi` for the caller to inspect in the
+response[^21].
+
+---
+
+## 3. All Outbound Dependencies
+
+| # | Dependency | Protocol | Direction | Purpose | Sync/Async | Config key |
+|---|---|---|---|---|---|---|
+| 1 | **IDP Token Service** | HTTPS REST (GET) | Out | Obtains JWT Bearer token for authenticating all
+  subsequent REST calls | Synchronous | `${wdp_token_service_url}` |
+| 2 | **Case Search** | HTTPS REST (GET) | Out | Looks up existing dispute case by ARN or
+  NetworkCaseId | Synchronous | `${case_search_url}` |
+| 3 | **Create Case** | HTTPS REST (POST) | Out | Creates a new dispute case in the case management
+  system | Synchronous | `${create_case_url}` |
+| 4 | **Update Case / Add Action** | HTTPS REST (POST) | Out | Appends a new action to an existing
+  dispute case | Synchronous | `${update_case_url}` |
+| 5 | **Workflow Rule Lookup** | HTTPS REST (POST) | Out | Determines the workflow name for a new case
+  based on card network, reason code, product type | Synchronous | `${workflow_rule_lookup_url}` |
+| 6 | **Case Action Search** | HTTPS REST (GET) | Out | Retrieves existing action summaries for an
+  existing case | Synchronous | `${case_action_search_url}` |
+| 7 | **New Case Action Rules** | HTTPS REST (GET) | Out | Determines the stage code, action code,
+  owner, and SLA days for a new case action | Synchronous | `${new_case_action_rules_response_url}` |
+| 8 | **CBK Response Rules** | HTTPS REST (GET) | Out | Looks up chargeback response rules by
+  `napResponseCode` and `napResponseType` | Synchronous | `${cbk_response_rules_url}` |
+| 9 | **Pre-Action Status Rules** | HTTPS REST (POST) | Out | Determines which prior action status to
+  set before adding the new action | Synchronous | `${preaction_status_rule_url}` |
+| 10 | **Insert Notes** | HTTPS REST (POST) | Out | Adds a free-text note (from `dataRecord` field)
+  to a case action | Synchronous | `${add_note_url}` |
+| 11 | **API Log** | HTTPS REST (POST) | Out | Logs field-mismatch diagnostic information for a case |
+  Synchronous | `${log_api_url}` |
+| 12 | **PostgreSQL (NAP schema)** | JDBC (PostgreSQL driver) | Read/Write | Error tracking, MCM queue
+  lookup, timeframe rules lookup | Synchronous | `${nap_datasource_jdbc_url}` |
+| 13 | **AWS MSK (Kafka)** | SASL_SSL / IAM | In (consume) | Dispute event source | Asynchronous
+  (consumer) | `${kafka_bootstrap_servers}` |
+
+### Authentication for REST Calls
+
+All REST calls use a **Bearer JWT token** obtained from the IDP Token Service[^22]. The token is fetched
+on-demand per message processing thread via `KafkaTokenHolder` (ThreadLocal pattern), and cleared in a
+`finally` block at the end of `processSrv116Notification()`[^11].
+
+### Retry Configuration
+
+Retry is implemented using **Spring Retry** (`@Retryable` / `@Recover` annotations on
+`NapEventProcessingService`)[^23]:
+
+| Operation | Max Attempts | Delay |
+|---|---|---|
+| `databaseLookup` (Case Search) | 1 (no retry: `ApplicationConstants.FIRST = "1"`) |
+  `${consumer_retrydelay}` |
+| `createCase` | `${consumer_retrycount}` | `${consumer_retrydelay}` |
+| `updateCase` | `${consumer_retrycount}` | `${consumer_retrydelay}` |
+| `workflowRuleLookup` | 1 | `${consumer_retrydelay}` |
+| `caseActionLookUp` | 1 | `${consumer_retrydelay}` |
+| `newCaseActionLookup` | 1 | `${consumer_retrydelay}` |
+| `insertNotes` | `${consumer_retrycount}` | `${consumer_retrydelay}` |
+| `timeFrameLookup` (DB) | 1 | 1 | `${consumer_retrydelay}` |
+| `insertApiLogs` | `${consumer_retrycount}` | `${consumer_retrydelay}` |
+| `cbkResponseStatusRules` | 1 | `${consumer_retrydelay}` |
+| `mcmQueueLookup` (DB) | 1 | `${consumer_retrydelay}` |
+| `modifyCardNetwork` | `${consumer_retrycount}` | `${consumer_retrydelay}` |
+
+> **Note:** Actual retry count and delay values are environment-variable driven. No circuit breaker
+(e.g., Resilience4j, Hystrix) is configured; the service has no `resilience4j` or `hystrix` dependency
+in `pom.xml`.
+
+IMAGE 7
+| `modifyCardNetwork` | `${consumer_retrycount}` | `${consumer_retrydelay}` |
+
+> **Note:** Actual retry count and delay values are environment-variable driven. No circuit breaker
+(e.g., Resilience4j, Hystrix) is configured; the service has no `resilience4j` or `hystrix` dependency
+in `pom.xml`.
+
+### `@Recover` Behaviour
+
+Every `@Retryable` method has a paired `@Recover`. On exhaustion of retries, the recover method:
+- Sets `notificationEvent.errorOccured = true`.
+- If **not** an error-topic reprocessing event: writes a new `ConsumerError` record to PostgreSQL with
+  status `FAILED1` (or `SKIPPED_FAILED` for notes/API-log failures, which are non-blocking).
+- If **is** an error-topic reprocessing event: sets error fields on `NapMessageEvent` for the caller to
+  inspect.
+- Sets `apiName = ""` (blank), halting the pipeline[^24].
+
+---
+
+## 4. Kafka Consumer Configuration
+
+### Topic and Group
+
+| Parameter | Config key | Notes |
+|---|---|---|
+| Topic consumed | `${kafka_consumer_topic}` | Single topic; one `@KafkaListener` |
+| Consumer group ID | `${kafka_group_id}` | Group-based consumption; no per-instance override |
+| Bootstrap servers | `${kafka_bootstrap_servers}` | AWS MSK endpoint(s) |
+
+### Offset Commit Strategy
+
+| Setting | Value | Source |
+|---|---|---|
+| `ENABLE_AUTO_COMMIT_CONFIG` | `false` | `KafkaConsumerConfig.java:61`[^25] |
+| `AckMode` | `MANUAL_IMMEDIATE` | `KafkaConsumerConfig.java:85`[^26] |
+| `setSyncCommits` | `true` | `KafkaConsumerConfig.java:86`[^27] |
+
+The offset is acknowledged **before** processing begins[^28]:
+```java
+// KafkaConsumer.java line 33
+acknowledgment.acknowledge();  // commit offset first
+...
+caseService.processSrv116Notification(napMessageEvent);  // then process
+```
+
+This is an **at-most-once** delivery guarantee: if the application crashes after acknowledging but before
+finishing processing, the event is lost (will not be redelivered). This is a deliberate design choice —
+the service manages its own error state via the `DISPUTE_EVENT_CONSUMER_ERROR` table rather than relying
+on Kafka redelivery.
+
+### Offset Reset Policy
+
+| Setting | Value | Source |
+|---|---|---|
+| `AUTO_OFFSET_RESET_CONFIG` | `"latest"` | `KafkaConsumerConfig.java:63`[^25] |
+
+New consumer group instances will not replay historical messages; they start from the newest available
+offset.
+
+IMAGE 8
+| `AUTO_OFFSET_RESET_CONFIG` | `"latest"` | `KafkaConsumerConfig.java:63`[^25] |
+
+New consumer group instances will not replay historical messages; they start from the newest available
+offset.
+
+### Concurrency
+
+No explicit concurrency is set on the `ConcurrentKafkaListenerContainerFactory`. Spring Kafka defaults
+to **concurrency = 1** (one container, one consumer thread per listener)[^29]. There is no
+`factory.setConcurrency(N)` call in `KafkaConsumerConfig`.
+
+### Polling Configuration
+
+| Setting | Config Key | Default in code |
+|---|---|---|
+| `MAX_POLL_INTERVAL_MS_CONFIG` | `${max_poll_interval}` | Environment-specific |
+| `MAX_POLL_RECORDS_CONFIG` | `${max_poll_records}` | Environment-specific |
+| `SESSION_TIMEOUT_CONFIG` | `${session_timeout_ms}` | `KafkaConstants.SESSION_TIMEOUT_MS = 60000`
+  (fallback) |
+| `HEARTBEAT_INTERVAL_MS_CONFIG` | `${heartbeat_interval_ms}` | `KafkaConstants.HEARTBEAT_INTERVAL_MS
+  = 10000` (fallback) |
+
+### Deserializer and Error Handling on Bad Payload
+
+The value is deserialized using `JsonDeserializer<NotificationEvent>` wrapped in
+`ErrorHandlingDeserializer`[^30]:
+```java
+ErrorHandlingDeserializer<NotificationEvent> errorHandlingDeserializer =
+    new ErrorHandlingDeserializer<>(deserializer);
+```
+
+If JSON deserialization fails, `ErrorHandlingDeserializer` catches the exception and delivers a `null`
+(or a `DeserializationException`-annotated record) rather than crashing the listener. The
+`notificationListener` factory is configured with an empty `CommonErrorHandler` (`new
+CommonErrorHandler(){}`) [^31], meaning Spring will use its default behaviour (log the error and
+continue).
+
+### Authentication to AWS MSK
+
+The consumer authenticates to AWS MSK using **IAM authentication** (not username/password SASL)[^32]:
+security.protocol      = SASL_SSL
+sasl.mechanism         = AWS_MSK_IAM
+sasl.jaas.config       = software.amazon.msk.auth.iam.IAMLoginModule required;
+sasl.client.callback.handler.class = software.amazon.msk.auth.iam.IAMClientCallbackHandler
+
+The `aws-msk-iam-auth:2.3.5` library is declared in `pom.xml`[^33].
+
+### Dead-Letter Queue (DLQ) / Dead-Letter Behaviour
+
+**There is no Kafka-level DLQ.** The service does not configure `DeadLetterPublishingRecoverer` or any
+`@SendTo` dead-letter topic. Instead, it uses a database-backed error queue:
+
+1. On processing failure: a `ConsumerError` row is written to `NAP.DISPUTE_EVENT_CONSUMER_ERROR` with
+   the raw Kafka JSON in the `C_KAFKA_EVENT` column and a status of `FAILED1`[^6].
+2. The `C_ERROR_REASON` column records which pipeline step (`apiName`) failed and what the exception
+   message was.
+3. Status escalation lifecycle: `FAILED1` → `FAILED2` → `ERROR` on repeated failures; `DRAFT` for
+   blocked-on-prior-error; `SKIPPED` / `SKIPPED_FAILED` for business-rule-skipped events; `PROCESSED`
+   on successful reprocessing[^34].
+4. Reprocessing is triggered manually via `POST /merchant/gcp/event-consumer/nap/event`.
+
+IMAGE 9
+**There is no Kafka-level DLQ.** The service does not configure `DeadLetterPublishingRecoverer` or any
+`@SendTo` dead-letter topic. Instead, it uses a database-backed error queue:
+
+1. On processing failure: a `ConsumerError` row is written to `NAP.DISPUTE_EVENT_CONSUMER_ERROR` with
+   the raw Kafka JSON in the `C_KAFKA_EVENT` column and a status of `FAILED1`[^6].
+2. The `C_ERROR_REASON` column records which pipeline step (`apiName`) failed and what the exception
+   message was.
+3. Status escalation lifecycle: `FAILED1` → `FAILED2` → `ERROR` on repeated failures; `DRAFT` for
+   blocked-on-prior-error; `SKIPPED` / `SKIPPED_FAILED` for business-rule-skipped events; `PROCESSED`
+   on successful reprocessing[^34].
+4. Reprocessing is triggered manually via `POST /merchant/gcp/event-consumer/nap/event`.
+
+### Idempotency on Redelivery
+
+Because the offset is acknowledged before processing[^28], **Kafka-level redelivery of the same message
+does not occur under normal operation**. However, the service has several idempotency guards for
+duplicate processing at the application level:
+
+1. **Duplicate action check**: before creating/updating a case action, `newCaseActionLookup` inspects
+   existing action summaries using `NotificationConsumerUtil.caseActionPredicate()` which matches on
+   `acquirerCaseNumber` + `uniqueId` + `stageCode` + `actionCode` + `creditDebitIndicator`. If a match
+   is found, the event is SKIPPED with a `SKIPPED` error entry[^35].
+2. **SRV116 duplicate check**: `isCbkActionAlreadyExists()` checks for an existing action with the same
+   source case ID and unique ID before applying a chargeback response[^19].
+3. **Previous error gate**: `checkAndProcessConsumerErrorSrvNotification()` queries the error table by
+   ARN/NetworkCaseId before processing and blocks the new event if a prior ERROR-status entry
+   exists[^8].
+4. **Win/Loss NA/CLOSED skip**: if the `outcome` field is `NA` or `CLOSED`, the event is silently
+   discarded with a SKIPPED record, preventing unwanted case updates[^16].
+
+---
+
+### Key Repositories Summary
+
+| File | Purpose |
+|---|---|
+| `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumer.java` | Kafka listener; acknowledgement
+  point; entry into processing pipeline |
+| `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java` | Kafka consumer factory; all
+  Kafka configuration |
+| `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java` | Main orchestrator;
+  event-type routing; entire pipeline state machine |
+| `src/main/java/com/wp/gcp/nap/event/service/NapEventProcessingService.java` | Spring Retry interface;
+  all `@Retryable` / `@Recover` declarations |
+| `src/main/java/com/wp/gcp/nap/event/service/impl/NapEventProcessingServiceImpl.java` | Retry
+  delegates; calls `RestInvoker` and DB repositories |
+| `src/main/java/com/wp/gcp/nap/event/restclient/RestInvoker.java` | All outbound HTTP calls via
+  `RestTemplate` |
+| `src/main/java/com/wp/gcp/nap/event/restclient/IdpRestInvoker.java` | IDP token fetch |
+| `src/main/java/com/wp/gcp/nap/event/config/KafkaTokenHolder.java` | ThreadLocal JWT cache; cleared
+  per-event |
+| `src/main/java/com/wp/gcp/nap/event/service/impl/ConsumerErrorServiceImpl.java` | DB error record
+  creation, lookup, update, reprocessing |
+| `src/main/java/com/wp/gcp/nap/event/entity/ConsumerError.java` | JPA entity for
+  `NAP.DISPUTE_EVENT_CONSUMER_ERROR` |
+| `src/main/java/com/wp/gcp/nap/event/entity/McmQueueEntity.java` | JPA entity for `NAP.mcm_queue_data` |
+| `src/main/java/com/wp/gcp/nap/event/model/NotificationEvent.java` | Canonical Kafka message payload —
+  100+ fields |
+| `src/main/java/com/wp/gcp/nap/event/util/ApplicationConstants.java` | All pipeline step name
+  constants and business constants |
+| `src/main/java/com/wp/gcp/nap/event/controller/EventController.java` | REST endpoint for manual
+  error reprocessing |
+| `src/main/resources/application.yml` | All externally-injected configuration via environment
+  variables |
+
+## Confidence Assessment
+
+| Area | Confidence | Notes |
+|---|---|---|
+| Kafka consumer configuration (AckMode, offset, auth) | **High** — direct source code evidence |
+  `KafkaConsumerConfig.java` is explicit |
+| Event type classification logic | **High** | `CaseServiceImpl.updateEventType()` is clear |
+| IN_SRV116 happy path | **High** | Traced fully through `CaseServiceImpl` |
+| IN_WIN_LOSS and IN_SRV118 paths | **High** | Full code traces available |
+| Retry configuration | **High** | `@Retryable` annotations on interface are unambiguous |
+
+IMAGE 10
+| IN_SRV116 happy path | **High** | Traced fully through `CaseServiceImpl` |
+| IN_WIN_LOSS and IN_SRV118 paths | **High** | Full code traces available |
+| Retry configuration | **High** | `@Retryable` annotations on interface are unambiguous |
+| Circuit breaker | **High (absent)** — confirmed by `pom.xml` scan | No resilience4j dependency |
+| Downstream service names / URLs | **Medium** — only env-var references; actual hostnames not in
+  source | Runtime values not visible |
+| Actual retry count/delay values | **Low** — env-var driven; no defaults for `consumer_retrycount` /
+  `consumer_retrydelay` | Would need deployment config to confirm |
+| Concurrency = 1 | **High** — no `setConcurrency()` call found; Spring Boot default | Could be
+  overridden in an undetected Spring Boot auto-config |
+
+---
+
+## Footnotes
+
+[^1]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumer.java:24-44` — `@KafkaListener`
+  annotation and manual `Acknowledgment` parameter.
+[^2]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:138-156` —
+  `updateEventType()` method.
+[^3]: `src/main/java/com/wp/gcp/nap/event/service/impl/NapEventProcessingServiceImpl.java:437-450` —
+  `modifyCardNetwork()` method; `src/main/java/com/wp/gcp/nap/event/util/NapCardSchemeNameMap.java`.
+[^4]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:592-686` —
+  `processSrvNotification()`, `createCaseDetails()`, `updateCaseDetails()`.
+[^5]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1553-1609` —
+  `createCase()` and `1611-1663` — `updateCase()`.
+[^6]: `src/main/java/com/wp/gcp/nap/event/service/impl/ConsumerErrorServiceImpl.java:40-57` —
+  `insertNotificationEventToEventConsumerError()`; `src/main/java/com/wp/gcp/nap/event/entity/
+  ConsumerError.java:23` — `@Table(name = "DISPUTE_EVENT_CONSUMER_ERROR", schema = "NAP")`.
+[^7]: `src/main/java/com/wp/gcp/nap/event/controller/EventController.java:30-41` — `POST /event`
+  endpoint.
+[^8]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:223-465` —
+  `checkAndProcessConsumerErrorSrvNotification()`.
+[^9]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1526` — commented-out
+  `FRAUD_SWITCH_LOOKUP` step; `src/main/java/com/wp/gcp/nap/event/util/ApplicationConstants.java:39`.
+[^10]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java:62` —
+  `config.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, false)`.
+[^11]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:132-135` —
+  `tokenService.clear()` in `finally` block;
+  `src/main/java/com/wp/gcp/nap/event/config/KafkaTokenHolder.java:9` — `ThreadLocal<String>`.
+[^12]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:138-156`.
+[^13]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1505-1511`.
+[^14]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1480-1492` — MCM Queue
+  lookup branch for MASTERCARD/MAESTRO.
+[^15]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1059-1071` — duplicate
+  check in `newCaseActionLookup()`.
+[^16]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1400-1451` —
+  `processWinLossCase()`.
+[^17]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1337-1344` — migration
+  status check.
+[^18]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1364-1380` — SRV118
+  routing through CBK Response Rules.
+[^19]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1789-1795` —
+  `isCbkActionAlreadyExists()` check.
+
+IMAGE 11
+[^17]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1337-1344` — migration
+  status check.
+[^18]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1364-1380` — SRV118
+  routing through CBK Response Rules.
+[^19]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1789-1795` —
+  `isCbkActionAlreadyExists()` check.
+[^20]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1843-1847` — ARB + 9952
+  special case.
+[^21]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:468-530` —
+  `processConsumerErrorInformation()` private method; `notificationEvent.setErrorTopic(true)`.
+[^22]: `src/main/java/com/wp/gcp/nap/event/restclient/RestInvoker.java:142-153` —
+  `getHttpHeaders()` fetches Bearer token from `KafkaTokenHolder`.
+[^23]: `src/main/java/com/wp/gcp/nap/event/service/NapEventProcessingService.java:38-137` — all
+  `@Retryable` and `@Recover` declarations.
+[^24]: `src/main/java/com/wp/gcp/nap/event/service/impl/NapEventProcessingServiceImpl.java:83-100`
+  (example: `recoverDatabaseLookupFailure`).
+[^25]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java:61-63`.
+[^26]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java:85`.
+[^27]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java:86`.
+[^28]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumer.java:33` — `acknowledgment.acknowledge()`
+  called before `caseService.processSrv116Notification()`.
+[^29]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java:83-92` —
+  `notificationListener()` factory; no `setConcurrency()` call.
+[^30]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java:52-78`.
+[^31]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java:88-89` —
+  `factory.setCommonErrorHandler(new CommonErrorHandler(){})`.
+[^32]: `src/main/java/com/wp/gcp/nap/event/config/KafkaConsumerConfig.java:67-70`;
+  `src/main/java/com/wp/gcp/nap/event/util/KafkaConstants.java`.
+[^33]: `pom.xml:169-172` — `aws-msk-iam-auth:2.3.5`.
+[^34]: `src/main/java/com/wp/gcp/nap/event/enums/EventConsumerErrorStatus.java` — `SKIPPED, FAILED1,
+  FAILED2, PROCESSED, SKIPPED_FAILED, ERROR, DRAFT`.
+[^35]: `src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1059-1070`.
+
+Transcription complete. 485 lines across 11 images.
+Immediate observations for architecture review:
+
+Draft entry in WDP-COMPONENTS.md needs significant updating — the existing 2.1.2 entry for NAPDisputeEventProcessor is a stub. This report provides the full picture.
+Naming discrepancy — the report service name is gcp-nap-dispute-event-consumer but the WDP docs call it NAPDisputeEventProcessor. Confirm whether these are the same component or different ones before we update docs.
+At-most-once delivery — offset acknowledged before processing is a significant architectural fact not captured in current docs.
+No circuit breaker confirmed — relevant to NFRs. Flag for your review.
+
+Shall I proceed with a full architecture analysis and doc update recommendations?4:12 PMTranscription — Part 2: Pod Scaling, Architectural Risks & Planned Changes
+
+IMAGE 1
+# Technical Research Report: Pod Scaling, Architectural Risks & Planned Changes
+**Service:** `gcp-nap-dispute-event-consumer` (v1.6.5)
+
+---
+
+## Executive Summary
+
+The service's Kubernetes deployment is a **Deployment** (not a StatefulSet) with replicas driven purely
+by a placeholder value — there is no HPA configured in the repository, and CPU limits are entirely
+absent from the manifest. The resource manifest exposes several operational risks: no CPU throttle
+boundary, no PodDisruptionBudget, and a `WhenUnsatisfiable: ScheduleAnyway` topology spread that
+provides no hard availability guarantee. Within the codebase, significant architectural risks include:
+at-most-once Kafka delivery with no replay safety net at the broker level, a shared `RestTemplate` bean
+with no timeout/connection-pool configuration, a `SEND_BUSINESS_RULES_INFO_TO_KAFKA` pipeline terminal
+state that never actually sends to Kafka, a deep recursive error-reprocessing flow vulnerable to stack
+overflow on large error queues, and no circuit breaker on any of the 11 downstream REST dependencies.
+Evidence of active migration work is visible throughout: a `wdpOnly` / `migrationStatus` flag gates WDP-
+only records from processing, commented-out `FRAUD_SWITCH_LOOKUP` and `VISA_CASE_LOOKUP` steps mark
+intended-but-deferred functionality, and a commented user-story reference (`US2137854`) documents a
+replaced amount-calculation strategy.
+
+---
+
+## 1. Pod Count and Scaling
+
+### 1.1 Replica Count
+
+The replica count is **fully externalised** via an XL Deploy placeholder:
+```yaml
+# resources.yaml:8
+replicas: {{ replicas-mdvs-gcp-nap-dispute-event-consumer }}
+```
+
+The actual value is injected at deployment time by XL Deploy (the `deployit-manifest.xml` references
+`scanPlaceholders: true`)[^1]. **No static default is set in the source repository.** The number of
+running pods at any given time is therefore only visible in the cluster or in XL Deploy environment
+dictionaries, not in this codebase.
+
+### 1.2 HPA Configuration
+
+**No HorizontalPodAutoscaler manifest exists** in `resources.yaml` or anywhere else in the
+repository[^2]. The service does **not auto-scale based on CPU, memory, or any custom metric**. All
+scaling is manual, done by changing the XL Deploy dictionary value for `replicas-mdvs-gcp-nap-dispute-
+event-consumer`.
+
+> **Implication:** Because the Kafka consumer has concurrency=1 (single thread per pod), throughput
+scales linearly only with pod count, and lag-based autoscaling (e.g., KEDA on consumer group lag) is
+not present.
+
+### 1.3 Resource Limits and Requests
+
+| Resource | Requests | Limits |
+|---|---|---|
+| **Memory** | `2048Mi` | `4096Mi` |
+| **CPU** | *(not set)* | *(not set)* |
+
+Source: `resources.yaml:60-64`[^3]
+
+- **No CPU request or limit is defined.** The container will be scheduled as a Burstable QoS class for
+  CPU (and Burstable for memory since request ≠ limit). In practice this means: the pod competes with
+  all other workloads for CPU time under contention, and the JVM can consume unbounded CPU.
+- The **memory limit (4096Mi) is double the request (2048Mi)**, allowing the JVM heap to grow
+  significantly before OOM-kill. Given the service processes events with many large model objects
+  (100+ field `NotificationEvent`, deep action summary lists), this headroom is plausible but the OOM
+  risk under heavy load is non-trivial.
+
+IMAGE 2
+- The **memory limit (4096Mi) is double the request (2048Mi)**, allowing the JVM heap to grow
+  significantly before OOM-kill. Given the service processes events with many large model objects
+  (100+ field `NotificationEvent`, deep action summary lists), this headroom is plausible but the OOM
+  risk under heavy load is non-trivial.
+
+### 1.4 Deployment Strategy
+```yaml
+# resources.yaml:9-12
+strategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+  type: RollingUpdate
+```
+
+- **Zero-downtime rolling update**: `maxUnavailable: 0` guarantees no reduction in running replicas
+  during a rollout.
+- `maxSurge: 1` allows exactly one extra pod during the transition.
+- `minReadySeconds: 30` (pod level)[^4] prevents a new pod from being counted as available until it
+  has been running for 30 seconds.
+
+### 1.5 Readiness and Liveness Probes
+
+| Probe | Path | Port | `initialDelay` | `period` | `failureThreshold` |
+|---|---|---|---|---|---|
+| Readiness | `/merchant/gcp/event-consumer/nap/readyz` | 8082 | 30s | 10s | 3 |
+| Liveness  | `/merchant/gcp/event-consumer/nap/livez`  | 8082 | 40s | 10s | 3 |
+
+Source: `resources.yaml:40-56`[^5]
+
+Both probes use the Spring Boot Actuator liveness/readiness groups configured in `application.yaml`[^6].
+The 30-second `minReadySeconds` combined with 30-second readiness `initialDelay` means a new pod must
+be healthy for at least 30 seconds before the rollout considers it done — reasonable for a JVM cold-start.
+
+### 1.6 Topology Spread Constraints
+```yaml
+# resources.yaml:30-36
+topologySpreadConstraints:
+  - maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+    topologyKey: kubernetes.io/hostname
+    labelSelector: ...
+```
+
+- Pods are spread across nodes with a max skew of 1.
+- `WhenUnsatisfiable: ScheduleAnyway` means if spreading is not achievable, the pod is **still
+  scheduled** (soft constraint, not hard). This provides no real availability guarantee if nodes are
+  limited.
+
+### 1.7 No PodDisruptionBudget
+
+There is no `PodDisruptionBudget` resource defined[^2]. During node drain, voluntary disruptions, or
+cluster upgrades, Kubernetes is free to evict all pods simultaneously, potentially causing complete
+service downtime and Kafka consumer lag accumulation.
+
+IMAGE 3
+---
+
+## 2. Architectural Risks and Failure Modes
+
+### Risk 1 – At-Most-Once Kafka Delivery (Severity: HIGH)
+
+The Kafka consumer **acknowledges the offset before processing begins**:
+```java
+// KafkaConsumer.java:33-41
+acknowledgment.acknowledge();              // commit first
+NapMessageEvent napMessageEvent = new NapMessageEvent();
+...
+caseService.processSrv116Notification(napMessageEvent);  // then process
+```
+
+- **Failure mode**: If the JVM crashes, pod is OOM-killed, or a network partition occurs after the
+  `acknowledge()` call but before `processSrv116Notification()` completes, the event is **permanently
+  lost** — Kafka will not redeliver it because the offset has already been committed.
+- There is no Kafka DLQ (`DeadLetterPublishingRecoverer` is not configured). The only safety net is
+  the PostgreSQL error table, which is only written **during** processing — not before it begins.
+- **Severity**: HIGH. Dispute events that are never processed will result in unrecorded chargebacks.
+
+### Risk 2 – No CPU Resource Limit (Severity: MEDIUM)
+
+No CPU request or limit is set in `resources.yaml`[^3]. The Spring Boot JVM with Logstash appender
+and extensive JSON serialization/deserialization can spike CPU. Without a limit:
+- A noisy-neighbour pod could starve other workloads on the same node.
+- Under sustained load, the pod cannot be predictably scheduled or throttled.
+- OOM-killer behaviour becomes unpredictable when CPU and memory pressure coincide.
+
+### Risk 3 – Bare RestTemplate with No Timeout Configuration (Severity: HIGH)
+
+`RestTemplate` is instantiated as a no-arg Spring bean with no connection timeout, read timeout, or
+connection pool:
+```java
+// CommonConfig.java:12-13
+@Bean
+public RestTemplate getRestTemplate() {
+    return new RestTemplate();  // no HttpComponentsClientHttpRequestFactory, no timeouts
+}
+```
+
+- The underlying `SimpleClientHttpRequestFactory` uses JVM defaults (effectively infinite read timeout
+  on most platforms).
+- The single Kafka consumer thread will block indefinitely if any downstream call (Case Search,
+  Workflow Rules, IDP token, etc.) hangs or becomes slow. With `concurrency=1`, this means **the entire
+  Kafka consumer pauses** — offset commits stop, the consumer group heartbeat continues but
+  `max.poll.interval.ms` will eventually be exceeded, causing a consumer group rebalance and partition
+  re-assignment.
+- No circuit breaker (Resilience4j, Hystrix) is present anywhere in the codebase (`pom.xml` has no
+  resilience4j or spring-cloud-circuitbreaker dependency).
+- **Severity**: HIGH. A single slow downstream call can halt all message processing.
+
+### Risk 4 – `SEND_BUSINESS_RULES_INFO_TO_KAFKA` Is a No-Op Terminal State (Severity: MEDIUM)
+
+The constant `ApplicationConstants.SEND_BUSINESS_RULES_INFO_TO_KAFKA = "SEND_BUSINESS_RULES_INFO_TO_
+KAFKA"` is set as the `apiName` at the end of every successful pipeline execution[^7]:
+
+IMAGE 4
+- **Severity**: HIGH. A single slow downstream call can halt all message processing.
+
+### Risk 4 – `SEND_BUSINESS_RULES_INFO_TO_KAFKA` Is a No-Op Terminal State (Severity: MEDIUM)
+
+The constant `ApplicationConstants.SEND_BUSINESS_RULES_INFO_TO_KAFKA = "SEND_BUSINESS_RULES_INFO_TO_
+KAFKA"` is set as the `apiName` at the end of every successful pipeline execution[^7]:
+```java
+// CaseServiceImpl.java:911
+napMessageEvent.setApiName(ApplicationConstants.SEND_BUSINESS_RULES_INFO_TO_KAFKA);
+```
+
+However, **no code ever checks for this state and performs a Kafka publish**. The entire
+`createCaseDetails()` and `updateCaseDetails()` pipelines end by setting this state and returning —
+the name is aspirational (i.e., the intention was to send a business-rules event downstream), but the
+actual send is not implemented. The `BusinessRulesConsumerError` entity and
+`ConsumerErrorService.insertBusinessRulesConsumerError()` method exist in the codebase and are
+reachable from the service interface, but are **never called from the main event processing pipeline**.
+
+- **Severity**: MEDIUM. This is a silent incomplete feature — downstream consumers expecting a business-
+  rules Kafka message will never receive one, but the service itself does not fail.
+
+### Risk 5 – Recursive Error Reprocessing (Severity: MEDIUM)
+
+`checkAndProcessConsumerErrorSrvNotification()` iterates over all previous `ConsumerError` records for
+the same ARN/NetworkCaseId and calls `processPreviousConsumerErrorInformation()` for each, which in
+turn calls `processSrvNotification()`, which can call
+`checkAndProcessConsumerErrorSrvNotification()` again through the
+`CHECK_AND_PROCESS_PREVIOUS_ERROR_NOTIFICATION` pipeline step[^8]:
+
+processSrv116Notification
+  → checkAndProcessConsumerErrorSrvNotification
+    → processPreviousConsumerErrorInformation(consumerError[0])
+      → processSrvNotification          → re-enters modifyCardNetwork / caseLookup
+    → processPreviousConsumerErrorInformation(consumerError[1])
+      → processSrvNotification
+
+---
+
+- **Failure mode**: For a dispute with many accumulated error records, this creates a large synchronous
+  call tree inside a single Kafka consumer thread. Each nested `processSrvNotification()` call may in
+  turn make multiple blocking HTTP calls (10+ REST round-trips each).
+- Under high error accumulation (e.g., database outage followed by recovery), the first new event for
+  a heavily-errored ARN will trigger a large burst of HTTP calls.
+- **Severity**: MEDIUM-HIGH. Risk of thread starvation + `max.poll.interval.ms` violation causing
+  rebalance.
+
+### Risk 6 – MCM Queue Lookup Silently Drops Multi-Result Case (Severity: MEDIUM)
+
+`NapEventProcessingServiceImpl.mcmQueueLookup()` only returns a `McmQueueResponse` if **exactly one**
+network case ID is found for the ARN:
+```java
+// NapEventProcessingServiceImpl.java:506-516
+List<String> mcmQueueList = mcmQueueRepository.getMcmQueueByAcqRefNumber(notificationEvent.getArn());
+if (null != mcmQueueList && !mcmQueueList.isEmpty()) {
+    if(mcmQueueList.size() == ApplicationConstants.ONE) {
+        mcmQueueResponse.setNetworkCaseId(mcmQueueList.get(0));
+    }
+    // if size > 1: silently returns null, puts event on ONHOLD
+}
+```
+
+---
+
+## IMAGE 5
+if(mcmQueueList.size() == ApplicationConstants.ONE) {
+    mcmQueueResponse.setNetworkCaseId(mcmQueueList.get(0));
+}
+// if size > 1: silently returns null, puts event on ONHOLD
+}
+
+If an ARN maps to more than one MCM claim ID (possible if data quality issues exist), the event is
+silently put on ONHOLD status (FAILED1) with the message "ONHOLD – MCM claim id not exist." — even
+though data does exist for that ARN.
+The ONHOLD event will only recover after napEventExpiryHour hours have elapsed, at which point a
+default claim ID ("111111111111111") is substituted1.
+Severity: MEDIUM. Events are not lost but are silently delayed; the ONHOLD reason does not mention
+multiple results, making diagnosis difficult.
+
+Risk 7 – RestTemplate.setErrorHandler() Called on a Shared Spring Bean (Severity: MEDIUM)
+In IdpRestInvoker.java:40, the shared RestTemplate bean has its error handler mutated on every
+token call:
+java// IdpRestInvoker.java:40
+restTemplate.setErrorHandler(new DefaultResponseErrorHandler());
+RestTemplate is a shared singleton injected into both RestInvoker and IdpRestInvoker. Mutating
+setErrorHandler() on a shared instance is not thread-safe in principle — in a concurrent environment
+(e.g., if concurrency > 1, were enabled or if the REST endpoint is called concurrently), one invocation
+could overwrite the error handler set by another. Currently at concurrency=1 this is not exploited,
+but it is a latent race condition.
+
+Severity: LOW-MEDIUM. Currently benign at concurrency=1; would become a real race if concurrency
+is increased.
+
+Risk 8 – ThreadLocal Token Not Cleared on Exception Before finally Block (Severity: LOW)
+KafkaTokenHolder stores the IDP JWT in a ThreadLocal. The finally block in
+processSrv116Notification() clears it:
+java// CaseServiceImpl.java:132-135
+} finally {
+    tokenService.clear();
+}
+This is correct for the Kafka listener path. However, the manual reprocessing path
+(processConsumerErrorInformation() called from EventController.processConsumerErrorInformation())
+calls processSrvNotification() directly without a finally block. If the HTTP request thread
+encounters an exception mid-processing, the token could remain in the ThreadLocal for that HTTP thread,
+potentially leaking to a subsequent request on the same thread (depending on the thread pool
+configuration). This is a low-severity concern because the ThreadLocal holds only a short-lived JWT,
+but it represents inconsistent cleanup.
+Risk 9 – No CPU Limit Means No Guaranteed QoS Class (Severity: MEDIUM)
+Without a CPU request set, the pod's Quality of Service class is Burstable (not Guaranteed). Under
+node memory pressure, Burstable pods are the first candidates for eviction after BestEffort pods.
+Given this service performs complex in-memory data transformations on large models, it can legitimately
+consume significant memory, and being subject to early eviction under node pressure is a production
+availability risk.
+Risk 10 – No PodDisruptionBudget (Severity: MEDIUM)
+Absence of a PDB means Kubernetes node drains (for maintenance, upgrades, spot instance termination)
+will evict all pods without constraint. For a Kafka consumer with AckMode.MANUAL_IMMEDIATE and pre-
+processing acknowledge, any mid-processing eviction causes event loss (Risk 1). A PDB with
+minAvailable: 1 would be a minimum viable mitigation.
+
+---
+
+## IMAGE 6
+If the upstream Kafka producer adds new fields (e.g., as the NAP message format evolves), they are
+silently discarded. This is standard practice but means schema evolution is entirely producer-driven
+with no consumer-side contract validation or alerting.
+
+3. Planned Changes and Migration Work
+3.1 WDP-Only Migration Flag (wdpOnly / migrationStatus)
+A migration flag wdpOnly on NotificationEvent (mapped from the Kafka payload field) propagates
+throughout the entire pipeline and is written to:
+
+The NAP.DISPUTE_EVENT_CONSUMER_ERROR.C_MIGRATION_STATUS column2
+The CaseRequest.migrationStatus field sent to the Case Create API3
+The ActionRequest.migrationStatus field sent to the Case Update API4
+
+When wdpOnly = 'Y', Win/Loss and SRV118 flows are entirely skipped with a log message "So
+skipping Win & Loss flow" / "So skipping SRV118 flow"5. This indicates the service is in a
+hybrid migration state where some cases exist in a legacy system ("WDP-only") and are processed by
+this service differently from native NAP cases. The migration is ongoing and gated by this runtime flag.
+3.2 Commented-Out VISA Case Lookup (Visa_Case_Lookup)
+A complete visaCaseLookup() method body is commented out in CaseServiceImpl.java (lines 757-805)
+6, and the two call sites in createCaseDetails() and updateCaseDetails() are also commented out
+(lines 632-635, 670-673)7. The constant ApplicationConstants.VISA_CASE_LOOKUP = "Visa_Case_Lookup"
+remains defined. This step was intended to perform a separate Visa-specific case lookup for the NEW flow
+path, but was removed — presumably because the general caseLookup() handles VISA via networkCaseId
+instead of arn (line 1508)8.
+3.3 Commented-Out Fraud Switch Lookup
+ApplicationConstants.FRAUD_SWITCH_LOOKUP = "Fraud_Switch_Lookup" exists9 and there is a
+fraudswitch.fraudswitchTransactionLookupSearchUrl property in application.yaml10 and a
+corresponding @Value injection in RestInvoker.java. However, the call site in caseLookup() is
+commented out:
+java// CaseServiceImpl.java:1526-1527
+//napMessageEvent.setApiName(ApplicationConstants.FRAUD_SWITCH_LOOKUP);
+napMessageEvent.setApiName(ApplicationConstants.WORKFLOW_RULE_LOOKUP);
+The Fraud Switch lookup was planned (URL configuration is still present and the RestInvoker field is
+still injected) but is deferred. The URL placeholder ${fraudswitch_transactionlookup_searchurl} must
+still be provided as a secret or env-var, even though it is never called.
+3.4 Amount Calculation Logic Replacement (User Story US2137854)
+A comment in CaseServiceSupport.java:1029-1033 explicitly references a replaced user story:
+java/*
+ * Commented both amount and percentage calculation commented as part of user
+ * story US2137854 : NAP Consumer changes to update the amount calculation logic
+ * calculateWorkableAmount(notificationEvent, actionRequest);
+ * actionRequest.setOutcomeDeptTransPercntge(amountCalculationUtil.getOutcomeDeptTransPercntge(
+   notificationEvent));
+ */
+
+---
+
+## IMAGE 7
+story US2137854 : NAP Consumer changes to update the amount calculation logic
+calculateWorkableAmount(notificationEvent, actionRequest);
+actionRequest.setOutcomeDeptTransPercntge(amountCalculationUtil.getOutcomeDeptTransPercntge(
+notificationEvent));
+*/
+The old calculation methods (calculateWorkableAmount() and getOutcomeDeptTransPercntge()) are
+commented out and replaced with a direct field mapping approach11. The old calculateWorkableAmount()
+method body still exists in the class (lines 1067-1101) but is never called from the main path — it is
+dead code and a maintenance liability.
+3.5 SEND_BUSINESS_RULES_INFO_TO_KAFKA – Planned But Not Implemented Kafka Produce
+As documented in Risk 4, the terminal pipeline state SEND_BUSINESS_RULES_INFO_TO_KAFKA is set but
+never actioned. The BusinessRulesConsumerError entity, its JPA repository, and the full
+insertBusinessRulesConsumerError() / searchPreviousBusinessRulesErrorInformation() service methods
+all exist and compile12 — they are infrastructure for a planned feature (publishing enriched
+business-rules data downstream to another Kafka consumer or to the case management system), but the
+feature is incomplete.
+3.6 VISA_ALLOCATION and JCB_FLOW Workflow Types
+ApplicationConstants.VISA_ALLOCATION = "VISA_ALLOCATION" and ApplicationConstants.JCB_FLOW = "JCB_FLOW" are referenced in CaseServiceSupport.java:1154-115613 when determining which previous
+action to use for the IACP/EAB amount calculation. These constants suggest active development for VISA
+allocation and JCB card network flows beyond the current standard VISA/MASTERCARD/MAESTRO/AMEX handling.
+3.7 Commented Stage-Action Routing in newCaseActionLookup()
+Lines 1024-1051 of CaseServiceImpl.java contain a large block of commented-out stage/action code
+that previously gated which events would proceed to the TIME_FRAME_RULE step (only CH1/FCHS,
+REQ/RREQ, APC/PCMP). The uncommented code14 unconditionally routes all events to TIME_FRAME_ RULE. The commented block is kept as documentation of the previous business rule.
+3.8 RECORD_TYPE_INDICATOR_O (Outgoing) is Set in Some Paths
+ApplicationConstants.RECORD_TYPE_INDICATOR_O = "O" is set on some action requests in
+CaseServiceSupport.java:914 and 157315, while RECORD_TYPE_INDICATOR_I = "I" is used in others
+(lines 207 and 1061). The distinction between inbound and outbound records appears to be an evolving
+classification tied to the SRV118 / SRV116 flow difference and may change as the scheme-response flow
+is extended.
+
+Key Files Reference
+FileRelevanceresources.yamlAll Kubernetes deployment config — replicas, resources, probes, strategyJenkinsfileCI/CD pipeline — namespace (gcp-ff), ECR repo, Checkmarx, Snyk configdeployit-manifest.xmlXL Deploy packaging — placeholder injectionsrc/main/java/.../config/CommonConfig.javaRestTemplate bean (no timeouts)src/main/java/.../config/KafkaConsumerConfig.javaKafka consumer setup (AckMode, no HPA)src/main/java/.../config/KafkaConsumer.javaPre-processing ACKsrc/main/java/.../service/impl/CaseServiceImpl.javaPipeline orchestration, migration flags,commented codesrc/main/java/.../service/impl/NapEventProcessingServiceImpl.javaMCM multi-result silent dropsrc/main/java/.../util/ApplicationConstants.javaAll state machine constants includingunimplemented onessrc/main/java/.../util/CaseServiceSupport.javaUS2137854 comment, dead calculateWorkableAmount()
+Confidence Assessment
+
+---
+
+## IMAGE 8
+src/main/java/.../util/CaseServiceSupport.java | US2137854 comment, dead calculateWorkableAmount() |
+Confidence Assessment
+FindingConfidenceBasisNo HPA in repositoryHigh — confirmed by full resources.yaml reviewresources.yamlcontains only Deployment, Service, IngressNo CPU limitHighresources.yaml:60-64 is explicitReplica count is external placeholderHighresources.yaml:8 is clearPre-processing ACK (at-most-once)HighKafkaConsumer.java:33 is unambiguousRestTemplate has no timeoutsHighCommonConfig.java:13 — bare new RestTemplate()SEND_BUSINESS_RULES_INFO_TO_KAFKA is a no-opHighNo code branches on this apiNamevalue in any reachable pathBusinessRulesConsumerError is dead code in main pipelineHighFull pipeline trace confirmsno call sites from Kafka listener pathFraud Switch URL still configured but never calledHighapplication.yaml:50-51,RestInvoker:69-70, commented call sitewdpOnly migration is ongoingHighRuntime checks and skip logic are activevisaCaseLookup was removedHighMethod body and both call sites are commented outNo PodDisruptionBudgetHigh — confirmed by resources.yaml file contentNo PDB manifestpresentActual replica count in productionCannot determineXL Deploy dictionary values not inrepositoryActual consumer_retrycount / consumer_retrydelay valuesCannot determineEnv-var driven
+
+Footnotes
+
+---
+
+## IMAGE 9
+
+---
+
+**Transcription complete.** 370 lines across 9 images.
+
+---
+
+**Key architecture flags from this second report:**
+
+| Risk | Severity | Confirmed in Part 1? |
+|---|---|---|
+| At-most-once delivery (offset ACK before processing) | HIGH | ✅ Yes |
+| Bare RestTemplate, no timeouts, no circuit breaker | HIGH | ✅ Yes |
+| `SEND_BUSINESS_RULES_INFO_TO_KAFKA` is dead-end state | MEDIUM | ✅ Yes (partially) |
+| Recursive error reprocessing — stack growth risk | MEDIUM-HIGH | ❌ New finding |
+| MCM multi-result silent ONHOLD | MEDIUM | ❌ New finding |
+| No PDB — eviction causes event loss | MEDIUM | ❌ New finding |
+| No HPA — manual scaling only | MEDIUM | ✅ Yes |
+| WDP-only migration flag still active | Informational | ✅ Yes |
+
+Shall I now proceed with the full architecture analysis and **WDP-COMPONENTS.md update** for `NAPDisputeEventProcessor` (2.1.2)?
+Footnotes
+
+
+src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:704-709 —
+isOnHoldEventExpired() and DEFAULT_CLAIM_ID = "111111111111111". ↩
+
+
+src/main/java/com/wp/gcp/nap/event/entity/ConsumerError.java:102-103 —
+@Column(name = "C_MIGRATION_STATUS"). ↩
+
+
+src/main/java/com/wp/gcp/nap/event/util/CaseServiceSupport.java:497 —
+caseRequest.setMigrationStatus(notificationEvent.getWdpOnly()). ↩
+
+
+src/main/java/com/wp/gcp/nap/event/util/CaseServiceSupport.java:1060 —
+actionRequest.setMigrationStatus(notificationEvent.getWdpOnly()). ↩
+
+
+src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1338-1344 and
+1368-1374. ↩
+
+
+src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:757-805 —
+visaCaseLookup() method body commented out. ↩
+
+
+src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:632-635 and 670-673 —
+call sites commented out. ↩
+
+
+src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1507-1510 — VISA uses
+networkCaseId path in caseLookup(). ↩
+
+
+src/main/java/com/wp/gcp/nap/event/util/ApplicationConstants.java:39 —
+FRAUD_SWITCH_LOOKUP = "Fraud_Switch_Lookup". ↩
+
+
+src/main/resources/application.yaml:50-51 —
+fraudswitch.fraudswitchTransactionLookupSearchUrl: ${fraudswitch_transactionlookup_searchurl};
+src/main/java/com/wp/gcp/nap/event/restclient/RestInvoker.java:69-71. ↩
+
+
+src/main/java/com/wp/gcp/nap/event/util/CaseServiceSupport.java:1029-1043 — commented block
+referencing US2137854; dead calculateWorkableAmount() at line 1067. ↩
+
+
+src/main/java/com/wp/gcp/nap/event/service/impl/ConsumerErrorService.java:44-59 —
+insertBusinessRulesConsumerError(), searchPreviousBusinessRulesErrorInformation() etc;
+src/main/java/com/wp/gcp/nap/event/service/impl/ConsumerErrorServiceImpl.java:225-335. ↩
+
+
+src/main/java/com/wp/gcp/nap/event/util/ApplicationConstants.java:95-96. ↩
+
+
+src/main/java/com/wp/gcp/nap/event/service/impl/CaseServiceImpl.java:1024-1053 — commented
+block; line 1051-1053 unconditionally sets TIME_FRAME_RULE. ↩
+
+
+src/main/java/com/wp/gcp/nap/event/util/CaseServiceSupport.java:914 and 1573 —
+RECORD_TYPE_INDICATOR_O; lines 207 and 1061 — RECORD_TYPE_INDICATOR_I. ↩
+
+
+Sonnet 4.6Claude is AI and can make mistakes. P

@@ -1,0 +1,920 @@
+Good — I've checked our existing docs. The NAPDisputeDeclineBatch component in WDP-COMPONENTS.md is currently a stub marked ⚠️ DRAFT with repository and implementation details missing. The images you've shared are a deep technical research report on that exact component (gcp-visa-issuer-decline-batch). This is valuable — let me extract the full text now.
+
+Extracted Text — All 12 Images
+
+IMAGE 1
+**Artifact ID:** `visa-issuer-decline-batch` v1.1.1
+**Runtime:** Java 17 / Spring Boot 3.5.7 / Spring Batch
+**Deployed on:** Kubernetes (k8s namespace `gcp-ff` / `wdp-micro`)
+
+---
+
+## Executive Summary
+
+`gcp-visa-issuer-decline-batch` is a Spring Batch application that runs on a configurable cron schedule to process Visa issuer pre-arbitration decline cases. It reads queued action records from a PostgreSQL database (`nap.action`), enriches each record via REST calls to three internal microservices (Case Management, Visa Adapter, and Case Actions), and writes a new IDCL-coded draft action back to the Case Actions service. The job is a **VISA-only, NAP-platform** workflow specifically targeting `Pre-Arb Declined` dispute states; all non-VISA cases and cases without a valid `disputePreArbResponseId` are silently skipped. No Kafka or file I/O is involved in the current implementation despite the `spring-kafka` dependency being present in the POM.
+
+---
+
+## Architecture Overview
+
+[Diagram showing:]
+BatchScheduler (cron: ${scheduler_cron})
+@Scheduled → JobLauncher.run(job, params)
+↓
+Spring Batch Job
+VisaIssuerDeclineBatchJob
+(chunk size = 1)
+↓
+BatchItem Reader | BatchItem Processor | BatchItem Writer
+↓                        ↓
+nap.action            IDP Token Service (once/job)
+PostgreSQL            Case Management Service (GET)
+(read)                Visa Adapter HyperSearch (POST)
+                      Case Actions Service (GET)
+                      Case Actions Service (POST)
+
+IMAGE 2
+## 1. RESPONSIBILITY
+
+### What This Job Does
+
+The batch job polls the `nap.action` table in a PostgreSQL database for open Pre-Arbitration (PAB) dispute action records that have been migrated and are of type `OPAB`. For each qualifying record it calls the internal Case Management service to verify the card network is **VISA**, queries the internal Visa Adapter for the Visa HyperSearch case details, and — if the VISA case is in a `Fraud Dispute - Pre-Arb Declined` or `Authorization Dispute - Pre-Arb Declined` state — creates a new `IDCL` (Issuer Decline) action in the Case Actions service to advance the dispute workflow.
+
+### What It Explicitly Does NOT Do
+
+- **Does not process non-VISA cards.** Any case whose `cardNetwork` is not "VISA" (e.g., Mastercard, Amex) is immediately skipped with `skipCase=true`.[^1]
+- **Does not handle partial decline or acceptance states.** Only exact matches on "Fraud Dispute - Pre-Arb Declined" and "Authorization Dispute - Pre-Arb Declined" trigger an action; all other `stageStateDesc` values are skipped.[^2]
+- **Does not write to any database directly.** The job reads from the DB but all writes are delegated to the Case Actions REST service.[^3]
+- **Does not produce or consume Kafka messages.** Despite `spring-kafka` and `aws-msk-iam-auth` being declared in the POM, the dependencies appear vestigial or staged for future use. `KafkaTemplate`, `KafkaListener`, `@SendTo` etc. are absent.[^4]
+- **Does not update the `nap.action` table** upon processing. There is no status update (e.g., marking rows as `PROCESSED`) after the action is created downstream.
+- **Does not process Mastercard, Amex, or any non-NAP platform cases.**
+
+---
+
+## 2. TRIGGER AND SCHEDULE
+
+### What Triggers the Job
+
+The job is triggered by a **Spring `@Scheduled` cron expression** on the `BatchScheduler.run()` method.[^5]
+
+### Exact Schedule / Interval
+
+The cron value is **not hard-coded**; it is externalized via the environment variable / property `${scheduler_cron}` bound to `app.scheduler.cron`:
+```yaml
+# application-prod.yaml (line 16)
+app:
+  scheduler:
+    cron: ${scheduler_cron}
+```
+
+The actual value is injected at runtime via Kubernetes secrets (`gcp-visa-issuer-decline-batch-secrets`) or environment-specific override.[^6] The cron expression format is standard Spring cron (`second minute hour dom month dow`).
+
+IMAGE 3
+### Where It Is Configured
+
+| Source | Path | Key |
+|--------|------|-----|
+| Spring property | `app.scheduler.cron` | `${scheduler_cron}` env var |
+| All env YAMLs | `src/main/resources/application-{env}.yaml` | `scheduler_cron` |
+| Kubernetes | `resources.yaml` → `gcp-visa-issuer-decline-batch-secrets` | runtime secret injection |
+| Job name | `VisaIssuerDeclineBatchJob` | `app.batchProperties.jobName` |
+| Step name | `processVisaIssuerDeclineBatchStep` | `app.batchProperties.processingStep` |
+
+Each execution is made unique by appending a timestamp parameter `date=yyyyMMdd_HHmmss.SSS` to `JobParameters`, ensuring Spring Batch does not deduplicate runs at the infrastructure level.[^7]
+
+---
+
+## 3. INBOUND
+
+### 3a. PostgreSQL — Primary Data Source (Read)
+
+| Attribute | Value |
+|-----------|-------|
+| **Name** | NAP PostgreSQL Database |
+| **Config key** | `spring.datasource.nap.*` |
+| **Protocol** | JDBC (PostgreSQL driver `org.postgresql.Driver`) |
+| **Dev URL** | `jdbc:postgresql://wdp-disputes-dev-postgres-cluster.cql8rsklwshz.us-east-2.rds.amazonaws.com:5432/globaldisputedatabase` |
+| **Prod URL** | `${nap_datasource_jdbc_url}` (injected at runtime) |
+| **Schema/Table** | `nap.action` |
+| **Auth** | Username/password (`napprodapp` in prod; env-specific usernames in other envs) with password from K8s secret `${nap_datasource_password}` |
+| **Purpose** | Read queue of OPAB (open pre-arb) actions to process |
+
+**Query executed (first page):**
+```sql
+SELECT * FROM nap.action
+WHERE C_CASE_STAGE = 'PAB'
+  AND C_ACTION_TYPE = 'OPAB'
+  AND C_ACTION_STA = 'OPEN'
+  AND C_MIGRATION_STA = 'Y'
+```
+
+IMAGE 4
+  AND Z_INSRT > :insertedTimestamp
+ORDER BY Z_INSRT ASC
+LIMIT {numberOfRecords}
+[^8]
+Query for subsequent pages (cursor-based pagination):
+sqlSELECT * FROM nap.action
+WHERE C_CASE_STAGE = 'PAB'
+  AND C_ACTION_TYPE = 'OPAB'
+  AND C_ACTION_STA = 'OPEN'
+  AND C_MIGRATION_STA = 'Y'
+  AND I_ACTION_ID > :actionId
+ORDER BY Z_INSRT ASC
+LIMIT {numberOfRecords}
+[^9]
+The insertedTimestamp cutoff is Instant.now().minus(pastDays, DAYS) where pastDays is configured via ${past_days}.[^10] The page size is ${number_of_records}.[^11]
+Columns read from nap.action:
+ColumnJava FieldTypeDescriptionI_ACTION_IDactionIdLong (PK)Unique action identifierI_CASEcaseNumberStringDispute case numberI_ACTION_SEQactionSequenceStringAction sequence within caseC_MIGRATION_STAmigrationStatusStringMust be 'Y' to be eligible
+[^12]
+
+3b. IDP Token Service (REST GET — Authentication Bootstrap)
+AttributeValueNamewdp-idp-token-service (IDP = Identity Provider)Config keyidpService.tokenUrlProd URLhttp://wdp-idp-token-service.wdp-micro:8082/merchant/gcp/idp-token/tokenHTTP MethodGET
+
+---
+
+### IMAGE 5
+3b. IDP Token Service (REST GET — Authentication Bootstrap)
+AttributeValueNamewdp-idp-token-service (IDP = Identity Provider)Config keyidpService.tokenUrlProd URLhttp://wdp-idp-token-service.wdp-micro:8082/merchant/gcp/idp-token/tokenHTTP MethodGETAuthNo bearer token required (unauthenticated bootstrap call; only Content-Type: application/json and Accept: application/json headers)PurposeObtain a Bearer token for all downstream Dispute service callsResponseIdpTokenResponse { tokenValue, expiresIn, tokenType, expirationDate }
+The token is fetched once per job execution (lazy-initialized via StepTokenHolder which is @JobScope and stores the token in an instance field). Subsequent REST calls within the same job reuse the cached token.[^13]
+
+3c. Case Management Service (REST GET — Case Lookup)
+AttributeValueNamemdvs-gcp-case-management-serviceConfig keyapp.disputeService.getCaseUrlProd URLhttp://mdvs-gcp-case-management-service.wdp-micro:8082/merchant/gcp/case-management/{platform}/case?caseNumber={caseNumber}HTTP MethodGETURI Variables{platform} = "nap", {caseNumber} = action's case numberAuthBearer token from IDP service (via Authorization: Bearer <token> header); also passes v-correlation-id headerPurposeRetrieve case metadata: cardNetwork, networkCaseID, productType, subProductTypeResponseCaseSearchResponse { caseNumber, cardNetwork, networkCaseID, productType, subProductType }
+Cases where cardNetwork != "VISA" are immediately skipped.[^14]
+
+3d. Visa Adapter — HyperSearch (REST POST — VISA Network Lookup)
+AttributeValueNamemdvs-gcp-visa-adapterConfig keyapp.disputeService.hyperSearchUrlProd URLhttp://mdvs-gcp-visa-adapter.wdp-micro:8082/merchant/wdp/visaadapter/hyperSearchHTTP MethodPOSTAuthBearer token; v-correlation-id headerPurposeLook up the case on the Visa network (VCR/Resolve) using the networkCaseID; retrieves stageStateDesc, disputePreArbResponseId, deadlines, and amount info
+
+---
+
+### IMAGE 6
+| Config key | app.disputeService.hyperSearchUrl |
+| Prod URL | http://mdvs-gcp-visa-adapter.wdp-micro:8082/merchant/wdp/visaadapter/hyperSearch |
+| HTTP Method | POST |
+| Auth | Bearer token; v-correlation-id header |
+| Purpose | Look up the case on the Visa network (VCR/Resolve) using the networkCaseID; retrieves stageStateDesc, disputePreArbResponseId, deadlines, and amount info |
+| Request Body | HyperSearchRequest { RequestData: { CaseMatchingInfo: { VisaCaseNumber } }, RequestHeader: {} } |
+| Response | HyperSearchResponse { Status[], ResponseData: { Cases[]: { VisaCaseNumber, AccountNumber, AcquirerBIN, ARN, MerchantName, DisputeAmount, LastActionDate, DaysToAct, LastDateToAct, StageStateDesc, CaseViewIndicators: { DisputeIndicators: { DisputePreArbResponseId } } } } } |
+Only the first case in ResponseData.Cases is processed.[^15]
+
+3e. Case Actions Service — GET Action (REST GET — Action Sequence Lookup)
+AttributeValueNamemdvs-gcp-case-actions-serviceConfig keyapp.disputeService.getActionUrlProd URLhttp://mdvs-gcp-case-actions-service.wdp-micro:8082/merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions/{actionSequence}HTTP MethodGETURI Variables{platform} = "nap", {caseNumber}, {actionSequence} (from nap.action.I_ACTION_SEQ)AuthBearer token; v-correlation-id headerPurposeRetrieve the current action's financial details (amounts, currencies, exponents, disputeTransPercentage) to copy into the new actionResponseActionSearchResponse { actionSequence, disputeSourceAmount, disputeSourceAmountCurrency, disputeSourceAmountExponent, convertedDisputeAmount, convertedDisputeAmountCurrency, convertedDisputeAmountExponent, disputeSettlementAmount, ..., disputeWorkableAmount, ..., disputeTransPercentage }
+[^16]
+
+4. OUTBOUND
+4a. Case Actions Service — POST Add Action (REST POST)
+AttributeValueNamemdvs-gcp-case-actions-serviceConfig keyapp.disputeService.addActionUrlProd URLhttp://mdvs-gcp-case-actions-service.wdp-micro:8082/merchant/gcp/case-actions/{platform}/case/{caseNumber}/actionsHTTP MethodPOSTURI Variables{platform} = "nap", {caseNumber}AuthBearer token; v-correlation-id headerPurposeCreate a new IDCL (Issuer Decline) draft action on the dispute case, closing/copying from the previous PAB action
+
+---
+
+### IMAGE 7
+| Prod URL | http://mdvs-gcp-case-actions-service.wdp-micro:8082/merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions |
+| HTTP Method | POST |
+| URI Variables | {platform} = "nap", {caseNumber} |
+| Auth | Bearer token; v-correlation-id header |
+| Purpose | Create a new IDCL (Issuer Decline) draft action on the dispute case, closing/copying from the previous PAB action |
+| Response | AddActionResponse { caseNumber, actionSequence, actionSequenceList } |
+Request body structure (AddActionRequest):
+json{
+  "copyFromPrevsAction": true,
+  "copyFromPrevsActionSequence": "<existingActionSequence>",
+  "closePreviousAction": true,
+  "closePreviousActionSequence": "<existingActionSequence>",
+  "userId": "NPRBDECLB",
+  "actionRequest": [
+    {
+      "actionCode": "IDCL",
+      "stageCode": "PAB",
+      "actionStatus": "DRAFT",
+      "owner": "MERCHANT" | "SIGNIFYD",
+      "disputeSourceAmount": <BigDecimal>,
+      "disputeSourceAmountCurrency": "<currency>",
+      "disputeSourceAmountExponent": <int>,
+      "convertedDisputeAmount": <BigDecimal>,
+      "convertedDisputeAmountCurrency": "<currency>",
+      "convertedDisputeAmountExponent": <int>,
+      "responseDueDate": "<lastDateToAct or today>",
+      "expirationDate": "<lastDateToAct or today>",
+      "dateReceivedByAcquirer": "<today yyyy-MM-dd>",
+      "disputeSettlementAmount": <BigDecimal>,
+      "disputeSettlementAmountCurrency": "<currency>",
+      "disputeSettlementAmountExponent": <int>,
+      "disputeWorkableAmount": <BigDecimal>,
+      "disputeWorkableAmountCurrency": "<currency>",
+      "disputeWorkableAmountExponent": <int>,
+      "networkPhaseId": "<disputePreArbResponseId>",
+      "disputeTransPercentage": "<value>",
+      "recordTypeIndicator": "I"
+    }
+  ]
+}
+
+---
+
+### IMAGE 8
+  "disputeWorkableAmountExponent": <int>,
+  "networkPhaseId": "<disputePreArbResponseId>",
+  "disputeTransPercentage": "<value>",
+  "recordTypeIndicator": "I"
+}
+]
+}
+
+[^17]
+
+**Owner logic:**
+- `"SIGNIFYD"` if `subProductType == "TIER1"` (case-insensitive)
+- `"MERCHANT"` in all other cases (including when `productType` or `subProductType` is blank)[^18]
+
+### 4b. WDP PostgreSQL — Spring Batch Metadata (Implicit Write)
+
+| Attribute | Value |
+|-----------|-------|
+| **Name** | WDP PostgreSQL Database |
+| **Config key** | `spring.datasource.wdp.*` (`@BatchDataSource`) |
+| **Dev URL** | `jdbc:postgresql://wdp-disputes-dev-postgres-cluster.cql8rsklwshz.us-east-2.rds.amazonaws.com:5432/globaldisputedatabase` |
+| **Prod URL** | `${wdp_datasource_jdbc_url}` (runtime injected) |
+| **Tables written** | Spring Batch metadata tables with prefix `${table_prefix}`: `BATCH_JOB_INSTANCE`, `BATCH_JOB_EXECUTION`, `BATCH_JOB_EXECUTION_PARAMS`, `BATCH_STEP_EXECUTION`, etc. |
+| **Purpose** | Spring Batch framework's job repository — tracks job/step execution status, start/end times, exit codes |
+
+The schema is pre-existing (`initialize-schema: never`) and the table prefix is runtime-configured.[^19]
+
+### 4c. Logstash / AWS ELK (Log Shipping)
+
+| Attribute | Value |
+|-----------|-------|
+| **Name** | Logstash TCP Appender |
+| **Config key** | `logstash.server.host.port` |
+| **Protocol** | TCP socket to `${logstash_server_host_port}` |
+| **Format** | JSON (Logstash encoder with custom fields `Environment` and `AppName`) |
+| **Purpose** | Structured log shipping for observability |
+
+[^20]
+
+### No Kafka Output
+
+Despite `spring-kafka` in the POM, no Kafka producer or consumer code exists. The `Event` model class (`platform`, `caseNumber`, `actionSequence`, `startRuleGroup`, `source`) with
+
+IMAGE 9
+constant `VISA_ISS_DEC = "BRVISD"` and `START_RULE_GROUP = "ISSUER_DOCUMENTS"` in `ApplicationConstants` may suggest a planned Kafka event, but no publishing code is implemented.[^21]
+
+---
+
+## 5. ERROR HANDLING
+
+### Retry Strategy
+
+**No explicit retry configuration** (`@Retryable`, `RetryTemplate`, or Spring Batch `.faultTolerant().retry()`) is present in the codebase. The `spring-retry` dependency is declared in the POM[^22] but is unused in the current implementation.
+
+### Per-Record Failure Behavior
+
+Spring Batch is configured with **chunk size = 1** (`app.batchProperties.chunk=1`).[^23] This means each item is individually committed.
+
+In `BatchItemProcessor.process()`:
+- Any `Exception` during processing is **caught and swallowed**, returning `null`.[^24]
+- Spring Batch treats a `null` return from a processor as "skip this item" (the item is not passed to the writer).
+- **One record failure does NOT stop the batch.** The next item continues to be processed.
+
+In `BatchItemWriter.write()`:
+- Per-item exceptions are **caught and logged** (`log.error(...)`) within the for-each loop.[^25]
+- Processing continues to the next item.
+- **A writer-level failure for one case does not stop the batch.**
+
+### Dead Letter / Error Tracking
+
+- **No dead-letter queue.** Failed items are not sent to a DLQ, error table, or retry queue.
+- **No database status update on failure.** The `nap.action` row remains `C_ACTION_STA = 'OPEN'` and `C_MIGRATION_STA = 'Y'`, meaning it will be **picked up again on the next scheduled run** (if still within the `pastDays` window).
+- Errors are logged via SLF4J/Logback to console and Logstash.
+
+### Alerting / Monitoring Hooks
+
+- **OpenTelemetry:** The Kubernetes deployment manifest injects the OTel Java agent via annotation `instrumentation.opentelemetry.io/inject-java:`
+
+IMAGE 10
+- **OpenTelemetry:** The Kubernetes deployment manifest injects the OTel Java agent via annotation `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default`.[^26] This provides distributed tracing and metrics.
+- **Spring Actuator:** Included as a dependency, providing `/actuator/health`, `/actuator/info` etc. on port 8082 for liveness/readiness probes.
+- **Logstash ELK:** All log output (including errors) is shipped to the ELK stack for alerting.
+- **No custom `JobExecutionListener` or `StepExecutionListener`** is registered; batch job outcome is logged at INFO level by the scheduler only.[^27]
+
+### IDP Token Failure
+
+If the IDP token call fails, a `RuntimeException` is thrown from `IdpTokenServiceImpl`, which propagates to the `StepTokenHolder`, ultimately causing the REST call (and thus the `process()` or `write()` step) to fail. Because exceptions are caught at the processor/writer level, the individual record fails silently; however if the token is unavailable for the entire run, all records will fail silently.
+
+---
+
+## 6. IDEMPOTENCY
+
+### Mechanism Analysis
+
+**There is no explicit idempotency mechanism** in the application code. Specifically:
+
+1. **No "processed" status flag is set** on `nap.action` rows after successful processing.
+2. **Records will be re-queried on every run** as long as `C_ACTION_STA = 'OPEN'` and `C_MIGRATION_STA = 'Y'` and `Z_INSRT > (now - pastDays)`.
+3. **Duplicate action creation is therefore possible.** If the job runs twice (e.g., due to a pod restart mid-run, multiple replicas, or overlapping cron windows), the same `nap.action` records will be read again and `addAction` will be called again against the Case Actions service.
+
+**Only partial de-duplication comes from:**
+- The downstream Case Actions service (`mdvs-gcp-case-actions-service`) — it may enforce its own duplicate prevention, but this is outside the scope of this codebase.
+- Spring Batch's `JobRepository` — the job parameters include a timestamp (`date=yyyyMMdd_HHmmss.SSS`), ensuring each scheduled invocation creates a new `BATCH_JOB_INSTANCE`. This prevents re-running the same logical job instance, but does **not** prevent re-processing the same source records in a new run.[^28]
+
+**Kubernetes replicas:** The `resources.yaml` `spec.replicas` is parameterized (`{{ replicas-gcp-visa-issuer-decline-batch }}`). If more than 1 replica is deployed, multiple instances will fire simultaneously on the same cron schedule, reading the same records and potentially creating duplicate actions. No distributed locking is implemented.
+
+---
+
+## Key Repositories Summary
+
+| Repository | Purpose | Key Files |
+|------------|---------|-----------|
+| `Worldpay/gcp-visa-issuer-decline-batch` | This batch job | `BatchScheduler.java`, `BatchItemProcessor.java`, `ActionEntityRepository.java` |
+| `mdvs-gcp-case-management-service` | Case lookup API | `/merchant/gcp/case-management/{platform}/case` |
+| `mdvs-gcp-visa-adapter` | Visa network HyperSearch proxy | `/merchant/wdp/visaadapter/hyperSearch` |
+| `mdvs-gcp-case-actions-service` | Action CRUD API | `/merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions` |
+| `wdp-idp-token-service` | Bearer token issuer | `/merchant/gcp/idp-token/token` |
+
+IMAGE 11
+| `wdp-idp-token-service` | Bearer token issuer | `/merchant/gcp/idp-token/token` |
+
+---
+
+## Confidence Assessment
+
+| Finding | Confidence | Notes |
+|---------|-----------|-------|
+| Schedule externalized via `${scheduler_cron}` | **High** — direct code evidence | Actual value not discoverable in source |
+| 4 REST inbound services | **High** — all URLs, methods, and models traced | |
+| No Kafka usage despite dependency | **High** — grep confirms zero Kafka API usage | Dependency may be for future use |
+| No explicit retry mechanism | **High** — `spring-retry` present but unused | |
+| Chunk size = 1 | **High** — all env configs confirm `chunk: 1` | |
+| No idempotency / no status updates | **High** — repository and service code reviewed | Downstream service may provide idempotency |
+| WDP DB used only for Spring Batch metadata | **High** — `@BatchDataSource` annotation and `PersistenceConfig` reviewed | |
+| `SIGNIFYD` owner assignment for TIER1 | **High** — `DisputeActionServiceImpl.constructAddActionRequest()` | |
+| No `JobExecutionListener` | **High** — `JobConfiguration` only defines reader/processor/writer | |
+| Actual `scheduler_cron` and `past_days` values | **Low** — externalized; not in source; depends on K8s secret/config | |
+| Whether Case Actions service is idempotent | **Unknown** — out of scope for this repo | |
+
+---
+
+## Footnotes
+
+[^1]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/BatchItemProcessor.java:46-51` — Non-VISA cases return `ProcessedItems.builder().skipCase(true).build()`
+
+[^2]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/BatchItemProcessor.java:63-66` and `src/main/java/com/wp/gcp/visa/issuer/decline/batch/util/ApplicationConstants.java:19-20` — Only "Fraud Dispute - Pre-Arb Declined" and "Authorization Dispute - Pre-Arb Declined" trigger action creation
+
+IMAGE 12
+[^3]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/BatchItemWriter.java:34` — Delegates all writes to `actionService.addAction(item)` (REST POST)
+
+[^4]: `pom.xml:160-171` — `spring-kafka` and `kafka-clients` declared; grep on `src/` for Kafka API usage returns zero matches
+
+[^5]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/scheduler/BatchScheduler.java:30-31` — `@Scheduled(cron = "${app.scheduler.cron}")`
+
+[^6]: `src/main/resources/application-prod.yaml:16` — `cron: ${scheduler_cron}` and `resources.yaml:47` — `gcp-visa-issuer-decline-batch-secrets`
+
+[^7]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/scheduler/BatchScheduler.java:34-37` — `JobParametersBuilder().addString("date", date)` using `yyyyMMdd_HHmmss.SSS` format
+
+[^8]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/repository/ActionEntityRepository.java:17-18` — `findQueueItems` native query
+
+[^9]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/repository/ActionEntityRepository.java:20-21` — `findQueueItemsWithActionId` native query
+
+[^10]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/service/impl/ActionServiceImpl.java:39` — `Instant.now().minus(applicationProps.getBatchProperties().getPastDays(), ChronoUnit.DAYS)`
+
+[^11]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/service/impl/ActionServiceImpl.java:36` — `PageRequest.of(pageNumber, applicationProps.getBatchProperties().getNumberOfRecords(), Sort.by("Z_INSRT").ascending())`
+
+[^12]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/entity/ActionEntity.java` — full entity definition
+
+[^13]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/config/StepTokenHolder.java:18-25` — `@JobScope` scoped bean; `token` field is lazy-initialized once per job execution
+
+[^14]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/service/impl/DisputeCaseServiceImpl.java:29-30` — calls `disputeRestInvoker.get(getCaseUrl, CaseSearchResponse.class, NAP_PLATFORM, caseNumber)`
+
+[^15]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/service/impl/VisaServiceImpl.java:44-45` — `response.getResponseData().getCases().get(0)` — only first case used
+
+[^16]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/service/impl/DisputeActionServiceImpl.java:55-66` — `getActionSequence()` GET call
+
+[^17]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/service/impl/DisputeActionServiceImpl.java:68-121` — `constructAddActionRequest()` method; `ActionRequest.java` and `ActionRequest.java`
+
+[^18]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/service/impl/DisputeActionServiceImpl.java:75-78` — owner ternary logic
+
+[^19]: `src/main/resources/application.yml:8-14` — `spring.batch.jdbc.initialize-schema: never`, `tablePrefix: ${table_prefix}`; `src/main/java/com/wp/gcp/visa/issuer/decline/batch/dbconfig/PersistenceConfig.java:43-53` — `@BatchDataSource wdpDataSource()`
+
+[^20]: `src/7main/resources/logback-spring.xml:15-23` — `LogstashTcpSocketAppender` with `${LOGSTASH_SERVER_HOST_PORT}`
+
+[^21]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/util/ApplicationConstants.java:23-24` — `VISA_ISS_DEC = "BRVISD"`, `START_RULE_GROUP = "ISSUER_DOCUMENTS"`; `src/main/java/com/wp/gcp/visa/issuer/decline/batch/model/Event.java` — unused Event model
+
+[^22]: `pom.xml:134-143` — `spring-retry` and `spring-aspects` declared but no `@Retryable` or `RetryTemplate` found in source
+
+[^23]: `src/main/resources/application.yml:21` — `chunk: 1`; `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/config/JobConfiguration.java:47-49` — `.<ActionEntity, ProcessedItems>chunk(chunk, transactionManager)`
+
+[^24]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/BatchItemProcessor.java:88-92` — `catch (Exception e) { log.error(...); return null; }`
+
+That's the complete text extracted from all 12 images.
+What this tells us architecturally
+This is significant new information for WDP-COMPONENTS.md. The NAPDisputeDeclineBatch stub is now fully resolvable. Before I propose the updated component entry, I need to flag a few things:
+⚠️ Architecture concern — Idempotency gap: The research confirms there is no idempotency mechanism and no status update on nap.action after processing. With parameterised replicas, duplicate IDCL actions can be created. Is this a known accepted risk, or a gap that needs an ADR?
+⚠️ Conflict check — Repository name: Our docs say NAPDisputeDeclineBatch polls the Visa API. The research report says it actually reads from the NAP PostgreSQL nap.action table and calls Visa Adapter HyperSearch. That's a materially different inbound pattern than what WDP-ARCHITECTURE.md implies. Should I flag this as a correction to WDP-ARCHITECTURE.md?
+📋 Documents needing update: WDP-COMPONENTS.md (NAPDisputeDeclineBatch section), potentially WDP-ARCHITECTURE.md (NAP inbound path description), and WDP-INTEGRATIONS.md (new internal service contracts now documented).
+Shall I proceed to draft the updated NAPDisputeDeclineBatch component entry?Extract exact text5:32 PMHere is the complete extracted text from all 11 images:
+
+IMAGE 1
+# Deep Technical Research Report: `gcp-visa-issuer-decline-batch`
+## Volume · Scaling & Deployment · Configuration · Planned Changes
+
+**Repository:** `Worldpay/gcp-visa-issuer-decline-batch`
+**Artifact ID:** `visa-issuer-decline-batch` v1.1.1
+**Runtime:** Java 17 / Spring Boot 3.5.7 / Spring Batch
+**Deployed on:** Kubernetes (namespace `gcp-ff` / `wdp-micro`)
+
+## Executive Summary
+
+This report covers the operational dimensions of the Visa Issuer Decline batch job. Volume-related parameters (page size, look-back window, polling frequency) are **fully externalized** via environment variables and are not discoverable from source alone — only their property keys are known. The deployment model is a Kubernetes **Deployment** (not a CronJob), meaning the container runs continuously and executes batch jobs on an internal Spring scheduler cron. No HPA is configured; replica count is an XL Deploy placeholder. The codebase contains several strong indicators of **planned but unimplemented features**: an unused `Event` model, unused Kafka/spring-retry POM dependencies, and two constants (`VISA_ISS_DEC`, `START_RULE_GROUP`) that are defined but never referenced.
+
+---
+
+## 1. VOLUME
+
+### Expected Records Per Run
+
+The volume of records processed per run is **not deterministic from source code alone**. All volume-related parameters are externalized:
+
+| Parameter | Property Key | Source |
+|-----------|-------------|--------|
+| Look-back window | `app.batchProperties.pastDays` | `${past_days}` env var |
+| Records per page | `app.batchProperties.numberOfRecords` | `${number_of_records}` env var |
+
+- The first query reads all rows from `nap.action` where `Z_INSRT > (now - pastDays)` and the four status filter columns match, sorted by `Z_INSRT` ascending, limited to `numberOfRecords`.[^1]
+- The **unit test mock** uses `pastDays = 7` and `numberOfRecords = 5` as example values — this is the only concrete number in the source and is a test fixture, not a production value.[^2]
+- There is no maximum total record cap enforced in application code. The reader uses cursor-based pagination; once a page is exhausted, it fetches the next page using `I_ACTION_ID > lastSeenId`, continuing until no more records are returned.[^3]
+
+### Batch (Chunk) Size
+
+The Spring Batch chunk size is **hardcoded to `1`** in every environment configuration YAML.[^4] This means:
+- Each `ActionEntity` is read, processed, and written **individually** in its own transaction.
+- There is no batching of multiple records into a single commit.
+- Each record triggers up to **4 REST API calls**: Case Management GET, Visa Adapter HyperSearch POST, Case Actions GET, Case Actions POST.
+
+### Polling Frequency
+
+The cron schedule is fully externalized:
+```yaml
+# All env application-*.yaml files
+app:
+  scheduler:
+    cron: ${scheduler_cron}
+```
+
+IMAGE 2
+# All env application-*.yaml files
+app:
+  scheduler:
+    cron: ${scheduler_cron}
+
+[^5]
+
+The actual value of `scheduler_cron` is injected at runtime from the Kubernetes secret `gcp-visa-issuer-decline-batch-secrets`.[^6] The Spring `@Scheduled` annotation format is `second minute hour day-of-month month day-of-week`. **The actual interval is not deterministic from source.**
+
+### Observed Volume Inference
+
+The only inference possible from the code:
+- The look-back window prevents unbounded scans; records older than `pastDays` days are excluded.
+- The pagination cursor (`I_ACTION_ID > :actionId`) ensures that large queues can be processed across multiple pages within a single run.
+- Chunk size = 1 means the throughput is bounded by the sum of 4 serial REST call latencies per record, making this a low-throughput, correctness-oriented batch design.
+
+---
+
+## 2. SCALING AND DEPLOYMENT
+
+### Deployment Type
+
+The workload is deployed as a Kubernetes **`Deployment`**, not a `CronJob`, `StatefulSet`, or `DaemonSet`.[^7]
+```yaml
+# resources.yaml:1-3
+apiVersion: {{ deploymentApiVersion }}
+kind: Deployment
+metadata:
+  name: gcp-visa-issuer-decline-batch${BRANCH_NAME_PLACEHOLDER}
+```
+
+The container runs as a **long-lived process** with an internal Spring scheduling loop (`@EnableScheduling` + `@Scheduled`). This is a design choice: the JVM stays warm between cron fires rather than starting cold each time.
+
+### Pod / Instance Count
+
+The replica count is **parameterized via XL Deploy**:
+```yaml
+# resources.yaml:8
+spec:
+  replicas: {{ replicas-gcp-visa-issuer-decline-batch }}
+```
+
+[^8]
+
+The actual value is injected by XL Deploy at deployment time per environment. It is **not present in source code**. This means multiple replicas could be running simultaneously, each firing the same cron independently — a
+
+IMAGE 3
+replicas: {{ replicas-gcp-visa-issuer-decline-batch }}
+
+[^8]
+
+The actual value is injected by XL Deploy at deployment time per environment. It is **not present in source code**. This means multiple replicas could be running simultaneously, each firing the same cron independently — a potential source of duplicate processing (see previous report on idempotency).
+
+### HPA / Autoscaling
+
+**No HorizontalPodAutoscaler is defined.** There is no HPA manifest, no `autoscaling` resource, and no `targetCPUUtilizationPercentage` or `targetMemoryUtilizationPercentage` configuration anywhere in the repository.[^9] Scaling is entirely manual via the XL Deploy `replicas` placeholder.
+
+### Memory and CPU Limits / Requests
+```yaml
+# resources.yaml:38-42
+resources:
+  limits:
+    memory: 2048Mi
+  requests:
+    memory: 512Mi
+```
+
+[^10]
+
+| Resource | Limit | Request |
+|----------|-------|---------|
+| Memory | **2048 Mi** | **512 Mi** |
+| CPU | **Not set** | **Not set** |
+
+**CPU limits and requests are entirely absent.** This means the container will consume as much CPU as the node provides with no throttling. For a batch job making serial REST calls with chunk size = 1, CPU is unlikely to be a bottleneck, but the lack of a CPU request means the Kubernetes scheduler has no guarantee for CPU allocation.
+
+### Deployment Strategy
+```yaml
+# resources.yaml:9-13
+strategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+  type: RollingUpdate
+```
+
+[^11]
+
+- **Rolling update** with `maxSurge: 1` — one extra pod is launched before the old one terminates.
+- `maxUnavailable: 0` — zero downtime deployments; the old pod only terminates after the new one is ready.
+- `minReadySeconds: 30` — new pod must remain stable for 30 seconds before it is considered available.[^12]
+
+IMAGE 4
+- `maxUnavailable: 0` — zero downtime deployments; the old pod only terminates after the new one is ready.
+- `minReadySeconds: 30` — new pod must remain stable for 30 seconds before it is considered available.[^12]
+
+### Topology Spread
+```yaml
+# resources.yaml:25-31
+topologySpreadConstraints:
+  - maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+    topologyKey: kubernetes.io/hostname
+    labelSelector:
+      matchLabels:
+        app: gcp-visa-issuer-decline-batch${BRANCH_NAME_PLACEHOLDER}
+```
+
+[^13]
+
+Pods are spread across nodes with a tolerance of `maxSkew: 1` (at most 1 more pod on any node than another). The `ScheduleAnyway` policy means this is a **best-effort** constraint — pods will still schedule even if the skew exceeds 1.
+
+### Container Port
+
+The container exposes port **8082**, which serves Spring Actuator health endpoints.[^14]
+
+---
+
+## 3. CONFIGURATION
+
+The table below enumerates every configurable parameter, its Spring property key, its value in production, and how it is injected.
+
+**Injection method key:**
+- **Hardcoded** — value is in source YAML and does not change across environments
+- **Env YAML** — value is hardcoded differently per environment in the checked-in `application-{env}.yaml` files
+- **Env w/K8s secret** — value is a `${placeholder}` resolved at runtime from Kubernetes secrets or environment variables
+- **XL Deploy** — value is a `{{ placeholder }}` resolved by XL Deploy at deployment time
+
+### Scheduler & Batch Parameters
+
+| Parameter | Property Key | Value (Prod) | Injection Method |
+|-----------|-------------|--------------|-----------------|
+| Cron schedule | `app.scheduler.cron` | `${scheduler_cron}` | Env var / K8s secret |
+| Job name | `app.batchProperties.jobName` | `VisaIssuerDeclineBatchJob` | Hardcoded in env YAML |
+| Step name | `app.batchProperties.processingStep` | `processVisaIssuerDeclineBatchStep` | Hardcoded in env YAML |
+| Chunk size | `app.batchProperties.chunk` | `1` | Hardcoded in env YAML |
+| Batch user ID | `app.batchProperties.userId` | `NPRBDECLB` | Hardcoded in env YAML |
+| Look-back window (days) | `app.batchProperties.pastDays` | `${past_days}` | Env var / K8s secret |
+| Page size (records per query) | `app.batchProperties.numberOfRecords` | `${number_of_records}` | Env var / K8s secret |
+
+[^15]
+
+IMAGE 5
+| Batch user ID | `app.batchProperties.userId` | `NPRBDECLB` | Hardcoded in env YAML |
+| Look-back window (days) | `app.batchProperties.pastDays` | `${past_days}` | Env var / K8s secret |
+| Page size (records per query) | `app.batchProperties.numberOfRecords` | `${number_of_records}` | Env var / K8s secret |
+
+[^15]
+
+### REST API Endpoint URLs
+
+All service URLs are hardcoded per-environment in the checked-in YAML files. There is no runtime override mechanism; changing a URL requires a code/config change and redeployment.
+
+| Service | Property Key | Prod URL | Pattern |
+|---------|-------------|----------|---------|
+| Case Management (GET) | `app.disputeService.getCaseUrl` | `http://mdvs-gcp-case-management-service.wdp-micro:8082/merchant/gcp/case-management/{platform}/case?caseNumber={caseNumber}` | Env YAML |
+| Add Action (POST) | `app.disputeService.addActionUrl` | `http://mdvs-gcp-case-actions-service.wdp-micro:8082/merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions` | Env YAML |
+| HyperSearch (POST) | `app.disputeService.hyperSearchUrl` | `http://mdvs-gcp-visa-adapter.wdp-micro:8082/merchant/wdp/visaadapter/hyperSearch` | Env YAML |
+| Get Action (GET) | `app.disputeService.getActionUrl` | `http://mdvs-gcp-case-actions-service.wdp-micro:8082/merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions/{actionSequence}` | Env YAML |
+| IDP Token (GET) | `idpService.tokenUrl` | `http://wdp-idp-token-service.wdp-micro:8082/merchant/gcp/idp-token/token` | Env YAML |
+
+[^16]
+
+**Note on namespace differences:** Non-prod environments (dev, test, stg) use the `gcp-ff` Kubernetes namespace (`*.gcp-ff:8082`), while cert, prod, and UAT use `wdp-micro` (`*.wdp-micro:8082`). STG uses `gcp-ff` dev URLs.
+
+### Database Configuration
+
+| Parameter | Property Key | Value | Injection |
+|-----------|-------------|-------|-----------|
+| NAP DB URL (prod) | `spring.datasource.nap.jdbc-url` | `${nap_datasource_jdbc_url}` | Env var / K8s secret |
+| NAP DB username (prod) | `spring.datasource.nap.username` | `napprodapp` | Hardcoded in env YAML |
+| NAP DB password | `spring.datasource.nap.password` | `${nap_datasource_password}` | K8s secret |
+| WDP DB URL (prod) | `spring.datasource.wdp.jdbc-url` | `${wdp_datasource_jdbc_url}` | Env var / K8s secret |
+| WDP DB username (prod) | `spring.datasource.wdp.username` | `wdpprodapp` | Hardcoded in env YAML |
+| WDP DB password | `spring.datasource.wdp.password` | `${wdp_datasource_password}` | K8s secret |
+| Spring Batch table prefix | `spring.batch.jdbc.tablePrefix` | `${table_prefix}` | Env var / K8s secret |
+| Schema init | `spring.batch.jdbc.initialize-schema` | `never` | Hardcoded in `application.yml` |
+
+[^18]
+
+### Infrastructure / Observability Configuration
+
+| Parameter | Property Key | Value | Injection |
+|-----------|-------------|-------|-----------|
+| Spring active profile | `spring.profiles.active` | `${gcp_env}` | Env var |
+| Log level | `logger.level` | `${log_level}` | Env var |
+| Logstash endpoint | `logstash.server.host.port` | `${logstash_server_host_port}` | Env var |
+| Server port | `server.port` | `8082` | Hardcoded in `application.yml` |
+| OTel Java agent injection | K8s annotation | `opentelemetry-operator-system/default` | Hardcoded in `resources.yaml` |
+
+[^19]
+
+### Kubernetes Secret Sources
+
+IMAGE 6
+| Server port | `server.port` | `8082` | Hardcoded in `application.yml` |
+| OTel Java agent injection | K8s annotation | `opentelemetry-operator-system/default` | Hardcoded in `resources.yaml` |
+
+[^19]
+
+### Kubernetes Secret Sources
+
+All runtime secrets are injected via `envFrom.secretRef` in the pod spec:
+```yaml
+# resources.yaml:43-49
+envFrom:
+  - secretRef:
+      name: {{ ingressTLSsecretName }}        # XL Deploy placeholder
+  - secretRef:
+      name: gcp-visa-issuer-decline-batch-secrets   # job-specific K8s secret
+  - secretRef:
+      name: wdp-common-secrets                # shared platform secret
+```
+
+[^20]
+
+### Timeouts and Thread Pools
+
+**No HTTP timeouts, connection pool settings, or thread pool configurations are present in the codebase.** The `RestTemplate` is instantiated with default Spring settings (no `connectTimeout`, no `readTimeout`, no `connectionPoolSize`).[^21] `@Scheduled` tasks run in Spring's default single-threaded `ThreadPoolTaskScheduler` — no custom `ThreadPoolTaskScheduler` bean is defined.[^22]
+
+---
+
+## 4. PLANNED CHANGES AND INDICATORS OF IN-PROGRESS WORK
+
+Six distinct indicators of planned or incomplete work were found. None is a formal `TODO` comment (the grep for `TODO`, `FIXME`, `HACK` returned zero results[^23]), but the structural evidence is clear.
+
+---
+
+### 4.1 Unused `Event` Model — Planned Kafka Event Publishing
+
+**File:** `src/main/java/com/wp/gcp/visa/issuer/decline/batch/model/Event.java`[^24]
+```java
+@Data
+public class Event {
+    private String platform;
+    private String caseNumber;
+    private String actionSequence;
+    private String startRuleGroup;
+    private String source;
+}
+```
+
+This class is **defined but never instantiated or referenced** anywhere in the production codebase. The fields (`platform`, `caseNumber`, `actionSequence`, `startRuleGroup`, `source`) are strongly consistent with a downstr
+
+IMAGE 7
+    private String platform;
+    private String caseNumber;
+    private String actionSequence;
+    private String startRuleGroup;
+    private String source;
+}
+
+This class is **defined but never instantiated or referenced** anywhere in the production codebase. The fields (`platform`, `caseNumber`, `actionSequence`, `startRuleGroup`, `source`) are strongly consistent with a downstream event-routing message that other services in the Worldpay disputes platform would consume to trigger rule execution or workflow transitions.
+
+### 4.2 Unused Constants: `VISA_ISS_DEC` and `START_RULE_GROUP`
+
+**File:** `src/main/java/com/wp/gcp/visa/issuer/decline/batch/util/ApplicationConstants.java:23-24` [^25]
+```java
+String START_RULE_GROUP = "ISSUER_DOCUMENTS";
+String VISA_ISS_DEC = "BRVISD";
+```
+
+Both constants are **declared but never used** in any production or test class. In the context of the broader disputes platform:
+- `BRVISD` is consistent with a Kafka topic key or event type identifier (compare with other batch jobs that publish events with source codes).
+- `ISSUER_DOCUMENTS` is consistent with a rule group name that would be triggered after an IDCL action is created, suggesting a downstream rule evaluation step that was planned but not yet wired.
+- Together with the `Event` model, these constants form a complete (but unconnected) event-publishing signature.
+
+### 4.3 Unused Kafka Dependencies in POM
+
+**File:** `pom.xml:158-172` [^26]
+```xml
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.apache.kafka</groupId>
+    <artifactId>kafka-clients</artifactId>
+</dependency>
+<dependency>
+    <groupId>software.amazon.msk</groupId>
+    <artifactId>aws-msk-iam-auth</artifactId>
+    <version>2.1.1</version>
+</dependency>
+```
+
+All three Kafka-related dependencies (`spring-kafka`, `kafka-clients`, `aws-msk-iam-auth` for Amazon MSK IAM authentication) are present in the POM but **zero Kafka API usage exists** in the source. The presence of `aws-msk-iam-auth` specifically indicates the intended Kafka broker is Amazon MSK with IAM-based authentication — a production-ready configuration that has been staged but not activated.
+
+IMAGE 8
+All three Kafka-related dependencies (`spring-kafka`, `kafka-clients`, `aws-msk-iam-auth` for Amazon MSK IAM authentication) are present in the POM but **zero Kafka API usage exists** in the source. The presence of `aws-msk-iam-auth` specifically indicates the intended Kafka broker is Amazon MSK with IAM-based authentication — a production-ready configuration that has been staged but not activated.
+
+**Assessment:** This, combined with indicators 4.1 and 4.2, constitutes strong evidence of a planned feature: after creating the IDCL action, the job was intended to publish an `Event` to an MSK Kafka topic (likely keyed by `BRVISD` / topic `BRVISD`) to trigger downstream `ISSUER_DOCUMENTS` rule processing.
+
+### 4.4 Unused `spring-retry` / `spring-aspects` Dependencies
+
+**File:** `pom.xml:134-143` [^27]
+```xml
+<dependency>
+    <groupId>org.springframework.retry</groupId>
+    <artifactId>spring-retry</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework</groupId>
+    <artifactId>spring-aspects</artifactId>
+</dependency>
+```
+
+`spring-retry` requires `spring-aspects` (for AOP proxy support with `@Retryable`). Both are present but **no `@Retryable`, `@EnableRetry`, or `RetryTemplate` usage exists** in the source. This indicates retry logic was planned for the REST calls but was not implemented. Given the job's current silent-swallow exception handling pattern, adding `@Retryable` to the service methods would be the natural completion.
+
+### 4.5 Commented-Out Logstash Destinations (Hardcoded IP Addresses)
+
+**File:** `src/main/resources/logback-spring.xml:17-18` [^28]
+```xml
+<!--    <destination>10.43.145.125:5044</destination>    -->
+<!--    <destination>10.43.145.125:5044</destination>    -->
+```
+
+Two identical commented-out `<destination>` entries reference the same hardcoded IP `10.43.145.125:5044`. The live configuration uses `${LOGSTASH_SERVER_HOST_PORT}` (an externalized property). These commented lines suggest:
+- An earlier configuration that had the Logstash IP hardcoded (likely a development/debugging phase)
+- The developer switched to the externalized property approach but left the old entries as comments rather than deleting them
+
+These are benign dead code but represent technical debt.
+
+### 4.6 Unused Return Value in `BatchItemWriter`
+
+IMAGE 9
+These are benign dead code but represent technical debt.
+
+### 4.6 Unused Return Value in `BatchItemWriter`
+
+**File:** `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/BatchItemWriter.java:34` [^29]
+```java
+AddActionResponse response = addAction(item);
+// response is assigned but never used
+```
+
+The `AddActionResponse` (containing `caseNumber`, `actionSequence`, `actionSequenceList`) is returned from the Case Actions service and assigned to a local variable but is **never read, logged, or validated**. This suggests response-based logging, validation (e.g., checking `actionSequence` is non-null), or post-processing was planned but not implemented.
+
+### 4.7 Migration-Flag as a Processing Gate
+
+**File:** `src/main/java/com/wp/gcp/visa/issuer/decline/batch/repository/ActionEntityRepository.java:17` [^30]
+```sql
+AND C_MIGRATION_STA = 'Y'
+```
+
+The `C_MIGRATION_STA = 'Y'` filter in both repository queries acts as a **hard gate**: only records that have been explicitly flagged with migration status `Y` are eligible for processing. The entity maps this to `migrationStatus` field.[^31] This pattern is characteristic of a **phased data migration rollout** where:
+1. Records are migrated from a legacy system to the new NAP database
+2. Upon successful migration, `C_MIGRATION_STA` is set to `Y`
+3. This batch only processes migrated records
+
+This flag is a structural indicator that the job may be a **transitional component** in an ongoing migration project. As migration completes and all records reach `C_MIGRATION_STA = 'Y'`, this filter becomes effectively a no-op. Future planned work may include removing the migration flag requirement entirely.
+
+---
+
+## Confidence Assessment
+
+| Section | Finding | Confidence | Basis |
+|---------|---------|-----------|-------|
+| **Volume** | Chunk size = 1 | **High** | Hard-coded in all 7 env YAMLs |
+| **Volume** | Records per page = `${number_of_records}` | **High** | Confirmed in all env YAMLs |
+| **Volume** | Look-back = `${past_days}` | **High** | Confirmed in all env YAMLs |
+| **Volume** | Actual record counts per run | **Low** | Cannot be determined from source; actual K8s secrets not visible |
+| **Volume** | Test uses `pastDays=7`, `numberOfRecords=5` | **High** | Direct test fixture code |
+| **Scaling** | Deployment type = `Deployment` | **High** | `resources.yaml:2` explicit |
+| **Scaling** | No HPA | **High** | No HPA manifest anywhere in repo |
+| **Scaling** | Memory limit 2048Mi, request 512Mi | **High** | `resources.yaml:39-42` explicit |
+| **Scaling** | No CPU limits/requests | **High** | Absent from `resources.yaml` |
+| **Scaling** | Actual replica count | **Low** | XL Deploy placeholder; value not in source |
+
+IMAGE 10
+| **Scaling** | Memory limit 2048Mi, request 512Mi | **High** | `resources.yaml:39-42` explicit |
+| **Scaling** | No CPU limits/requests | **High** | Absent from `resources.yaml` |
+| **Scaling** | Actual replica count | **Low** | XL Deploy placeholder; value not in source |
+| **Configuration** | All property keys | **High** | Traced across all env YAML files |
+| **Configuration** | Prod URL pattern (`wdp-micro` namespace) | **High** | `application-prod.yaml` explicit |
+| **Configuration** | `CommonConfig.java` uses bare `new RestTemplate()` | **High** | 3 corroborating pieces of evidence |
+| **Configuration** | No HTTP timeouts configured | **High** | `CommonConfig.java` uses bare `new RestTemplate()` |
+| **Planned Changes** | Kafka event publishing planned (unused deps + model + constants) | **High** | 3 corroborating pieces of evidence |
+| **Planned Changes** | `spring-retry` planned but not implemented | **High** | Dep present; no usage in source |
+| **Planned Changes** | Migration flag as temporary gate | **Medium** | Inferred from naming convention; no documentation |
+| **Planned Changes** | Unused `AddActionResponse` — planned validation | **Medium** | Pattern suggests intent, but could also be oversight |
+
+---
+
+## Footnotes
+
+[^1]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/repository/ActionEntityRepository.java:17-18` — first-page query with timestamp filter and pageable
+
+[^2]: `src/test/java/com/wp/gcp/visa/issuer/decline/batch/job/service/impl/ActionServiceImplTest.java:57-59` — `batch.setPastDays(7L); batch.setNumberOfRecords(5);`
+
+[^3]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/BatchItemReader.java:58-68` — cursor pagination: when page exhausted, `findQueueItemsWithActionId(lastId)` is called; `ActionEntityRepository.java:20-21` — second query using `I_ACTION_ID > :actionId`
+
+[^4]: `src/main/resources/application-prod.yaml:21`, `application-dev.yaml:20`, `application-cert.yaml:19`, `application-uat.yaml:19`, `application-stg.yaml:19`, `application-test.yaml:20`, `application-local.yaml:28` — all read `chunk: 1`
+
+[^5]: `src/main/resources/application-prod.yaml:15-17` — `app.scheduler.cron: ${scheduler_cron}`; confirmed identical in all env YAMLs
+
+[^6]: `resources.yaml:47` — `secretRef: name: gcp-visa-issuer-decline-batch-secrets`
+
+[^7]: `resources.yaml:2` — `kind: Deployment`; `src/main/java/com/wp/gcp/visa/issuer/decline/batch/VisaIssuerDeclineBatchApplication.java:12` — `@EnableScheduling` confirms in-process scheduling
+
+[^8]: `resources.yaml:8` — `replicas: {{ replicas-gcp-visa-issuer-decline-batch }}`
+
+[^9]: Full search across all `*.yaml` files in the repository for `hpa`, `HorizontalPodAutoscaler`, `autoscal`, `minReplica`, `maxReplica`, `targetCPU` returned zero matches
+
+[^10]: `resources.yaml:38-42` — `limits.memory: 2048Mi`, `requests.memory: 512Mi`; CPU section is absent entirely
+
+[^11]: `resources.yaml:9-13` — rolling update strategy definition
+
+[^12]: `resources.yaml:24` — `minReadySeconds: 30`
+
+[^13]: `resources.yaml:25-31` — `topologySpreadConstraints` block
+
+[^14]: `resources.yaml:36-37` — `containerPort: 8082`; `src/main/resources/application.yaml:2` — `server.port: 8082`
+
+[^15]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/config/ApplicationProps.java` — `Batch` inner class defines all these fields; each env YAML sets them
+
+[^16]: `src/main/resources/application-prod.yaml:25-30` — all 5 service URLs for prod
+
+[^17]: `application-stg.yaml:24-30` and `application-test.yaml:24-30` — both reference `*.develop.gcp-ff:8082` URLs (dev namespace), not a dedicated stg or test namespace
+
+IMAGE 11
+[^17]: `application-stg.yaml:24-30` and `application-test.yaml:24-30` — both reference `*.develop.gcp-ff:8082` URLs (dev namespace), not a dedicated stg or test namespace
+
+[^18]: `src/main/resources/application.yml:8-14` — batch JDBC config; `application-prod.yaml:2-12` — prod DB config; `src/main/java/com/wp/gcp/visa/issuer/decline/batch/dbconfig/DataSourceProps.java` and `WdpDataSourceProps.java`
+
+[^19]: `src/main/resources/application.yml:1-22` — server port, profile, batch settings; `resources.yaml:22` — OTel annotation; `logback-spring.xml:32-36` — log level property
+
+[^20]: `resources.yaml:43-45` — three `secretRef` entries
+
+[^21]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/config/CommonConfig.java:10-13` — `return new RestTemplate()` with no builder, timeouts, or interceptors
+
+[^22]: No `ThreadPoolTaskScheduler` bean found anywhere in the codebase; Spring Boot default is a single-thread scheduler
+
+[^23]: grep for `TODO|FIXME|HACK|XXX|TEMP|WTF` across all `*.java` files returned zero matches
+
+[^24]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/model/Event.java` — complete class; not referenced by any import or instantiation in the production source
+
+[^25]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/util/ApplicationConstants.java:21-24` — `START_RULE_GROUP = "ISSUER_DOCUMENTS"` and `VISA_ISS_DEC = "BRVISD"` — grep for usages of these constants returns zero hits in production code
+
+[^26]: `pom.xml:158-172` — `spring-kafka`, `kafka-clients`, `aws-msk-iam-auth` dependencies; grep for `KafkaTemplate`, `KafkaListener`, `@SendTo`, `ProducerRecord` across `src/` returned zero matches
+
+[^27]: `pom.xml:134-143` — `spring-retry` and `spring-aspects`; grep for `@Retryable`, `@EnableRetry`, `RetryTemplate` across `src/` returned zero matches
+
+[^28]: `src/main/resources/logback-spring.xml:17-18` — two identical commented-out `<destination>10.43.145.125:5044</destination>` entries
+
+[^29]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/job/BatchItemWriter.java:34` — `AddActionResponse response = addAction(item);` — `response` is never read after assignment
+
+[^30]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/repository/ActionEntityRepository.java:17` and `:20` — `C_MIGRATION_STA = 'Y'` present in both query predicates
+
+[^31]: `src/main/java/com/wp/gcp/visa/issuer/decline/batch/entity/ActionEntity.java:28-29` — `@Column(name = "C_MIGRATION_STA") private String migrationStatus;`
+
+That's the complete text from all 11 images — the Volume, Scaling & Deployment, Configuration, and Planned Changes report for gcp-visa-issuer-decline-batch.
+Key architectural signals from this second report
+A few things worth flagging immediately before we proceed to update the docs:
+⚠️ No HTTP timeouts on RestTemplate — bare new RestTemplate() with no timeout config. At chunk size=1 with 4 serial REST calls per record, a single slow downstream (e.g. Visa Adapter) will block that record indefinitely. This is a resilience gap worth noting in WDP-NFRS.md once we confirm NFR currency.
+⚠️ STG/Test environments point at dev namespace — application-stg.yaml and application-test.yaml both resolve to *.develop.gcp-ff:8082 URLs. STG and Test are not isolated from dev. Worth flagging as an environment hygiene risk.
+📋 Planned Kafka feature is well-evidenced — Event model + BRVISD/ISSUER_DOCUMENTS constants + 3 Kafka POM deps all point to a planned post-IDCL event to trigger downstream rule evaluation. This needs an ADR or at minimum a placeholder in WDP-DECISIONS.md.
+Shall I now proceed to draft the updated NAPDisputeDeclineBatch component entry using both reports combined?Sonnet 4.6Claude is AI and can make mistakes. Please double-che

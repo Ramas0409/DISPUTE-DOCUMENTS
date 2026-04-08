@@ -1,0 +1,475 @@
+Good — this maps directly to FirstChargebackBatch (section 2.2.2 in WDP-COMPONENTS.md), which is currently marked ⚠️ DRAFT — Repository: To be confirmed. This research report resolves a significant amount of that DRAFT content.
+Here is the full extracted text across all 20 images:
+
+Deep Technical Research Report: wdp-mcm-first-chargeback-queue-batch
+Repository: com.wp.gcp / wdp-mcm-first-chargeback-queue-batch
+Version: 0.0.1
+Spring Boot: 3.5.3 | Java: 17 | Build: Maven
+
+Executive Summary
+wdp-mcm-first-chargeback-queue-batch is a Spring Boot / Spring Batch application that runs continuously inside a Kubernetes Deployment. Every cron tick it polls a MasterCard Dispute Management (MCM) queue for unworked first chargeback claims via a DataPower proxy, enriches each claim with settled-transaction data, encrypts the PAN through a WDP internal encryption service, and writes a ready-to-publish row into the wdp.chbk_outbox_row PostgreSQL outbox table. It never directly publishes to Kafka — that responsibility belongs to a downstream outbox publisher. The job acknowledges each processed item back to the MCM queue via a PUT call, so it is not re-queued on the next run.
+
+1. PRIMARY RESPONSIBILITY
+What it does
+The batch pulls open, unworked first chargeback items from the MasterCard Dispute queue (via DataPower), fetches full claim and settlement data, encrypts the cardholder account number, and writes a normalised WDP event payload into the chbk_outbox_row table for downstream Kafka publishing. After writing, it acknowledges the items as worked so they are removed from the MCM queue.
+What it explicitly does NOT do
+
+Does not publish to Kafka directly (despite Kafka dependencies being declared).
+Does not handle second/subsequent chargebacks, pre-arbitration, or arbitration stages.
+Does not process reversed chargebacks or reversal records.
+Does not perform any case routing, decisioning, or response filing.
+Does not write to S3 or any file system.
+Does not invoke RTSL, RTDS, or any WDP case management REST API to create cases.
+
+Job and Step Structure
+There is exactly one Spring Batch job with exactly one step:
+ComponentName (from config)ClassJobmcmFirstChargebackQueueJobJobConfiguration.job()StepprocessMcmFirstChargeBackQueueBatchStepJobConfiguration.processingStep()ReaderBatchItemReaderImplements ItemReader<QueueClaim>ProcessorBatchItemProcessorImplements ItemProcessor<QueueClaim, List<ProcessedItem>>WriterBatchItemWriterImplements ItemWriter<List<ProcessedItem>>
+The step is chunk-oriented with chunk = 1 (hardcoded default, configurable via app.batchProperties.chunk). The type signature is chunk(chunk, transactionManager).<QueueClaim, List<ProcessedItem>>.
+The job is NOT auto-started by Spring Batch (spring.batch.job.enabled=false). It is launched by BatchScheduler on a cron schedule via JobLauncher.run(job, jobParameters) with a timestamp-based JobParameter (format yyyyMMdd_HHmmss.SSS).
+Source references:
+
+src/main/java/.../job/config/JobConfiguration.java — job and step bean definitions
+src/main/resources/application.yml lines 28–33 — job/step name config
+src/main/java/.../scheduler/BatchScheduler.java — trigger mechanism
+
+
+2. MASTERCARD ENDPOINTS
+The job accesses MasterCard via an internal DataPower proxy (IBM DataPower Gateway acting as an API facade/gateway). All three MCM calls are made by MCMServiceImpl through DataPowerRestInvoker. A fourth call (acknowledgement) is a PUT that marks items as worked.
+2a. Unworked Chargebacks Queue
+AttributeValueConfig keyapp.dataPowerService.unworkedChargebacksQueueUrlHTTP methodGETCalled byMCMServiceImpl.getUnworkedChargebackClaims()PurposeRetrieves all open/unworked first chargeback items in the MCM queueDispute stageQueue polling — pre-processing
+Request:
+GET {unworkedChargebacksQueueUrl}
+Headers: Content-Type: application/json, Accept: application/json, Authorization: {vantiveLicense}, v-correlation-id: {UUID}
+Response (deserialised to QueueClaim[]):
+json[
+  { "claimId": "MCM-CASE-12345" },
+  ...
+]
+Only claimId is mapped — all unknown fields are ignored (@JsonIgnoreProperties(ignoreUnknown=true)).
+Empty response handling: If the array is null or empty, the method returns null. BatchItemReader treats null as an empty list — no records are processed and the job exits cleanly.
+Error handling: RestClientException → ServiceException (re-thrown), generic Exception → ServiceException. Both are caught in BatchItemReader.getUnworkedChargebackClaims(), logged, and return null (not re-thrown), so a queue poll failure silently aborts the run with zero records.
+
+2b. Claim Detail
+AttributeValueConfig keyapp.dataPowerService.claimDetailHTTP methodGETCalled byMCMServiceImpl.getClaimDetail(claimId)URI pattern{claimDetail} with claimId as a URI variablePurposeRetrieves full dispute case detail including chargeback sub-recordsDispute stageClaim detail enrichment
+Request:
+GET {claimDetail}/{claimId} (URI variable expansion via RestTemplate.exchange)
+Response (deserialised to ClaimDetail):
+acquirerId, claimId, acquirerRefNum, primaryAccountNum, clearingDueDate,
+clearingNetwork, createDate, dueDate, transactionId, isAccurate, isAcquirer,
+isIssuer, isOpen, issuerId, lastModifiedBy, lastModifiedDate, merchantId,
+queueName, claimType, claimValue, standardClaims,
+chargebackDetails: [
+  { currency, documentIndicator, messageText, amount, reasonCode,
+    isPartialChargeback, chargebackType, chargebackId, claimId,
+    reversed, reversal, createDate, chargebackRefNum,
+    reconciliationAmount, reconciliationCurrency }
+]
+Key field transactionId: A compound string TI:{networkSettledId}#{networkAuthId} which the processor parses with StringUtils.split(masterCardTransactionId, "#") and StringUtils.substringAfter(transactionIdArray[0], "TI:").
+Empty/null response: If ClaimDetail is null, BatchItemProcessor throws Exception("Chargeback detail is empty") which is caught internally and results in an empty processedItems list for that claim — the claim is not written and not acknowledged.
+Error handling: Same RestClientException → ServiceException pattern; re-thrown from MCMServiceImpl, caught by BatchItemProcessor.process().
+
+2c. Settled Transaction Detail
+AttributeValueConfig keyapp.dataPowerService.settledTransactionHTTP methodGETCalled byMCMServiceImpl.getSettledTransactionDetail(claimId, transactionId)URL patternURI variables: claimId, transactionIdPurposeRetrieves the settled clearing record for PAN mapping via mastercardMappingServiceAccountNumberDispute stagePre-chargeback — original authorisation/settlement lookup
+Request:
+GET {settledTransaction}/{claimId}/{transactionId}
+Response (deserialised to SettledTransactionDetail): 116-field clearing record. The only field consumed by this application is:
+mastercardMappingServiceAccountNumber — the mapped/resolved account number
+Other significant fields present (but not currently used): primaryAccountNumber, cardAcceptorName, approvalCode, localTransactionDateTime, tokenRequestorId, walletIdentifierMsea, transactionLifeCycleId.
+Null/blank field handling: If mastercardMappingServiceAccountNumber is blank, StringUtils.defaultIfBlank() falls back to claimDetail.getPrimaryAccountNum().
+Skip condition: If networkSettledTransactionId is null/blank (transaction ID absent from claimDetail.transactionId), the settlement API call is skipped entirely and primaryAccountNum is used directly.
+Error handling: Exception caught in BatchItemProcessor.getMCMappingServiceAccountNumber() — logs the error and falls back to claimDetail.getPrimaryAccountNum().
+
+2d. Acknowledge Chargeback (Claim Acknowledgement)
+AttributeValueConfig keyapp.dataPowerService.claimAcknowledgementHTTP methodPUTCalled byMCMServiceImpl.acknowledgeChargebackWorked(List<Chargeback>)PurposeMarks processed chargebacks as worked in the MCM queue so they are not re-queuedDispute stagePost-processing acknowledgement
+Request body (serialised from AcknowledgeChargeback):
+json{
+  "chargebackList": [
+    { "claimId": "MCM-12345", "chargebackId": "CB-67890" },
+    ...
+  ]
+}
+This is a batch acknowledgement — all chargebacks from the write phase are accumulated in acknowledgeList and sent in a single PUT at the end of BatchItemWriter.write().
+Response (deserialised to AcknowledgeChargebackResponse):
+json{
+  "chargebackResponseList": [{
+    { "chargebackId": "CB-67890", "status": "...", "failureReason": "..." }
+  }]
+}
+If failureReason is non-blank for any chargeback, ServiceException is thrown. The exception is caught and logged; it does not roll back previously-written outbox rows.
+Skip condition: If removeItemFromQueueDisabled = true (feature flag), the acknowledge PUT is not called. This allows testing without affecting the MCM queue.
+Authentication to DataPower/MCM
+All three MCM calls use a static license key passed as the Authorization header:
+Authorization: {app.dataPowerService.vantiveLicense}
+This is a Vantiv/Worldpay proprietary license token, not OAuth. It is injected from a Kubernetes secret (wdp-mcm-first-chargeback-queue-batch-secrets or wdp-common-secrets).
+A v-correlation-id UUID header is generated fresh per request for tracing.
+
+3. TRIGGER AND SCHEDULE
+Trigger mechanism
+Spring @Scheduled annotation on BatchScheduler.run():
+java@Scheduled(cron = "${app.scheduler.cron}")
+The cron expression is injected from environment variable scheduler_cron via application.yml:
+yamlapp:
+  scheduler:
+    cron: ${scheduler_cron}
+The scheduler is enabled by @EnableScheduling on McmFirstChbkQueBatchApplication. Spring Batch auto-run is disabled (spring.batch.job.enabled=false), so the only trigger is the scheduler.
+Schedule configuration
+The production cron value is not committed to source — it is an XL Deploy / environment-variable placeholder (${scheduler_cron}). The actual value is injected at deploy time via Kubernetes secret/configmap.
+Kubernetes resource type
+Kubernetes Deployment (not a CronJob). The resources.yaml declares apiVersion: {{ deploymentApiVersion }} and kind: Deployment. The application runs continuously as a long-lived pod; the schedule is handled internally by Spring Scheduler, not by Kubernetes CronJob semantics.
+Single or multiple schedules
+One schedule — a single @Scheduled cron on BatchScheduler.run(). There are no other scheduled methods.
+Source references:
+
+src/main/java/.../scheduler/BatchScheduler.java — schedule annotation
+src/main/resources/application.yml line 25 — config key
+resources.yaml line 2 — kind: Deployment
+
+
+4. INBOUND DEPENDENCIES
+4a. DataPower / MCM API (MasterCard proxy)
+AttributeValueConfig keyapp.dataPowerService.*AuthStatic license header Authorization: {vantiveLicense}HTTP methodGET (queue, claim, settlement), PUT (acknowledge)Client classDataPowerRestInvokerPurposeRead unworked chargeback queue; read claim detail; read settled transaction; write acknowledgementRetry@Retryable(retryFor = {Exception.class}, maxAttempts = RETRY_COUNT, backoff = @Backoff(delay = RETRY_DELAY)) where RETRY_COUNT = "3", RETRY_DELAY = "2000" ms
+Retry applies to both GET and PUT methods in DataPowerRestInvoker. Fixed 2-second delay, no exponential backoff configured.
+
+4b. WDP Encryption Service (DisputeService)
+AttributeValueConfig keyapp.disputeService.encryptionUrlAuthBearer token from IDP service (Authorization: Bearer {idpToken})HTTP methodPOSTClient classRestInvokerPurposeEncrypts clear PAN → HPANRetry@Retryable(retryFor = {Exception.class}, maxAttempts = RETRY_COUNT, backoff = @Backoff(delay = RETRY_DELAY)) — same 3 attempts, 2-second delay
+
+4c. IDP Token Service
+AttributeValueConfig keyapp.idpService.tokenUrl (injected via @Value)AuthNone — unauthenticated GETHTTP methodGETClient classIdpRestInvokerPurposeFetches a short-lived bearer token used by RestInvoker to authenticate calls to the encryption serviceRetry@Retryable — same 3 attempts, 2-second fixed delayResponseIdpTokenResponse { tokenValue, expiresIn, tokenType, expirationDate }
+Token is fetched per-request (no in-memory caching observed in source). IdpTokenServiceImpl.getIdpToken() calls IdpRestInvoker.getIdpToken() every time RestInvoker.getHttpHeaders() is called.
+
+4d. PostgreSQL Database (chbk_outbox_row)
+AttributeValueConfig keyspring.datasource.wdp.*AuthUsername/password from Kubernetes secretPurposeIdempotency lookups (read) and outbox row writesClientSpring Data JPA / Hibernate via ChbkOutboxRepositorySchemawdp.chbk_outbox_rowTransaction managerwdpTransactionManager (JPA, primary)
+
+5. PROCESSING LOGIC
+Step-by-step flow
+BatchScheduler.run()
+  └── JobLauncher.run(job, {date: "yyyyMMdd_HHmmss.SSS"})
+        └── processMcmFirstChargeBackQueueBatchStep (chunk=1)
+              |
+              ├── [BEFORE STEP] BatchItemReader.searchQueueItems()
+              │     └── MCMService.getUnworkedChargebackClaims()
+              │           └── DataPowerRestInvoker.GET(unworkedChargebacksQueueUrl)
+              │                 → QueueClaim[] (claimId list)
+              │     └── filterQueueClaims()
+              │           if readSpecificItemFromQueue=true → filter by mcmDisputeCaseNumbers
+              │           else → return all
+              │
+              ├── [READ] BatchItemReader.read()
+              │     — returns next QueueClaim from in-memory list (index-based)
+              │     — returns null when exhausted (terminates step)
+              │
+              ├── [PROCESS] BatchItemProcessor.process(queueClaim)
+              │     1. MCMService.getClaimDetail(claimId)
+              │           → DataPowerRestInvoker.GET(claimDetail, claimId)
+              │           → ClaimDetail (full case + List<ChargebackDetail>)
+              │
+              │     2. getFirstChargeBackDetail(claimDetail)
+              │           Filter: chargebackType == "CHARGEBACK"
+              │                   && !reversed && !reversal
+              │           → List<ChargebackDetail> (qualifying first chargebacks only)
+              │           if empty → throw Exception → return empty processedItems
+              │
+              │     3. ChbkOutboxService.findChbkByNetworkCaseId(claimId)
+              │           → SELECT * FROM chbk_outbox_row WHERE c_ntwk_case_id = claimId
+              │
+              │     4a. IF empty (new claim) → processClaims()
+              │           for each ChargebackDetail:
+              │              extractNetworkTransactionId() from claimDetail.transactionId
+              │                 split on "#" → transactionIdArray[0] → substringAfter "TI:"
+              │                 → networkSettledTransactionId
+              │              getMCMappingServiceAccountNumber() [only for FIRST cb, subsequent skip]
+              │                 if networkSettledTransactionId is not blank:
+              │                    MCMService.getSettledTransactionDetail(claimId, transId)
+              │                       → DataPowerRestInvoker.GET(settledTransaction, claimId, transId)
+              │                       use mastercardMappingServiceAccountNumber (fallback: primaryAccountNum)
+              │                 else: use claimDetail.primaryAccountNum
+              │              truncate to last 16 digits if > 16 chars
+              │              derive accountLastFourDigit (last 4)
+              │              if not masked (no "*") → encrypt:
+              │                 DisputeService.encryptAccountNumber(accountNumber)
+              │                    → RestInvoker.POST(encryptionUrl, {pan: accountNumber})
+              │                    → Auth: Bearer {IdpTokenService.getIdpToken()}
+              │                    → returns hpan
+              │              ProcessorUtil.mapToChbkOutboxEntity(...)
+              │                 status = "PENDING"
+              │                 isAccountNumberRequired = false for 2nd+ chargebacks in same claim
+              │
+              │     4b. IF existing records found (update path) → processUpdatedClaims()
+              │           for each ChargebackDetail:
+              │              ChbkOutboxService.chbkOutboxLookup(claimId, chargebackId)
+              │                 → COUNT from chbk_outbox_row WHERE c_ntwk_case_id=? AND c_ntwk_phase_id=?
+              │              if count == 0 → status = "PENDING" (new chargeback on existing case)
+              │              else
+              │                 → status = "SKIPPED" (already exists)
+              │              NOTE: NO PAN/encryption in update path
+              │              ProcessorUtil.mapToChbkOutboxEntity(... accountNumber=null ...)
+              │              → List<ProcessedItem>
+              │
+              └── [WRITE] BatchItemWriter.write(chunk)
+                    for each ProcessedItem:
+                       if chbkOutboxEntity != null:
+                          ChbkOutboxService.saveEventChbkOutbox(entity)
+                             → INSERT INTO chbk_outbox_row (...)
+                          add to acknowledgeList
+                       if !removeItemFromQueueDisabled && acknowledgeList not empty:
+                          MCMService.acknowledgeChargebackWorked(acknowledgeList)
+                             → DataPowerRestInvoker.PUT(claimAcknowledgement, {chargebackList: [...]})
+
+MasterCard field mapping to WDP internal structures
+MCM Field (source)WDP Internal FieldEntity ColumnclaimDetail.claimIdnetworkCaseId, networkCaseNumberc_ntwk_case_idchargebackDetail.chargebackIdnetworkPhaseIdc_ntwk_phase_idchargebackDetail.chargebackRefNumnetworkChargebackId(payload JSON)chargebackDetail.reasonCodereasonCode(payload JSON)chargebackDetail.amount or reconciliationAmountdisputeAmount(payload JSON)chargebackDetail.currency or reconciliationCurrencydisputeCurrency(payload JSON)chargebackDetail.messageTextnotes[].text (type=FRNTWK)(payload JSON)chargebackDetail.documentIndicatornetworkDocInd (Y/N)(payload JSON)chargebackDetail.isPartialChargebackpartialIndicator (Y/N)(payload JSON)claimDetail.acquirerIddestICA(payload JSON)claimDetail.issuerIdsendICA(payload JSON)claimDetail.acquirerRefNumacqreRefnce_num, arnl_acq_refnce_numclaimDetail.merchantId, levelEntity, merchantDetail.midc_levell_entityclaimDetail.queueNameschemeRef.queueName(payload JSON)claimDetail.dueDateschemeRef.lastActionDate(payload JSON)Encrypted PANoriginalTransIdentifier.accountNumber(payload JSON)Last 4 digitsoriginalTransIdentifier.accountNumberLast4(payload JSON)Hardcoded "CHARGEBACK_PROCESS"eventTypeevent_typeHardcoded "CH1"caseStage, disputeStagec_case_stageHardcoded "CORE"platform, sourceSystemc_acq_platformHardcoded "MASTERCARD"cardNetworkc_case_ntwk
+Conditional branching on chargebackDetail
+
+Only chargebacks where chargebackType == "CHARGEBACK" AND !reversed AND !reversal are processed.
+Other types (REVERSAL records or reversed chargebacks) are excluded at processor step 2.
+For multiple qualifying chargebacks in one claim: account number encryption is performed only for the first (isAccountNumberRequired flag flips to false after first iteration).
+In the update path (processUpdatedClaims), account number encryption is never performed regardless.
+
+What is unique about first chargeback vs. subsequent
+The job only processes chargebackType == "CHARGEBACK" records — not chargebackType == "ARBITRATION" or "SECOND_CHARGEBACK" etc. (though those type strings are inferred from MCM convention; only "CHARGEBACK" is hardcoded in ApplicationConstants.CHARGEBACK).
+
+Dispute stage is hardcoded to "CH1" (First Chargeback) across all records.
+PAN encryption and settlement lookup only apply to first-chargeback processing — there is no equivalent flow in this batch for pre-arb or arbitration.
+The enrichmentFailure flag on OriginalTransIdentifier is hardcoded to true — signalling to downstream processors that transaction enrichment data was not fully resolved at this stage.
+
+
+6. PAN HANDLING
+Is PAN present in MasterCard responses?
+Yes. Two sources:
+
+ClaimDetail.primaryAccountNum — present in the claim detail response from MCM.
+SettledTransactionDetail.mastercardMappingServiceAccountNumber — the preferred (mapped) account number from the settled transaction.
+SettledTransactionDetail.primaryAccountNumber — also present but not used by the application.
+
+Encryption pipeline
+
+Source: claimDetail.primaryAccountNum or settledTransactionDetail.mastercardMappingServiceAccountNumber (preferred).
+Pre-processing: Truncate to last 16 characters if > 16 chars.
+Masking check: If the account number contains "*" (already masked), encryption is skipped — the masked value is written as-is.
+Encryption call: DisputeServiceImpl.encryptAccountNumber() calls RestInvoker.POST(encryptionUrl, {pan: accountNumber}).
+Auth for encryption call: Bearer token from IdpTokenService.getIdpToken() (IDP service).
+Result: EncryptionResponse.hpan (HPAN — hashed/encrypted PAN).
+Written to outbox: The HPAN is stored in CommonEvent.originalTransIdentifier.accountNumber in the payload JSON column of chbk_outbox_row.
+
+Is clear PAN ever written anywhere?
+
+NOT written to the database. Only the HPAN is stored in the payload.
+Not logged: ClaimDetail has @ToString(exclude = "primaryAccountNum") preventing PAN from appearing in log output. SettledTransactionDetail has @ToString(exclude = "mastercardMappingServiceAccountNumber").
+The account number field in ProcessorUtil.createCommonEvent() receives either the HPAN (if encryption succeeded) or the potentially clear value (if the account number contains "*" or encryption throws and falls through).
+If encryption fails, DisputeServiceImpl throws a ServiceException which propagates up and prevents the entity from being saved.
+
+
+7. OUTBOUND — WHAT IT WRITES
+Database table: wdp.chbk_outbox_row
+ColumnTypePopulated by this jobNotesidBIGINT (sequence)Yes — auto-generatedPF, CHBK_OUTBOX_ROW_ID_SEQevent_typeVARCHARYes — "CHARGEBACK_PROCESS"c_ntwk_case_idVARCHARYes — claimDetail.claimIdMCM claim/case IDc_ntwk_phase_idVARCHARYes — chargebackDetail.chargebackIdMCM chargeback IDc_case_ntwkVARCHARYes — "MASTERCARD"c_acq_platformVARCHARYes — "CORE"c_case_stageVARCHARYes — "CH1"Dispute stage: First ChargebackstatusVARCHARYes — "PENDING" or "SKIPPED"ChbkOutboxStatus enumpayloadJSON/JSONBYes — serialised CommonEventFull WDP inbound event JSONl_acq_refnce_numVARCHARYes — claimDetail.acquirerRefNumARNl_acq_entityVARCHARYes — claimDetail.merchantIdl_ntwk_tran_idVARCHARYes — extracted networkSettledTransactionIdFrom TI: prefix of transactionIdretry_countINTYes — 0created_atTIMESTAMPYes — System.currentTimeMillis()updated_atTIMESTAMPYes — same as created_atcreated_byVARCHARYes — "WMFDPB"WDP MasterCard First Chargeback Dispute Processor_Batchupdated_byVARCHARYes — "WMFDPB"file_job_idBIGINTNOT SET — nullrow_numberINTNOT SET — nullparent_row_numberINTNOT SET — nulll_action_idBIGINTNOT SET — nullc_reasonVARCHARNOT SET — nullc_migration_staVARCHARNOT SET — nullnext_retry_atTIMESTAMPNOT SET — nullpublished_atTIMESTAMPNOT SET — nullkafka_partitionVARCHARNOT SET — null (set by downstream)kafka_offsetVARCHARNOT SET — null (set by downstream)kafka_topicVARCHARNOT SET — null (set by downstream)version_codeVARCHARNOT SET — nullerror_messageVARCHARNOT SET — nulldocument_typeVARCHARNOT SET — nullsource_eventVARCHARNOT SET — null
+payload JSON structure (CommonEvent)
+json{
+  "eventType": "WDP_INBOUND_EVENT",
+  "eventTimestamp": "<ISO8601>",
+  "createdBy": "WMFDPB",
+  "sourceSystem": "CORE",
+  "correlationId": "<UUID>",
+  "disputeAmount": 100.00,
+  "disputeCurrency": "USD",
+  "disputeCurrencyExponent": 2,
+  "reasonCode": "<MCM reason code>",
+  "disputeStage": "CH1",
+  "cpdDate": "<claimDetail.createDate>",
+  "networkDocInd": "Y|N",
+  "reversal": "N",
+  "creditDebitIndicator": "+|-",
+  "partialIndicator": "Y|N",
+  "destICA": "<acquirerId>",
+  "sendICA": "<issuerId>",
+  "schemeRef": {
+    "queueName": "<queue>",
+    "stageDate": "<chargebackDetail.createDate>",
+    "lastActionDate": "<claimDetail.dueDate>",
+    "cardNetwork": "MASTERCARD",
+    "networkCaseNumber": "<claimId>",
+    "networkChargebackId": "<chargebackRefNum>",
+    "networkPhaseId": "<chargebackId>",
+    "notes": [{ "type": "FRNTWK", "text": "<messageText>" }]
+  },
+  "merchantDetail": {
+    "mid": "<merchantId>"
+  },
+  "originalTransIdentifier": {
+    "accountNumber": "<hpan or masked>",
+    "accountNumberLast4": "<last4>",
+    "arn": "<acquirerRefNum>",
+    "networkAuthTransactionId": "<transactionIdArray[1]>",
+    "networkSettleTransactionId": "<extracted TI: value>",
+    "enrichmentFailure": true
+  },
+  "originalTransDetail": {}
+}
+Kafka — NOT directly published
+Despite spring-kafka and aws-msk-iam-auth being declared in pom.xml, no Kafka producer configuration or KafkaTemplate is present in this application's source code. The chbk_outbox_row table has kafka_partition, kafka_offset, kafka_topic columns, but these are populated by a separate downstream outbox publisher service, not this batch.
+Spring Batch metadata tables
+Spring Batch writes its job/step execution metadata to a schema specified by spring.batch.jdbc.tablePrefix = ${table_prefix}. Tables include:
+
+{prefix}JOB_INSTANCE
+{prefix}JOB_EXECUTION
+{prefix}JOB_EXECUTION_PARAMS
+{prefix}STEP_EXECUTION
+{prefix}STEP_EXECUTION_CONTEXT
+{prefix}JOB_EXECUTION_CONTEXT
+
+Schema initialisation is never (spring.batch.jdbc.initialize-schema: never), meaning the tables must pre-exist.
+S3 / file system
+Nothing written to S3 or any file system. No file-related imports, writers, or configurations are present.
+
+8. ERROR HANDLING AND FAILURE MODES
+Chunk size and transaction boundary
+Chunk size: 1 (configured via app.batchProperties.chunk).
+Each chunk (single claim) is processed within the wdpTransactionManager (JPA). A failure in the writer for one claim does not roll back previously written claims (separate transactions per chunk).
+Retry strategy
+CallRetry CountDelayBackoffClassDataPower GET (queue, claim, settlement)32000ms fixedNoneDataPowerRestInvokerDataPower PUT (acknowledge)32000ms fixedNoneDataPowerRestInvokerEncryption POST32000ms fixedNoneRestInvokerIDP token GET32000ms fixedNoneIdpRestInvoker
+All retries use spring-retry @Retryable. The retry count "3" and delay "2000" are String constants in ApplicationConstants evaluated as SpEL expressions in maxAttemptsExpression and delayExpression.
+No exponential or multiplier backoff is configured.
+Whether one record failure stops the batch
+No. In BatchItemProcessor.process(), the entire processing block is wrapped in try/catch(Exception ex), which logs the error and returns an empty processedItems list. This means failed claims are silently skipped — the batch continues to the next claim. The failed claim is not acknowledged (since there are no processed items to add to acknowledgeList), so it remains in the MCM queue for the next run.
+Dead letter mechanism
+None explicitly implemented. There is no DLQ, error table, or separate error-capture mechanism. Failed claims remain in the MCM queue. The error_code and error_message columns in chbk_outbox_row exist in the entity but are never populated by this job.
+Job-level failure — restart and checkpoint
+
+Spring Batch's JobRepository stores job execution state in the {prefix}* metadata tables.
+With chunk size 1, each claim's outbox write commits independently. On restart after a mid-run failure, Spring Batch would re-execute the step. Because BatchItemReader.searchQueueItems() is @BeforeStep, it re-fetches the queue on every step.
+Checkpoint risk: Since acknowledged items are removed from the MCM queue immediately after the writer commits them, a crash between write and acknowledge could result in the outbox row existing but the MCM item still being in the queue — causing a duplicate write attempt on the next run. The idempotency check in the processor (see Section 9) mitigates but does not eliminate this.
+
+
+9. IDEMPOTENCY
+Mechanism
+Before writing a new outbox row, the processor checks whether chbk_outbox_row already contains a record for the (networkCaseId, chargebackId) pair:
+New claim path (processClaims):
+First calls chbkOutboxService.findChbkByNetworkCaseId(claimId) — if this returns any rows, the update path is taken instead.
+Update/existing path (processUpdatedClaims):
+For each ChargebackDetail, calls chbkOutboxService.chbkOutboxLookup(claimId, chargebackId) which executes:
+sqlSELECT COUNT(*) FROM wdp.chbk_outbox_row
+WHERE c_ntwk_case_id = ? AND c_ntwk_phase_id = ?
+If count > 0, status is set to "SKIPPED".
+What "SKIPPED" means
+A ProcessedItem with skipCase = true and status = "SKIPPED" is still created and passed to the writer. The writer does not check skipCase before saving — it saves the entity regardless. This means a duplicate run will write a duplicate row with status "SKIPPED" for already-processed chargebacks.
+
+⚠️ Duplicate risk: If the same claim is processed twice (e.g., restart or double-trigger), the first run writes status="PENDING", the second run writes a second row with status="SKIPPED". The downstream publisher must deduplicate on (c_ntwk_case_id) or the "PENDING" status.
+
+The acknowledgement to MCM should prevent re-queuing under normal conditions, but if acknowledgement fails (network error after write), the claim remains in the queue and will be processed again.
+PENDING rows from previous runs
+There is no mechanism to process stale "PENDING" rows from failed prior runs. The update path only marks new chargebacks within an existing case as "PENDING" — it does not re-evaluate or retry previously-failed "PENDING" rows.
+
+10. VOLUME AND THROUGHPUT
+Records per run
+Not statically configured. The number of records equals the size of the MCM unworked chargeback queue at poll time. No maximum cap per run is implemented.
+Chunk/page size
+Chunk size: 1 (one QueueClaim per chunk/transaction). The reader fetches all queue items in a single batch call before the step starts (via @BeforeStep), then returns them one at a time.
+Polling frequency
+Determined by ${scheduler_cron} — production value unknown (placeholder). The job runs within the same JVM continuously, so frequency is purely a function of the cron expression.
+Rate limiting on MasterCard API
+Not implemented in this application. No rate-limiting, throttling, or sleep-between-calls logic exists. No MCM rate limit documentation is referenced in the codebase.
+Maximum record cap per run
+None. All items returned by the queue poll are processed.
+
+11. SCALING AND DEPLOYMENT
+Kubernetes Resource Type
+Deployment — resources.yaml declares kind: Deployment (not CronJob).
+Replica count
+{{ replicas-wdp-mcm-first-chargeback-queue-batch }} — XL Deploy placeholder. Exact value is injected at deployment time and is unknown from source.
+Memory
+
+Limit: 204BMi
+Request: 256Mi
+
+CPU
+
+Limit: Not configured (absent from resources.yaml).
+Request: Not configured.
+
+HPA (Horizontal Pod Autoscaler)
+Not present in resources.yaml. No HPA definition.
+Rolling update strategy
+yamlstrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+Zero-downtime rolling update.
+minReadySeconds
+Set to 30 seconds at the pod spec level (inside template.spec).
+
+⚠️ Note: minReadySeconds is a spec for the container definition, not the Deployment spec. In the YAML as written, it appears at spec.template.spec.minReadySeconds which is not a valid Kubernetes field at that path — it should be at spec.minReadySeconds. This may be a YAML placement bug.
+
+PodDisruptionBudget
+Not present in resources.yaml.
+Topology spread constraints
+Not present in resources.yaml.
+Observability
+
+OpenTelemetry: OTel Java auto-instrumentation is injected via pod annotation: instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default. Instrumentation is zero-config in source — handled by the OTel operator.
+Actuator: spring-boot-starter-actuator is a declared dependency. Default Actuator endpoints are available (health, info, metrics). Exposed on port 8092.
+Logstash: logstash-logback-encoder 7.4 is declared. Logstash host/port injected via ${logstash_server_host_port}. Structured JSON log output.
+Logging: SLF4J/Logback with logstash encoder. Log level via ${log_level}.
+
+Volume mounts
+A secret volume ws-int-inTrp is mounted at:
+/layers/paketo-buildpacks_bellsoft-liberica/jre/lib/security/cacerts
+Replacing the JVM trust store with an enterprise CA certificate bundle.
+Secrets
+Two environment-variable secrets are consumed:
+
+wdp-mcm-first-chargeback-queue-batch-secrets — app-specific secrets (DataPower license, DB creds, API URLs, etc.)
+wdp-common-secrets — shared WDP secrets
+{{ ingressTLSecretName }} — TLS secret (XL Deploy placeholder)
+
+
+12. CONFIGURATION
+All known configuration parameters
+Property keyProduction valueInjection methodPurposespring.profiles.active${gcp_env}Env varActive profileserver.port8092HardcodedHTTP portspring.application.nameMCM-First-Chargeback-Queue-BatchHardcodedApp namespring.batch.job.enabledfalseHardcodedDisable auto-runspring.batch.jdbc.initialize-schemaneverHardcodedNo DDLspring.batch.jdbc.isolation-level-for-createREPEATABLE_READHardcodedspring.batch.jdbc.table-prefix${table_prefix}K8s secretBatch metadata table prefixlogger.level${log_level}K8s secretLog levellogstash.server.host.port${logstash_server_host_port}K8s secretLogstash endpointapp.datasource.wdp.*${...}K8s secretPostgreSQL connection (URL, user, password)app.scheduler.cron${scheduler_cron}K8s secretCron expressionapp.batchProperties.jobNamemcmFirstChargeBackQueueJobHardcodedJob nameapp.batchProperties.processingStepNameprocessMcmFirstChargeBackQueueBatchStepHardcodedStep nameapp.batchProperties.chunk1HardcodedChunk sizeapp.batchProperties.userIdWMFDPBHardcodedAudit user IDapp.batchProperties.readSpecificItemFromQueue${read_specific_item_from_queue}K8s secret/envFeature flag: filter to specific case IDsapp.batchProperties.mcmDisputeCaseNumbers${mcm_case_numbers}K8s secret/envList of case numbers for selective processingapp.batchProperties.removeItemFromQueueDisabled${remove_item_from_queue_disabled}K8s secret/envFeature flag: disable acknowledgement PUTapp.dataPowerService.vantiveLicense${...}K8s secretDataPower/MCM auth tokenapp.dataPowerService.unworkedChargebacksQueueUrl${...}K8s secretMCM queue GET URLapp.dataPowerService.claimDetail${...}K8s secretMCM claim detail GET URLapp.dataPowerService.claimAcknowledgement${...}K8s secretMCM acknowledgement PUT URLapp.dataPowerService.settledTransaction${...}K8s secretMCM settled transaction GET URLapp.idpService.tokenUrl${app.idpService.tokenUrl} via @ValueK8s secretIDP token GET URLapp.disputeService.encryptionUrl${...}K8s secretWDP encryption service POST URLApplicationConstants.RETRY_COUNT"3"HardcodedMax retry attempts for all REST callsApplicationConstants.RETRY_DELAY"2000"HardcodedRetry delay in milliseconds
+No thread pool configuration is present — Spring Batch uses its default SyncTaskExecutor (single-threaded step execution).
+
+13. PLANNED CHANGES AND IN-PROGRESS WORK
+Commented-out code blocks
+1. ProcessorUtil.java line 96:
+java//commonEvent.setDocumentRequired(chargebackDetail.isDocumentIndicator()?ApplicationConstants.Y:ApplicationConstants.N);
+The documentRequired field was replaced by networkDocInd on line 97. The documentRequired field still exists on CommonEvent but is never populated. This appears to be a field renaming/migration where the old field was commented out rather than removed.
+2. ProcessorUtil.java line 103:
+java//commonEvent.setCaseType(chargebackDetail.isPartialChargeback() ? ApplicationConstants.PART : null);
+caseType mapping from partial chargeback indicator was commented out. The caseType field still exists on CommonEvent but is never set. Reason for removal is unknown.
+3. ChbkOutboxRepository.java lines 11–22:
+java/*
+ * @Query(...) Long countRequiredChbkOutboxEntityByNtwkIdAndNtwkPhaseId(...)
+ * @Query(...) Long countChbkOutboxByClaimId(...)
+ */
+Two named @Query JPQL methods were replaced by Spring Data derived query methods (countByNetworkCaseIdAndNetworkPhaseId, countByNetworkCaseId). Not a functional difference — likely a simplification.
+4. MCMServiceImplTest.java line 149:
+java//assertThrows(ServiceException.class, () -> mcmService.acknowledgeChargebackWorked(acknowledgeList));
+A test assertion for failureReason handling is commented out. The test exists but the assertion is disabled, meaning the failureReason error path is not currently test-verified.
+5. Multiple MCMServiceImplTest.java comments:
+java// when(props.getDataPowerService().getClaimAcknowledgement()).thenReturn("http://mock-ack");
+Several mock setup lines commented out — replaced by the Mockito object pattern above them. Refactoring artifact.
+6. RestInvoker.java line 49:
+java//throw new Exception(String.format("Failed POST %s, error code: %s, message: %s, httpStatus: %s", ...));
+A more verbose exception message was commented out in favour of re-throwing RestTemplateCustomException directly.
+
+Unused model classes / dead code
+ClassStatusNotesCaseEventUnused — never instantiatedContains full case event mapping including accountNumber, reasonCode, disputeStage etc. Was likely a prior payload structure before CommonEvent was adoptedWebResponseUnused — never instantiatedGeneric HTTP response wrapper, not consumed anywhereSearchCaseRequestUnused — never instantiatedCase search request DTO, not wired to any service callMerchantDetailsUnused — MerchantDetail (singular) is used insteadDuplicate merchant detail class with slightly different field namesHistoricalDisputeDetailPresent on CommonEvent as a field; never populated in ProcessorUtil.createCommonEvent()The field is declared on the event object but not setOriginalTransDetailPresent on CommonEvent; object is instantiated (new OriginalTransDetail()) but no fields are populatedEmpty object is written to payload
+Unused Kafka dependencies
+spring-kafka, kafka-clients, and aws-msk-iam-auth are declared in pom.xml but no Kafka producer, consumer, KafkaTemplate, or Kafka configuration class exists in the source. The Kafka infrastructure is pre-declared, suggesting Kafka publishing is planned to be implemented in this service (or was moved to a downstream service) but is not yet implemented here. The chbk_outbox_row table columns (kafka_partition, kafka_offset, kafka_topic) confirm the outbox pattern is in use with a separate publisher.
+
+Feature flags / incomplete work indicators
+FlagConfig keyCurrent effectreadSpecificItemFromQueue${read_specific_item_from_queue}Enables filtering to specific case numbers — a testing/debug flagremoveItemFromQueueDisabled${remove_item_from_queue_disabled}Disables the MCM acknowledgement PUT — a testing/debug flagenrichmentFailure = trueHardcoded in ProcessorUtilAlways set — indicates downstream enrichment is not yet complete at this stage
+The enrichmentFailure = true hardcoding is particularly notable — it implies this batch intentionally marks every record as needing further enrichment downstream. This aligns with the fact that OriginalTransDetail is always empty and several CommonEvent fields (networkRuling, rejectDate, rejectReason, historicalDsptDetail) are never populated.
+
+TODO/FIXME/user-Story references
+None found in source code via inspection. No TODO or FIXME comments are present.
+
+oauth2-client dependency declared but unused
+spring-boot-starter-oauth2-client is declared in pom.xml but no OAuth2 client configuration (@EnableOAuth2Client, WebSecurityConfigurerAdapter, OAuth2AuthorizedClientService) is present in any configuration class. Authentication is handled via static license header (DataPower) and manual bearer token fetching (IDP). This dependency appears to be a remnant or preparation for a future OAuth2 migration.
+
+commons-beanutils declared but unused
+commons-beanutils 1.11.0 is in pom.xml but no usage in source. Possibly a transitive dependency explicitly pinned for security reasons, or a leftover from a refactored feature.
+
+14. CONFIDENCE ASSESSMENT
+SectionConfidenceBasis1. Primary ResponsibilityHighDirect source: JobConfiguration, BatchItemProcessor, BatchItemWriter, ApplicationConstants.CHARGEBACK filter. Job structure fully deterministic from source.2. MasterCard EndpointsHighDirect source: MCMServiceImpl, DataPowerRestInvoker, service impls, ApplicationProps. Request/response structures from field mappings. Auth mechanism from getter/readtemplate call signatures.3. Trigger and ScheduleHighDirect source: BatchScheduler.java, application.yml, resources.yaml. Production cron value is Low (unknown placeholder).4. Inbound DependenciesHighDirect source: all REST invoker classes, service impls, ApplicationProps. Retry counts from ApplicationConstants constants. IDP token URL via @Value in IdpRestInvoker.5. Processing LogicHighDirect source: full processor, reader, and writer code traced. Field mapping table derived from ProcessorUtil annotations. Clear PAN never logged or written confirmed from code.6. PAN HandlingHighDirect source: BatchOutboxEntity all fields, ProcessorUtil setter calls, ChbkOutboxRepository.save(). Kafka not published — confirmed by absence of any producer.7. IdempotencyHigh for mechanismInferred from Spring Batch semantics + @BeforeStep re-fetch pattern. Medium for effectiveness — the SKIPPED rows are still written (identified from writer code).10. Volume and ThroughputMediumNo cap or rate-limit in source. Chunk size hardcoded. Polling frequency unknown (cron placeholder). CPU limits absent from source.11. Scaling and DeploymentHighDirect source: resources.yaml. Replica count is Low (XL Deploy placeholder). CPU limits absent from source.12. ConfigurationHighDirect source for structure. All keys from ApplicationProps, application.yml, @Value. Production values for secrets are Low — all are environment-variable or XL Deploy placeholders.13. Planned changes / in-progressHighDirect source: commented-out code, unused classes found via inspection. Kafka dependency intent is inferred.
+
+Key Repositories Summary
+ComponentIdentifierLocationThis batch applicationwdp-mcm-first-chargeback-queue-batchC:\workspace-intel\wdp\wdp-mcm-first-chargeback-queue-batchMasterCard proxy (MCM)DataPower gatewayExternal — URLs in K8s secretEncryption serviceWDP internal service${app.disputeService.encryptionUrl}IDP token serviceWDP internal IDP${app.idpService.tokenUrl}Downstream Kafka publisherUnknown — separate serviceConsumes chbk_outbox_row PENDING rows

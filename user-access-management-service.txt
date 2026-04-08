@@ -1,0 +1,675 @@
+gcp-user-access-management-service — Comprehensive Technical Reference
+Executive Summary
+gcp-user-access-management-service is a Spring Boot 3.5 / Java 17 REST API (v1.5.5) that serves as the central access control and user lifecycle management hub for the WDP (Worldpay Data Platform) NAP (Network Access Platform) ecosystem. It has four primary responsibilities: (1) managing a two-level merchant entity hierarchy (Parent → Child entities), (2) managing Merchant IDs (MIDs) and their relationships to that hierarchy, (3) provisioning and managing users in an external SunGard Identity Provider (IdP), and (4) authorising inbound JWT-bearing requests by cross-checking JWT claims against the merchant hierarchy. All inbound calls arrive as HTTPS/REST on port 8082 behind a Kubernetes nginx Ingress; all callers must present an OAuth2 Bearer JWT. The service makes outbound calls to two SunGard IdP instances and to AWS S3 for bulk file uploads, and reads/writes two PostgreSQL database schemas. It does not issue JWTs, store credentials, process payments, manage cases, or send emails directly.
+Architecture Overview
+INBOUND CALLERS
+
+┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐
+│ Internal Worldpay   │  │ NAP Merchant         │  │ Merchant Fraud/     │
+│ Systems             │  │ Portal Users         │  │ Disputes Portal     │
+│ (iss=internal)      │  │ (WDP_NAP_ADMIN/      │  │ Users               │
+│ Full access         │  │ WDP_NAP_REGULAR)     │  │ (WDP_NAP_ADMIN/     │
+└─────────────────────┘  └─────────────────────┘  │ WDP_PIN_ADMIN)      │
+                                                    └─────────────────────┘
+
+              HTTPS (all callers)
+
+              ▼
+┌─────────────────────────────┐    TLS termination
+│ nginx Ingress (K8s)         │    4 hostnames
+│ path: /merchant/gcp/        │
+│       access-management     │
+└─────────────────────────────┘
+              │
+              HTTP
+              ▼
+┌─────────────────────────────────────────────────┐
+│ gcp-user-access-management-service              │
+│ port: 8082                                      │
+│ context: /merchant/gcp/access-management        │
+│                                                 │
+│ Controllers:                                    │
+│ ├── AccessManagementController (entity + ACL)   │
+│ ├── MerchantController                          │
+│ ├── UserController                              │
+│ └── AuthorizationController                     │
+└─────────────────────────────────────────────────┘
+         │              │              │
+         ▼              ▼              ▼
+┌──────────────┐  ┌──────────┐  ┌────────────┐
+│ SunGard IdP  │  │ AWS S3   │  │ PostgreSQL │
+│ (×2 instances│  │ EU_WEST_2│  │ nap schema │
+│ REST/HTTP)   │  │ PutObject│  │ wdp schema │
+└──────────────┘  └──────────┘  └────────────┘
+
+Part 1: Primary Responsibility
+What the Service Does
+1. Merchant Hierarchy (Entity) Management
+The service manages a two-level parent/child entity hierarchy in the nap PostgreSQL schema:1
+JPA EntityDB TableDescriptionParentEntitynap.nap_parent_entityTop-level grouping (e.g., merchant organisation)ChildEntitynap.nap_child_entitySub-groupings beneath a parentMerchantEntitynap.nap_merchantIndividual Merchant IDs with MCC and WPG IDMerchantRelationshipEntitynap.nap_entity_relLinks merchants to parent/child entitiesCaseEntitynap.caseDispute case → merchant ID mapping (read-only by this service)
+When a parent entity is created, a matching default child entity of the same name is automatically created.2
+2. Merchant (MID) Management
+Merchants are stored in nap.nap_merchant with fields: merchantId, merchantName, mcc (Merchant Category Code), wpgId (Worldpay Gateway ID). The service supports creating, updating, deleting, and searching merchants, always linked to a parent/child entity.3
+3. User Lifecycle Management via IdP
+The service acts as a proxy/orchestrator to a SunGard IdP, supporting two distinct "firms":4
+ConstantValueIdP Config KeyUS_MERCHANT_FIRM"US_Merchant"idp.user-api-base-urlMERCHANT_DISPUTES_FIRM"Merchant_Fraud_Disputes"idp.mfd-user-api-base-url
+Operations: create user, update user, get user, list users, reset password, activate/deactivate/suspend/resume. No user credentials are stored — all are delegated to the IdP.
+4. ACL (Access Control List) Management
+ACL entries in wdp.acl link named consumers to source systems (CORE, VAP, NAP) and entity values.5 Fields: consumerName, sourceSystem, entityType, entityValue, status, with full audit timestamps (createdBy/activatedBy/deactivatedBy).
+5. JWT-Based Runtime Authorisation
+A dedicated POST /authorize endpoint validates whether a JWT-bearer's napParentEntity/napChildEntities claims grant access to a given merchant ID or dispute case number, by cross-referencing nap.nap_entity_rel.6
+What the Service Does NOT Do
+CapabilityReasonIssue/mint JWT tokensTokens come from SunGard IdP or an external OAuth2 serverStore user credentials or passwordsAll credential operations delegated to IdPProcess financial transactionsNo payment/dispute logic existsManage dispute casesReferences nap.case read-only (to resolve case number → merchant ID)Process bulk onboarding filesOnly uploads CSV to S3; downstream processing happens elsewhereSend notification emailsEmail address is collected and passed to S3 metadata, not used to send mail directlyRate limiting / throttlingNo such logic exists in the codebase
+
+Part 2: Inbound Interfaces
+Protocol and Transport
+All inbound calls use HTTP REST with JSON bodies (or multipart/form-data for bulk upload).7
+PropertyValueProtocolHTTP/1.1 (HTTPS at the Ingress)Port8082Context path/merchant/gcp/access-managementKubernetes Service typeClusterIP on port 8082Ingress classnginx, CORS enabled
+The service is exposed on four hostnames via Kubernetes Ingress:8
+
+{{ hostName }} — primary external hostname
+{{ internalHostName }} — internal DNS hostname
+{{ wdpInternalHostName }} — WDP-internal hostname
+{{ wdpreverseproxyHostName }} — reverse proxy hostname
+
+Authentication
+Every endpoint (except probes and non-prod Swagger) requires Authorization: Bearer <JWT>.9 The service acts as a Spring OAuth2 Resource Server with multi-issuer JWT validation via JwtIssuerAuthenticationManagerResolver configured from ${jwt.trustedIssuers}.9
+An optional v-correlation-id request header is read and echoed in every response (auto-generated as UUID if absent).10
+Unauthenticated paths: /actuator/health, /livez, /readyz (all environments); /swagger-ui/**, /access-management-service-api-docs/** (non-prod only).9
+Caller Types
+1 — Internal Worldpay Systems
+
+Identified by: JWT iss claim contains us_worldpay_fis_int11
+Access: Full — all entity-scoping and role checks are bypassed
+Exclusive operations: Create/rename/delete parent entities, create/update/delete merchants, bulk S3 upload
+
+2 — External NAP Merchant Portal Users
+
+Identified by: External JWT with napParentEntity + napChildEntities claims
+Roles (in AuthorizationList claim): WDP_NAP_ADMIN or WDP_NAP_REGULAR
+Access: Read own entity/merchant data; admins can manage child entities and their own users
+
+3 — External Merchant Fraud/Disputes Portal Users
+
+Identified by: Same JWT structure, issuer maps to Merchant_Fraud_Disputes firm
+Roles: WDP_NAP_ADMIN or WDP_PIN_ADMIN
+Access: User lifecycle operations (create, update, suspend, reset password) scoped to their napParentEntity; cannot act on their own account12
+
+4 — Internal Backend Systems (ACL callers)
+
+Identified by: Any valid JWT
+Access: ACL CRUD endpoints — no additional role enforcement
+
+
+Part 3: Outbound Interfaces
+1. SunGard IdP REST API (two instances)
+IdpRestInvoker wraps all IdP calls using Spring RestTemplate. Auth headers on every call: Authorization: Bearer <token> and X-SunGard-IdP-API-Key.13
+Two instances are selected via getFirmDetails() in UserServiceImpl:4
+HTTP MethodURL PatternPurposePOST{idpBaseURL}Create a new userGET{idpBaseURL}/{userId}Fetch a user by numeric IDGET{idpBaseURL}?crit=...&limit=...&offset=...Paginated user listing filtered by NAP parent entityGET{idpBaseURL}?crit=loginName eq '...'&viewName=Default&shared=trueLook up a user by login namePUT{idpBaseURL}/matching?crit=loginName eq '...'Update a user's profile fieldsPUT{idpBaseURL}/reset-pwd/{userId}Trigger a password resetPUT{idpBaseURL}/activate/{userId}?status={0|1}Activate (1) or deactivate (0)PUT{idpBaseURL}/suspend/{userId}?status={0|1}Suspend (1) or resume (0)
+Status values are mapped via UserStatusType enum: ACTIVATE→"1", DEACTIVATE→"0", SUSPEND→"1", RESUME→"0".14
+2. AWS S3 (bulk entity onboarding only)
+S3ClientConfig creates an S3Client in region EU_WEST_2.15
+AWS OperationBucketKey PatternPurposePutObject${app.s3.bucketname}RECEIVED/{ENV}/{filename}Store uploaded CSV/XLSX for downstream async processing
+S3 object metadata includes uploaded-by, user-email, and username extracted from JWT claims.16 The service does not process the file content.
+3. PostgreSQL Databases (JPA / Spring Data)
+Two separate datasource configurations:1718
+DataSourceConfig PrefixSchemaKey TablesPurposeNAPspring.datasource.napnapnap_parent_entity, nap_child_entity, nap_merchant, nap_entity_rel, nap.case, nap_merchant_relationship_searchMerchant hierarchy, MIDs, merchant-entity relationships, case-to-merchant lookupWDPspring.datasource.wdpwdpaclACL entries linking consumers to source systems and entities
+Both use PostgreSQL dialect. The pom.xml also includes the IBM DB2 JCC JDBC driver, suggesting the WDP datasource may target DB2 in certain environments.19
+
+Part 4: REST Endpoint Reference
+Base URL: https://{host}/merchant/gcp/access-management
+All endpoints require Authorization: Bearer <JWT> unless noted as (no auth). * = required parameter.
+Entity Management — AccessManagementController
+MethodPathAuth ScopeRequest Body / ParamsPurposePOST/entityInternal onlyBody: { type* (PARENT|CHILD), name*, parentId (required for CHILD), userId* }Create a parent entity (also auto-creates a matching default child) or a standalone child entity under an existing parentGET/entityAny JWTParams: pageNumber*, pageSize, parentName, column, order, parentEntityIdList parent entities with pagination and optional sorting; external users scoped to their own napParentEntityPUT/entity/{entityId}Internal onlyBody: { type*, name*, parentId, userId* }Rename a parent or child entity by its IDDELETE/entityInternal or external adminBody: { type* (CHILD), entityId* }Delete a parent or child entity; external WDP_NAP_ADMIN users can only delete child entities within their own parentPOST/entity/bulk/onboardAny JWTmultipart/form-data: file (CSV/XLSX/XLS), optional notifyEmailId query paramUpload entity batch file to AWS S3 for downstream async processingGET/v2/entity/{parentEntityId}/childExternal: WDP_NAP_ADMIN; Internal: anyParams: pageNumber*, pageSize, childName (partial search)List child entities under a parent; external users scoped to their napParentEntityPOST/{parentEntityId}/childAny JWTBody: { childName, merchantDetails*[], userId* }Create a new child entity with linked merchants under the given parentPUT/{parentEntityId}/child/{childEntityId}Any JWTBody: { childName, merchantDetails*[], userId* }Update an existing child entity's name and/or linked merchants
+ACL Management — AccessManagementController
+MethodPathAuth ScopeRequest Body / ParamsPurposePOST/aclAny JWTBody: List<{ consumerName, sourceSystem (CORE|VAP|NAP), entityType, entityValue, status, createdBy }>Create one or more ACL entries; rejects duplicates with a 400PUT/aclAny JWTBody: { aclId*, consumerName, sourceSystem, entityType, entityValue, status, updatedBy* }Update an existing ACL entry by IDPOST/acl/searchAny JWTBody: { aclId, consumerName, sourceSystem*, entityType, entityValue, status, createdBy, createdDate, updatedDate, activatedDate, deactivatedDate }Search ACL entries by any combination of fields and date ranges
+Merchant Management — MerchantController
+MethodPathAuth ScopeRequest Body / ParamsPurposePOST/v2/merchantInternal onlyBody: { parentEntityId*, merchantDetails*[], userId* }Create a new child entity and link one or more MIDs to itGET/merchantAny JWTParams: pageNumber*, pageSize, childEntityId, column, order, parentName, merchantId, merchantNameList/search merchants with pagination and sorting; external users scoped to their entity treePUT/merchant/{merchantId}Internal onlyBody: { merchantName, mcc, wpgId, userId* }Update merchant name, MCC code, or WPG IDDELETE/v2/merchantInternal onlyBody: { parentEntityId*, merchantId* }Delete a merchant and its entity relationship record
+User Management — UserController
+MethodPathAuth ScopeRequest Body / ParamsPurposeGET/user/entityAny JWTParams: pageNumber*, pageSize, napParentEntity, napParentName, childNameGet parent and child entity tree for the calling user; internal users can filter by any parentPOST/v2/userWDP_NAP_ADMIN or WDP_PIN_ADMIN (external)Body: { loginName*, lastName*, firstName*, emailAddress*, customInfos, mobile, userProfile* }Create a user in the SunGard IdP; external users can only create within their own napParentEntityPUT/v2/user/{loginName}WDP_NAP_ADMIN or WDP_PIN_ADMIN (external)Body: { lastName*, firstName*, emailAddress*, customInfos, mobile, userProfile }Update a user's profile in IdP; external users cannot update their own accountPUT/v2/user/reset-password/{userId}WDP_NAP_ADMIN or WDP_PIN_ADMIN (external)Path: userIdTrigger IdP password reset for a user; external users cannot reset their own passwordPUT/v2/user/{userId}/{status}WDP_NAP_ADMIN or WDP_PIN_ADMIN (external)Path: userId, status = ACTIVATE | DEACTIVATE | SUSPEND | RESUMEChange user access status in IdP; external users cannot change their own statusGET/v2/usersAny JWTParams: pageNumber*, pageSize, napParentEntityList all IdP users; external users auto-filtered to their own napParentEntityGET/user/entity/{loginName}/childAny JWTPath: loginNameFetch user profile from IdP and return the child entities assigned to that user
+Authorization — AuthorizationController
+MethodPathAuth ScopeRequest Body / ParamsPurposePOST/authorizeAny JWTBody: { platform* (NAP), caseNumber OR merchantId }Validate that the JWT-bearer's napParentEntity/napChildEntities claims grant access to the specified merchant or dispute case; internal users always pass
+Probe Endpoints (no auth required)
+MethodPathPurposeGET/actuator/healthSpring Boot health indicatorGET/livezKubernetes liveness probeGET/readyzKubernetes readiness probe
+
+Data Model Summary
+nap.nap_parent_entity (ParentEntity)
+└── nap.nap_child_entity (ChildEntity)
+    └── nap.nap_entity_rel (MerchantRelationshipEntity)
+        └── nap.nap_merchant (MerchantEntity)
+                    │
+                    └── used by AuthorizationService to
+                        validate JWT napParentEntity claims
+
+nap.case (CaseEntity) ── read-only ── caseNumber → merchantId lookup
+
+wdp.acl (MerchantDisputeAcl)
+└── ACL entries: consumerName + sourceSystem + entityType + entityValue + status
+
+Key JWT Claims Used for Application-Level Authorization
+JWT ClaimConsumed ByPurposeissAuthorizationUtil.validateInternalFirm()Identifies internal (us_worldpay_fis_int) vs external callersnapParentEntityAuthorizationUtil.getNAPParentChildEntityInfo()Parent entity the caller has access tonapChildEntitiesAuthorizationUtil.getNAPParentChildEntityInfo()Comma-separated child entity IDs the caller has access toAuthorizationListAuthorizationUtil.validateUserRoles()Comma-separated roles (WDP_NAP_ADMIN, WDP_NAP_REGULAR, WDP_PIN_ADMIN)LoginNameAuthorizationUtil.validateUserAction()Prevents external users from modifying their own accountEmailAddressAccessManagementController.uploadFile()Default notification email for bulk upload if none supplied
+
+Confidence Assessment
+FindingConfidenceEvidenceSpring Boot REST, port 8082, context /merchant/gcp/access-managementHighresources.yaml:41,61-62,108OAuth2 JWT Bearer auth, multi-issuerHighSecurityConfig.java:39-44Four nginx Ingress hostnamesHighresources.yaml:99-144Internal vs external callers via JWT iss containing us_worldpay_fis_intHighAuthorizationUtil.java:51-62, ApplicationConstants.java:35Two SunGard IdP instances, firm-based routingHighIdpRestInvoker.java, UserServiceImpl.java:350-368AWS S3 EU_WEST_2, key pattern RECEIVED/{ENV}/{filename}HighS3ClientConfig.java:18, AccessManagementServiceImpl.java:596-623Two PostgreSQL datasources (nap + wdp schemas)HighNapDataSourceConfig.java, WdpDataSourceConfig.javaIBM DB2 driver present (possible alternate env for WDP datasource)Mediumpom.xml:99-102 — driver present but no DB2 config in sourceACL callers are CORE/VAP/NAP systemsMediumpom.xml:99-102 — Inferred from AclSourceSystem enum values; no caller repos examinedExact portal names for external callersMediumInferred from MERCHANT_DISPUTES_FIRM, US_MERCHANT_FIRM constants and firm routing
+
+Footnotes
+Footnotes
+
+
+src/main/java/com/wp/wdp/access/management/nap/entity/ParentEntity.java, ChildEntity.java, MerchantEntity.java, MerchantRelationshipEntity.java, CaseEntity.java — JPA entities mapping to nap schema tables. ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AccessManagementServiceImpl.java:71-97 — createEntity() creates a ParentEntity then immediately creates a matching ChildEntity with the same name. ↩
+
+
+src/main/java/com/wp/wdp/access/management/nap/entity/MerchantEntity.java — nap.nap_merchant table with fields merchantId, merchantName, mcc, wpgId. ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/UserServiceImpl.java:350-368 — getFirmDetails() branches on MERCHANT_DISPUTES_FIRM to select IdP URL, sungard key, auth token, department, and profile registry name. ↩ ↩2
+
+
+src/main/java/com/wp/wdp/access/management/wdp/entity/MerchantDisputeAcl.java — wdp.acl JPA entity with audit columns. ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AuthorizationServiceImpl.java:74-161 — authorizeNAPToken() resolves case number → merchant ID via nap.case, then validates merchant-entity relationship. ↩
+
+
+src/main/java/com/wp/wdp/access/management/controller/AccessManagementController.java:179-199 — bulk upload endpoint uses multipart/form-data; all others use application/json. ↩
+
+
+resources.yaml:86-144 — Ingress with four host rules all routing path /merchant/gcp/access-management to the ClusterIP service on port 8082. ↩
+
+
+src/main/java/com/wp/wdp/access/management/config/SecurityConfig.java:29-44 — authWhiteList differs between prod and non-prod; JwtIssuerAuthenticationManagerResolver validates multi-issuer JWTs. ↩ ↩2 ↩3
+
+
+src/main/java/com/wp/wdp/access/management/config/HttpInterceptor.java:19-28 — preHandle() reads/generates v-correlation-id and writes to MDC and response header. ↩
+
+
+src/main/java/com/wp/wdp/access/management/util/ApplicationConstants.java:35 — INTERNAL_FIRM = "us_worldpay_fis_int". ↩
+
+
+src/main/java/com/wp/wdp/access/management/util/AuthorizationUtil.java:117-131 — validateUserAction() throws UnauthorizedException if the JWT LoginName matches the target login name. ↩
+
+
+src/main/java/com/wp/wdp/access/management/restclient/impl/IdpRestInvoker.java:168-178 — getHttpHeader() sets Authorization: Bearer <token> and X-SunGard-IdP-API-Key on every IdP request. ↩
+
+
+src/main/java/com/wp/wdp/access/management/enums/UserStatusType.java — ACTIVATE("1"), DEACTIVATE("0"), SUSPEND("1"), RESUME("0"). ↩
+
+
+src/main/java/com/wp/wdp/access/management/config/S3ClientConfig.java:18 — S3Client.builder().region(Region.EU_WEST_2).build(). ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AccessManagementServiceImpl.java:596-623 — entityFileUpload() sets S3 key as RECEIVED/{env}/{filename}, metadata: uploaded-by, user-email, username. ↩
+
+
+src/main/java/com/wp/wdp/access/management/dbconfig/NapDataSourceConfig.java — NAP datasource (spring.datasource.nap), repositories in nap.repository package. ↩
+
+
+src/main/java/com/wp/wdp/access/management/dbconfig/WdpDataSourceConfig.java — WDP datasource (spring.datasource.wdp), repositories in wdp.repository package. ↩
+
+
+pom.xml:99-102 — IBM DB2 JCC driver (com.ibm.db2:jcc) included alongside the PostgreSQL driver. ↩
+
+Data Ownership, /authorize, CRUD vs Auth, and Access Control — Deep Dive
+Executive Summary
+This service owns and persists two distinct data domains: (1) a merchant entity hierarchy + MID relationships in the nap PostgreSQL schema, and (2) an access control list (ACL) in the wdp schema. The /authorize endpoint performs a runtime read-only check — it looks up a merchant's parent/child entity relationships and validates them against JWT claims; it does not grant or deny access to any resource, just validates that a JWT-bearer "can see" a given merchant or case. This service is both an authorization-check service AND a full CRUD service — it manages the reference data (entities, merchants, users, ACLs) that authorization decisions are based on. Access control is enforced in two layers: a transport-level JWT validation (Spring OAuth2 Resource Server), and an application-level scope enforcement that extracts napParentEntity/napChildEntities claims from the JWT and restricts every data query and mutation to only the entities the caller has been granted.
+
+Part 1: Data Owned and Persisted
+The service writes to two separate PostgreSQL datasources (and reads a third table, nap.case, which it treats as read-only).
+NAP Schema — spring.datasource.nap
+This is the primary operational data store for the merchant entity hierarchy.
+nap.nap_parent_entity — Parent entities1
+ColumnTypeDescriptionidsequence PKSurrogate row keyi_entity_idLongBusiness identifier (generated via nap.nap_parent_entity_id_seq)c_nameStringUnique parent entity name (uppercase)x_insrtStringSystem user ID that created the recordX_INSRT_DISPLAYStringDisplay user ID that created the recordz_insrtTimestampCreation timestampx_updtStringSystem user ID that last updatedX_UPDT_DISPLAYStringDisplay user ID that last updatedz_updtTimestampLast update timestamp
+Uniqueness constraint: nap_parent_entity_c_name_key — duplicate parent names are rejected with a specific error.2
+nap.nap_child_entity — Child entities3
+ColumnTypeDescriptionidsequence PKSurrogate row keyi_entity_idLongBusiness identifier (generated via nap.nap_child_entity_id_seq)i_parent_entity_idLongFK to parent entity's i_entity_idc_nameStringChild entity name (unique within a parent, uppercase)x_insrt / X_INSRT_DISPLAYStringAudit: creatorz_insrt / x_updt / X_UPDT_DISPLAY / z_updtString/TimestampAudit: update tracking
+Key rule: When a parent entity is created, a default child entity with the same name is automatically created.4 This default child cannot be independently deleted (delete on CHILD type is allowed via API, but parent-type delete is blocked by RequestValidator).5
+nap.nap_merchant — Merchant IDs (MIDs)6
+ColumnTypeDescriptionidsequence PKSurrogate row keyi_merchant_idStringThe Merchant ID (MID) — must be numeric per validationc_merchant_nameStringMerchant name (max 80 chars)c_mccStringMerchant Category Codec_wpg_idStringWorldpay Gateway IDAudit columnsx_insrt, X_INSRT_DISPLAY, z_insrt, x_updt, X_UPDT_DISPLAY, z_updt
+Uniqueness rule: A merchant ID can only belong to one parent entity. The existsRelationshipForInsert check in MerchantRelationshipEntityRepository prevents a MID from being linked to multiple parent entities.7
+nap.nap_entity_rel — Merchant-entity relationships8
+ColumnTypeDescriptionidsequence PKSurrogate row keyi_midStringThe Merchant IDi_parent_entity_idLongParent entity business IDi_child_entity_idLongChild entity business ID
+This table is the authorisation lookup table — every /authorize check ultimately queries this table to determine if a merchant belongs to a caller's entity scope.
+nap.case — Dispute cases (read-only by this service)9
+ColumnTypeDescriptionI_CASE_IDLong PKCase sequenceI_CASEStringCase number (e.g., N123456789)C_LEVEL1_ENTITYStringMerchant ID associated with the case
+This table is not written to by this service. It is queried only during /authorize to resolve a caseNumber → merchantId.10
+
+WDP Schema — spring.datasource.wdp
+wdp.acl — Access Control List entries11
+ColumnTypeDescriptioni_acl_idsequence PKGenerated via ACL_I_ACL_ID_SEQUENCEc_consumer_nameStringThe system/service being granted access (stored uppercase)c_source_systemStringOrigin system: CORE, VAP, or NAPc_entity_typeStringType of entity the ACL covers (free-text)c_entity_valueStringValue of the entity (stored uppercase)c_statusStringACTIVE or INACTIVEc_created_byStringWho created it (uppercase)t_created_timestampTimestampCreation timec_updated_byStringWho last updated it (uppercase)t_updated_timestampTimestampLast update timec_activated_byStringWho activated it (set when status → ACTIVE)t_activated_timestampTimestampWhen activatedc_deactivated_byStringWho deactivated it (set when status → INACTIVE, cleared when activated)t_deactivated_timestampTimestampWhen deactivated
+An index on (c_consumer_name, c_status) supports fast consumer lookups.11
+ACL scope: The ACL records which consumers (internal services) are allowed to interact with which entity values in which source systems. The service persists and queries this data but does not perform enforcement decisions based on it — the ACL is maintained for downstream systems.
+Data NOT Persisted by This Service
+DataWhere It LivesHow This Service Uses ItUser accounts, credentials, passwordsSunGard IdP (external)Reads/writes via REST calls to IdPJWT tokensNot storedValidated on each request, never persistedBulk onboarding file contentAWS S3Written once; no local copy kept
+
+Part 2: The /authorize Endpoint — Deep Dive
+Request Contract
+POST /merchant/gcp/access-management/authorize12
+Requires: Authorization: Bearer <JWT> header.
+Request body (AuthorizationRequest):
+json{
+  "platform": "NAP",
+  "caseNumber": "N123456789",
+  "merchantId": "12345678"
+}
+FieldRequired?Valid ValuesNotesplatformYesAny value in SourceSystemName enum: CORE, NAP, VAP, LATAM, PINOnly NAP is actually implemented; all others throw BadRequestException("Implementation is in progress")caseNumberOne of theseString (e.g., N123456789)If provided, service resolves this to a merchantId via nap.casemerchantIdOne of theseNumeric stringUsed directly if caseNumber is blank
+RequestValidator.validateAuthorizeRequest() rejects requests where both caseNumber and merchantId are blank.13
+What It Looks Up
+The logic is in AuthorizationServiceImpl.authorizeEntity() and authorizeNAPToken():14
+Step 1: Check JWT issuer
+  └─ if iss contains "us_worldpay_fis_int" → return true immediately (always authorized)
+
+Step 2: Extract JWT claims
+  ├─ napParentEntity  (required; throws UnauthorizedException if blank)
+  └─ napChildEntities (optional; comma-separated child IDs)
+
+Step 3: Resolve merchant ID
+  ├─ if caseNumber provided → query nap.case WHERE I_CASE = caseNumber → get C_LEVEL1_ENTITY (merchantId)
+  │    └─ throws UnauthorizedException if case not found or has no merchantId
+  └─ else → use request.merchantId directly
+
+Step 4: Authorisation check (depends on JWT shape)
+
+  Case A: napChildEntities present AND napChildEntities.size() ≤ 4
+    → native query against nap.nap_entity_rel:
+      SELECT ... FROM nap.nap_entity_rel WHERE
+        i_mid = ? AND i_parent_entity_id = ? AND i_child_entity_id = ?
+        (one clause per child entity, joined with OR)
+    → if rows found → return true
+    → else → throw UnauthorizedException
+
+  Case B: napChildEntities present AND size > 4  (falls through to Case C)
+
+  Case C: napChildEntities absent (parent-only user)
+    → query MerchantRelationshipEntityRepository.findByMerchantId(merchantId)
+      SELECT i_parent_entity_id FROM nap.nap_entity_rel WHERE i_mid = merchantId
+    → if no rows → throw UnauthorizedException
+    → check if any row's parentEntityId matches napParentEntity (string comparison)
+    → if no match → throw UnauthorizedException
+    → if match → return true
+
+  Case D: Both napChildEntities present AND size > 4
+    → query MerchantRelationshipEntityRepository.findByMerchantId(merchantId)
+    → check if any row's childEntityId is in the JWT's napChildEntitiesSet
+    → if none match → throw UnauthorizedException
+    → if match → return true
+What It Returns
+Success (200 OK): Empty body. The HTTP 200 itself is the signal that the JWT-bearer is authorised for the requested merchant/case.12
+Failure: One of:
+
+401 Unauthorized — JWT claims don't cover the merchant
+400 Bad Request — missing/invalid platform, missing both caseNumber and merchantId, case not found
+
+The endpoint does not return any entity data, permission sets, or user information. It is a pure boolean gate expressed as HTTP status.
+
+Part 3: Authorization Checks vs. CRUD — Both
+This service performs both:
+CRUD Operations It Performs
+DomainOperationsParent entitiesCreate, read (paginated + sorted), update (rename), deleteChild entitiesCreate, read (paginated), update, deleteMerchants (MIDs)Create, read (paginated + sorted + filtered), update, deleteMerchant-entity relationshipsCreate, delete (managed as part of merchant and entity CRUD)Users (via IdP proxy)Create, read (list + get by login name), update, delete access (activate/deactivate/suspend/resume), reset passwordACL entriesCreate, read (filtered search), update
+Authorization / Access-Check Operations
+OperationDescriptionPOST /authorizeRuntime check: does this JWT's entity scope cover this merchant/case?Per-request JWT enforcementEvery non-probe endpoint enforces JWT auth and entity-scoping
+The service is therefore an access management service in the fullest sense — it both maintains the reference data (the entity hierarchy, ACL entries, user accounts) that define who has access to what, AND enforces those rules on every incoming request. The /authorize endpoint makes the enforcement queryable by other services.
+
+Part 4: How Access Control Is Enforced
+Access control is implemented in two distinct layers.
+Layer 1 — Spring Security (Transport-Level JWT Validation)
+Handled by SecurityConfig.15 Every request to a business endpoint must present a valid Bearer JWT. Spring validates the token's signature and expiry against one of the configured trustedIssuers. No application code runs if this fails — Spring returns 401 before the controller is reached.
+Layer 2 — Application-Level Scope Enforcement
+Once the JWT is valid, the application reads custom claims from it and applies business rules. This is entirely in AuthorizationUtil and the controllers/services. There are four distinct rule categories:
+Rule 1: Internal vs. External Split (applies to ALL endpoints)
+java// AuthorizationUtil.java:51-62
+Boolean isInternalFirm = AuthorizationUtil.validateInternalFirm(jwt);
+// Reads jwt.claims["iss"]
+// Returns true if iss contains "us_worldpay_fis_int"
+
+Internal callers (isInternalFirm = true): Bypass ALL entity-scoping, ALL role checks. Full access.
+External callers (isInternalFirm = false): Subject to all rules below.16
+
+Rule 2: Role-Based Action Gating (user management endpoints)
+For external callers on user management endpoints, AuthorizationUtil.validateUserRoles() or validateNapUserRoles() checks the AuthorizationList JWT claim:17
+java// jwt.claims["AuthorizationList"] = "WDP_NAP_ADMIN,WDP_NAP_REGULAR"
+List<String> roles = Arrays.stream(authorizationList.split(","))...
+if (!roles.contains("WDP_NAP_ADMIN") && !roles.contains("WDP_PIN_ADMIN")) {
+    throw new UnauthorizedException(errorMessage, "Unauthorized");
+}
+ActionRequired RoleCreate userWDP_NAP_ADMIN or WDP_PIN_ADMINUpdate userWDP_NAP_ADMIN or WDP_PIN_ADMINReset passwordWDP_NAP_ADMIN or WDP_PIN_ADMINChange user statusWDP_NAP_ADMIN or WDP_PIN_ADMINList child entities (external)WDP_NAP_ADMIN
+Rule 3: Entity Scope Enforcement (merchant/entity/user endpoints)
+For external callers, AuthorizationUtil.getNAPParentChildEntityInfo(jwt) extracts:18
+
+jwt.claims["napParentEntity"] → the parent entity ID the caller belongs to
+jwt.claims["napChildEntities"] → comma-separated child entity IDs (if child-scoped user)
+
+These are then applied as data filters:
+EndpointEnforcementGET /entityIf external: parentEntityId is forced to napParentEntity; any attempt to query a different parent throws 401GET /v2/entity/{parentEntityId}/childIf external: parentEntityId in URL must equal napParentEntity from JWTPOST /{parentEntityId}/childIf external: checked against napParentEntityPUT /{parentEntityId}/child/{childEntityId}If external: childEntityId must be in napChildEntities AND parent must matchDELETE /entityIf external: Can only delete CHILD type; child must belong to their parentGET /merchantnapParentChildEntities passed as filter; merchant query uses entity relationship table to scope resultsGET /v2/usersnapParentEntity used as search criterion in IdP queryPOST /v2/usercustomInfos._napParentEntity in request must equal JWT's napParentEntityPUT /v2/user/{loginName}Same check on customInfos._napParentEntity
+Rule 4: Self-Action Prevention (user management endpoints)
+External users cannot act on their own account.19 validateUserAction() compares the JWT's LoginName claim against the target user:
+java// AuthorizationUtil.java:117-131
+String tokenLoginName = (String) jwt.getClaims().get("LoginName");
+if (loginName.equals(tokenLoginName)) {
+    throw new UnauthorizedException(messages.actionErrorMsg(), "Unauthorized");
+}
+This applies to update user, reset password, and change user status operations.
+Rule 5: Bulk Upload Email Restriction
+RequestValidator.validateFileAndEmail() enforces that if a notifyEmailId is supplied, it must be a @worldpay.com address.20
+Access Control Summary Table
+RuleMechanismData SourceWho It Applies ToValid JWT requiredSpring Security OAuth2 Resource ServerJWT signature/expiryEveryoneInternal vs externaljwt.claims["iss"] contains us_worldpay_fis_intJWT iss claimEveryoneRole required for user actionsjwt.claims["AuthorizationList"]JWT AuthorizationList claimExternal callers onlyEntity scope on readsData filtered to napParentEntity/napChildEntitiesJWT claims → nap.nap_entity_rel lookupExternal callers onlyEntity scope on writesRequest napParentEntity must match JWTJWT claims compared to request bodyExternal callers onlyRuntime merchant access check/authorize: nap.nap_entity_rel joinJWT claims + nap.nap_entity_rel + nap.caseExternal callers onlySelf-action blockjwt.claims["LoginName"] vs. targetJWT LoginName claimExternal callers only
+
+Confidence Assessment
+FindingConfidenceEvidenceFull schema and column definitions for nap.* tablesHighJPA entity classes, repository query annotationsACL wdp.acl schema and column semanticsHighMerchantDisputeAcl.java, AclServiceImpl.java:141-168/authorize only implements NAP platform; others throw "in progress"HighAuthorizationServiceImpl.java:58-62/authorize returns HTTP 200 (empty body) on successHighAuthorizationController.java:43 — ResponseEntity.status(HttpStatus.OK).build()Merchant uniqueness: one MID per parent entity onlyHighMerchantRelationshipEntityRepository.java:53-58 — existsRelationshipForInsert querynap.case is read-only (not written by this service)HighNo write methods on NapCaseRepository; only findByCaseNumber existsACL is maintained for downstream consumers (not for this service's own auth)MediumNo code path in the service reads the ACL for its own access decisions; it is purely CRUDSourceSystemName.LATAM and PIN platforms would also throw "in progress"HighAuthorizationServiceImpl.java:60-62 — only "nap" platform has implementation
+
+Footnotes
+Footnotes
+
+
+src/main/java/com/wp/wdp/access/management/nap/entity/ParentEntity.java — JPA entity for nap.nap_parent_entity. ↩
+
+
+src/main/java/com/wp/wdp/access/management/dao/impl/AccessManagementDaoImpl.java:75-80 — catches PSQLException with state 23505 and constraint name nap_parent_entity_c_name_key. ↩
+
+
+src/main/java/com/wp/wdp/access/management/nap/entity/ChildEntity.java — JPA entity for nap.nap_child_entity. ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AccessManagementServiceImpl.java:71-97 — createEntity() creates ParentEntity then immediately creates a matching ChildEntity. ↩
+
+
+src/main/java/com/wp/wdp/access/management/util/RequestValidator.java:276-280 — validateDeleteEntityRequest() throws BadRequestException if type == PARENT. ↩
+
+
+src/main/java/com/wp/wdp/access/management/nap/entity/MerchantEntity.java — JPA entity for nap.nap_merchant. ↩
+
+
+src/main/java/com/wp/wdp/access/management/nap/repository/MerchantRelationshipEntityRepository.java:53-58 — existsRelationshipForInsert() query checks (merchantId AND parentEntityId <> x) OR (childEntityId AND merchantId). ↩
+
+
+src/main/java/com/wp/wdp/access/management/nap/entity/MerchantRelationshipEntity.java — JPA entity for nap.nap_entity_rel. ↩
+
+
+src/main/java/com/wp/wdp/access/management/nap/entity/CaseEntity.java — JPA entity for nap.case, columns I_CASE and C_LEVEL1_ENTITY. ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AuthorizationServiceImpl.java:93-108 — napCaseRepository.findByCaseNumber(request.getCaseNumber()) then caseEntity.getMerchantId(). ↩
+
+
+src/main/java/com/wp/wdp/access/management/wdp/entity/MerchantDisputeAcl.java — all column definitions; index on (c_consumer_name, c_status). ↩ ↩2
+
+
+src/main/java/com/wp/wdp/access/management/controller/AuthorizationController.java:35-44 — POST /authorize, returns ResponseEntity.status(HttpStatus.OK).build() on success. ↩ ↩2
+
+
+src/main/java/com/wp/wdp/access/management/util/RequestValidator.java:127-141 — validateAuthorizeRequest(): validates platform enum, then checks both caseNumber and merchantId not blank for NAP. ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AuthorizationServiceImpl.java:44-161 — complete authorizeEntity() and authorizeNAPToken() logic. ↩
+
+
+src/main/java/com/wp/wdp/access/management/config/SecurityConfig.java:29-44 — Spring Security filter chain with JWT resource server config. ↩
+
+
+src/main/java/com/wp/wdp/access/management/util/AuthorizationUtil.java:51-63 — validateInternalFirm(). ↩
+
+
+src/main/java/com/wp/wdp/access/management/util/AuthorizationUtil.java:142-162 — validateUserRoles() checks for WDP_NAP_ADMIN or WDP_PIN_ADMIN in AuthorizationList. ↩
+
+
+src/main/java/com/wp/wdp/access/management/util/AuthorizationUtil.java:24-48 — getNAPParentChildEntityInfo() parses napParentEntity and napChildEntities claims. ↩
+
+
+src/main/java/com/wp/wdp/access/management/util/AuthorizationUtil.java:117-131 — validateUserAction() throws if loginName.equals(tokenLoginName). ↩
+
+
+src/main/java/com/wp/wdp/access/management/util/RequestValidator.java:227-261 — validateFileAndEmail() enforces @worldpay.com email domain. ↩
+
+Pods, Scaling, Memory Configuration & Architectural Risks
+gcp-user-access-management-service
+
+Executive Summary
+The pod replica count is a template placeholder ({{ replicas-user-access-management-service }}) resolved by XL Deploy at deploy time — the actual number is not visible in the codebase. There is no Horizontal Pod Autoscaler (HPA): scaling is purely static. Memory is the only resource with configured limits (2 GB limit / 1 GB request); CPU is completely unset. The codebase contains several architectural concerns ranging from a confirmed NPE bug in updateEntity, through a topology spread constraint that can never take effect (wrong label), to no connection/read timeouts on outbound HTTP calls and an S3 region hardcoded to EU_WEST_2 regardless of deployment environment.
+
+Pod Count & Replica Configuration
+Static Replica Count (Placeholder)
+yaml# resources.yaml:8
+spec:
+  replicas: {{ replicas-user-access-management-service }}
+The value {{ replicas-user-access-management-service }} is an XL Deploy template placeholder1. It is substituted at deployment time using the deployit-manifest.xml configuration2, which references an environment-specific variable store managed by the XL Deploy/DeployIt system. The codebase does not contain a default value. The actual replica count per environment (dev / staging / prod) is stored externally in the XL Deploy variable dictionary and is not visible in this repository.
+Rolling Update Strategy
+yaml# resources.yaml:9-13
+strategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+  type: RollingUpdate
+
+maxSurge: 1 → during a deploy, at most N + 1 pods run simultaneously3
+maxUnavailable: 0 → no pods are terminated until a replacement is ready
+minReadySeconds: 30 → a new pod must be healthy for 30 seconds before the old one is removed4
+
+No HPA
+There is no HorizontalPodAutoscaler resource anywhere in resources.yaml or the wider codebase5. The replica count is static; the service cannot auto-scale in response to CPU, memory pressure, or custom metrics.
+
+Memory & Resource Configuration
+Container Resources
+yaml# resources.yaml:55-59
+resources:
+  limits:
+    memory: 2048Mi
+  requests:
+    memory: 1024Mi
+ParameterValueNotesMemory limit2048 Mi (2 GB)Pod is OOMKilled if exceededMemory request1024 Mi (1 GB)Scheduler uses this for bin-packingCPU limitNot setUnbounded — can monopolize node CPUCPU requestNot setScheduler cannot distribute pods by CPU load
+The absence of CPU requests/limits is a known risk (see Architectural Risks section).
+JVM Memory
+There are no JAVA_OPTS or JVM_OPTS environment variables in resources.yaml6. The JVM uses its container-aware defaults (available since JDK 8u191 / 11+), which calculate heap as roughly 25% of container memory limit. With a 2 GB limit and the OpenTelemetry Java agent injected at runtime (see below), the effective heap available to the application is approximately 400-500 MB by default unless explicitly tuned.
+OpenTelemetry Agent (Injected Sidecar/Agent)
+yaml# resources.yaml:22-23
+annotations:
+  instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default
+The OTel Java agent is injected by the OpenTelemetry Operator at pod start. This adds ~100-200 MB to the JVM's non-heap footprint and measurable CPU overhead for tracing and metrics collection7. Combined with no explicit JVM heap settings, actual usable heap may be lower than expected.
+Async Thread Pool
+yaml# application.yaml:53-56
+async:
+  corepoolsize: ${gcp_async_corepoolsize}
+  maxpoolsize: ${gcp_async_maxpoolsize}
+  queuecapacity: ${gcp_async_queuecapacity}
+All three values are environment variables8. The AsyncConfiguration.java creates a named ThreadPoolTaskExecutor bean called asyncExecutor9. The actual values are set in the Kubernetes secret user-access-management-service10 and are not visible in source code.
+Database Connection Pool
+Both datasources (nap and wdp) are created via DataSourceBuilder.create().build() with only the four base properties bound (username, password, jdbc-url, driverClassName)1112. No Hikari pool properties (maximumPoolSize, minimumIdle, connectionTimeout, etc.) are configured anywhere in application.yaml. Spring Boot's HikariCP defaults apply:
+
+Maximum pool size: 10 connections per datasource
+Minimum idle: 10
+Connection timeout: 30 seconds
+Idle timeout: 10 minutes
+
+At default settings, each pod holds up to 20 database connections (2 pools × 10). Without explicit sizing this could be either over- or under-provisioned depending on database server limits.
+
+Architectural Concerns & Known Risks
+RISK-1 (HIGH): NPE / Incorrect Guard Order in updateEntity
+java// AccessManagementServiceImpl.java:129-132
+Optional<ParentEntity> entity = accessManagementDao.getParentEntity(entityId);
+String childName = entity.get().getParentName();   // ← line 130: called BEFORE isPresent() check
+if (!entity.isPresent()) {                          // ← line 131: too late
+    throw new BadRequestException(...);
+}
+entity.get() is called unconditionally at line 130 before the isPresent() guard at line 131. If no parent entity exists for entityId, this throws NoSuchElementException (an unchecked exception) rather than the intended BadRequestException. Callers receive an unhandled 500 rather than a descriptive 40013.
+RISK-2 (HIGH): Topology Spread Constraint Uses Wrong Label
+yaml# resources.yaml:25-31
+topologySpreadConstraints:
+  - maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+    topologyKey: kubernetes.io/hostname
+    labelSelector:
+      matchLabels:
+        app: gcp-user-access-management-service${BRANCH_NAME_PLACEHOLDER}  # ← "gcp-" prefix
+But the pod template labels are:
+yaml# resources.yaml:6, 16, 20
+metadata:
+  labels:
+    app: user-access-management-service${BRANCH_NAME_PLACEHOLDER}  # ← no "gcp-" prefix
+The labelSelector references gcp-user-access-management-service while the pods are labelled user-access-management-service. The constraint never matches any pod. whenUnsatisfiable: ScheduleAnyway means Kubernetes will silently schedule all pods to the same node with no warning14.
+RISK-3 (MEDIUM): No Timeouts on Outbound HTTP (RestTemplate)
+java// CommonConfig.java:11-13
+public RestTemplate getRestTemplate() {
+    return new RestTemplate();
+}
+The RestTemplate bean is created with default JDK HttpURLConnection and no timeouts15. All IdP calls (IdpRestInvoker.java) use this bean16. If the SunGard IdP is slow or unreachable, request threads will block indefinitely, exhausting Tomcat's thread pool and rendering the service unresponsive to all other callers.
+RISK-4 (MEDIUM): S3 Region Hardcoded to eu-west-2
+java// S3ClientConfig.java:18
+s3Client = S3Client.builder().region(Region.EU_WEST_2).build();
+The AWS region is hardcoded to EU_WEST_217. The service is deployed from ECR us-east-2 (784102274315.dkr.ecr.us-east-2.amazonaws.com/frauddispute/...)18. If the S3 bucket is in a different region (e.g., us-east-2 matching the deployment), all S3 upload requests for bulk file upload will be cross-region, increasing latency and potentially failing if the IAM policy or bucket policy is region-locked. The region is not configurable via environment variable.
+RISK-5 (MEDIUM): @Async Without Explicit Executor Qualifier
+java// AccessManagementDaoImpl.java:178, 195
+@Async
+public CompletableFuture<List<ChildEntity>> searchChildEntitiesByParentEntityIds(...)
+@Async
+public CompletableFuture<List<MerchantRelationshipEntity>> searchMerchantEntitiesByParentEntityIds(...)
+The @Async annotation does not specify "asyncExecutor". Spring resolves unqualified @Async by looking for a bean named taskExecutor; failing that it falls back to SimpleAsyncTaskExecutor (which creates a new thread per call, unbounded)19. The configured pool bean is named asyncExecutor20, not taskExecutor. Whether the custom pool is actually used depends on whether it is the sole Executor/TaskExecutor bean at runtime. If Spring Boot registers additional executors (e.g., for scheduling), the custom pool may be silently bypassed. The safe fix is @Async("asyncExecutor").
+RISK-6 (MEDIUM): No CPU Limits or Requests
+resources.yaml specifies only memory limits and requests; CPU is completely absent21. Consequences:
+
+No CPU request → Kubernetes scheduler cannot bin-pack pods by CPU; all pods may land on the same node
+No CPU limit → a CPU-intensive request (large bulk upload, heavy pagination) can monopolize node CPU at the expense of other workloads
+Combined with no HPA, there is no automated response to CPU pressure
+
+RISK-7 (LOW): Platform Stubs in Production Code
+java// AuthorizationServiceImpl.java — non-NAP platform handling
+case CORE: case VAP: case LATAM: case PIN:
+    throw new BadRequestException("Implementation is in progress");
+POST /authorize for platforms CORE, VAP, LATAM, and PIN unconditionally returns 400 "Implementation is in progress"22. This stub code is deployed to production. Any caller attempting to authorize against these platforms gets a 400 with a developer-facing message rather than a more appropriate 501 Not Implemented or feature-flag-controlled response.
+RISK-8 (LOW): In-Memory Count Pattern — Potential Memory Pressure
+getChildDetails() in AccessManagementServiceImpl.java (lines 265-277) loads all MerchantRelationshipEntity records for a page of child entity IDs via a single unbounded JPA query, then counts by streaming/filtering in Java23. For merchants with thousands of MIDs across many children, this pattern loads large result sets into JVM heap rather than delegating the aggregation to the database. A COUNT(*)... GROUP BY child_entity_id query would be correct; this pattern is also present in the getParentDetailsWithMerchantCount and getParentDetailsWithChildCount sort paths (lines 413, 470).
+RISK-9 (LOW): @Transactional Without Manager on AclServiceImpl
+java// AclServiceImpl.java:46
+@Transactional
+public AclResponse createAcl(...)
+AclServiceImpl writes to the wdp schema but uses plain @Transactional (no transactionManager qualifier)24. This works because wdpTransactionManager is annotated @Primary25, so Spring selects it by default. The risk is implicit: if @Primary is ever removed or the nap manager becomes primary, wdp writes silently use the wrong transaction manager and roll back incorrectly.
+RISK-10 (LOW): Swagger / API Docs Exposed in All Non-Prod Environments
+java// SecurityConfig.java:35-37
+authWhiteList = new String[] {
+    "/actuator/health", "/access-management-service-api-docs",
+    "/swagger-ui/**", ... };
+In non-production environments Swagger UI and the OpenAPI spec are on the auth whitelist26. Any network-reachable client can enumerate all 25 endpoints, their request contracts, and their error messages without a JWT. This is acceptable for dev/staging but could be a concern if non-prod hosts are accessible outside the corporate network.
+
+Architecture Diagram
+K8s Namespace: gcp-ff
+
+┌──────────────────────────────────────────────────────────────┐
+│ Deployment: user-access-management-service                   │
+│                                                              │
+│ replicas: {{ replicas-user-access-management-service }}      │
+│ (static, no HPA)                                            │
+│                                                              │
+│ ┌────────────────────────────────────────────────────────┐   │
+│ │ Pod (each)                                             │   │
+│ │ image: ECR us-east-2`/ frauddispute/...               │   │
+│ │ port: 8082                                             │   │
+│ │ memory limit: 2048Mi                                   │   │
+│ │ memory request: 1024Mi                                 │   │
+│ │ CPU: NOT CONFIGURED                    ←RISK-6        │   │
+│ │ JVM opts: NONE (relies on auto-detect) ← see $JVM     │   │
+│ │ OTel Java agent (injected)             ← adds ~100-200MB│  │
+│ │                                                        │   │
+│ │ async ThreadPoolTaskExecutor                           │   │
+│ │   corePoolSize: ${gcp_async_corepoolsize}              │   │
+│ │   maxPoolSize:  ${gcp_async_maxpoolsize}               │   │
+│ │   queueCapacity: ${gcp_async_queuecap}                 │   │
+│ │                                                        │   │
+│ │ HikariCP: nap datasource (max 10 conns)               │   │
+│ │ HikariCP: wdp datasource (max 10 conns)               │   │
+│ └────────────────────────────────────────────────────────┘   │
+│                                                              │
+│ ClusterIP Service → port 8082                               │
+│ Ingress (nginx) → 4 hostnames → /merchant/gcp/access-management│
+└──────────────────────────────────────────────────────────────┘
+         │                        │
+         ▼                        ▼
+PostgreSQL (nap schema)    PostgreSQL (wdp schema)
+(HikariCP default: 10      (HikariCP default: 10
+connections/pod)            connections/pod)
+
+Summary Table: Risks
+#SeverityRiskLocationImpact1HIGHNPE in updateEntity (guard inverted)AccessManagementServiceImpl.java:130500 instead of 400 when entity not found2HIGHTopology spread constraint label mismatchresources.yaml:31All pods can schedule to single node3MEDIUMNo HTTP timeouts on RestTemplateCommonConfig.java:12Thread exhaustion on IdP failure4MEDIUMS3 region hardcoded to EU_WEST_2S3ClientConfig.java:18Cross-region latency / ACL failures5MEDIUM@Async may not use configured thread poolAccessManagementDaoImpl.java:178,195Unbounded thread creation under load6MEDIUMNo CPU limits or requestsresources.yaml:55-59Node CPU starvation; poor scheduling7LOWPlatform stubs returning 400 in productionAuthorizationServiceImpl.javaMisleading error for CORE/VAP/LATAM/PIN8LOWIn-memory aggregation of large result setsAccessManagementServiceImpl.java:265-277Heap pressure under large data volumes9LOW@Transactional without explicit managerAclServiceImpl.java:46Wrong tx manager if @Primary changes10LOWSwagger exposed on non-prod without authSecurityConfig.java:35-37API enumeration in reachable non-prod envs
+
+Confidence Assessment
+FindingConfidenceBasisReplica count is a placeholderCertainDirect read of resources.yaml:8No HPACertainFull resources.yaml read; no HPA resourceMemory limits/requestsCertainDirect read of resources.yaml:55-59No CPU limits/requestsCertainDirect read of resources.yaml:55-59NPE bug in updateEntityCertainLines 130-131 of AccessManagementServiceImpl.javaTopology constraint label mismatchCertainCompared resources.yaml:20 vs :31No HTTP timeoutsCertainCommonConfig.java:12 — bare new RestTemplate()S3 region hardcodedCertainS3ClientConfig.java:18@Async may miss custom poolHigh@Async without qualifier, bean named asyncExecutor not taskExecutorHikari defaults (10 conns)HighNo pool config in application.yaml or *DataSourceConfig.java; Spring Boot HikariCP default is 10JVM heap sizingInferredNo explicit JAVA_OPTS; JVM auto-detection appliesActual replica values per envUnknownStored in XL Deploy variable store, not in sourceAsync pool sizes per envUnknownSet in K8s secret user-access-management-service
+
+Footnotes
+Footnotes
+
+
+resources.yaml:8 — replicas: {{ replicas-user-access-management-service }} XL Deploy placeholder ↩
+
+
+deployit-manifest.xml:6-8 — <k8s.ResourcesFile> with <scanPlaceholders>true</scanPlaceholders> ↩
+
+
+resources.yaml:11 — maxSurge: 1 ↩
+
+
+resources.yaml:24 — minReadySeconds: 30 ↩
+
+
+resources.yaml — complete file contains only Deployment, Service, and Ingress resources ↩
+
+
+resources.yaml:60-69 — env: block contains only SERVER_SERVLET_CONTEXT_PATH; no JVM flags ↩
+
+
+resources.yaml:22-23 — OTel annotation instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default ↩
+
+
+application.yaml:53-56 — async pool sizes bound to ${gcp_async_corepoolsize}, ${gcp_async_maxpoolsize}, ${gcp_async_queuecapacity} ↩
+
+
+src/main/java/com/wp/wdp/access/management/config/AsyncConfiguration.java:26-35 ↩
+
+
+resources.yaml:67 — secretRef: name: user-access-management-service ↩
+
+
+src/main/java/com/wp/wdp/access/management/dbconfig/NapDataSourceConfig.java:27-31 ↩
+
+
+src/main/java/com/wp/wdp/access/management/dbconfig/WdpDataSourceConfig.java:27-31 ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AccessManagementServiceImpl.java:129-132 ↩
+
+
+resources.yaml:25-31 — topologySpreadConstraints labelSelector uses gcp-user-access-management-service vs pod label user-access-management-service at line 20 ↩
+
+
+src/main/java/com/wp/wdp/access/management/config/CommonConfig.java:11-13 ↩
+
+
+src/main/java/com/wp/wdp/access/management/restclient/impl/IdpRestInvoker.java:45 — @Autowired RestTemplate restTemplate ↩
+
+
+src/main/java/com/wp/wdp/access/management/config/S3ClientConfig.java:18 ↩
+
+
+Jenkinsfile:12 — imageTag: "784102274315.dkr.ecr.us-east-2.amazonaws.com/..." ↩
+
+
+Spring Framework docs: @Async resolution — looks for taskExecutor bean; falls back to SimpleAsyncTaskExecutor ↩
+
+
+src/main/java/com/wp/wdp/access/management/config/AsyncConfiguration.java:26 — @Bean(name = "asyncExecutor") ↩
+
+
+resources.yaml:55-59 — only memory under limits and requests; no cpu key ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AuthorizationServiceImpl.java — non-NAP platform stubs ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AccessManagementServiceImpl.java:265-277 ↩
+
+
+src/main/java/com/wp/wdp/access/management/service/impl/AclServiceImpl.java:46 ↩
+
+
+src/main/java/com/wp/wdp/access/management/dbconfig/WdpDataSourceConfig.java:27,34,45 — three @Primary annotations ↩
+
+
+src/main/java/com/wp/wdp/access/management/config/SecurityConfig.java:35-37 ↩

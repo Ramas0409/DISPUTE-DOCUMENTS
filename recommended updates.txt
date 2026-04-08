@@ -1,0 +1,16 @@
+WDP-ARCHITECTURE.md — the architecture diagram in section 3.3 currently shows only UAMS as the authorization target. It should be updated to reflect both UAMS (NAP) and CoreHierarchyAuthorizationService (PIN) as authorization targets from the gateway.
+WDP-DECISIONS.md — the three [DEC-PLACEHOLDER] entries in the old 1.1 should be captured as real ADRs when you rebuild DECISIONS.md. I've identified five decisions in the new entry worth recording.
+
+WDP-COMPONENTS.md — replace section 2.1.1 with the above. Change status from 📝 DRAFT to ✅ COMPLETE. Correct the boundary inputs (remove srv117/vin-loss, replace with the four confirmed endpoints).
+WDP-DECISIONS.md — the following decisions are currently DEC-PLACEHOLDER in the existing draft and should now be formalised:
+
+Push model for NAP (NAP-DPS pushes to WDP)
+Two-path design: document upload bypasses Kafka
+Enrichment before publish pattern
+Security enforcement delegated to network layer
+
+DocumentChange requiredWDP-COMPONENTS.mdReplace 2.1.2 stub with the above entry. Change status from 📝 DRAFT to ✅ COMPLETE.WDP-DECISIONS.mdAdd a note to DEC-005 flagging that NAPDisputeEventProcessor is a known deliberate exception — it uses at-most-once delivery by design, managing event safety via the DB error table rather than Kafka redelivery. Without this note, DEC-005 appears to be a universal platform standard when it is not.WDP-DECISIONS.mdAdd a note to DEC-014 flagging that NAPDisputeEventProcessor has no circuit breaker — confirmed absent from pom.xml. Known deviation.
+
+DocumentChange requiredWDP-COMPONENTS.mdReplace 2.1.3 stub with the above. Status → ✅ COMPLETE.WDP-ARCHITECTURE.mdThe NAP inbound diagram and description both state this job "polls Visa API". This is incorrect — it reads from nap.action PostgreSQL and calls the internal Visa Adapter. The arrow and description need correcting to: reads nap.action (DB) → calls Visa Adapter HyperSearch → calls Case Actions Service.WDP-DECISIONS.mdThe planned Kafka publish feature (BRVISD / ISSUER_DOCUMENTS) has no ADR. Recommend adding a placeholder decision record for the planned post-IDCL event publish pattern before it gets implemented without governance.
+
+One thing I noticed in the search results — WDP-ARCHITECTURE.md still refers to this component as "InboundDisputeEventScheduler" publishing to new-case-events and case-evidence-events. When you're ready to tackle the architecture doc, those publisher references will need updating to reflect the multi-scheduler reality — particularly that Scheduler3 and Scheduler4 also publish to topics that the architecture doc may not currently show. Flag me when you want to work through that.

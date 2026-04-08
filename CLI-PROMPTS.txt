@@ -1,0 +1,831 @@
+Here are the Copilot CLI prompts for 1.3 CoreHierarchyAuthorizationService:
+For the core-hierarchy-authorization-service:
+1. What is the primary responsibility of this
+   service — what does it do and what does it
+   not do?
+2. What are the inbound interfaces — what calls
+   this service, over what protocol, and for
+   what purpose?
+3. What are the outbound interfaces — what does
+   this service call, and for what purpose?
+4. What REST endpoints does this service expose?
+   List path, method, and purpose for each.
+   
+ For the core-hierarchy-authorization-service:
+1. How does this service enforce access control —
+   what rules does it apply and based on what data?
+2. What does the /authorize endpoint do — what is
+   the exact request contract, what data does it
+   look up, and what does it return?
+3. Does this service handle both authorization
+   checks AND hierarchy CRUD operations, or is
+   it authorization only?
+4. What data does this service own or persist,
+   and what is the scope of that data?
+   
+For the core-hierarchy-authorization-service:
+1. How many pods does this service run, and what
+   are the key scaling or memory configuration
+   parameters?
+2. Are there any known risks, failure modes, or
+   architectural concerns in this codebase?
+   
+   For the nap-dispute-event-service:
+1. What is the primary responsibility of this
+   service — what does it do and what does it
+   not do?
+2. What are the inbound interfaces — what calls
+   or sends messages to this service, over what
+   protocol, and for what purpose?
+3. What are the outbound interfaces — what does
+   this service call or publish to, and for
+   what purpose?
+4. What REST endpoints or message listeners
+   does this service expose? List each with
+   its purpose.
+   
+   For the nap-dispute-event-service:
+1. How does this service handle the two inbound
+   sources — NAP-DPS events and WPG 119-response
+   documents — differently?
+2. What Kafka topics does this service publish
+   to, and what is the message structure?
+3. What data does this service own or persist,
+   and what is the scope of that data?
+4. How does this service handle failures —
+   retries, dead letter, error tracking?
+   
+For the nap-dispute-event-service:
+1. How many pods does this service run, and
+   what are the key scaling or memory
+   configuration parameters?
+2. Are there any known risks, failure modes,
+   or architectural concerns in this codebase?
+   
+For this service provide a deep technical research report covering:
+
+1. Primary responsibility — what it does and does NOT do. 
+   Include whether it is stateless or stateful, whether it 
+   has persistence, and what it produces or writes.
+
+2. For each event type it consumes: how it is identified, 
+   what processing path it follows, what outbound calls or 
+   writes it makes, and what success/failure outcomes are.
+
+3. All outbound dependencies — for each: protocol, target 
+   service or system, purpose, synchronous or asynchronous, 
+   retry and circuit breaker configuration.
+
+4. Kafka consumer configuration — topic(s) consumed, consumer 
+   group ID, offset commit strategy, concurrency, error 
+   handling on failure, DLQ or dead-letter behaviour, and 
+   how idempotency is enforced on redelivery.
+   
+For this service provide a deep technical research report covering:
+
+1. Pod count and scaling — replica count, HPA configuration, 
+   resource limits and requests (CPU and memory), 
+   deployment strategy.
+
+2. All known architectural risks and failure modes visible 
+   in the codebase — include severity where identifiable.
+
+3. Any planned changes or migration work referenced 
+   in the code or configuration.
+   
+
+NAPDisputeDeclineBatch repository.
+Provide a deep technical research report on this 
+batch job covering:
+
+RESPONSIBILITY: What does this job do in 2-3 sentences. 
+What does it explicitly NOT do.
+
+TRIGGER AND SCHEDULE: What triggers this job. Exact 
+schedule or interval. Where it is configured.
+
+INBOUND: Every external API, system, or data source 
+this job reads from or polls. For each: name, URL or 
+config key, HTTP method, purpose, authentication used.
+
+OUTBOUND: Everything this job writes or produces. Every 
+database table (schema + table name), Kafka topic, file, 
+or downstream REST API call. Be exhaustive.
+
+ERROR HANDLING: Retry strategy with count and delay. 
+Dead letter or error tracking mechanism. Whether one 
+record failure stops the whole batch or continues. 
+Any alerting or monitoring hooks.
+
+IDEMPOTENCY: Any mechanism to prevent duplicate 
+processing if the job runs twice. If none exists, 
+say so explicitly.
+
+Continue the research report on this batch job covering:
+
+VOLUME: Expected or observed records per run. Batch 
+size. Polling frequency.
+
+SCALING AND DEPLOYMENT: Pod or instance count. HPA or 
+scaling config. Memory and CPU limits and requests. 
+Deployment type — Deployment, CronJob, or StatefulSet.
+
+CONFIGURATION: All key config parameters — schedule, 
+timeouts, batch size, thread pool, API URLs — and 
+whether each is hardcoded, env-var driven, or externally 
+injected such as XL Deploy.
+
+PLANNED CHANGES: Any commented-out code, feature flags, 
+migration flags, TODO comments, or user-story references 
+indicating planned or in-progress work. Describe each 
+one found.
+
+CONFIDENCE: For each section above, state your 
+confidence level — High, Medium, or Low — and the 
+basis for it.
+
+VisaDisputeBatch 
+
+Provide a deep technical research report on this 
+Spring Batch application covering:
+
+RESPONSIBILITY: What does this job do in 2-3 sentences.
+What does it explicitly NOT do. Is there a single job
+or multiple jobs/steps — one per Visa queue?
+
+VISA QUEUES: List every Visa queue this job polls.
+For each queue provide:
+- Queue name or identifier
+- What dispute lifecycle stage it represents
+- What event types or dispute states it returns
+- How the job determines which queue to poll and when
+
+TRIGGER AND SCHEDULE: What triggers this job — cron,
+SQS, database polling, or something else. Is there one
+schedule for all queues or a separate schedule per queue.
+Where is the schedule configured. Is this a Kubernetes
+Deployment or CronJob.
+
+INBOUND DEPENDENCIES: Every external API, Visa network
+endpoint, or data source this job reads from. For each:
+- Name and URL or config key
+- HTTP method and auth mechanism
+- Request structure — what is sent to Visa
+- Response structure — what Visa returns
+- How errors or empty responses are handled
+
+PROCESSING LOGIC: For each Visa queue, what does the
+job do with the response. How does it map Visa response
+fields to WDP internal data structures. Does it call
+any internal WDP services during processing (enrichment,
+case lookup, etc).
+
+OUTBOUND — WHAT IT WRITES: Everything this job produces.
+Every database table written (schema + table name and
+key columns), Kafka topic published to, file written,
+or downstream REST API called. Is PAN encrypted before
+writing — which service handles encryption and when.
+
+ERROR HANDLING: Retry strategy with count and delay.
+Dead letter or error tracking mechanism. Whether one
+record failure stops the whole batch or continues.
+Chunk size and transaction boundary per queue.
+
+IDEMPOTENCY: Any mechanism to prevent duplicate
+processing if a queue is polled twice or the job
+restarts mid-run. If none, say so explicitly.
+
+
+second:
+Continue the research report on this Visa batch job:
+
+VOLUME AND THROUGHPUT: Expected or observed records
+per queue per run. Page or chunk size per queue.
+Polling frequency per queue. Any rate limiting
+or throttling applied to Visa API calls.
+
+SCALING AND DEPLOYMENT: Kubernetes Deployment type
+— Deployment or CronJob. Pod replica count or XL
+Deploy placeholder. Memory and CPU limits and requests.
+HPA or autoscaling config. Rolling update strategy.
+PodDisruptionBudget. Topology spread constraints.
+
+CONCURRENCY AND ORDERING: Does the job process queues
+sequentially or in parallel. Is there any ordering
+guarantee within a queue — does it matter which record
+is processed first. Any partition or merchant-level
+isolation.
+
+CONFIGURATION: All key config parameters and for each:
+- Property key
+- Production value or placeholder key
+- Injection method — hardcoded, env-var, XL Deploy,
+  K8s secret
+
+PLANNED CHANGES AND IN-PROGRESS WORK: Any commented-out
+code, feature flags, TODO comments, unused dependencies,
+unused model classes, unused constants, or user-story
+references indicating planned or deferred work.
+Describe each one found explicitly.
+
+CONFIDENCE: For each section state High, Medium, or Low
+confidence and the basis — direct source evidence,
+inferred, or not determinable from source alone.
+
+
+FirstChargebackBatch
+
+Provide a deep technical research report on this
+MasterCard First Chargeback batch application.
+I need full architecture-level detail. For each
+section, if something is not implemented or not
+visible in source, say so explicitly.
+
+## 1. PRIMARY RESPONSIBILITY
+What does this job do in 2-3 sentences. What does
+it explicitly NOT do. Is there a single Spring Batch
+job or multiple jobs and steps — describe the full
+job and step structure.
+
+## 2. MASTERCARD ENDPOINTS
+List every MasterCard API endpoint this job calls.
+For each provide:
+- Endpoint name, identifier, and config key
+- What dispute lifecycle stage it represents
+- HTTP method and full request structure
+- Full response structure — key fields returned
+- How MasterCard authentication is handled
+- How errors or empty responses are handled
+
+## 3. TRIGGER AND SCHEDULE
+Exact trigger mechanism and schedule. Where it is
+configured and how injected. Is this a Kubernetes
+Deployment or CronJob. One schedule or multiple.
+
+## 4. INBOUND DEPENDENCIES
+Every external and internal service called during
+processing. For each:
+- Name, URL, or config key
+- HTTP method and auth mechanism
+- Purpose — enrichment, lookup, encryption, rules
+- Retry behaviour on this specific call
+
+## 5. PROCESSING LOGIC
+Step by step — what happens to each MasterCard
+first chargeback record from receipt to write.
+How MasterCard fields map to WDP internal
+structures. Which internal WDP services are called
+during enrichment and in what order. Any conditional
+branching based on record type or dispute stage.
+How does this differ from subsequent chargeback
+processing — what is unique about first chargeback.
+
+## 6. PAN HANDLING
+Is PAN present in MasterCard responses. If so:
+- At what point in the pipeline is PAN encrypted
+- Which internal service handles encryption
+- What token or encrypted form is written
+- Is clear PAN ever written anywhere
+
+## 7. OUTBOUND — WHAT IT WRITES
+Everything this job produces:
+- Every database table written — schema, table name,
+  key columns, and when
+- Any Kafka topic published to
+- Any file written to S3 or disk
+- Any downstream REST API called as output
+Include Spring Batch metadata tables and log targets.
+
+## 8. ERROR HANDLING AND FAILURE MODES
+- Chunk size and transaction boundary
+- Retry strategy — count, delay, backoff per call
+- Whether one record failure stops the batch
+- Dead letter mechanism — error table, DLQ, or none
+- Job-level failure — restart behaviour and
+  checkpoint strategy
+
+## 9. IDEMPOTENCY
+Exact mechanism to prevent duplicate processing on
+restart or double-run. If none exists say so and
+describe the duplicate risk.
+
+## 10. VOLUME AND THROUGHPUT
+Records per run. Chunk or page size. Polling
+frequency. Any rate limiting on MasterCard API.
+Any maximum record cap per run.
+
+## 11. SCALING AND DEPLOYMENT
+- Kubernetes resource type — Deployment or CronJob
+- Replica count — exact or XL Deploy placeholder
+- Memory limit and request
+- CPU limit and request
+- HPA — present or absent
+- Rolling update strategy
+- PodDisruptionBudget — present or absent
+- Topology spread constraints
+- Observability — OTel, Actuator, Logstash
+
+## 12. CONFIGURATION
+All key config parameters — for each:
+- Property key
+- Production value or placeholder
+- Injection method: hardcoded / env-var / K8s secret
+  / XL Deploy placeholder
+Include: schedule, URLs, credentials, batch sizes,
+timeouts, thread pools, feature flags.
+
+## 13. PLANNED CHANGES AND IN-PROGRESS WORK
+Search for and describe every indicator of planned
+or incomplete work:
+- Commented-out code blocks — what they did and
+  why removed or deferred
+- Unused dependencies in pom.xml
+- Unused model classes or constants
+- Feature flags or migration flags
+- TODO / FIXME / user-story references
+- Configured properties never used at runtime
+
+## 14. CONFIDENCE ASSESSMENT
+For each section state:
+- Confidence: High / Medium / Low
+- Basis: direct source evidence / inferred /
+  not determinable from source alone
+  
+  
+CaseFillingBatch
+
+Provide a deep technical research report on this
+MasterCard Case Filing batch application.
+I need full architecture-level detail. For each
+section, if something is not implemented or not
+visible in source, say so explicitly.
+
+## 1. PRIMARY RESPONSIBILITY
+What does this job do in 2-3 sentences. What does
+it explicitly NOT do. Is there a single Spring Batch
+job or multiple jobs and steps — describe the full
+job and step structure. How does this differ from
+the First Chargeback batch — what dispute lifecycle
+stages does it cover that FirstChargebackBatch
+does not.
+
+## 2. MASTERCARD ENDPOINTS
+List every MasterCard API endpoint this job calls.
+For each provide:
+- Endpoint name, identifier, and config key
+- What dispute lifecycle stage it represents
+- HTTP method and full request structure
+- Full response structure — key fields returned
+- How MasterCard authentication is handled
+- How errors or empty responses are handled
+
+## 3. TRIGGER AND SCHEDULE
+Exact trigger mechanism and schedule. Where it is
+configured and how injected. Is this a Kubernetes
+Deployment or CronJob. Does it share a schedule
+with FirstChargebackBatch or run independently.
+
+## 4. INBOUND DEPENDENCIES
+Every external and internal service called during
+processing. For each:
+- Name, URL, or config key
+- HTTP method and auth mechanism
+- Purpose — enrichment, lookup, encryption, rules
+- Retry behaviour on this specific call
+
+## 5. PROCESSING LOGIC
+Step by step — what happens to each MasterCard
+case filing record from receipt to write. How
+MasterCard fields map to WDP internal structures.
+Which internal WDP services are called and in what
+order. Any conditional branching based on record
+type, dispute stage, or event type. What makes
+case filing events structurally different from
+first chargeback events in how they are processed.
+
+## 6. PAN HANDLING
+Is PAN present in MasterCard responses. If so:
+- At what point in the pipeline is PAN encrypted
+- Which internal service handles encryption
+- What token or encrypted form is written
+- Is clear PAN ever written anywhere
+
+## 7. OUTBOUND — WHAT IT WRITES
+Everything this job produces:
+- Every database table written — schema, table name,
+  key columns, and when
+- Any Kafka topic published to
+- Any file written to S3 or disk
+- Any downstream REST API called as output
+Include Spring Batch metadata tables and log targets.
+
+## 8. ERROR HANDLING AND FAILURE MODES
+- Chunk size and transaction boundary
+- Retry strategy — count, delay, backoff per call
+- Whether one record failure stops the batch
+- Dead letter mechanism — error table, DLQ, or none
+- Job-level failure — restart behaviour and
+  checkpoint strategy
+
+## 9. IDEMPOTENCY
+Exact mechanism to prevent duplicate processing on
+restart or double-run. If none exists say so and
+describe the duplicate risk.
+
+## 10. VOLUME AND THROUGHPUT
+Records per run. Chunk or page size. Polling
+frequency. Any rate limiting on MasterCard API.
+Any maximum record cap per run.
+
+## 11. SCALING AND DEPLOYMENT
+- Kubernetes resource type — Deployment or CronJob
+- Replica count — exact or XL Deploy placeholder
+- Memory limit and request
+- CPU limit and request
+- HPA — present or absent
+- Rolling update strategy
+- PodDisruptionBudget — present or absent
+- Topology spread constraints
+- Observability — OTel, Actuator, Logstash
+
+## 12. CONFIGURATION
+All key config parameters — for each:
+- Property key
+- Production value or placeholder
+- Injection method: hardcoded / env-var / K8s secret
+  / XL Deploy placeholder
+Include: schedule, URLs, credentials, batch sizes,
+timeouts, thread pools, feature flags.
+
+## 13. PLANNED CHANGES AND IN-PROGRESS WORK
+Search for and describe every indicator of planned
+or incomplete work:
+- Commented-out code blocks — what they did and
+  why removed or deferred
+- Unused dependencies in pom.xml
+- Unused model classes or constants
+- Feature flags or migration flags
+- TODO / FIXME / user-story references
+- Configured properties never used at runtime
+- Any shared code or shared libraries with
+  FirstChargebackBatch — are these two separate
+  repos or one monorepo with two jobs
+
+## 14. CONFIDENCE ASSESSMENT
+For each section state:
+- Confidence: High / Medium / Low
+- Basis: direct source evidence / inferred /
+  not determinable from source alone
+  
+  
+FileProcessor
+
+Provide a deep technical research report on this
+file processing component. This is a critical
+inbound component that processes files from
+multiple sources and formats. I need the deepest
+possible architecture-level detail. For each
+section, if something is not implemented or not
+visible in source, say so explicitly rather
+than guessing.
+
+## 1. PRIMARY RESPONSIBILITY
+What does this component do in 2-3 sentences.
+What does it explicitly NOT do. Is this a Spring
+Batch application, a Spring Boot service, or
+something else. Describe the full job and step
+structure if Spring Batch.
+
+## 2. FILE SOURCES
+List every file source this component handles.
+For each source provide:
+- Source name or identifier
+- File format — fixed-width, CSV, XML, ISO8583,
+  proprietary, or other
+- How the file arrives — S3 path, SQS trigger,
+  SFTP poll, or other
+- Any source-specific parsing or routing logic
+- How the component identifies which source a
+  file belongs to
+
+## 3. TRIGGER MECHANISM
+Exact trigger — SQS event, S3 event notification,
+scheduled poll, REST call, or other. For each
+trigger type:
+- What message or event initiates processing
+- What information the trigger carries — S3 path,
+  file type, source identifier
+- Is there one trigger type for all sources or
+  different triggers per source
+- Where trigger configuration lives and how
+  it is injected
+
+## 4. FILE READING AND PARSING
+How files are read from S3 or other storage:
+- S3 bucket and path structure — how paths are
+  determined per source
+- Streaming vs full load into memory
+- Parser per source — is there a separate parser
+  per file format or a shared parser
+- How records are extracted from each file type
+- How malformed records or unparseable files
+  are handled
+- Maximum file size or record count limits
+
+## 5. INBOUND DEPENDENCIES
+Every external and internal service called during
+file processing. For each:
+- Name, URL, or config key
+- HTTP method and auth mechanism
+- Purpose — enrichment, PAN encryption, case
+  lookup, rules evaluation, validation
+- At what point in the pipeline it is called
+- Retry behaviour on this specific call
+
+## 6. PAN HANDLING
+Is PAN present in any file source. If so:
+- Which sources contain PAN
+- At what point in the pipeline PAN is encrypted
+- Which internal service handles encryption
+- What token or encrypted form is written
+- Is clear PAN ever written to any store
+
+## 7. PROCESSING LOGIC PER FILE TYPE
+For each file source or file type, describe
+step by step what happens to each record from
+file read to final write:
+- Field mapping from source format to WDP
+  internal data structure
+- Any enrichment calls made per record
+- Any validation or business rule applied
+- Any conditional branching per record type
+  or dispute stage within the same file
+- How evidence records are handled differently
+  from chargeback records if in the same file
+
+## 8. OUTBOUND — WHAT IT WRITES
+Everything this component produces:
+- Every database table written — schema, table
+  name, key columns written, and when
+- The exact outbox table and columns written
+  for chargeback events
+- The exact outbox table and columns written
+  for evidence events
+- Any Kafka topic published to directly
+- Any file written to S3 — bucket and path
+- Any downstream REST API called as output
+- Spring Batch metadata tables if applicable
+- Log shipping targets
+Be exhaustive — miss nothing.
+
+## 9. EVIDENCE HANDLING
+How evidence files or evidence records within
+combined files are handled:
+- How evidence is separated from chargeback
+  data if in the same file
+- Where evidence files are staged — S3 path
+- How evidence is linked to its parent
+  chargeback case
+- BLOCKED status pattern — is evidence blocked
+  until the parent chargeback is processed
+- Which component unblocks evidence and how
+
+## 10. ERROR HANDLING AND FAILURE MODES
+- Chunk size and transaction boundary
+- Retry strategy — count, delay, backoff,
+  per dependency if different
+- Whether one record failure stops the file
+  or continues to next record
+- Whether one file failure stops the job
+  or continues to next file
+- Dead letter mechanism — error table, DLQ,
+  S3 error path, or none
+- What happens to a partially processed file
+  on pod restart
+- Alerting and monitoring hooks
+
+## 11. IDEMPOTENCY
+Exact mechanism to prevent duplicate processing
+if the same file is delivered twice or the job
+restarts mid-file. If none exists say so and
+describe the full duplicate risk per file source.
+
+## 12. VOLUME AND THROUGHPUT
+Records per file per source. File sizes. Number
+of files per run. Polling or trigger frequency
+per source. Any rate limiting. Any maximum
+record or file size cap. Chunk or page size.
+
+## 13. SCALING AND DEPLOYMENT
+- Kubernetes resource type — Deployment or CronJob
+- Replica count — exact or XL Deploy placeholder
+- Memory limit and request
+- CPU limit and request
+- HPA — present or absent
+- Rolling update strategy
+- PodDisruptionBudget — present or absent
+- Topology spread constraints
+- Concurrency — can multiple files be processed
+  simultaneously or is processing sequential
+- Observability — OTel, Actuator, Logstash
+
+## 14. CONFIGURATION
+All key config parameters — for each:
+- Property key
+- Production value or placeholder
+- Injection method: hardcoded / env-var /
+  K8s secret / XL Deploy placeholder
+Include: S3 buckets, SQS queue names, service
+URLs, batch sizes, timeouts, thread pools,
+feature flags, source routing config.
+
+## 15. PLANNED CHANGES AND IN-PROGRESS WORK
+Search for and describe every indicator of
+planned or incomplete work:
+- Commented-out code blocks — what they did
+  and why removed or deferred
+- Unused dependencies in pom.xml
+- Unused model classes or constants
+- Feature flags or migration flags — especially
+  any per-source feature flags
+- TODO / FIXME / user-story references
+- Configured properties never used at runtime
+- Any sources referenced in config but not
+  yet active in processing code
+
+## 16. CONFIDENCE ASSESSMENT
+For each section state:
+- Confidence: High / Medium / Low
+- Basis: direct source evidence / inferred /
+  not determinable from source alone
+  
+  
+  
+  
+
+
+InboundDisputeEventScheduler
+
+Provide a deep technical research report on this
+scheduler component. I need full architecture-
+level detail. For each section, if something is
+not implemented or not visible in source, say
+so explicitly.
+
+## 1. PRIMARY RESPONSIBILITY
+What does this component do in 2-3 sentences.
+What does it explicitly NOT do. How does it
+relate to FileProcessor — does it run after
+FileProcessor writes to the outbox, or does
+it operate independently.
+
+## 2. TRIGGER AND SCHEDULE
+Exact trigger mechanism — cron schedule, database
+poll, SQS, or other. Polling interval. Where the
+schedule is configured and how injected.
+Is this a Kubernetes Deployment or CronJob.
+
+## 3. OUTBOX POLLING LOGIC
+How does this component read from the outbox:
+- Exact table and schema polled
+- Query — what filters, ordering, and page size
+- How it determines which rows to pick up
+- How it marks rows as in-progress to prevent
+  double processing by concurrent instances
+- Pagination or cursor strategy
+
+## 4. WHAT IT PUBLISHES
+For each outbox row type it processes:
+- What Kafka topic it publishes to
+- What the published message structure looks like
+- Partition key used
+- How it handles publish failures
+
+## 5. INBOUND DEPENDENCIES
+Every internal service or database this component
+reads from. For each:
+- Name, URL, or config key
+- Purpose and when called
+
+## 6. ERROR HANDLING
+- Retry strategy on Kafka publish failure
+- What happens to a row that cannot be published
+- Dead letter mechanism — error table, DLQ, or none
+- Whether one row failure stops processing or
+  continues to next row
+
+## 7. IDEMPOTENCY
+How duplicate publishing is prevented if the
+scheduler fires twice or restarts mid-run.
+Describe the at-least-once vs exactly-once
+guarantee. If none exists say so explicitly.
+
+## 8. VOLUME AND THROUGHPUT
+Records processed per run. Polling frequency.
+Batch or page size per poll. Any backpressure
+or rate limiting on Kafka publishing.
+
+## 9. SCALING AND DEPLOYMENT
+- Kubernetes resource type
+- Replica count — exact or placeholder
+- Memory and CPU limits and requests
+- HPA — present or absent
+- Concurrency risk — what happens with
+  replicas > 1 polling the same outbox table
+
+## 10. CONFIGURATION
+All key config parameters with property key,
+production value or placeholder, and injection
+method.
+
+## 11. PLANNED CHANGES AND IN-PROGRESS WORK
+Any commented-out code, unused dependencies,
+feature flags, or TODO references.
+
+## 12. CONFIDENCE ASSESSMENT
+For each section state High / Medium / Low
+and the basis.
+
+
+
+FileAcknowledgementProcessor
+Provide a deep technical research report on this
+file acknowledgement component. I need full
+architecture-level detail. For each section,
+if something is not implemented or not visible
+in source, say so explicitly.
+
+## 1. PRIMARY RESPONSIBILITY
+What does this component do in 2-3 sentences.
+What does it explicitly NOT do. Which merchants
+or sources receive acknowledgement files —
+is this all sources or specific ones only
+(docs suggest Meijer, Walmart, CapitalOne).
+
+## 2. TRIGGER AND SCHEDULE
+Exact trigger — cron, SQS, database poll, or
+event driven. Schedule and where configured.
+Is this a Kubernetes Deployment or CronJob.
+
+## 3. WHAT TRIGGERS AN ACK FILE
+What event or condition causes an acknowledgement
+file to be generated:
+- Is it triggered per inbound file received
+- Or triggered on a schedule regardless of
+  whether new files arrived
+- How does it know which inbound files need
+  an ACK generated
+- Is there a tracking table that links inbound
+  files to their ACK status
+
+## 4. ACK FILE GENERATION
+For each merchant or source that receives ACKs:
+- ACK file format — fixed-width, CSV, XML, other
+- Key fields included in the ACK
+- How the ACK content is derived from inbound
+  processing results
+- Success vs failure ACK — are rejected records
+  included
+
+## 5. OUTBOUND DELIVERY
+How ACK files are delivered to recipients:
+- Target location — S3 path, SFTP, API
+- Naming convention for ACK files
+- Any encryption or signing of ACK files
+- Confirmation that delivery succeeded
+
+## 6. INBOUND DEPENDENCIES
+Every internal service or database read during
+ACK generation. For each:
+- Name, URL, or config key
+- Purpose and when called
+
+## 7. ERROR HANDLING
+- What happens if ACK generation fails
+- What happens if ACK delivery fails
+- Retry strategy
+- Dead letter mechanism or error tracking
+
+## 8. IDEMPOTENCY
+How duplicate ACK generation is prevented if
+the component runs twice. If none, say so.
+
+## 9. SCALING AND DEPLOYMENT
+- Kubernetes resource type
+- Replica count — exact or placeholder
+- Memory and CPU limits and requests
+- HPA — present or absent
+
+## 10. CONFIGURATION
+All key config parameters with property key,
+production value or placeholder, and injection
+method.
+
+## 11. PLANNED CHANGES AND IN-PROGRESS WORK
+Any commented-out code, unused dependencies,
+feature flags, new merchants being added,
+or TODO references.
+
+## 12. CONFIDENCE ASSESSMENT
+For each section state High / Medium / Low
+and the basis.

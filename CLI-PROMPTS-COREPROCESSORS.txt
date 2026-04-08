@@ -1,0 +1,710 @@
+ CaseCreationConsumer
+ 
+ Provide a deep technical research report on the
+CaseCreationConsumer component. This is the primary
+case creation component for all non-NAP dispute
+events and one of the most critical consumers in
+the platform. I need the deepest possible
+architecture-level detail. For each section, if
+something is not implemented or not visible in
+source, say so explicitly rather than guessing.
+
+## 1. PRIMARY RESPONSIBILITY
+What this component does in 2-3 sentences.
+What it explicitly does NOT do. Is this a
+standalone service or part of a shared codebase
+with other consumers. Which acquiring platforms
+does it handle — confirm whether CORE, LATAM,
+and VAP are all active or some are still pending.
+
+## 2. KAFKA CONFIGURATION
+- Topic consumed — exact topic name
+- Consumer group ID — exact value
+- Partition key expected
+- Offset commit strategy — auto or manual, and
+  exactly when the offset is committed relative
+  to processing — before, during, or after all
+  processing and outbox writes complete
+- AckMode — exact Spring Kafka AckMode value
+- Concurrency — number of consumer threads
+- Auto offset reset policy
+- Max poll records and max poll interval ms
+- Authentication to AWS MSK — IAM or SASL
+- Deserializer — type and error handling on
+  bad payload. What happens if a message
+  cannot be deserialized
+
+## 3. MESSAGE STRUCTURE
+What does the inbound message look like:
+- Key fields in the consumed event
+- How the acquiring platform is identified
+  from the message — which field determines
+  the enrichment path taken
+- How dispute type and network are identified
+
+## 4. ENRICHMENT PIPELINE PER ACQUIRING PLATFORM
+For each acquiring platform handled, describe
+the full enrichment pipeline:
+- Which internal services are called
+- In what order
+- What data is retrieved and why
+- How EPAN is decrypted for enrichment calls
+  and which service handles decryption
+- Whether clear PAN is ever written anywhere
+- What happens if an enrichment call fails —
+  does the consumer retry, skip, or fail
+  the whole message
+
+## 5. PAN HANDLING
+- Exactly when and how EPAN is decrypted
+- Which service handles decryption
+- What token form is stored in the case table
+- Is clear PAN ever written to any persistent
+  store at any point in the pipeline
+- How the decrypted PAN is scoped to the
+  processing lifecycle — is it cleared after use
+
+## 6. CASE CREATION LOGIC
+- What internal service or database call
+  creates the dispute case
+- Key fields written at case creation
+- How duplicate case creation is prevented
+  if the same message is redelivered
+- Does this consumer implement the deferred
+  processing sequence guard (DEC-006) for
+  UPDATE events that arrive before their
+  corresponding NEW event — if so describe
+  the exact mechanism
+
+## 7. OUTBOX TABLE
+- Exact schema and table name
+- Key columns — idempotency key, status,
+  checkpoint if any, error column, timestamps
+- Full status lifecycle — every status value
+  and transitions between them
+- Whether the outbox write and case creation
+  write are in the same transaction or separate
+- How the row is created, updated on success,
+  and updated on failure
+
+## 8. IDEMPOTENCY
+- Exact mechanism to detect a redelivered
+  message
+- Which field(s) form the idempotency key
+- What happens when a duplicate is detected
+- Gaps — any scenario where duplicate
+  processing can still occur despite the
+  mechanism (e.g. replicas > 1, crash windows)
+
+## 9. ERROR HANDLING AND RECOVERY
+- What happens when processing fails part
+  way through the enrichment pipeline
+- Dead letter queue, error table, or other
+  durable error capture mechanism
+- Status written on failure — exact value
+- Whether a failed message is retried
+  automatically on redelivery or requires
+  manual intervention
+- Maximum retry attempts before permanent
+  failure state
+- Operational visibility for failed messages
+
+## 10. ALL OUTBOUND DEPENDENCIES
+For each external service or database called:
+- Service name and URL or config key
+- HTTP method and auth mechanism
+- Purpose and at what point in the pipeline
+- Retry strategy — count, delay, backoff
+- Circuit breaker — is Resilience4j configured
+  and if so what are the exact thresholds:
+  failure rate, wait duration, half-open
+  test call count
+- What happens if the dependency is
+  unavailable — stop, skip, or degrade
+
+## 11. SCALING AND DEPLOYMENT
+- Kubernetes resource type
+- Replica count — exact value or XL Deploy
+  placeholder
+- Memory limit and request
+- CPU limit and request
+- HPA — present or absent
+- Rolling update strategy
+- PodDisruptionBudget — present or absent
+- Topology spread constraints
+- Observability — OTel, Actuator, Logstash
+
+## 12. PLANNED CHANGES AND IN-PROGRESS WORK
+Every indicator of planned or incomplete work:
+- Commented-out code — what it did and why
+  removed or deferred
+- Unused dependencies in pom.xml
+- Feature flags — especially any per-platform
+  flags gating LATAM or VAP enrichment paths
+- Migration flags
+- TODO / FIXME / user-story references
+- Configured properties never used at runtime
+
+## 13. CONFIDENCE ASSESSMENT
+For each section state:
+- Confidence: High / Medium / Low
+- Basis: direct source evidence / inferred /
+  not determinable from source alone
+  
+
+
+EvidenceConsumer
+
+Provide a deep technical research report on the
+EvidenceConsumer component. This consumer attaches
+evidence documents to dispute cases and uses
+Resilience4j per-merchant circuit breakers. I need
+full architecture-level detail. For each section,
+if something is not implemented or not visible in
+source, say so explicitly.
+
+## 1. PRIMARY RESPONSIBILITY
+What this component does in 2-3 sentences.
+What it explicitly does NOT do. Is this a
+standalone service or shared codebase.
+
+## 2. KAFKA CONFIGURATION
+- Topic consumed — exact topic name
+- Consumer group ID — exact value
+- Partition key expected
+- Offset commit strategy — auto or manual,
+  and exactly when the offset is committed
+  relative to all processing completing
+- AckMode — exact Spring Kafka AckMode value
+- Concurrency — number of consumer threads
+- Auto offset reset policy
+- Max poll records and max poll interval ms
+- Authentication to AWS MSK
+- Deserializer and error handling on bad payload
+
+## 3. MESSAGE STRUCTURE
+- Key fields in the consumed event
+- How the S3 staging path is carried in
+  the message
+- How the parent chargeback case is
+  identified from the message
+
+## 4. BLOCKED STATUS HANDLING
+- How does this consumer know if the parent
+  chargeback case has been created yet
+- Is there a BLOCKED status check before
+  processing — exactly how is it implemented
+- What happens when evidence arrives before
+  its parent case exists — is it held, skipped,
+  or retried
+- How and when does a BLOCKED evidence row
+  become unblocked — which component triggers
+  the unblock and what is the exact mechanism
+- Is there an Unblock Reconciler — if so what
+  is its schedule and how does it work
+
+## 5. DOCUMENT RETRIEVAL AND ATTACHMENT
+- How the document is retrieved from S3 —
+  exact bucket and path pattern
+- How DocumentManagementService is called —
+  URL, method, request structure
+- What metadata is written to DynamoDB
+- What is written to S3 final storage vs
+  S3 staging
+
+## 6. RESILIENCE4J CIRCUIT BREAKER
+This is critical — describe in full detail:
+- Is Resilience4j configured on the
+  DocumentManagementService call
+- Is it per-merchant or global
+- Exact failure rate threshold that opens
+  the circuit
+- Wait duration in open state
+- Number of test calls in half-open state
+- What happens when the circuit is open —
+  does the message fail, get held, or skip
+- How merchant isolation is achieved —
+  which field identifies the merchant for
+  the circuit breaker key
+
+## 7. OUTBOX TABLE
+- Exact schema and table name
+- Key columns — idempotency key, status,
+  error column, timestamps
+- Full status lifecycle — every status
+  value and transitions
+- Whether the outbox write and document
+  attachment are in the same transaction
+- How the row is created, updated on
+  success, and updated on failure
+
+## 8. IDEMPOTENCY
+- Exact mechanism to detect a redelivered
+  message
+- Which field(s) form the idempotency key
+- What happens when a duplicate is detected
+- Gaps — scenarios where duplicate
+  attachment can still occur
+
+## 9. ERROR HANDLING AND RECOVERY
+- What happens when document retrieval
+  from S3 fails
+- What happens when DocumentManagementService
+  call fails
+- Dead letter or error capture mechanism
+- Status written on failure — exact value
+- Retry behaviour — automatic or manual
+- Maximum retry attempts
+- Operational visibility for failures
+
+## 10. ALL OUTBOUND DEPENDENCIES
+For each service or store called:
+- Name, URL or config key
+- Method and auth
+- Purpose and pipeline position
+- Retry strategy
+- Circuit breaker config if present
+- Behaviour on unavailability
+
+## 11. SCALING AND DEPLOYMENT
+- Kubernetes resource type
+- Replica count — exact or placeholder
+- Memory limit and request
+- CPU limit and request
+- HPA — present or absent
+- Rolling update strategy
+- PodDisruptionBudget
+- Topology spread constraints
+- Observability
+
+## 12. PLANNED CHANGES AND IN-PROGRESS WORK
+- Commented-out code blocks
+- Unused dependencies
+- Feature flags
+- TODO / FIXME references
+- Configured properties never used
+
+## 13. CONFIDENCE ASSESSMENT
+For each section state:
+- Confidence: High / Medium / Low
+- Basis: direct source evidence / inferred /
+  not determinable from source alone
+  
+
+BusinessRulesProcessor
+
+Provide a deep technical research report on the
+BusinessRulesProcessor component. This is the
+business rules execution engine — it applies
+configured rules to dispute events and is the
+only component that publishes to outgoing-events.
+DEC-011 (BRE step checkpointing) is a critical
+architectural decision that must be verified in
+full detail. I need the deepest possible
+architecture-level detail. For each section, if
+something is not implemented or not visible in
+source, say so explicitly.
+
+## 1. PRIMARY RESPONSIBILITY
+What this component does in 2-3 sentences.
+What it explicitly does NOT do. Confirm whether
+this is a Kafka consumer, a batch job, or
+something else. Is it a standalone service or
+shared codebase. Confirm it does NOT call
+BusinessRulesService — it reads rules directly
+from the database.
+
+## 2. KAFKA CONFIGURATION
+- Topic consumed — exact topic name
+- Consumer group ID — exact value
+- CRITICAL: What component publishes to this
+  topic — identify the exact publisher from
+  source code. This is currently unconfirmed
+  in our architecture docs.
+- Partition key expected
+- Offset commit strategy — auto or manual,
+  and exactly when the offset is committed
+- AckMode — exact Spring Kafka AckMode value
+- Concurrency — number of consumer threads
+- Auto offset reset policy
+- Max poll records and max poll interval ms
+- Authentication to AWS MSK
+- Deserializer and error handling on bad payload
+
+## 3. FULL BRE STEP PIPELINE
+This is the most critical section. Provide:
+- The complete ordered list of every BRE
+  step executed per message
+- For each step:
+  - Step name or identifier
+  - Whether it is a DB read, DB write,
+    internal REST call, or in-memory operation
+  - What service or table it interacts with
+  - What data it reads or writes
+  - Whether it can fail independently of
+    other steps
+- Which step or steps publish to outgoing-events
+  and under what conditions
+
+## 4. STEP CHECKPOINTING (DEC-011)
+This is architecturally critical — describe
+in full detail exactly how it is implemented:
+- Which table and exact column the checkpoint
+  is written to after each step completes
+- Whether the checkpoint write is in a
+  separate independently committed transaction
+  from the step's business logic — or in the
+  same transaction
+- On message redelivery — how the consumer
+  reads the checkpoint and resumes from the
+  correct step rather than restarting
+- What happens if the checkpoint write itself
+  fails — is the step re-executed or skipped
+- Are all steps checkpointed or only some
+
+## 5. RULES DATABASE ACCESS
+- Exact schema and table(s) read for rules
+- How rules are queried — what filters
+  determine which rules apply to an event
+- Are rules cached in memory or fetched
+  fresh per message
+- What fields in the event determine which
+  rules are selected
+- How rules are applied — ordered evaluation,
+  first match, or all matching rules
+
+## 6. OUTBOX TABLE
+- Exact schema and table name
+- Key columns — idempotency key, status,
+  checkpoint column (exact name), error
+  column, timestamps
+- Full status lifecycle — every status
+  value and transitions
+- Whether the outbox write and rule
+  application are in the same transaction
+- How the checkpoint column is updated —
+  in the same transaction as the step or
+  in a separate independently committed
+  transaction (verify against DEC-011)
+
+## 7. IDEMPOTENCY
+- Exact mechanism to detect a redelivered
+  message
+- Which field(s) form the idempotency key
+- How the checkpoint integrates with
+  idempotency — does re-delivery resume
+  from checkpoint or restart from scratch
+- Gaps — scenarios where duplicate rule
+  application can occur
+
+## 8. KAFKA OUTPUT
+- Exact topic published to — confirm
+  outgoing-events
+- Partition key used on publish
+- Message structure published
+- Whether Kafka publish and offset commit
+  are in the same transaction or separate
+- What happens if the Kafka publish fails —
+  is the offset still committed, is the
+  outbox row rolled back
+
+## 9. ERROR HANDLING AND RECOVERY
+- What happens when a BRE step fails
+- What happens when the Kafka publish fails
+- Dead letter or error capture mechanism
+- Status written on failure — exact value
+- Whether failed messages are retried
+  automatically or need manual intervention
+- Maximum retry attempts
+- Operational visibility for failures
+
+## 10. ALL OUTBOUND DEPENDENCIES
+For each service or database called:
+- Name, URL or config key
+- Method and auth
+- Purpose and pipeline position
+- Retry strategy
+- Circuit breaker config if present
+- Behaviour on unavailability
+
+## 11. SCALING AND DEPLOYMENT
+- Kubernetes resource type
+- Replica count — exact or placeholder
+- Memory limit and request
+- CPU limit and request
+- HPA — present or absent
+- Rolling update strategy
+- PodDisruptionBudget
+- Topology spread constraints
+- Observability
+
+## 12. PLANNED CHANGES AND IN-PROGRESS WORK
+- Commented-out code blocks
+- Unused dependencies in pom.xml
+- Feature flags or rule evaluation flags
+- TODO / FIXME / user-story references
+- Configured properties never used
+
+## 13. CONFIDENCE ASSESSMENT
+For each section state:
+- Confidence: High / Medium / Low
+- Basis: direct source evidence / inferred /
+  not determinable from source alone
+  
+
+CaseExpiryUpdateConsumer
+
+Provide a deep technical research report on the
+CaseExpiryUpdateConsumer component. I need full
+architecture-level detail. For each section, if
+something is not implemented or not visible in
+source, say so explicitly.
+
+## 1. PRIMARY RESPONSIBILITY
+What this component does in 2-3 sentences.
+What it explicitly does NOT do. Is this a
+standalone service or shared codebase. Confirm
+it only updates case expiry status and triggers
+no further downstream processing.
+
+## 2. KAFKA CONFIGURATION
+- Topic consumed — exact topic name and
+  confirm it is case-action-events (expiry)
+- Consumer group ID — exact value
+- Partition key — currently unconfirmed in
+  our docs, identify it from source
+- Offset commit strategy — auto or manual,
+  exactly when committed
+- AckMode — exact Spring Kafka AckMode value
+- Concurrency — number of consumer threads
+- Auto offset reset policy
+- Max poll records and max poll interval ms
+- Authentication to AWS MSK
+- Deserializer and error handling on
+  bad payload
+
+## 3. MESSAGE STRUCTURE
+- Key fields in the consumed expiry event
+- How the case to be expired is identified
+- What expiry information is carried —
+  expiry date, expiry type, reason
+
+## 4. EXPIRY UPDATE LOGIC
+- Exactly what is updated in WDP Core —
+  which table, which column(s)
+- How the case is looked up before update
+- Any validation performed before updating
+- Whether any other state changes are
+  triggered beyond the expiry status update
+- What happens if the case does not exist
+
+## 5. OUTBOX TABLE
+- Exact schema and table name
+- Key columns — idempotency key, status,
+  error column, timestamps
+- Full status lifecycle
+- Transaction boundary — outbox write vs
+  case update in same or separate transaction
+
+## 6. IDEMPOTENCY
+- Exact mechanism to detect redelivery
+- Which field(s) form the idempotency key
+- What happens when a duplicate is detected
+- Gaps in idempotency coverage
+
+## 7. ERROR HANDLING AND RECOVERY
+- What happens when the case update fails
+- Dead letter or error capture mechanism
+- Status on failure — exact value
+- Retry behaviour — automatic or manual
+- Maximum retry attempts
+- Operational visibility
+
+## 8. ALL OUTBOUND DEPENDENCIES
+For each service or database called:
+- Name, URL or config key
+- Method and auth
+- Purpose and pipeline position
+- Retry strategy
+- Circuit breaker if present
+- Behaviour on unavailability
+
+## 9. SCALING AND DEPLOYMENT
+- Kubernetes resource type
+- Replica count — exact or placeholder
+- Memory limit and request
+- CPU limit and request
+- HPA — present or absent
+- Rolling update strategy
+- PodDisruptionBudget
+- Topology spread constraints
+- Observability
+
+## 10. PLANNED CHANGES AND IN-PROGRESS WORK
+- Commented-out code blocks
+- Unused dependencies
+- Feature flags
+- TODO / FIXME references
+- Configured properties never used
+
+## 11. CONFIDENCE ASSESSMENT
+For each section state:
+- Confidence: High / Medium / Low
+- Basis: direct source evidence / inferred /
+  not determinable from source alone
+  
+
+ NotificationOrchestrator
+ 
+Provide a deep technical research report on the
+NotificationOrchestrator component. This is the
+central outbound routing hub — it consumes from
+outgoing-events and routes each event to the
+correct outbound Kafka topic or database table.
+The routing logic is code-defined with no
+configuration table. I need the deepest possible
+architecture-level detail. For each section, if
+something is not implemented or not visible in
+source, say so explicitly.
+
+## 1. PRIMARY RESPONSIBILITY
+What this component does in 2-3 sentences.
+What it explicitly does NOT do. Confirm it does
+NOT publish to internal-integration-events —
+that topic is published only by AcceptService
+and ContestService. Is this a standalone service
+or shared codebase.
+
+## 2. KAFKA CONFIGURATION
+- Topic consumed — exact topic name
+- Consumer group ID — exact value
+- Partition key expected
+- Offset commit strategy — auto or manual,
+  exactly when committed relative to all
+  routing and writes completing
+- AckMode — exact Spring Kafka AckMode value
+- Concurrency — number of consumer threads
+- Auto offset reset policy
+- Max poll records and max poll interval ms
+- Authentication to AWS MSK
+- Deserializer and error handling on
+  bad payload
+
+## 3. MESSAGE STRUCTURE
+- Key fields in the inbound outgoing-event
+- Which fields drive routing decisions
+- Whether the event carries acquiring
+  platform, network, merchant, and
+  notification type information
+
+## 4. ROUTING LOGIC — CRITICAL SECTION
+This is the most important section. Describe
+in full detail:
+- The complete routing decision tree — every
+  condition and its target output
+- For each route, what is the condition that
+  triggers it and what is the exact target:
+  - external-request-events topic
+  - core-request-events topic
+  - case-action-events (expiry) topic
+  - file_notifications DB table
+  - any other targets found in source
+- Whether routing is based on a switch/if
+  chain, a configuration map, a strategy
+  pattern, or something else
+- What happens when no routing rule matches
+  an event — is it logged, dead-lettered,
+  or silently dropped
+- Whether a single event can be routed to
+  multiple targets simultaneously
+
+## 5. KAFKA PUBLISHING
+For each Kafka topic this component publishes to:
+- Exact topic name
+- Partition key used on publish
+- Message structure — key fields in the
+  published event
+- Whether the message is transformed or
+  passed through as-is from the inbound event
+- Delivery guarantee — at-least-once or
+  exactly-once
+- What happens if the Kafka publish fails
+
+## 6. FILE_NOTIFICATIONS DB WRITE
+- Exact schema and table name
+- Key columns written
+- When this write is triggered vs Kafka publish
+- Transaction boundary — is this write in
+  the same transaction as the offset commit
+  or separate
+
+## 7. OUTBOX TABLE
+- Exact schema and table name for this
+  consumer's own outbox
+- Key columns — idempotency key, status,
+  error column, timestamps
+- Full status lifecycle
+- Transaction boundaries
+
+## 8. IDEMPOTENCY
+- Exact mechanism to detect a redelivered
+  message
+- Which field(s) form the idempotency key
+- What happens when a duplicate is detected
+- Gaps — scenarios where duplicate routing
+  or publishing can occur
+
+## 9. ERROR HANDLING AND RECOVERY
+- What happens when a routing target is
+  unavailable — Kafka broker down, DB down
+- Dead letter or error capture mechanism
+- Status written on failure — exact value
+- Whether failed messages are retried
+  automatically or need manual intervention
+- Maximum retry attempts
+- Operational visibility for failures
+
+## 10. ALL OUTBOUND DEPENDENCIES
+For each service, topic, or database written:
+- Name, URL or config key
+- Method and auth
+- Purpose and pipeline position
+- Retry strategy
+- Circuit breaker if present
+- Behaviour on unavailability
+
+## 11. CASE EXPIRY PUBLISHING
+This component publishes to case-action-events
+(expiry) which is consumed by
+CaseExpiryUpdateConsumer. Describe:
+- What triggers the expiry event publication
+- How expiry dates are calculated or
+  determined from the inbound event
+- Whether expiry is published immediately
+  or deferred
+
+## 12. SCALING AND DEPLOYMENT
+- Kubernetes resource type
+- Replica count — exact or placeholder
+- Memory limit and request
+- CPU limit and request
+- HPA — present or absent
+- Rolling update strategy
+- PodDisruptionBudget
+- Topology spread constraints
+- Observability
+
+## 13. PLANNED CHANGES AND IN-PROGRESS WORK
+- Commented-out routing paths
+- Unused dependencies in pom.xml
+- Any planned new routing targets —
+  especially EDIA consumer integration
+- Feature flags
+- TODO / FIXME references
+- Configured properties never used
+
+## 14. CONFIDENCE ASSESSMENT
+For each section state:
+- Confidence: High / Medium / Low
+- Basis: direct source evidence / inferred /
+  not determinable from source alone

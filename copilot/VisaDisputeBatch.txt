@@ -1,0 +1,1373 @@
+Extract accurate and exact text from images
+
+6:21 PM
+
+Orchestrated systematic extraction across multiple images
+Orchestrated systematic extraction across multiple images
+Here is the extracted text from all 17 images:
+
+Image 1
+# Deep Technical Research Report: `gcp-visa-disputes-processor-batch`
+
+**Artifact:** `com.wp.gcp:visa-disputes-processor-batch` v1.2.5
+**Runtime:** Spring Boot 3.5.3 / Spring Batch / Java 17
+**Repository root:** `C:\workspace-intel\wdp\gcp-visa-disputes-processor-batch`
+
+---
+
+## Executive Summary
+
+`gcp-visa-disputes-processor-batch` is a Spring Batch application that polls Visa's RTSI (Real-Time Settlement Interface) batch queues on a cron schedule, processes incoming dispute lifecycle events, enriches them against several internal WDP APIs, and writes structured case events to a PostgreSQL transactional outbox table (`wdp.chbk_outbox_row`) for downstream Kafka publishing. There is exactly **one Spring Batch Job** with **one Step** that processes all seven configured Visa queues sequentially within a single execution. The application is deployed as a **Kubernetes Deployment** (not a CronJob); the embedded `@Scheduled` cron drives execution.
+
+---
+
+## Architecture Overview
+
+┌─────────────────────────────────────────────────────────────┐
+│              Kubernetes Deployment                          │
+│         gcp-visa-disputes-processor-batch                   │
+│                                                             │
+│  @Scheduled(cron = "${app.scheduler.cron}")  BatchScheduler │
+│           └──▶ JobLauncher.run(visaDisputesProcessorJob)    │
+│                                                             │
+│  BatchItemReader ──▶ BatchItemProcessor ──▶ BatchItemWriter │
+│                                                             │
+│  Iterates all    1. IDP Token          1. Duplicate check vs│
+│  configured      2. QueueStatus rules     chbk_outbox_row   │
+│  queues via      3. HyperSearch        2. Save to           │
+│  Visa RTSI API   4. PIN validation        chbk_outbox_row   │
+│                  5. Case lookup        3. MarkAsRead on Visa │
+│                  6. Map create/update     RTSI              │
+│                  7. PAN encrypt                             │
+└─────────────────────────────────────────────────────────────┘
+         ↓                    ↓                    ↓
+Visa RTSI (DataPower)   Internal WDP APIs    PostgreSQL (RDS)
+- GetBatchQueue         - wdp-idp-token-service   wdp.chbk_outbox_row
+- HyperSearch           - mdvs-gcp-rules-service
+- MarkAsRead            - mdvs-gcp-case-search
+- PreArbDetail          - wdp-encryption-service
+- VisaTransSearch       - gcp-api-log-service
+Image 2
+- VisaTransSearch       - gcp-api-log-service
+
+---
+
+## 1. RESPONSIBILITY
+
+### What the Job Does
+
+This batch application polls Visa's RTSI batch queues for inbound dispute lifecycle events across seven queue types (first chargebacks, pre-arbitrations, arbitrations, acceptances, recalls, pre-compliances, and compliances). For each queued item, it determines whether to create a new WDP dispute case or update an existing one, maps the Visa dispute data to a WDP `CaseEvent`, encrypts the PAN, and persists the result to the `wdp.chbk_outbox_row` transactional outbox. It then calls Visa RTSI to mark the item as read/consumed from the queue for eligible platforms.
+
+### What the Job Explicitly Does NOT Do
+
+- It does **not** process Mastercard disputes (only Visa `networkId` values are filtered in)[^1].
+- It does **not** directly publish to Kafka; it writes to a transactional outbox (`chbk_outbox_row`) with status `PENDING` — a separate downstream process handles actual Kafka publishing[^2].
+- It does **not** send dispute responses or updates back to Visa (only acknowledgement via mark-as-read).
+- It does **not** handle merchant-side transaction lookup from a WDP internal database; the transaction lookup service call is commented out in the processor[^3].
+- It does **not** manage dispute outcomes (accept/deny) — only inbound queue ingestion.
+
+### Single Job vs Multiple Jobs
+
+There is **one Spring Batch Job** (`visaDisputesProcessorJob`) with **one Step** (`processVisaDisputesProcessorBatchStep`). The `BatchItemReader` iterates through all queues in the configured `queueNameList` sequentially within a single job execution — not as separate steps or jobs[^4].
+
+---
+
+## 2. VISA QUEUES
+
+### Queue Enumeration
+
+All queue names are defined in `QueueName.java`[^5]:
+
+| Enum Constant    | Queue Name (BatchQueueType value)    | Dispute Lifecycle Stage              |
+|------------------|--------------------------------------|--------------------------------------|
+| `FIRSTCHARGEBACK`| `AWAITING_ACTION_BQ_DISPUTE`         | First chargeback — acquirer must respond |
+| `PREARB`         | `AWAITING_ACTION_BQ_PRE_FILING`      | Pre-arbitration filing pending       |
+| `ARB`            | `INCOMING_BQ_ARBITRATIONS`           | Incoming arbitration filing          |
+| `ACCEPT`         | `INCOMING_BQ_ACCEPTANCES_RECEIVED`   | Issuer acceptance of chargeback      |
+| `RECALL`         | `INCOMING_BQ_RECALLS`                | Issuer recall request                |
+| `PRECOMP`        | `INCOMING_BQ_PRECOMPLIANCES`         | Incoming pre-compliance              |
+| `COMP`           | `INCOMING_BQ_COMPLIANCES`            | Incoming compliance filing           |
+
+### Per-Queue Details
+
+**AWAITING_ACTION_BQ_DISPUTE (FIRSTCHARGEBACK)**
+- Represents the initial chargeback stage where the acquirer has items requiring a response.
+- Dispute stage assigned by rules service (returned from `queueStatusRulesResponse.getDisputeStage()`).
+- Create case mapped via `mapFirstChargeBackCreateCaseRequest()`[^6].
+Image 3
+- Dispute stage assigned by rules service (returned from `queueStatusRulesResponse.getDisputeStage()`).
+- Create case mapped via `mapFirstChargeBackCreateCaseRequest()`[^6].
+
+**AWAITING_ACTION_BQ_PRE_FILING (PREARB)**
+- Pre-arbitration phase — acquirer must decide to accept or contest.
+- Special handling: calls `ProcessorUtil.getDisputeId()` to extract the `disputeId` from HyperSearch response and sets it on `ProcessedItem`[^7].
+- Dispute stages for PAR (pre-arb), FAR (pre-arb response), PAA (pre-arb accept) are configured values[^8].
+- Create case mapped via `mapPreArbCreateCaseRequest()`[^6].
+
+**INCOMING_BQ_ARBITRATIONS (ARB)**
+- Incoming arbitration filings from issuer.
+- Create case mapped via `mapArbCreateCaseRequest()`[^6].
+
+**INCOMING_BQ_ACCEPTANCES_RECEIVED (ACCEPT)**
+- Acknowledgement that issuer has accepted the chargeback.
+- Create case mapped via `mapAcceptCreateCaseRequest()`[^6].
+
+**INCOMING_BQ_RECALLS (RECALL)**
+- Issuer recall of a previously filed dispute.
+- **Bypasses the duplicate-check logic** in the writer (RECALL queue is explicitly excluded)[^9].
+- Create case mapped via `mapRecallCreateCaseRequest()`[^6].
+
+**INCOMING_BQ_PRECOMPLIANCES (PRECOMP)**
+- Pre-compliance filings.
+- Case lookup filters responses to only those with `StageCode = APC`[^10].
+- `precomplanceRecordType = APC` configured[^8].
+- Create case mapped via `mapPreCompCreateCaseRequest()`[^6].
+
+**INCOMING_BQ_COMPLIANCES (COMP)**
+- Compliance filings.
+- Most complex case lookup logic: distinguishes between open cases (filtered by `recordType` matching `disputeStage`) and closed cases (filtered by `ACTIONCODELIST = [PCMP, MDEL, WDNL, RCAL]` with `StageCode = APC`)[^11].
+- Create case mapped via `mapCompCreateCaseRequest()`[^6].
+
+### How the Reader Determines Which Queue to Poll
+
+The reader holds a `queueNameList` injected from `props.getBatchProperties().getQueueNameList()` which is populated from the environment variable `${queue_name_list}` in `application.yml`[^12]. On `@BeforeStep`, it sets `nextQueueSeq = 0` and calls `retrieveQueueItems()`. On each `read()` call, it returns items from the current queue. When items are exhausted, it increments `nextQueueSeq` and loads the next queue — continuing until all queues are drained[^13].
+
+If a queue returns empty (status code `I-300600000`), the exception causes the reader to advance to the next queue without failing the job[^14].
+
+---
+
+## 3. TRIGGER AND SCHEDULE
+
+### Trigger Mechanism
+
+The job is triggered by **Spring's `@Scheduled` annotation** with a cron expression externalized to the environment variable `${scheduler_cron}`[^15]:
+```java
+```
+
+---
+
+## Image 4
+The job is triggered by Spring's @Scheduled annotation with a cron expression externalized to the environment variable ${scheduler_cron}[^15]:
+
+java
+@Scheduled(cron = "${app.scheduler.cron}")
+public BatchStatus run() { ... }
+This is a single shared schedule for all queues — one cron invocation launches one job execution that processes all queues sequentially.
+
+Schedule Configuration Location
+In application.yml[^12]:
+
+yaml
+app:
+  scheduler:
+    cron: ${scheduler_cron}
+The actual cron expression is injected at runtime via Kubernetes secrets (environment variable scheduler_cron).
+
+Spring Batch is configured with spring.batch.job.enabled: false[^12] to prevent the job from auto-running at startup; all execution is driven by BatchScheduler.
+
+Kubernetes Deployment Type
+resources.yaml declares kind: Deployment — this is a Kubernetes Deployment, not a CronJob[^16]:
+
+yaml
+apiVersion: {{ deploymentApiVersion }}
+kind: Deployment
+metadata:
+  name: gcp-visa-disputes-processor-batch
+spec:
+  replicas: {{ replicas-gcp-visa-disputes-processor-batch }}
+A long-running pod runs continuously, and the embedded cron scheduler fires the batch job at the configured interval. The pod uses rolling update strategy with maxUnavailable: 0.
+
+4. INBOUND DEPENDENCIES
+4.1 Visa RTSI APIs (via DataPower Gateway)
+All RTSI calls go through VisaRTSIServiceImpl using dataPowerRestInvoker with vantiveLicense as the bearer token[^17]. The URL base variables are all externalized (e.g., ${batch_queue_url}).
+
+Get Batch Queue — batchQueueUrl
+Config key	app.rtsiService.batchQueueUrl / env var ${batch_queue_url}
+HTTP method	POST
+
+---
+
+## Image 5
+| Config key | app.rtsiService.batchQueueUrl / env var ${batch_queue_url} | | HTTP method | POST | | Auth | vantiveLicense (static license key as Authorization header) |
+
+Request structure (SIGetBatchQueueRequest):
+
+json
+{
+  "RequestHeader": { ... },
+  "RequestData": {
+    "BatchQueueType": "AWAITING_ACTION_BQ_DISPUTE",
+    "PageNum": 1
+  }
+}
+Response structure (SIGetBatchQueueResponse → GetBatchQueueResponseData):
+
+json
+{
+  "ResponseData": {
+    "BatchQueueType": "...",
+    "Queue": {
+      "FormatDQueueItem": [
+        {
+          "BatchQueueItemSID": 12345,
+          "VisaCaseNumber": "...",
+          "CaseStatus": "...",
+          "DateToRespond": "...",
+          "DisputeAmt": { "value": "...", "currency": "..." },
+          "AccountNumber": "...",
+          "ARN": "...",
+          "NetworkID": "0001",
+          "InternalId": { ... },
+          "DCCode": "..."
+        }
+      ]
+    },
+    "PageInfo": { "TotalPages": 3 }
+  },
+  "StatusList": [ { "Code": "...", "Message": "..." } ]
+}
+Pagination: The reader fetches all pages — starts at pageNum=1, reads TotalPages from PageInfo, then iterates[^17].
+
+Empty queue handling: Status code I-300600000 (configured as emptyQueueCode) indicates an empty queue. The reader catches this and advances to the next queue[^14].
+
+Filtering: Responses are filtered by visaDisputeNetworkIds (e.g., Visa-only network IDs). If readSpecificItemFromQueue=true, further filtered by visaDisputeCaseNumbers[^17].
+
+
+---
+
+## Image 6
+HyperSearch — hyperSearchUrl
+Config key	app.rtsiService.hyperSearchUrl / env var ${hyper_search_url}
+HTTP method	POST
+Auth	vantiveLicense
+Request: SIHyperSearchRequest with CaseMatchingInfo.VisaCaseNumber = networkCaseNumber[^18].
+
+Response: Rich case details including account number, acquirer BIN, dispute IDs, transaction details, filing item IDs. Mapped to HyperSearchDetail by ProcessorUtil.processHyperSearchResponse()[^19]. Key fields extracted:
+
+disputeId, disputePreArbId, disputePreArbResponseId
+disputePreCompId, disputePreCompResponseId, rfcId
+disputeFilingItemId (for Arbitration type), disputeCompId (for Compliance type)
+transactionId, transactionAmount, tranDate, transactionReferenceNumber
+reasonCode, fraudClassification, daysToAct
+Error handling: Null or empty response throws ServiceException, converted to LoggingException, which is caught in the processor and returns null (item skipped)[^20].
+
+Mark As Read — markAsReadUrl
+Config key	app.rtsiService.markAsReadUrl / env var ${mark_as_read_url}
+HTTP method	POST
+Auth	vantiveLicense
+Request: SIMarkBatchQueueItemAsReadRequest with array of BatchQueueItemSID values[^21].
+
+When called: Only for PIN platform items (or CORE when coreDataNeedToMigrate=true) and only if removeItemFromQueueDisabled=false[^22].
+
+Pre-Arb Detail — prearbDetailUrl
+Config key	app.rtsiService.prearbDetailUrl / env var ${prearb_detail_url}
+HTTP method	POST
+Auth	vantiveLicense
+Used in getDisputeDetail() when disputeStage = PAB. Returns CaseHistorySummary, DisputeAsImageResponseDescriptor, DisputeImageAttachment, and image list[^23]. Note: The getDisputeDetail() call is currently commented out in the processor[^3].
+
+
+---
+
+## Image 7
+| Auth | vantiveLicense |
+
+Used in getDisputeDetail() when disputeStage = PAB[^23]. Note: Also currently not invoked (commented out in processor).
+
+Pre-Arb Response Detail — prearbResponseDetailUrl
+Config key	app.rtsiService.prearbResponseDetailUrl / env var ${prearb_response_detail_url}
+HTTP method	POST
+Auth	vantiveLicense
+Used in getDisputeDetail() when disputeStage = PAB[^23]. Note: Also currently not invoked (commented out in processor).
+
+Visa Transaction Search — visaTransSearchUrl
+Config key	app.rtsiService.visaTransSearchUrl / env var ${visa_transaction_url}
+HTTP method	POST
+Auth	vantiveLicense
+Request: VisaTransReq with RequestData combining VisaCaseNumber and RequestHeader[^24].
+
+Response: VisaTransResp with ResponseData.PinnedTransactionDetails.CardholderIdMethodCode[^25].
+
+When called: Only for networkId = 0002 (PIN network) items. Used to determine platform routing — if CardholderIdMethodCode = "2", the item is a valid PIN transaction[^26].
+
+4.2 Internal WDP Services
+All internal service calls use Bearer token authentication with the IDP token obtained from wdp-idp-token-service.
+
+IDP Token Service
+Dev URL	http://wdp-idp-token-service-develop.gcp-ff:8082/merchant/gcp/idp-token/token
+Prod URL	http://wdp-idp-token-service.wdp-micro:8082/merchant/gcp/idp-token/token
+HTTP method	GET
+Auth	None (unauthenticated — internal network only)
+Called once per item via IdpTokenServiceImpl.getIdpToken(). Returns IdpTokenResponse.tokenValue used as Bearer token for all other internal service calls[^27].
+
+
+---
+
+## Image 8
+| HTTP method | GET | | Auth | None (unauthenticated — internal network only) |
+
+Called once per item via IdpTokenServiceImpl.getIdpToken(). Returns IdpTokenResponse.tokenValue used as Bearer token for all other internal service calls[^27].
+
+Queue Status Rules — queueStatusUrl
+Dev URL	http://mdvs-gcp-rules-service-develop.gcp-ff:8082/merchant/gcp/rules/queue-status/skip
+Prod URL	http://mdvs-gcp-rules-service.wdp-micro:8082/merchant/gcp/rules/queue-status/skip
+HTTP method	POST
+Auth	Bearer IDP token
+Request: QueueStatusRulesRequest with caseStatus and queueName[^28].
+
+Response: QueueStatusRulesResponse with:
+
+isSkippable — if "YES", the item is skipped (not processed, not written, but marked as read)
+disputeStage — assigned dispute stage for the item
+Error handling: If no matching rule exists, the rules service returns an error message matching ExceptionMessages.RULE_NOT_FOUND. The service impl catches this and throws a LoggingException(empty=true, ...), which the processor treats as "skip reason: noQueueStatusRuleFound"[^29].
+
+Case Lookup — caseLookupUrl
+Dev URL	http://mdvs-gcp-case-search-service-develop.gcp-ff:8082/merchant/gcp/case-search/{platform}/case/lookup
+Prod URL	http://mdvs-gcp-case-search-service.wdp-micro:8082/merchant/gcp/case-search/{platform}/case/lookup
+HTTP method	GET
+Auth	Bearer IDP token
+Query params	networkCaseID, cardNetwork
+Returns List<CaseLookupResponse>. Used to determine if a WDP case already exists for the dispute. Behaviour is queue-specific (PRECOMP filters by APC, COMP has open/closed logic)[^10][^11].
+
+If caseNumber is blank in the response, a new case create path is taken. If populated, an update path is taken[^30].
+
+Encryption Service — encryptionUrl
+Dev URL	http://wdp-encryption-service-develop.gcp-ff:8082/merchant/gcp/encryption/v1/pan/encrypt
+Prod URL	http://wdp-encryption-service.wdp-micro:8082/merchant/gcp/encryption/v1/pan/encrypt
+HTTP method	POST
+Auth	Bearer IDP token
+
+---
+
+## Image 9
+| Prod URL | http://wdp-encryption-service.wdp-micro:8082/merchant/gcp/encryption/v1/pan/encrypt | | HTTP method | POST | | Auth | Bearer IDP token |
+
+Request: EncryptionRequest with pan = caseEvent.getAccountNumber()[^31]. Response: EncryptionResponse with hpan (hashed/encrypted PAN)[^31].
+
+Called only when caseEvent.getAccountNumber() is not blank. The returned hpan replaces the plain PAN on the CaseEvent before it is written to the outbox.
+
+API Log Service — apiLogUrl
+Dev URL	http://gcp-api-log-service-develop.gcp-ff:8082/merchant/gcp/api-log/log
+Prod URL	http://gcp-api-log-service.wdp-micro:8082/merchant/gcp/api-log/log
+HTTP method	POST
+Auth	Bearer IDP token
+Invoked by ErrorLoggingAspect via AOP @AfterThrowing on any LoggingException thrown in the application package. Sends an ApiLogRequest with platform, network, networkCaseId, caseNumber, errorInfo (up to 10,000 chars of stack trace)[^32]. Not called for normal success paths.
+
+Transaction Lookup — transactionUrl (currently inactive)
+Dev URL	http://gcp-merchant-transaction-service-develop.gcp-ff:8082/merchant/gcp/merchant-transaction/case/{platform}/transaction/search
+Prod URL	http://gcp-merchant-transaction-service.wdp-micro:8082/merchant/gcp/merchant-transaction/case/{platform}/transaction/search
+HTTP method	POST
+Auth	Bearer IDP token
+This call is commented out in BatchItemProcessor[^3]. It was used for transaction lookup to determine PIN vs CORE platform routing. Replaced by the Visa Transaction Search API for networkId=0002 items.
+
+5. PROCESSING LOGIC
+For each QueueReaderItem (queue name + QueueItem), the BatchItemProcessor executes the following pipeline:
+
+Step 1: Initial Mapping
+Maps queue item fields into a ProcessedItem builder with config-loaded values (userId, dispute stages, currency code, etc.)[^33]. Platform is initially set based on networkId:
+
+networkId = VISA → platform CORE
+networkId = 0002 → platform PIN
+Step 2: IDP Token Acquisition
+Calls IdpTokenService.getIdpToken() to obtain a Bearer token used for all internal WDP API calls[^34].
+
+
+---
+
+## Image 10
+networkId = VISA → platform CORE
+networkId = 0002 → platform PIN
+Step 2: IDP Token Acquisition
+Calls IdpTokenService.getIdpToken() to obtain a Bearer token used for all internal WDP API calls[^34].
+
+Step 3: Queue Status Rules Check
+Calls DisputeRulesService.getQueueStatusRulesSkipFlag() with platform, queueName, caseStatus, networkCaseNumber[^35].
+
+If isSkippable = YES — sets processedItem.skipCase = true and skipReason = QUEUE_STATUS_RULE_SKIP_FOUND, returns item (no further processing).
+If no rule found (empty LoggingException) — sets skipCase = true, skipReason = QUEUE_STATUS_RULE_NOT_FOUND, returns item.
+Otherwise, extracts disputeStage from response and sets it on processedItem.
+Step 4: HyperSearch
+Calls VisaRTSIService.getHyperSearchDetail() to retrieve enriched Visa case details[^18]. The response populates dispute IDs, transaction details, merchant info, document lists.
+
+Step 5: PIN Validation (networkId = 0002 only)
+For items with networkId = 0002[^26]: Calls visaRTSIService.searchVisaTransaction() to get CardholderIdMethodCode.
+
+If code = "2" → sets platform to PIN, continues.
+If code ≠ "2" and coreDataNeedToMigrate = true → sets platform to CORE, continues.
+Otherwise → returns null (item skipped, not marked as read).
+Step 6: Migration Status
+Sets processedItem.migrationStatus = "Y" (hardcoded)[^36].
+
+Step 7: Case Lookup
+Calls DisputeService.searchDisputeCases() which GETs from mdvs-gcp-case-search-service[^37]. Logic branches:
+
+Blank caseNumber — new case path, calls prepareCreateCaseRequest().
+Populated caseNumber — update case path, calls ProcessorUtil.mapUpdateCaseRequest().
+For PRECOMP: filters case lookup results to StageCode = APC[^10]. For COMP: complex open/closed logic using recordType derived from disputeStage (ACF=apcCaseLookupDisputeStages, APC=acfCaseLookupDisputeStages)[^11].
+
+Step 8: PAN Encryption
+If caseEvent.getAccountNumber() is not blank, calls DisputeService.panEncryption() → wdp-encryption-service[^31]. The hpan response replaces accountNumber in CaseEvent.
+
+Step 9: Return ProcessedItem
+Returns the populated ProcessedItem to the writer.
+
+Queue-Specific Create Case Mapping (via ProcessorUtil)
+Queue	Create Method	Key Identifiers Used
+FIRSTCHARGEBACK	mapFirstChargeBackCreateCaseRequest()	disputeId, transactionId
+PREARB	mapPreArbCreateCaseRequest()	disputeId, disputePreArbId, disputeStage
+ARB	mapArbCreateCaseRequest()	disputeFilingItemId (Arbitration type)
+ACCEPT	mapAcceptCreateCaseRequest()	disputeResponseId
+RECALL	mapRecallCreateCaseRequest()	rfcId
+COMP	mapCompCreateCaseRequest()	disputeCompId, disputeFilingItemId
+PRECOMP	mapPreCompCreateCaseRequest()	disputePreCompId
+
+---
+
+## Image 11
+| COMP | mapCompCreateCaseRequest() | disputeCompId, disputeFilingItemId | | PRECOMP | mapPreCompCreateCaseRequest() | disputePreCompId |
+
+6. OUTBOUND — WHAT IT WRITES
+6.1 PostgreSQL Outbox Table: wdp.chbk_outbox_row
+Schema: wdp | Table: chbk_outbox_row | Entity: ChbkOutboxEntity[^38]
+
+Column	Type	Description
+id	BIGINT	(PK, sequence WDP.CHBK_OUTBOX_ROW_ID_SEQ) Auto-generated ID
+c_ntwk_case_id	VARCHAR	Visa case number (networkCaseId)
+c_ntwk_phase_id	VARCHAR	Phase ID (networkPhaseId) — used for duplicate check
+c_case_stage	VARCHAR	Dispute stage — used for duplicate check
+c_acq_platform	VARCHAR	Platform (PIN or CORE)
+c_case_ntwk	VARCHAR	Card network (VISA)
+l_ntwk_tran_id	VARCHAR	Network transaction ID
+@payload	JSONB	Full CommonEvent serialized as JSON
+status	VARCHAR	PENDING, SKIPPED, or ERROR
+event_type	VARCHAR	Always WDP-INBOUND-EVENT
+kafka_topic	VARCHAR	Target Kafka topic (set by downstream publisher)
+kafka_partition	VARCHAR	Populated by downstream publisher
+kafka_offset	VARCHAR	Populated by downstream publisher
+retry_count	INT	Retry counter (managed by downstream)
+created_at, updated_at	TIMESTAMP	Audit timestamps
+created_by, updated_by	VARCHAR	Audit user
+document_type	VARCHAR	Document type
+source_event	VARCHAR	Source event identifier
+Statuses written by this batch:
+
+PENDING — successfully mapped event ready for Kafka publication
+SKIPPED — duplicate detected (same networkCaseId + networkPhaseId + disputeStage)
+ERROR — missing data prevented duplicate check
+No direct Kafka publishing. This batch writes to the outbox only. A separate downstream process (Kafka publisher) reads PENDING rows and publishes to Kafka, updating status, kafka_topic, kafka_partition, and kafka_offset[^2].
+
+6.2 Visa RTSI MarkAsRead Call
+Called via visaRTSIService.markBatchQueueItemAsRead() to acknowledge item consumption. Gated by:
+
+removeItemFromQueueDisabled = false (config flag)[^22]
+Platform is PIN, OR platform is CORE AND coreDataNeedToMigrate = true[^22]
+Items for CORE platform (where coreDataNeedToMigrate = false) are intentionally not marked as read, allowing a separate "core processor" to consume them.
+
+6.3 PAN Encryption
+The plain accountNumber (PAN) in CaseEvent is replaced with hpan returned by wdp-encryption-service before any persistence. This happens in the processor, before the item reaches the writer[^31]. The encryption service is a dedicated internal microservice; the batch itself performs no encryption — it delegates entirely.
+
+
+---
+
+## Image 12
+The plain accountNumber (PAN) in CaseEvent is replaced with hpan returned by wdp-encryption-service before any persistence. This happens in the processor, before the item reaches the writer[^31]. The encryption service is a dedicated internal microservice; the batch itself performs no encryption — it delegates entirely.
+
+7. ERROR HANDLING
+Retry Strategy
+RestInvoker.post() is annotated with Spring Retry[^39]:
+
+java
+@Retryable(
+  retryFor = {Exception.class},
+  maxAttemptsExpression = ApplicationConstants.RETRY_COUNT,  // *3*
+  backoff = @Backoff(delayExpression = ApplicationConstants.RETRY_DELAY)  // *2000* ms
+)
+Max attempts: 3 (1 original + 2 retries)
+Delay between retries: 2,000 ms (2 seconds)
+Retries on: Any Exception
+This applies to all internal WDP service calls. RTSI calls (dataPowerRestInvoker) also go through RestInvoker.post() and benefit from the same retry.
+
+DisputeServiceImpl.transactionLookup() has explicit retry-count awareness: on retryCount < 2, re-throws ServiceException (triggering another retry); on final attempt (count ≥ 2), throws LoggingException to log and skip[^40].
+
+AOP Error Logging
+An @AfterThrowing aspect on LoggingException persists error details to the gcp-api-log-service API log, capturing networkCaseNumber, platform, cardNetwork, and up to 10,000 characters of stack trace[^32].
+
+Item-Level Isolation
+Processor: Exceptions are caught per item — the processor catches both LoggingException and Exception and returns null, skipping that item. One item failure does not stop the batch[^41].
+
+Writer: The writer iterates the chunk and wraps each item in a try/catch. However, the catch block calls break — stopping processing of the remaining items in the current chunk[^42]. Since chunk size = 1 (see below), this is effectively equivalent to skipping that item.
+
+Dead Letter / Error Tracking
+LoggingException (non-empty flag) — persisted to gcp-api-log-service via AOP aspect.
+Writer duplicate-check failures — ChbkOutboxEntity row with status = ERROR written to database.
+No dedicated DLQ or dead letter queue mechanism; failed items (returning null from processor) are simply not written.
+Chunk Size and Transaction Boundary
+Chunk size = 1, configured in application.yml[^12]:
+
+yaml
+app:
+Image 13
+Chunk size = **1**, configured in `application.yml`[^12]:
+```yaml
+app:
+  batchProperties:
+    chunk: 1
+```
+
+With chunk size 1, each item is processed and written in its own transaction. The `wdpTransactionManager` (PostgreSQL JPA) manages the transaction boundary. This means every outbox row is committed individually.
+
+---
+
+## 8. IDEMPOTENCY
+
+### Duplicate Check in Writer
+
+The writer performs a database lookup before saving any non-RECALL queue item[^43]:
+```java
+List<ChbkOutboxEntity> outboxEntities = chbkOutboxService.fetchRequiredChbkOutboxEntity(
+  caseEvent.getNetworkCaseId(),
+  caseEvent.getNetworkPhaseId(),
+  caseEvent.getDisputeStage()
+);
+```
+
+The JPQL query:
+```sql
+SELECT C FROM ChbkOutboxEntity C
+WHERE C.networkCaseId = :networkCaseId
+  AND C.networkPhaseId = :networkPhaseId
+  AND C.caseStage = :disputeStage
+```
+
+If a match is found, the event is saved with `status = SKIPPED` instead of `PENDING`, and the item is still marked as read on Visa RTSI.
+
+### RECALL Queue Bypass
+
+The RECALL queue **explicitly skips the duplicate check**[^9]:
+```java
+if (!QueueName.RECALL.getValue().equalsIgnoreCase(item.getQueueName())) {
+  // duplicate check...
+}
+```
+
+No idempotency protection for RECALL queue items.
+
+### Missing Data Path
+
+If `networkPhaseId` or `networkCaseId` or `disputeStage` is blank, the duplicate check cannot be performed. The writer saves the row with `status = ERROR` and a log message "Unable to perform duplicate check due to missing data."[^44]
+
+### Queue-Side Deduplication Gaps
+Image 14
+### Queue-Side Deduplication Gaps
+
+- If the job is restarted before `markAsRead` is called (e.g., pod crash), items not yet marked as read will be re-polled from Visa RTSI.
+- For CORE platform items (where `markAsRead` is skipped), items will be polled again on the next run.
+- The chbk duplicate check (`networkPhaseId + disputeStage`) is the **primary safeguard** against re-processing if Visa queues are polled twice.
+- **No Spring Batch `JobRepository`-level idempotency** mechanism is visible in the job configuration that would prevent the same item from being re-read. Each job execution is uniquely identified by a timestamp parameter[^45].
+
+---
+
+## Key Repositories Summary
+
+| Component       | Class/File                    | Path                                                                 |
+|-----------------|-------------------------------|----------------------------------------------------------------------|
+| Scheduler       | `BatchScheduler`              | `src/.../scheduler/BatchScheduler.java`                             |
+| Job config      | `JobConfiguration`            | `src/.../job/config/JobConfiguration.java`                          |
+| Reader          | `BatchItemReader`             | `src/.../job/BatchItemReader.java`                                  |
+| Processor       | `BatchItemProcessor`          | `src/.../job/BatchItemProcessor.java`                               |
+| Writer          | `BatchItemWriter`             | `src/.../job/BatchItemWriter.java`                                  |
+| Queue names     | `QueueName` (enum)            | `src/.../enums/QueueName.java`                                      |
+| RTSI calls      | `VisaRTSIServiceImpl`         | `src/.../service/impl/VisaRTSIServiceImpl.java`                     |
+| Internal calls  | `DisputeServiceImpl`          | `src/.../service/impl/DisputeServiceImpl.java`                      |
+| Rules           | `DisputeRulesServiceImpl`     | `src/.../service/impl/DisputeRulesServiceImpl.java`                 |
+| Outbox entity   | `ChbkOutboxEntity`            | `src/.../us/Entity/ChbkOutboxEntity.java`                           |
+| Outbox repo     | `ChbkOutboxRepository`        | `src/.../us/repository/ChbkOutboxRepository.java`                   |
+| REST client     | `RestInvoker`                 | `src/.../restclient/RestInvoker.java`                               |
+| IDP client      | `IdpRestInvoker`              | `src/.../restclient/IdpRestInvoker.java`                            |
+| Field mapping   | `ProcessorUtil`               | `src/.../util/ProcessorUtil.java`                                   |
+| Logging         | `ErrorLoggingAspect`          | `src/.../aop/ErrorLoggingAspect.java`                               |
+| App config      | `ApplicationProps`            | `src/.../job/config/ApplicationProps.java`                          |
+| K8s manifest    | `resources.yaml`              | `resources.yaml`                                                    |
+
+---
+
+## Confidence Assessment
+
+| Finding                 | Confidence | Basis                                                                                    |
+|-------------------------|------------|------------------------------------------------------------------------------------------|
+| 7 queues, single job/step | **High** | `QueueName.java`, `JobConfiguration.java`, `BatchItemReader.java` — all source code     |
+| Cron schedule via env var | **High** | `application.yml`, `BatchScheduler.java`                                                |
+| Kubernetes Deployment (not CronJob) | **High** | `resources.yaml` explicitly states `kind: Deployment`                        |
+| Visa RTSI via DataPower, auth = vantiveLicense | **High** | `VisaRTSIServiceImpl.java`, `RestInvoker.getAuthToken()`             |
+| Chunk size = 1          | **High**   | `application.yml` hardcodes `chunk: 1`                                                  |
+| No direct Kafka publishing | **High** | `BatchItemWriter` writes to DB only; no `KafkaTemplate` injection                      |
+| PAN encrypted via wdp-encryption-service | **High** | `DisputeServiceImpl.panEncryption()`, `BatchItemProcessor`                |
+| Retry: 3 attempts, 2s delay | **High** | `ApplicationConstants.RETRY_COUNT = "3"`, `RETRY_DELAY = "2000"`, `@Retryable`        |
+| Duplicate check on chbk_outbox_row | **High** | `BatchItemWriter.java`, `ChbkOutboxRepository.fetchRequiredChbkOutboxEntity()`        |
+Image 15
+| Visa RTSI via DataPower, auth = vantiveLicense | **High** | `VisaRTSIServiceImpl.java`, `RestInvoker.getAuthToken()` |
+| Chunk size = 1          | **High**   | `application.yml` hardcodes `chunk: 1`                                  |
+| No direct Kafka publishing | **High** | `BatchItemWriter` writes to DB only; no `KafkaTemplate` injection      |
+| PAN encrypted via wdp-encryption-service | **High** | `DisputeServiceImpl.panEncryption()`, `BatchItemProcessor`       |
+| Retry: 3 attempts, 2s delay | **High** | `ApplicationConstants.RETRY_COUNT = "3"`, `RETRY_DELAY = "2000"`, `@Retryable` |
+| Duplicate check on chbk_outbox_row | **High** | `BatchItemWriter.java`, `ChbkOutboxRepository.fetchRequiredChbkOutboxEntity()` |
+| Actual cron expression value | **Low** | Externalized to env var `${scheduler_cron}` — not present in any config file in repo |
+| Kafka topic names       | **Low**    | The outbox `kafka_topic` column is present in the entity but is populated by downstream process, not this batch |
+| RTSI URL values for prod | **Medium** | All `batchQueueUrl`, `hyperSearchUrl`, etc. are externalized to env vars; only internal service URLs are hardcoded per profile |
+
+---
+
+## Footnotes
+
+[^1]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `filterVisaDisputes()` filters by `props.getBatchProperties().getVisaDisputeNetworkIds()`.
+
+[^2]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/us/entity/ChbkOutboxEntity.java` — `kafka_topic`, `kafka_partition`, `kafka_offset` columns present but written by downstream, not this batch.
+
+[^3]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — large block of transaction lookup code is commented out with `/* ... */` starting at the "hyper search call" comment.
+
+[^4]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/config/JobConfiguration.java` — single `Job` bean with single `.start(processingStep(...))` call; `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemReader.java` iterates queues internally.
+
+[^5]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/QueueName.java` — all 7 enum constants with their string values.
+
+[^6]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/ProcessorUtil.java` — `mapCreateCaseRequest()` dispatches to per-queue methods via `if/else if` on `QueueName`.
+
+[^7]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — `prepareCreateCaseRequest()` calls `ProcessorUtil.getDisputeId()` only when `queueName.equalsIgnoreCase(QueueName.PREARB.getValue())`.
+
+[^8]: `src/main/resources/application.yml` — `dispute-stage-prearb: PAR`, `dispute-stage-prearb-response: PAR`, `dispute-stage-prearb-accept: PAA`, `compliance-record-type: ACF`, `precompliance-record-type: APC`.
+
+[^9]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemWriter.java` — `if (!QueueName.RECALL.getValue().equalsIgnoreCase(item.getQueueName()))` gates the duplicate check.
+
+[^10]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/DisputeServiceImpl.java` — `searchDisputesForPreComp()` filters `actionList` by `ApplicationConstants.APC.equalsIgnoreCase(a.getStageCode())`.
+
+[^11]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/DisputeServiceImpl.java` — `searchDisputeCasesForComp()` full logic.
+
+[^12]: `src/main/resources/application.yml` — `chunk: 1`, `spring.batch.job.enabled: false`, `app.scheduler.cron: ${scheduler_cron}`, `queueNameList: ${queue_name_list}`.
+
+[^13]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemReader.java` — `searchQueueItems()` and `read()` methods showing sequential queue iteration.
+
+[^14]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemReader.java` — `retrieveQueueItems()` catch block increments `nextQueueSeq` and recurses; `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — empty queue detected via `props.getRtsiService().getEmptyQueueCode()`.
+
+[^15]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/scheduler/BatchScheduler.java` — `@Scheduled(cron = "${app.scheduler.cron}")`.
+
+[^16]: `resources.yaml` — `kind: Deployment`, `replicas: {{ replicas-gcp-visa-disputes-processor-batch }}`.
+
+[^17]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `getBatchQueueItems()`, pagination loop, `filterVisaDisputes()`.
+
+[^18]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `getHyperSearchDetail()`.
+Image 16
+[^17]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `getBatchQueueItems()`, pagination loop, `filterVisaDisputes()`.
+
+[^18]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `getHyperSearchDetail()`.
+
+[^19]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/ProcessorUtil.java` — `processHyperSearchResponse()`.
+
+[^20]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — outer try/catch returns `null` on `LoggingException` or `Exception`.
+
+[^21]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `markBatchQueueItemAsRead()`.
+
+[^22]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemWriter.java` — `processAndMarkQueueItemAsReadIfRequired()`.
+
+[^23]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `getDisputeDetail()` with `disputeStage` branching.
+
+[^24]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/rtsi/request/VisaTransReq.java`.
+
+[^25]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/rtsi/response/VisaTransResp.java`; `src/main/java/com/wp/gcp/visa/disputes/processor/batch/rtsi/response/PinnedTransactionDetails.java`.
+
+[^26]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — `isValidPinTransaction()` method.
+
+[^27]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/restclient/IdpRestInvoker.java`; `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/IdpTokenServiceImpl.java`.
+
+[^28]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/DisputeRulesServiceImpl.java` — `getQueueStatusRulesSkipFlag()`.
+
+[^29]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/DisputeRulesServiceImpl.java` — pattern match on `ExceptionMessages.RULE_NOT_FOUND` in catch block.
+
+[^30]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — `if (StringUtils.isBlank(caseLookupResponse.getCaseNumber()))` branching.
+
+[^31]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/DisputeServiceImpl.java` — `panEncryption()`; `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — call site.
+
+[^32]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/aop/ErrorLoggingAspect.java` — `@AfterThrowing` on `LoggingException`, truncates at `StringUtils.left(..., 10000)`.
+
+[^33]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — `mapProcessedItem()`.
+
+[^34]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — `String token = tokeService.getIdpToken(); processedItem.setIdpToken(token);`.
+
+[^35]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — queue status rules call and skip logic.
+
+[^36]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — `processedItem.setMigrationStatus("Y")`.
+
+[^37]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/DisputeServiceImpl.java` — `searchDisputeCases()`.
+
+[^38]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/us/Entity/ChbkOutboxEntity.java` — full entity definition with `@Table(name = "chbk_outbox_row", schema = "wdp")`.
+
+[^39]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/restclient/RestInvoker.java` — `@Retryable(retryFor = {Exception.class}, maxAttemptsExpression = ApplicationConstants.RETRY_COUNT, backoff = @BackOff(delayExpression = ApplicationConstants.RETRY_DELAY))`.
+
+[^40]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/DisputeServiceImpl.java` — `transactionLookup()` catch block using `RetrySynchronizationManager.getContext().getRetryCount()`.
+
+[^41]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — outer catch blocks return `null`.
+Image 17
+[^41]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — outer catch blocks return `null`.
+
+[^42]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemWriter.java` — `catch (Exception e) { log.error(...); break; }`.
+
+[^43]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/us/repository/ChbkOutboxRepository.java` — `fetchRequiredChbkOutboxEntity()` JPQL query.
+
+[^44]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemWriter.java` — `else { String logMessage = "Unable to perform duplicate check due to missing data."; ... ChbkOutboxStatus.ERROR }`.
+
+[^45]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/scheduler/BatchScheduler.java` — `new JobParametersBuilder().addString("date", date).toJobParameters()` uses timestamp to make each run unique.
+That is the complete and exact text from all 17 images. This is a deep technical research report on gcp-visa-disputes-processor-batch — the VisaDisputeBatch component in WDP.
+
+A few immediate observations from an architecture perspective worth flagging:
+
+Conflicts / gaps vs current WDP-COMPONENTS.md:
+
+The batch component entry in WDP-COMPONENTS.md currently has the repository marked as ⚠️ "To be confirmed" — this confirms it is gcp-visa-disputes-processor-batch v1.2.5
+WDP-COMPONENTS.md describes the polling interval as "every 2 minutes" — this report says the cron is externalized via K8s secret, so the actual interval is not visible in code
+The outbox write pattern, PAN encryption, and no-direct-Kafka-publish are all confirmed
+Want me to now propose how WDP-COMPONENTS.md should be updated with this information, using our Document Update Protocol?
+
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+photo.jpeg
+Extract accurate and exact text
+
+6:30 PM
+
+Orchestrated extraction of text from multiple images
+Orchestrated extraction of text from multiple images
+Here is the extracted text from all 13 images:
+
+Image 1
+# Continuation Research Report: `gcp-visa-disputes-processor-batch`
+
+**Supplement to:** `provide-a-deep-technical-research-report-on-this-s.md`
+**Artifact:** `com.wp.gcp:visa-disputes-processor-batch` v1.2.5
+**Repository root:** `C:\workspace-intel\wdp\gcp-visa-disputes-processor-batch`
+
+---
+
+## Executive Summary
+
+This report extends the prior deep-dive to cover volume/throughput characteristics, Kubernetes deployment topology, concurrency model, the full configuration catalogue, and a detailed inventory of commented-out code and deferred work. Key findings: there is **no rate limiting or throttling** implemented in the codebase; the replica count is an XL Deploy placeholder with no HPA; all queues are processed **strictly sequentially** in a single thread; and there is a **substantial body of commented-out code** (a full transaction lookup flow, a pre-arb dispute detail call, and several dead Kafka/fraud classes) indicating partially implemented or deferred features.
+
+---
+
+## 1. VOLUME AND THROUGHPUT
+
+### Expected Records per Queue per Run
+
+No explicit record count limits, expected volumes, or batch size caps are configured in code or config files. Volume is entirely determined by what Visa RTSI returns from each queue.
+
+### Page Size per Queue
+
+The RTSI `GetBatchQueue` API uses **server-driven pagination**. The batch requests page 1, reads `TotalPages` from `PageInfo`, and iterates through all pages until exhausted[^1]:
+```java
+int pageNum = 1;
+int totalPages = getBatchQueueItems(pageNum, queueItems, queueName);
+if (totalPages > 1) {
+  pageNum = pageNum + 1;
+  while (pageNum <= totalPages) {
+    getBatchQueueItems(pageNum, queueItems, queueName);
+    pageNum++;
+  }
+}
+```
+
+There is **no client-side page size configuration** — the page size is controlled by the Visa RTSI endpoint, not by this application. All pages for all 7 queues are fully loaded into memory before any processing begins for that queue.
+
+### Chunk Size per Queue
+
+Chunk size = **1** for all queues, hardcoded in `application.yml`[^2]:
+```yaml
+app:
+  batchProperties:
+    chunk: 1
+```
+Image 2
+yaml
+app:
+  batchProperties:
+    chunk: 1
+
+This is uniform — there is no per-queue chunk size configuration. Every individual `QueueReaderItem` is read, processed, and written in its own Spring Batch commit cycle.
+
+### Polling Frequency per Queue
+
+There is no per-queue polling frequency. All queues are polled in a single job execution, and the job execution frequency is controlled by the single cron expression `${scheduler_cron}`[^3]. All 7 queues are polled at the same rate. The actual cron expression is injected via Kubernetes secret and is not present in any committed config file.
+
+### Rate Limiting / Throttling on Visa API Calls
+
+**No rate limiting or throttling is implemented.** A search across all Java source files finds no use of `RateLimiter`, throttling annotations, sleep/delay calls between RTSI API requests, or circuit breaker patterns[^4]. The only pacing mechanism is the implicit serialization of one HTTP call at a time (sequential, single-threaded processing) and the Spring Retry backoff of 2,000 ms between retries on failures[^5].
+
+The `RestInvoker.post()` method is annotated with `@Retryable` for error recovery but there is no proactive rate control to stay within any Visa API quota[^5].
+
+### Confidence: **Low** for actual volumes (not determinable from source); **High** for page/chunk mechanics (direct source evidence).
+
+---
+
+## 2. SCALING AND DEPLOYMENT
+
+### Kubernetes Resource Type
+
+**`kind: Deployment`** — explicitly declared in `resources.yaml`[^6]. This is a long-running pod where an embedded `@Scheduled` cron fires the job at the configured interval. It is **not** a Kubernetes CronJob.
+
+### Pod Replica Count
+```yaml
+replicas: {{ replicas-gcp-visa-disputes-processor-batch }}
+```
+
+This is an **XL Deploy (Digital.ai Deploy) template placeholder**[^6]. The actual value is substituted at deployment time from the XL Deploy environment configuration. The source repository contains no hardcoded replica count and no environment-specific override in any Spring profile YAML.
+
+The Jenkinsfile confirms this repo uses XL Deploy: `deployXmlPath: 'deployit-manifest.xml'`[^7]. The manifest instructs XL Deploy to scan `resources.yaml` for placeholders (`<scanPlaceholders>true</scanPlaceholders>`)[^8].
+
+### Memory and CPU Limits/Requests
+
+From `resources.yaml`[^6]:
+
+| Resource | Type     | Value          |
+|----------|----------|----------------|
+| Memory   | limits   | `2048Mi` (2 GiB) |
+| Memory   | requests | `256Mi`        |
+| CPU      | limits   | **Not set**    |
+| CPU      | requests | **Not set**    |
+Image 3
+| Memory   | requests | `256Mi`        |
+| CPU      | limits   | **Not set**    |
+| CPU      | requests | **Not set**    |
+
+No CPU constraints are defined. The container has an 8:1 memory limit-to-request ratio. Without CPU limits, the pod is in the **Burstable** QoS class (not Guaranteed).
+
+### HPA / Autoscaling
+
+**No HPA (HorizontalPodAutoscaler) is configured.** There is no HPA manifest in the repository and no autoscaling annotations in `resources.yaml`[^6]. Scaling is entirely manual, controlled by the XL Deploy `replicas` placeholder.
+
+**Important implication:** If replicas > 1, multiple pod instances would each independently run the same cron schedule and attempt to poll the same Visa queues simultaneously. Spring Batch's `JobRepository` (PostgreSQL-backed) would serialize concurrent job executions for the same job name (by locking the job execution row), but **multiple replicas polling Visa queues in parallel is not protected against** at the application level.
+
+### Rolling Update Strategy
+
+From `resources.yaml`[^6]:
+```yaml
+strategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+  type: RollingUpdate
+minReadySeconds: 30
+```
+
+- **maxSurge: 1** — one extra pod may be created above the desired replica count during rollout.
+- **maxUnavailable: 0** — no pods are taken down until a new pod is fully ready.
+- **minReadySeconds: 30** — a new pod must be ready for at least 30 seconds before the old pod is terminated.
+
+This is a zero-downtime rolling strategy, though with a 30-second pod warmup gate.
+
+### PodDisruptionBudget
+
+**No PodDisruptionBudget (PDB) is defined** in the repository[^6]. There is no separate PDB manifest file.
+
+### Topology Spread Constraints
+
+**No topology spread constraints are defined** in `resources.yaml`[^6]. No node affinity, anti-affinity rules, or topologySpreadConstraints are configured.
+
+### OpenTelemetry
+
+The pod spec includes:
+```yaml
+annotations:
+  instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default
+```
+
+Java auto-instrumentation is injected by the OpenTelemetry Operator[^6].
+
+### Confidence: **High** for all deployment topology findings (direct source evidence from `resources.yaml` and `Jenkinsfile`); **Low** for actual replica count (XL Deploy placeholder).
+Image 4
+Java auto-instrumentation is injected by the OpenTelemetry Operator[^6].
+
+### Confidence: **High** for all deployment topology findings (direct source evidence from `resources.yaml` and `Jenkinsfile`); **Low** for actual replica count (XL Deploy placeholder).
+
+---
+
+## 3. CONCURRENCY AND ORDERING
+
+### Sequential vs Parallel Queue Processing
+
+All queues are processed **strictly sequentially in a single thread**. The `BatchItemReader` holds a pointer (`nextQueueSeq`) and processes queue N to exhaustion before advancing to queue N+1[^9]. There is no multi-threading, `TaskExecutor`, or parallel step configuration in `JobConfiguration`[^10].
+```java
+// BatchItemReader.java — single-threaded sequential iteration
+@BeforeStep
+public void searchQueueItems(StepExecution stepExecution) throws Exception {
+  nextQueueSeq = 0;
+  queueNameList = props.getBatchProperties().getQueueNameList();
+  queueListSize = queueNameList.size();
+  retrieveQueueItems(); // loads queue[0]
+}
+
+public QueueReaderItem read() throws Exception {
+  if (recordIndex >= queueItemsCount) {
+    // returns current item
+    if (recordIndex == queueItemsCount) {
+      nextQueueSeq++;        // advance to next queue
+      retrieveQueueItems();  // load next queue
+    }
+    return readerItem;
+  }
+  return null; // step ends
+}
+```
+
+### Ordering Within a Queue
+
+Items within a queue are processed **in the order returned by the Visa RTSI API**. No sorting or re-ordering is applied by this application. Whether Visa RTSI guarantees ordering (e.g., by `DateToRespond` or `BatchQueueItemSID`) is not determinable from the source alone — the application makes no assumption about order.
+
+**Ordering does not matter** for processing correctness: each item is independently processed via case lookup (create or update) with no dependency on prior items in the same queue run.
+
+### Partition or Merchant-Level Isolation
+
+**No partitioning or merchant-level isolation exists.** All items from all queues are processed in a flat sequential pipeline regardless of merchant, acquirer BIN, or geographic region. There are no `Partitioner` implementations and no merchant-specific threading[^10].
+
+### Confidence: **High** (direct source evidence).
+Image 5
+### Confidence: **High** (direct source evidence).
+
+---
+
+## 4. CONFIGURATION
+
+### Complete Configuration Catalogue
+
+The table below covers every configurable property. Injection methods: **Hardcoded** = literal in source; **Env-var** = Spring placeholder `${var}` resolved from Kubernetes secret or environment; **XL-Deploy** = `{{ var }}` resolved by XL Deploy at deploy time; **Spring-profile-default** = hardcoded in a Spring profile YAML.
+
+| Property Key | Description | Production Value / Placeholder | Injection Method |
+|---|---|---|---|
+| `server.port` | HTTP server port | `8082` | Hardcoded in `application.yml` |
+| `spring.application.name` | App name for logging | `Visa-Disputes-Processor-Batch` | Hardcoded in `application.yml` |
+| `spring.profiles.active` | Active profile | `${gcp_env}` | Env-var (K8s secret `wdp-common-secrets`) |
+| `spring.batch.job.enabled` | Auto-run batch job on startup | `false` | Hardcoded in `application.yml` |
+| `spring.batch.jdbc.initialize-schema` | Schema init | `never` | Hardcoded in `application.yml` |
+| `spring.batch.jdbc.isolation-level-for-create` | Isolation level | `REPEATABLE_READ` | Hardcoded in `application.yml` |
+| `spring.batch.jdbc.tablePrefix` | Batch metadata table prefix | `${table_prefix}` | Env-var |
+| `spring.datasource.wdp.username` | DB username | `wdpprodapp` (prod) | Env-var |
+| `spring.datasource.wdp.password` | DB password | `${wdp_datasource_password}` | Env-var (K8s secret) |
+| `spring.datasource.wdp.jdbc-url` | JDBC URL | `jdbc:postgresql://prod-wdp-rds-cluster...` | Spring-profile-default |
+| `logger.level` | Log level | `${log_level}` | Env-var |
+| `logstash.server.host.port` | Logstash endpoint | `${logstash_server_host_port}` | Env-var |
+| `app.scheduler.cron` | Job cron schedule | `${scheduler_cron}` | Env-var |
+| `app.batchProperties.jobName` | Spring Batch job name | `visaDisputesProcessorJob` | Hardcoded in `application.yml` |
+| `app.batchProperties.processingStep` | Spring Batch step name | `processVisaDisputesProcessorBatchStep` | Hardcoded in `application.yml` |
+| `app.batchProperties.chunk` | Chunk size (items per transaction) | `1` | Hardcoded in `application.yml` |
+| `app.batchProperties.usdCurrencyCode` | USD currency code | `WVDISPTB` | Hardcoded in `application.yml` |
+| `app.batchProperties.visaDisputeNetworkIds` | Allowed Visa network IDs to process | `${visa_network_ids}` | Env-var |
+| `app.batchProperties.queueNameList` | Ordered list of queues to poll | `${queue_name_list}` | Env-var |
+| `app.batchProperties.removeItemFromQueueDisabled` | Disable mark-as-read on Visa RTSI | `${remove_item_from_queue_disabled}` | Env-var |
+| `app.batchProperties.rdtChargebackStatusList` | Chargeback status list | `${rdr_chargeback_status_list}` | Env-var |
+| `app.batchProperties.dispute-stage-prearb` | Pre-arb chargeback stage code | `PAR` | Hardcoded in `application.yml` |
+| `app.batchProperties.dispute-stage-prearb-response` | Pre-arb response stage code | `PAR` | Hardcoded in `application.yml` |
+| `app.batchProperties.dispute-stage-prearb-accept` | Pre-arb accept stage code | `PAA` | Hardcoded in `application.yml` |
+| `app.batchProperties.visa-event-pre-arbitration` | Event label for pre-arbitration | `Dispute Response` | Hardcoded in `application.yml` |
+| `app.batchProperties.visa-event-pre-arbitration` | Event label for pre-arbitration | `Pre-Arbitration` | Hardcoded in `application.yml` |
+| `app.batchProperties.compliance-record-type` | Compliance stage code | `ACF` | Hardcoded in `application.yml` |
+| `app.batchProperties.precompliance-record-type` | Pre-compliance stage code | `APC` | Hardcoded in `application.yml` |
+| `app.batchProperties.apc-case-lookup-dispute-stages` | Dispute stages that map to APC record type | `ACF,BCF` | Hardcoded in `application.yml` |
+| `app.batchProperties.acf-case-lookup-dispute-stages` | Dispute stages that map to ACF record type | `CIF,CMF,CSR` | Hardcoded in `application.yml` |
+| `app.batchProperties.userId` | User ID set on case events | `WVDISPTB` | Hardcoded in `application.yml` |
+| `app.batchProperties.readSpecificItemFromQueue` | Filter queue to specific case numbers (testing) | `${read_specific_item_from_queue}` | Env-var |
+| `app.batchProperties.visaDisputeCaseNumbers` | Specific case numbers to read (when above=true) | `${visa_case_numbers}` | Env-var |
+| `app.batchProperties.coreDataNeedToMigrate` | Whether CORE platform items should be processed and marked read | `${core_data_need_to_migrate}` | Env-var |
+| `app.rtsiService.batchQueueUrl` | Visa RTSI GetBatchQueue URL | `${batch_queue_url}` | Env-var |
+| `app.rtsiService.hyperSearchUrl` | Visa RTSI HyperSearch URL | `${hyper_search_url}` | Env-var |
+| `app.rtsiService.markAsReadUrl` | Visa RTSI MarkAsRead URL | `${mark_as_read_url}` | Env-var |
+| `app.rtsiService.prearbDetailUrl` | Visa RTSI PreArb Detail URL | `${prearb_detail_url}` (note typo: `preaarb`) | Env-var |
+Image 6
+| `app.rtsiService.hyperSearchUrl` | Visa RTSI HyperSearch URL | `${hyper_search_url}` | Env-var |
+| `app.rtsiService.markAsReadUrl` | Visa RTSI MarkAsRead URL | `${mark_as_read_url}` | Env-var |
+| `app.rtsiService.prearbDetailUrl` | Visa RTSI PreArb Detail URL | `${prearb_detail_url}` (note typo: `preaarb`) | Env-var |
+| `app.rtsiService.prearbResponseDetailUrl` | Visa RTSI PreArb Response Detail URL | `${prearb_response_detail_url}` | Env-var |
+| `app.rtsiService.visaTransSearchUrl` | Visa Transaction Search URL | `${visa_transaction_url}` | Env-var |
+| `app.rtsiService.vantiveLicense` | DataPower auth license key for RTSI | `${vantive_license}` | Env-var (K8s secret) |
+| `app.rtsiService.emptyQueueCode` | RTSI status code for empty queue | `I-300600000` | Spring-profile-default (all profiles) |
+| `app.disputeService.apiLogUrl` | API log service URL | `http://gcp-api-log-service.wdp-micro:8082/...` (prod) | Spring-profile-default |
+| `app.disputeService.caseLookupUrl` | Case search service URL | `http://mdvs-gcp-case-search-service.wdp-micro:8082/...` (prod) | Spring-profile-default |
+| `app.disputeService.transactionUrl` | Merchant transaction service URL | `http://gcp-merchant-transaction-service.wdp-micro:8082/...` (prod) | Spring-profile-default |
+| `app.disputeService.encryptionUrl` | PAN encryption service URL | `http://wdp-encryption-service.wdp-micro:8082/...` (prod) | Spring-profile-default |
+| `app.disputeRulesService.queueStatusUrl` | Rules service URL | `http://mdvs-gcp-rules-service.wdp-micro:8082/...` (prod) | Spring-profile-default |
+| `app.idpService.tokenUrl` | IDP token service URL | `http://wdp-idp-token-service.wdp-micro:8082/...` (prod) | Spring-profile-default / `$Value` |
+
+#### Kubernetes Secret Sources
+
+From `resources.yaml`[^6], the pod mounts three K8s secret references via `envFrom`:
+
+| Secret Name | Contents |
+|---|---|
+| `{{ ingressTLSSecretName }}` | TLS ingress secret (XL Deploy placeholder) |
+| `gcp-visa-disputes-processor-batch-secrets` | App-specific secrets (RTSI URLs, license key, scheduler cron, DB password, etc.) |
+| `wdp-common-secrets` | Shared WDP secrets (includes `gcp_env`, `log_level`, common service settings) |
+
+#### Hardcoded Constants in Source Code
+
+The following are hardcoded in `ApplicationConstants.java` rather than in config[^11]:
+
+| Constant              | Value          | Usage                                                    |
+|-----------------------|----------------|----------------------------------------------------------|
+| `RETRY_COUNT`         | `"3"`          | `@Retryable` maxAttempts                                 |
+| `RETRY_DELAY`         | `"2000"` (ms)  | `@Retryable` backoff delay                               |
+| `DISPUTE_REST_INVOKER`| `"DISPUTE"`    | Internal service auth type flag                          |
+| `DATA_POWER_REST_INVOKER` | `"DATAPOWER"` | RTSI DataPower auth type flag                        |
+| `NETWORKID_0002`      | `"0002"`       | PIN network ID check                                     |
+| `USERID`              | `"WVDPB"`      | Hardcoded (differs from `userId: WVDISPTB` in config — possible inconsistency) |
+
+### Confidence: **High** for all properties from direct source evidence; **Low** for actual production values of env-var-injected properties (not committed to repo).
+
+---
+
+## 5. PLANNED CHANGES AND IN-PROGRESS WORK
+
+### 5.1 Commented-Out Block 1: Internal Transaction Lookup (Major)
+
+**File:** `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java`, lines 104-139[^12]
+
+This is the largest commented-out block. It contains a complete alternative PIN/CORE platform routing algorithm that uses the **internal WDP merchant transaction service** (`gcp-merchant-transaction-service`) instead of the Visa Transaction Search API. It was replaced by `isValidPinTransaction()` (using Visa RTSI), but the old implementation remains in code:
+```java
+```
+
+---
+
+## Image 7
+5.1 Commented-Out Block 1: Internal Transaction Lookup (Major)
+File: src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java, lines 104-139[^12]
+
+This is the largest commented-out block. It contains a complete alternative PIN/CORE platform routing algorithm that uses the internal WDP merchant transaction service (gcp-merchant-transaction-service) instead of the Visa Transaction Search API. It was replaced by isValidPinTransaction() (using Visa RTSI), but the old implementation remains in code:
+
+java
+/*
+  String strTransDate = hyperSearchDetail.getTranDate();
+  Date transactionDate = DateUtil.convertStringToDate(strTransDate);
+  String transactionFromDate = DateUtil.convertDateToString(DateUtil.addDays(-15, transactionDate));
+  String transactionToDate = DateUtil.convertDateToString(DateUtil.addDays(15, transactionDate));
+  String transactionId = StringUtils.trimToEmpty(hyperSearchDetail.getTransactionId());
+  String arn = StringUtils.isNotBlank(queueItem.getTransactionReferenceNumber())
+               ? queueItem.getTransactionReferenceNumber()
+               : hyperSearchDetail.getTransactionReferenceNumber();
+
+  TransactionSearchRequest transactionSearchRequest = ...
+  List<TransactionSearchResponse> transSearchResList =
+    disputeService.transactionLookup(transactionSearchRequest, ApplicationConstants.PIN);
+  // Checked for DEBIT cardType OR cardholderIdMethodCode=2
+*/
+The old logic checked both cardType = DEBIT OR cardholderIdMethodCode = '2' (from the WDP transaction service response). The current live logic checks only cardholderIdMethodCode = '2' (from Visa RTSI).
+
+Implication: DisputeService.transactionLookup() is fully implemented in DisputeServiceImpl and RestInvoker, but is never called from any active code path. The transactionUrl config property is still present but dead.
+
+5.2 Commented-Out Block 2: Pre-Arb Dispute Detail Call (Medium)
+File: src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java, lines 224-237[^13]
+
+Inside prepareCreateCaseRequest(), for PREARB queue items, there is a commented-out conditional that would call visaRTSIService.getDisputeDetail() to fetch the dispute amount for FAR (Pre-Arb Response) stage disputes:
+
+java
+/*
+* if (StringUtils.equalsIgnoreCase(item.getDisputeStage(),
+    props.getBatchProperties().getDisputeStagePRearbResponse())) {
+*   log.info("calling preArb disputes api to set disputeAmount");
+*   VisaDisputeDetail visaDisputeDetail =
+      visaRTSIService.getDisputeDetail(item.getPlatform(),
+        item.getNetworkCaseNumber(), disputeId,
+        item.getDisputeStage(), false, item.getCardnetwork());
+*   item.setVisaDisputeDetail(visaDisputeDetail);
+* }
+*/
+Image 8
+    visaRTSIService.getDisputeDetail(item.getPlatform(),
+      item.getNetworkCaseNumber(), disputeId,
+      item.getDisputeStage(), false, item.getCardnetwork());
+*   item.setVisaDisputeDetail(visaDisputeDetail);
+* }
+*/
+
+**Implication:** `VisaRTSIService.getDisputeDetail()` is fully implemented in `VisaRTSIServiceImpl` (with both PAB and FAR branches calling separate RTSI endpoints), but is **never called from active code**. The `prearbDetailUrl` and `prearbResponseDetailUrl` RTSI endpoints are configured in all environments but unused at runtime. The `VisaDisputeDetail` field on `ProcessedItem` is always null.
+
+---
+
+### 5.3 Dead Kafka Infrastructure (Significant)
+
+**Files:**
+- `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/KafkaConstant.java`[^14]
+- `pom.xml` — `spring-kafka` and `aws-msk-iam-auth` dependencies[^15]
+
+`KafkaConstant` is an interface defining AWS MSK IAM authentication constants:
+```java
+public interface KafkaConstant {
+  String SECURITY_PROTOCOL = "security/protocol";
+  String SASL_SSL = "SASL_SSL";
+  String AWS_MSK_IAM = "AWS_MSK_IAM";
+  String IAM_LOGIN_MODULE = "software.amazon.msk.auth.iam.IAMLoginModule required;";
+  String IAM_HANDLER = "software.amazon.msk.auth.iam.IAMClientCallbackHandler";
+}
+```
+
+`KafkaConstant` is **never referenced** in any Java class. The `spring-kafka` and `aws-msk-iam-auth` dependencies are in `pom.xml` but no `KafkaTemplate`, `@KafkaListener`, or Kafka producer/consumer is configured anywhere[^16].
+
+This suggests Kafka publishing was either planned for a future version or was removed from this service (moved to a separate publisher that reads the `chbk_outbox_row` table). The outbox entity's `kafka_topic`, `kafka_partition`, `kafka_offset` columns support this theory — they are populated by a downstream consumer, not this batch.
+
+---
+
+### 5.4 Unused Enum: `CaseLiability`
+
+**File:** `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/CaseLiability.java`[^17]
+
+Defines `MLIAB`, `MLIAB`, `ALIAB` values. A search across all source files finds **zero references** to `CaseLiability` other than the enum definition itself. The `ProcessedItem` class has a `caseLiability` field of type `String` (not `CaseLiability`), suggesting a refactor that left the enum orphaned.
+
+---
+
+### 5.5 Unused Enum: `TransactionStatus`
+
+**File:** `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/TransactionStatus.java`[^18]
+
+Defines `INTERNAL_TRANSACTION_FOUND`, `EXTERNAL_TRANSACTION_FOUND`, `NO_TRANSACTION_FOUND`. Referenced only in `TransactionSearchResponse.transactionStatus` — which is the response class for the commented-out transaction lookup
+Image 9
+### 5.5 Unused Enum: `TransactionStatus`
+
+**File:** `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/TransactionStatus.java`[^18]
+
+Defines `INTERNAL_TRANSACTION_FOUND`, `EXTERNAL_TRANSACTION_FOUND`, `NO_TRANSACTION_FOUND`. Referenced only in `TransactionSearchResponse.transactionStatus` — which is the response class for the commented-out transaction lookup flow. **Never read or acted upon in active code.**
+
+---
+
+### 5.6 Unused Fraud Enrichment Model Classes
+
+**Files:**
+- `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/response/FraudSightDetailMtr3.java`[^19]
+- `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/response/SignifydDetail.java`[^19]
+- `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/response/FraudCoverageType.java`
+- `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/response/FraudDetectionStage.java`
+- `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/response/FraudOsmStatus.java`
+- `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/response/FraudResponseCode.java`
+
+These are nested model classes on `TransactionSearchResponse` representing Signifyd fraud scoring and FraudSight fraud detection results. They are only present as fields on the response object for the **commented-out transaction lookup flow** — they are never instantiated, read, or mapped to any output in the active code path.
+
+---
+
+### 5.7 Unused `ChbkEventType.EVIDENCE_ATTACH`
+
+**File:** `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/ChbkEventType.java`[^20]
+```java
+public enum ChbkEventType {
+  CHARGEBACK_PROCESS, EVIDENCE_ATTACH;
+}
+```
+
+Only `CHARGEBACK_PROCESS` is referenced in `ProcessorUtil.mapCommonEventToChbkOutBox()`[^21]. `EVIDENCE_ATTACH` is defined but never used — likely a placeholder for a future document/evidence attachment workflow.
+
+---
+
+### 5.8 Unused `CardNetwork` Enum Values
+
+**File:** `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/CardNetwork.java`[^22]
+
+The enum defines:
+```java
+VISA("0002"), INTLNK("0003"), PLUS("0004"), ALLPOINT("0090"),
+PULSE("0017"), CARTES_BANCAIRES("CARTES_BANCAIRES"), JCN("JCN")
+```
+
+Only `CardNetwork.VISA` is referenced in `BatchItemProcessor`[^23]:
+```java
+```
+
+---
+
+## Image 10
+The enum defines:
+
+java
+VISA("0002"), INTLNK("0003"), PLUS("0004"), ALLPOINT("0090"),
+PULSE("0017"), CARTES_BANCAIRES("CARTES_BANCAIRES"), JCN("JCN")
+Only CardNetwork.VISA is referenced in BatchItemProcessor[^23]:
+
+java
+CardNetwork cardNetwork = CardNetwork.VISA;
+All other enum values (INTLNK, PLUS, ALLPOINT, PULSE, CARTES_BANCAIRES, JCN) are defined but never instantiated or used in any active code. The visaDisputeNetworkIds config filter also limits processing to specific network IDs. This indicates the enum was designed for a multi-network future but currently only processes Visa.
+
+5.9 Unused Fields on ProcessedItem
+File: src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/request/ProcessedItem.java[^24]
+
+The following fields are defined on the ProcessedItem builder but are never set or read in active code:
+
+Field	Comment in Source
+isAcquirerBinDispMainframe	// Not getting used in consumer, by default the processStatus will be NEW.
+partialAmountIndicator	No comment — never set
+partialAmount	No comment — never set
+skipNewOccurrence	No comment — never set (note: typo "Occurence")
+5.10 readSpecificItemFromQueue / visaDisputeCaseNumbers — Test/Surgical Feature Flag
+Files: application.yml[^2], VisaRTSIServiceImpl.java[^25]
+
+yaml
+readSpecificItemFromQueue: ${read_specific_item_from_queue}
+visaDisputeCaseNumbers: ${visa_case_numbers}
+When readSpecificItemFromQueue = true, the reader filters queue items to only those matching a pre-configured list of visaCaseNumbers. This is an undocumented surgical testing mechanism — allowing operators to process only specific cases without a code change. This is active production configuration (not commented out) but represents a feature primarily designed for manual testing or targeted re-processing.
+
+5.11 Typo in Config Property Key
+File: src/main/resources/application-dev.yaml and all other profile YAMLs[^26]:
+
+yaml
+prearb-detail-url: ${prearb_detail_url}   # Note: "preaarb" (triple 'a') in env var name
+Image 11
+**File:** `src/main/resources/application-dev.yaml` and all other profile YAMLs[^26]:
+```yaml
+prearb-detail-url: ${prearb_detail_url}   # Note: "preaarb" (triple 'a') in env var name
+```
+
+The environment variable placeholder `${prearb_detail_url}` contains a typo (double `a`: `preaarb` vs `prearb`). This is consistent across all profile YAMLs, so it's not a bug in practice — but the env var name is misspelled everywhere.
+
+---
+
+### 5.12 `USERID` Constant vs Config `userId`
+
+**File:** `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/ApplicationConstants.java`[^11]
+```java
+public static final String USERID = "WVDPB";
+```
+
+The config has `userId: WVDISPTB`[^2]. The constant `USERID = "WVDPB"` (also a typo: "USSERID" vs "USERID") is defined but **never referenced** in any active code. This is a dead constant, possibly from an earlier version.
+
+---
+
+## Summary Table of Deferred/Dead Code
+
+| Item                    | Type               | Location                                              | Status                                    |
+|-------------------------|--------------------|-------------------------------------------------------|-------------------------------------------|
+| Internal transaction lookup (WDP service) | Commented-out block | `BatchItemProcessor.java:104-139` | Dead — replaced by Visa TX Search |
+| Pre-arb dispute detail call (FAR stage) | Commented-out block | `BatchItemProcessor.java:224-237` | Deferred — infrastructure ready, not called |
+| Kafka infrastructure | Dead deps + dead class | `pom.xml`, `KafkaConstant.java` | Deferred — infrastructure ready, not called |
+| `CaseLiability` enum | Unused class | `enums/CaseLiability.java` | Dead — never referenced |
+| `TransactionStatus` enum values | Unused enum values | `enums/TransactionStatus.java` | Dead — only in commented-out response class |
+| FraudSightDetailMtr3, SignifydDetail, FraudCoverageType, FraudDetectionStage, FraudOsmStatus, FraudResponseCode | Unused model classes | `dispute/response/` | Dead — part of commented-out TX lookup response |
+| `ChbkEventType.EVIDENCE_ATTACH` | Unused enum value | `enums/ChbkEventType.java` | Dead — planned future workflow |
+| `CardNetwork` (all values except VISA) | Unused enum values | `enums/CardNetwork.java` | Deferred — multi-network future |
+| `ProcessedItem.isAcquirerBinDispMainframe` | Unused field (self-documented) | `dispute/request/ProcessedItem.java` | Dead |
+| `ProcessedItem.partialAmount/partialAmountIndicator` | Unused fields | `dispute/request/ProcessedItem.java` | Deferred — multi-network future |
+| `readSpecificItemFromQueue` / `visaDisputeCaseNumbers` | Unused fields | `dispute/request/ProcessedItem.java` | Deferred/dead |
+| `USERID = "WVDPB"` constant | Dead constant | `ApplicationConstants.java` | Active — testing/surgical tool |
+| `prearb detail url` typo in env var name | Config typo | `application.yml` | Active — testing/surgical tool |
+| `getDisputeDetail()` RTSI method | Implemented, never called | `VisaRTSIServiceImpl.java` | Deferred — infrastructure ready, not invoked |
+| `DisputeService.transactionLookup()` | Implemented, never called (active) | `DisputeServiceImpl.java` | Dead — commented-out caller |
+
+---
+
+## Footnotes
+
+[^1]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `getBatchQueueItems(String queueName)` pagination loop.
+
+[^2]: `src/main/resources/application.yml` — `chunk: 1`, scheduler cron, all hardcoded batch properties.
+
+[^3]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/scheduler/BatchScheduler.java` — single `@Scheduled(cron = "${app.scheduler.cron}")`.
+Image 12
+[^1]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `getBatchQueueItems(String queueName)` pagination loop.
+
+[^2]: `src/main/resources/application.yml` — `chunk: 1`, scheduler cron, all hardcoded batch properties.
+
+[^3]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/scheduler/BatchScheduler.java` — single `@Scheduled(cron = "${app.scheduler.cron}")`.
+
+[^4]: Grep of all Java source files for `RateLimiter`, `throttle`, `rate.limit` — zero matches.
+
+[^5]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/restclient/RestInvoker.java` — `@Retryable(maxAttemptsExpression = "3", backoff = @Backoff(delayExpression = "2000"))`.
+
+[^6]: `resources.yaml` — `kind: Deployment`, `replicas: {{ replicas-gcp-visa-disputes-processor-batch }}`, memory limits/requests, rolling update strategy, OpenTelemetry annotation.
+
+[^7]: `Jenkinsfile` — `deployXmlPath: 'deployit-manifest.xml'`, `resourcesYamlPath: 'resources.yaml'`, confirms XL Deploy usage.
+
+[^8]: `deployit-manifest.xml` — `<scanPlaceholders>true</scanPlaceholders>`.
+
+[^9]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemReader.java` — `nextQueueSeq` counter, sequential `retrieveQueueItems()` calls.
+
+[^10]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/config/JobConfiguration.java` — no `TaskExecutor`, no `Partitioner`, single linear step definition.
+
+[^11]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/ApplicationConstants.java` — all constant definitions.
+
+[^12]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` lines 104-139 — `/* ... */` block containing old internal transaction lookup logic.
+
+[^13]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` lines 224-237 — `/* ... */` block inside `prepareCreateCaseRequest()` commenting out `getDisputeDetail()` call for FAR stage.
+
+[^14]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/KafkaConstant.java` — interface with MSK IAM constants, zero references in active code.
+
+[^15]: `pom.xml` lines 132-143 — `spring-kafka` and `aws-msk-iam-auth:2.3.2` dependencies with no corresponding `@Configuration` using them.
+
+[^16]: Grep of all Java source files for `KafkaTemplate`, `@KafkaListener`, `@spring.kafka` — only matches in `ChbkOutboxEntity` column annotations (not producers/consumers).
+
+[^17]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/CaseLiability.java` — enum definition. Grep for `CaseLiability` finds only the definition file.
+
+[^18]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/TransactionStatus.java` — referenced only as a field type on `TransactionSearchResponse` which itself is only populated by the commented-out code path.
+
+[^19]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/response/FraudSightDetailMtr3.java`; `SignifydDetail.java` — fields on `TransactionSearchResponse`; only reachable via the commented-out TX lookup.
+
+[^20]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/ChbkEventType.java` — `EVIDENCE_ATTACH` value defined.
+
+[^21]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/ProcessorUtil.java` — `chbkOutboxEntity.setEventType(ChbkEventType.CHARGEBACK_PROCESS.toString())`.
+
+[^22]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/CardNetwork.java` — all seven enum values.
+
+[^23]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — `CardNetwork cardNetwork = CardNetwork.VISA;` — hardcoded, never switches to other values.
+
+[^24]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/request/ProcessedItem.java` — fields `isAcquirerBinDispMainframe`, `partialAmountIndicator`, `partialAmount`, `skipNewOccurrence`.
+Image 13
+[^7]: `Jenkinsfile` — `deployXmlPath: 'deployit-manifest.xml'`, `resourcesYamlPath: 'resources.yaml'`, confirms XL Deploy usage.
+
+[^8]: `deployit-manifest.xml` — `<scanPlaceholders>true</scanPlaceholders>`.
+
+[^9]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemReader.java` — `nextQueueSeq` counter, sequential `retrieveQueueItems()` calls.
+
+[^10]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/config/JobConfiguration.java` — no `TaskExecutor`, no `Partitioner`, single linear step definition.
+
+[^11]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/ApplicationConstants.java` — all constant definitions.
+
+[^12]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` lines 104-139 — `/* ... */` block containing old internal transaction lookup logic.
+
+[^13]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` lines 224-237 — `/* ... */` block inside `prepareCreateCaseRequest()` commenting out `getDisputeDetail()` call for PAR stage.
+
+[^14]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/KafkaConstant.java` — interface with MSK IAM constants, zero references in active code.
+
+[^15]: `pom.xml` lines 132-143 — `spring-kafka` and `aws-msk-iam-auth:2.3.2` dependencies with no corresponding `@Configuration` using them.
+
+[^16]: Grep of all Java source files for `KafkaTemplate`, `@KafkaListener`, `@spring.kafka` — only matches in `ChbkOutboxEntity` column annotations (not producers/consumers).
+
+[^17]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/CaseLiability.java` — enum definition. Grep for `CaseLiability` finds only the definition file.
+
+[^18]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/TransactionStatus.java` — referenced only as a field type on `TransactionSearchResponse` which itself is only populated by the commented-out code path.
+
+[^19]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/response/FraudSightDetailMtr3.java`; `SignifydDetail.java` — fields on `TransactionSearchResponse`; only reachable via the commented-out TX lookup.
+
+[^20]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/ChbkEventType.java` — `EVIDENCE_ATTACH` value defined.
+
+[^21]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/util/ProcessorUtil.java` — `chbkOutboxEntity.setEventType(ChbkEventType.CHARGEBACK_PROCESS.toString())`.
+
+[^22]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/enums/CardNetwork.java` — all seven enum values.
+
+[^23]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/job/BatchItemProcessor.java` — `CardNetwork cardNetwork = CardNetwork.VISA;` — hardcoded, never switches to other values.
+
+[^24]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/dispute/request/ProcessedItem.java` — fields `isAcquirerBinDispMainframe`, `partialAmountIndicator`, `partialAmount`, `skipNewOccurrence`.
+
+[^25]: `src/main/java/com/wp/gcp/visa/disputes/processor/batch/service/impl/VisaRTSIServiceImpl.java` — `filterVisaDisputes()` showing `readSpecificItemFromQueue` and `visaDisputeCaseNumbers` logic.
+
+[^26]: `src/main/resources/application-dev.yaml` (and all other profile YAMLs) — `prearb-detail-url: ${prearb_detail_url}` showing the typo.
+That's the complete text from all 13 images. This is the continuation research report on gcp-visa-disputes-processor-batch, covering volume/throughput, scaling/deployment topology, concurrency model, the full configuration catalogue, and a detailed inventory of dead/deferred code.
+
+Key architecture-level findings worth flagging immediately:
+
+Dead Kafka infrastructure — MSK IAM deps in pom.xml, KafkaConstant interface, but zero Kafka producers configured. Confirms the outbox-only pattern, but raises the question: should the pom.xml deps be cleaned up?
+No HPA, XL Deploy replica placeholder — scaling is entirely manual. With replicas > 1, Visa queue polling is not protected against parallel execution.
+No rate limiting on RTSI calls — potential Visa quota risk at scale.
+USERID constant vs userId config mismatch — WVDPB vs WVDISPTB — worth confirming which is authoritative.
+Want me to now propose the WDP-COMPONENTS.md update for VisaDisputeBatch using both research reports?
+
+
+
+
+
+
+Claude is AI and can make mistakes. Please double-check re

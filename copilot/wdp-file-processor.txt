@@ -1,0 +1,903 @@
+Here is the extracted text from all 19 images:
+
+Image 1
+# Deep Technical Research Report: wdp-file-processor
+
+## Executive Summary
+
+wdp-file-processor is a Spring Boot 4.0.3 / Java 17 microservice that acts as the **primary inbound file-ingestion component** for the WDP (Walmart Dispute Platform) chargeback system. It is triggered by AWS SQS S3-event notifications and processes ZIP files from six distinct source acronyms (DWSG, DBLK, DISR, MFAD, DCPO, DNWK), each mapping to a different file format and dispute lifecycle role. For each record it writes to two PostgreSQL tables — wdp.chbk_outbox_row (the chargeback outbox) and 'wdp.file_evidence' (evidence staging) — where a downstream consumer picks up work. It is **not** a Spring Batch application; record iteration is entirely custom. PAN is present in DNWK flat files and is encrypted in-flight via an internal REST encryption service before being written anywhere.
+
+## 1. PRIMARY RESPONSIBILITY
+
+### What It Does
+The component listens to an AWS SQS queue for S3 'ObjectCreated' event notifications. When a new inbound ZIP file appears in the S3 bucket, it:
+1. Identifies the source acronym from the filename.
+2. Opens the ZIP, extracts the index/flat/XML file and any embedded document images.
+3. Parses each record and maps it to WDP's internal 'ChbkOutboxRow' (chargeback events) and 'FileEvidence' (evidence attachment metadata) entities.
+4. Writes both to PostgreSQL so a separate consumer service can act on them.
+
+### What It Explicitly Does NOT Do
+- It does **not** execute the dispute workflow logic (no state machine, no rule engine).
+- It does **not** send Kafka events: the downstream consumer reads the outbox table.
+- It does **not** perform case look-ups or enrichment lookups against a case system.
+- It does **not** generate acknowledgement file content; it only sets 'ack_required' and 'ack_status' flags so a separate process can generate ACK files.
+- It does **not** produce outbound network response files.
+
+### Framework
+This is a **Spring Boot** application ('FileProcessorApplication'[^1]). There is **no Spring Batch dependency**, no 'Job', 'Step', 'ItemReader', 'ItemWriter', or 'JobLauncher' in the codebase. All record iteration is custom for-loop logic inside service implementations.
+
+---
+
+## 2. FILE SOURCES
+
+The component recognises six source acronyms, defined in 'AcroEnum'[^2] and 'FileAcroEnum'[^3]. File identification is performed by matching the zip filename prefix via 'FileAcroEnum.fromAcroType(fileName)'.
+
+| Acronym | Full Name | Format | File Name Prefix Pattern | Format Type |
+|---------|-----------|--------|--------------------------|-------------|
+| DWSG | Walmart Signature Capture | Fixed-width flat text (index) + TIFF images | 'AUE2_DWSG_POBCDWLJ_WMSIG' | Proprietary fixed-width |
+| DBLK | CORE Bulk Response | Fixed-width flat text (index) + document images | 'MEJR_DBLK_CHRGRESF' | Proprietary fixed-width |
+| DISR | Discover MAP Incoming (Issuer Doc) | Fixed-width flat text (index) + images | 'AUE2_DISR_POBCD71C_DISC_ISSURDOC' | Fixed-width |
+| MFAD | Discover MAP Notice Processor | Delimited flat text + images | 'AUE2_MFAD_POBDDVCL_DISC_DISPUTENOTIFY' | Delimited (quote-split) |
+| DCPO | Capital One Disputes Incoming | XML (JAXB/XSD schema) + document images | 'DCPO_PODMDCB1.BJWC' | XML (proprietary WP schema) |
+| DNWK | Network File Incoming | Fixed-width flat file, 5700-byte COBOL copybook layout | Multiple (see below) | Fixed-width COBOL |
+
+**DNWK sub-sources** (identified by filename substring after the DNWK prefix)[^4]:
+
+Image 2
+| Sub-Acronym | Full Name | File Prefix Contains |
+|-------------|-----------|----------------------|
+| 'AMEX' | AMEX Network Incoming | 'PODMDMAX.AMEX.CASES' |
+| 'AMEXHYB' | AMEX Hybrid Network Incoming | 'PODMDMAH.AMEXHYB.CASES' |
+| 'AMEXOPTB' | AMEX Opt-Blue Network Incoming | (implied by 'AMEXOPTB' substring) |
+| 'DISC' | Discover Network Incoming | 'PODMDMDI.DISC.CASES' |
+| 'MC_REVREJ' | Mastercard Reversal/Rejection | 'PODMDM2M.MC.REVREJ' |
+| 'NYCE' | NYCE Network Incoming | 'PODMDPIN.NYCE.CASES' |
+| 'DISCHYB' | Discover Hybrid Network Incoming | 'PODMDMDY.DISCHYB.CASES' |
+
+> **Note**: 'AMEXOPTB' is declared in 'NetworkFileEnum'[^5] but there is no corresponding 'NetworkFileService' implementation (see Section 15: Planned Work).
+
+### How Files Arrive
+All files arrive in an S3 bucket under an '/INBOUND/' path prefix. The inbound check is enforced in 'FileJobUtils.isInBoundMessage(key)' which requires the S3 key to contain '/INBOUND/'[^6].
+
+### Source Identification Logic
+Source routing is entirely filename-based:
+1. 'FileAcroEnum.fromAcroType(fileName)' — iterates all known prefix patterns and returns the matching enum[^3].
+2. If the returned acronym is null or not present in the S3 key path, the file is rejected with error code '912'[^7].
+3. For DNWK, sub-routing uses 'NetworkFileEnum' — the filename is checked for substrings 'AMEXHYB', 'AMEXOPTB', 'AMEX', 'MC_REVREJ', 'DISC', 'NYCE', 'DISCHYB' in that priority order[^8]. The matched value is set as 'fileDTO.networkAcroName' and 'NetworkServiceImpl' delegates to the appropriate 'NetworkFileService' bean[^9].
+
+---
+
+## 3. TRIGGER MECHANISM
+
+**Trigger type**: AWS SQS message listener. One listener, one queue, for all sources.
+
+### SQS Listener Configuration
+'SqsMessageListener.receiveMessage(Message message)' is annotated with '@SqsListener'[^10]:
+```java
+@SqsListener(value = "${cloud.aws.sqs.queue.name}", maxConcurrentMessages = "1", maxMessagesPerPoll = "1")
+```
+- 'maxConcurrentMessages = "1"' and 'maxMessagesPerPoll = "1"' — **strictly single-threaded, sequential processing**. No parallelism.
+
+### Message Content
+The SQS message body is a standard AWS S3 event notification JSON (the same schema Amazon publishes when you configure S3 → SQS event notification). It is deserialized via Jackson into 'Event'[^11] → 'Records' → 'S3'...
+- S3 bucket name ('event.records[0].s3.s3Bucket.name')
+- S3 object key ('event.records[0].s3.s3Object.key')
+- File size in bytes ('event.records[0].s3.s3Object.fileSize' / 'size')
+
+No file type or source identifier is in the message body — both are derived from the S3 key path and filename at processing time[^12].
+
+Image 3
+- S3 bucket name ('event.records[0].s3.s3Bucket.name')
+- S3 object key ('event.records[0].s3.s3Object.key')
+- File size in bytes ('event.records[0].s3.s3Object.fileSize' / 'size')
+
+No file type or source identifier is in the message body — both are derived from the S3 key path and filename at processing time[^12].
+
+### Visibility Timeout Extension
+Before processing starts, 'sqsAsyncClient.changeMessageVisibility(...)' extends the visibility timeout to '${cloud.aws.sqs.timeout}' seconds[^13]. This prevents the message from reappearing on the queue while a large file is being processed.
+
+### Idempotency Pre-Check
+Before invoking processing, 'fileProcessingService.IsProcessedMessage(message.body())' queries 'file_job' for an existing record with the same 'fileName' + 's3Key' where status is not 'PENDING'. If found, the message is immediately deleted from SQS without reprocessing[^14].
+
+---
+
+## 4. FILE READING AND PARSING
+
+### S3 Access and Streaming
+Files are read via AWS SDK v2 'S3Client.getObject(...)', returning a 'ResponseInputStream<GetObjectResponse>'[^15]. The file is **streamed, not loaded fully into memory** as a byte array. For ZIP sources, the stream is immediately wrapped in 'ZipInputStream'.
+
+### S3 Bucket Structure
+The bucket names differ per environment. In production[^16]:
+- Inbound bucket: 'wdp-files'
+- Failed evidence bucket: 'wdp-evidence-failed-files-prod'
+
+The S3 key convention for inbound files is:
+
+<ACRO>/INBOUND/<filename>.zip
+
+During processing, extracted document images are staged to:
+
+<ACRO>/STAGING/<YYYY-MM-DD>/<zipFileWithoutExtension>/<imageName>
+
+After processing completes or errors, the ZIP is archived to:
+
+<ACRO>/ARCHIVED/<MMYYYY>/<filename>.zip
+
+Failed STAGING evidence files are moved to the failed-evidence bucket under:
+
+<sourceEvent>/<YYYY-MM-DD>/<imageName>
+
+### Parsing Per Source
+
+#### DWSG (Walmart Sig Cap) — Fixed-Width, 99 bytes per detail record
+- Zip extracted via 'extractIndexFileFromZip()' — '.txt' file — split on '\r?\n|\r' into String[] lines; non-text files uploaded to S3 staging[^17].
+- Header: lines[0] starts with "H".
+- Trailer: lines[last] starts with "T".
+- Detail records: lines starting with "D" — parsed by 'WWChargebackInfo(line)' using fixed substring offsets (total record length = 99 bytes)[^18].
+
+Image 4
+#### DWSG (Walmart Sig Cap) — Fixed-Width, 99 bytes per detail record
+- Zip extracted via 'extractIndexFileFromZip()' — '.txt' file — split on '\r?\n|\r' into String[] lines; non-text files uploaded to S3 staging[^17].
+- Header: lines[0] starts with "H".
+- Trailer: lines[last] starts with "T".
+- Detail records: lines starting with "D" — parsed by 'WWChargebackInfo(line)' using fixed substring offsets (total record length = 99 bytes)[^18].
+- For DWSG, image names have '.tiff' appended before S3 lookup.
+
+#### DBLK (Core Bulk Response) — Fixed-Width, >102 bytes per detail record
+- Same ZIP extraction as DWSG.
+- Header: lines[0] starts with "1".
+- Trailer: lines[last] starts with "3".
+- Detail records: lines starting with "2" AND 'line.trim().length() > 102'[^19].
+- Parsed by 'CoreMerchantBulkResponseInfo(line)' — char-offset parsing. 'chartsNumber = values.substring(9, 21)'; 'imageName = values.substring(100)'[^20].
+
+> **Note**: The constant comment says '//134;// need to check the size in prod' — the production record length is **not confirmed** in source[^21].
+
+#### DISR (Discover MAP Incoming) — Fixed-Width, 105 bytes per detail record
+- Same ZIP extraction.
+- Header: lines[0] starts with "1"; Trailer: lines[last] starts with "3".
+- Detail records: lines starting with "2".
+- Parsed by 'MapDetail(line)': 'ntwkCaseNumber = values.substring(6, 16)'; 'merchantNumber = values.substring(21, 36)'; 'imageName = values.substring(44, 94)'[^22].
+
+#### MFAD (Discover MAP Notice) — Quote-Delimited Flat File
+- Same ZIP extraction.
+- No strict header/trailer validation (any non-blank line with alphanumeric chars is processed).
+- Parsed by 'DiscoverMapNoticeInfo(line)': splits on '"' (quote), takes 'splitLine[2]', then substring offsets: 'imageName = line.substring(8)', 'caseNumber = line.substring(14, 26)', 'occurrenceNumber = line.substring(26, 28)'[^23].
+
+#### DCPO (Capital One Disputes) — XML (JAXB)
+- ZIP extracted via 'extractXmlFromZip()' — '.xml' files — JAXB unmarshalling into 'WpPackage' (generated schema)[^24]; non-XML files → S3 staging.
+- 'WpPackage.getMessage()' returns a 'ListMessage'.
+- Each 'Message' has a 'messageType' (e.g., 'claim-request', 'outcome-chargeback') and an 'imageList'.
+- If filename contains 'BJWC' — 'caseType = "BJPLCC"', 'sourceAcroName = "CAPONE_BJWC"'[^25].
+
+#### DNWK (Network Files) — Fixed-Width COBOL Copybook, 5700 bytes per record
+- ZIP containing flat file extracted via 'processZipContainingFlatFile()' — first non-directory ZIP entry read as 'BufferedReader'[^26].
+- All records must start with "WDP" — the loop breaks on any line not starting with "WDP".
+- Validity: 'NetworkFileSupport.isValidLine(line)' checks that parsed 'eventType' field (bytes 0-25) equals "WDP_INBOUND_EVENT"[^27].
+- Full record layout: 'NetworkRecordLayout(line)' — 5700-byte fixed-width COBOL-derived copybook with named field positions[^28].
+
+### Malformed Record Handling
+- **Record too short / wrong length**: Sets 'status = ERROR' with appropriate error code. Record is still written to 'chbk_outbox_row' with ERROR status — processing does **not** stop.
+- **Image not found in S3 staging map**: Sets 's3Key = "IMAGE NOT FOUND IN S3"', 'status = ERROR'; error code '31' (DWSG/DBLK/MFAD) or '==' (DISR — blank error code, a likely gap).
+- **Unparseable ZIP**: Caught at top-level, entire file marked ERROR, archived.
+- **JAXBException**: caught per file; file marked ERROR[^29].
+
+### No Maximum File Size or Record Count Limits
+No hardcoded maximum file size or record count cap was found in source. The only size validation is a **zero-byte ZIP check** (error code '907')[^30].
+
+Image 5
+- **Unparseable XML**: JAXBException caught per file; file marked ERROR[^29].
+
+### No Maximum File Size or Record Count Limits
+No hardcoded maximum file size or record count cap was found in source. The only size validation is a **zero-byte ZIP check** (error code '907')[^30].
+
+---
+
+## 5. INBOUND DEPENDENCIES
+
+| Service | URL (Prod) | Method | Auth | Purpose | Call Point | Retry |
+|---------|-----------|--------|------|---------|-----------|-------|
+| 'wdp-encryption-service' | 'http://wdp-encryption-service.wdp-micro:8082/merchant/gcp/encryption/v1/pan/encrypt' | POST | Bearer token (IDP) | Encrypt PAN (account number) from DNWK records | Per record in 'NetworkFileSupport.encrypt()'[^31] | 3 attempts, 2_000 ms fixed backoff via '@Retryable'[^32] |
+| 'wdp-idp-token-service' | 'http://wdp-idp-token-service.wdp-micro:8082/merchant/gcp/idp/token/token' | GET | None (service mesh) | Retrieve Bearer token for encryption call | Per encryption call in 'IdpTokenServiceImpl.getIdpToken()'[^33] | No retry declared on IDP token fetch itself |
+
+**No other external service calls** are made. There is no enrichment call, no case lookup, no rules evaluation, no ACK submission via REST. All enrichment is deferred to the downstream consumer.
+
+---
+
+## 6. PAN HANDLING
+
+### Which Sources Contain PAN
+Only **DNWK (Network File)** sources contain a full account number (PAN). The 'NetworkRecordLayout' field 'acctNum' is extracted from bytes 198-217 of the COBOL record[^28].
+
+Other sources (DWSG, DBLK, DISR, MFAD, DCPO) carry at most the last-4 digits of a card number (DCPO: 'lastFourCardNumber'[^34]). No encryption is performed for those sources.
+
+### Encryption Point
+PAN encryption occurs inside 'NetworkFileSupport.mapNetworkFileLayoutToCommonEvent()'[^31], during field mapping, **before** any database write:
+```java
+if (layout.getAcctNum() != null && layout.getAcctNum().matches("\\d{8}")) {
+    originalTransIdentifier.setAccountNumber(encrypt(layout.getAcctNum()));
+} else {
+    originalTransIdentifier.setAccountNumber(layout.getAcctNum());
+}
+```
+
+### Encryption Call Flow
+1. 'NetworkFileSupport.encrypt(pan)' calls 'restInvoker.encryptField(encryptionUrl, request, idpToken)'.
+2. 'EncryptionRequest' contains '{ "pan": "<cleartext>" }'.
+3. 'EncryptionResponse' returns '{ "hpan": "<encrypted>" }'.
+4. The 'hpan' value is assigned to 'originalTransIdentifier.accountNumber'.
+
+### What Is Written
+- The **hpan (encrypted/tokenised PAN)** is serialised into the 'payload' JSON column of 'chbk_outbox_row'.
+- **Clear PAN is never written to any store.** If the encryption call fails or returns null, 'accountNumber' is set to 'null'[^31]; an exception causes the record to be written with ERROR status.
+
+### Encryption Failure Handling
+'encrypt()' throws a 'RuntimeException' wrapping the original exception if the REST call fails[^31]. This propagates up to the per-record try/catch in 'AmexNetworkFileServiceImpl' (and peers), which saves the record with 'errorStatus = ERROR', 'errorCode = DETAIL_ROW_INVALID_ERROR_CODE ("35")'[^35].
+
+Image 6
+- **Clear PAN is never written to any store.** If the encryption call fails or returns null, 'accountNumber' is set to 'null'[^31]; an exception causes the record to be written with ERROR status.
+
+### Encryption Failure Handling
+'encrypt()' throws a 'RuntimeException' wrapping the original exception if the REST call fails[^31]. This propagates up to the per-record try/catch in 'AmexNetworkFileServiceImpl' (and peers), which saves the record with 'errorStatus = ERROR', 'errorCode = DETAIL_ROW_INVALID_ERROR_CODE ("35")'[^35].
+
+---
+
+## 7. PROCESSING LOGIC PER FILE TYPE
+
+### Common Pattern (All Sources)
+1. SQS listener receives S3 event JSON.
+2. 'FileProcessingServiceImpl.processDataFromMessage()' — parses event, extracts S3 key, derives 'sourceAcro' from filename.
+3. 'insertFileJobTable()' — inserts 'file_job' row with 'status = PENDING'.
+4. Downloads file from S3 as 'ResponseInputStream'.
+5. Source-specific method ('processIndexZipFile', 'processXmlZipFile', 'processZipContainingFlatFile') extracts content.
+6. Dispatches to 'AcroService' implementation via the 'Map<String, AcroService>' acroServices bean map keyed by service bean name.
+7. Service iterates lines/records from 'rowStartNumber' (supports resume after pod restart).
+8. Per record: maps to 'RowDetail' — 'commonService.insertEvidenceOutBox()' writes 'chbk_outbox_row' + 'file_evidence'.
+9. After all records: 'updateStatusToPendingByFileJobIdAndStatusLoading()' — bulk 'LOADING→PENDING' promotion.
+10. 'archiveZipFile()' — moves ZIP from 'INBOUND/' to 'ARCHIVED/<MMYYYY>/'.
+11. 'updateFileJobTable()' — sets final status on 'file_job'.
+
+### DWSG (Walmart Sig Cap)
+- Processes lines starting with "D".
+- Parses fixed-width 'WWChargebackInfo' (99 bytes).
+- Case number: bytes 1-13 (12 chars). PIN indicator: bytes 69+.
+- 'formatCaseNumber()': if all numeric — truncate to 10 chars (strips occurrence number); if alphanumeric — trim to 12.
+- Source system: first char of case number — 'P' = 'PIN'; 'C' or numeric default = 'CORE'.
+- 'caseStage': 'caseNumber.substring(10, 12)' if case number ≤ 10 digits.
+- Image lookup: key = imageName + '.tiff' in 's3KeyMap'.
+- **PIN indicator special branch**: if 'pinIndicator = "y"' → 'status = SUCCESS' (no validation), copies document to '<ACRO>/PINDISPUTE/<date>/<pinNetwork>/<imageName>' via 'pinDocumentS3Transfer()'[^38].
+- ACK required if rowCount ≥ 0.
+
+### DBLK (Core Bulk Response)
+- Detail lines: start with "2" AND length > 102.
+- 'chartsNumber' (case number) = bytes 9-21; 'imageName' = bytes 100+.
+- Same 'formatCaseNumber()' / 'getSourceSystem()' logic.
+- EventType = 'EVIDENCE_ATTACH'. DocumentType = 'RESPDOC'. SourceSystem = always 'CORE'.
+- ACK required if rowCount > 0.
+
+### DISR (Discover MAP Incoming)
+- Detail lines start with "2".
+- 'ntwkCaseNumber' = bytes 6-16; 'imageName' = bytes 44-94 (50 chars).
+- No 'caseNumber' set; 'setNetworkCaseId' set instead.
+- CardNetwork = 'DISCOVER'. SourceSystem = 'ISSRDOC'. 'DocumentType = 'CORE'.
+- 'caseNumber' field is left **null** (no WDP case ID from this file).
+- ACK not required ('getAckRequired(false)').
+- No image size > limit check.
+
+Image 7
+- ACK not required ('setAckRequired(false)').
+- No image size > limit check.
+
+### MFAD (Discover MAP Notice)
+- All non-blank lines processed (no header/trailer markers checked).
+- Line split by '"' — third segment: 'imageName = line.substring(8)', 'caseNumber = line.substring(14, 26)', 'occurrenceNumber = line.substring(26, 28)'.
+- 'isValidDocument' flag gates downstream status — if false → 'ERROR', code '35'.
+- 'formatCaseNumber()' variant: leading-zero stripping for numeric, space-truncation for alphanumeric.
+- DocumentType = 'DSNOTDOC' (dispute notice document). ACK not required.
+
+### DCPO (Capital One Disputes)
+This is the most complex source. Each 'Message' in the XML produces **two types of outbox records**:
+
+**a) Chargeback record (CHARGEBACK_PROCESS)**:
+- 'caponeChargebackSupport.mapMessageToCommonEvent()' builds 'CommonEvent'.
+- 'messageType == "claim-request"' → 'isCreateCase = true' → 'disputeStage = "REQ"', 'sourceSystemCaseId = acquirerClaimId'.
+- Otherwise → 'disputeStage = "CH1"'.
+- CardNetwork = 'CAPONE'. CaseType = 'BJPLCC' (for BJWC files).
+- 'chbkOutboxRowRepository.save(chbkOutboxEntity)' — **direct save without 'insertEvidenceOutBox'**.
+
+**b) Evidence records (EVIDENCE_ATTACH)** — one per 'ImageMeta' in the message:
+- 'rowDetail.setStatus(StatusEnum.BLOCKED.name())' — **evidence is always written BLOCKED**.
+- 'rowDetail.setRecordDetail(null)' — no record detail in evidence row.
+- Parent row number = parent chargeback row's rowNumber.
+- 'commonService.insertEvidenceOutBox(rowDetail, s3KeyMap, fileJobId)' writes 'chbk_outbox_row' + 'file_evidence'.
+
+### DNWK (Network Files — AMEX, AMEXHYB, DISC, MC_REVREJ, NYCE, DISCHYB)
+All sub-implementations follow identical logic (same code with different service bean names):
+- Lines must start with "WDP" (loop breaks on first non-WDP line).
+- Validity: 'eventType' field (bytes 0-25) must equal "WDP_INBOUND_EVENT".
+- **PAN encryption** called per record.
+- 'NetworkFileSupport.mapNetworkFileLayoutToCommonEvent()' → 'CommonEvent'.
+- 'mapNetworkFileLayoutToDiscoverPayload()' → 'DiscoverPayload' (Discover-specific fields).
+- 'buildDiscoverNotes()' → 'DiscoverNotes' (notes XDISCA, XDISCE, XDISCM, MEMMSG).
+- If 'schNetCardNetwork' contains 'DISC' → 'discoverPayload' and 'networkNotes' columns populated; otherwise set to null[^37].
+- EventType = 'CHARGEBACK_PROCESS'. No evidence rows created.
+- ACK not required for network files.
+- 'isCreateCase' is hardcoded 'false' in all network services — **never creates a new case from these files**[^38].
+
+---
+
+## 8. OUTBOUND — WHAT IT WRITES
+
+### Database Tables (PostgreSQL, schema 'wdp')
+
+#### 'wdp.file_job'[^39]
+
+Image 8
+#### 'wdp.file_job'[^39]
+| Column | Type | Written When |
+|--------|------|-------------|
+| 'id' | bigint PK (auto-increment) | On receipt of new message |
+| 'file_name' | varchar(500) | Always |
+| 's3_bucket' | varchar(255) | Always |
+| 's3_key' | varchar(1000) | Initially inbound key; updated to archived key after archiving |
+| 'file_size_bytes' | bigint | From SQS message size field |
+| 'status' | varchar | 'PENDING' → 'PROCESSING' → 'ERROR' or remains 'PROCESSING' |
+| 'source' | varchar(1000) | AcroEnum value or sub-source name |
+| 'ack_required' | boolean | If source requires ACK generation |
+| 'ack_status' | varchar(50) | 'PENDING' if ack required |
+| 'total_rows' | int | Count of detail records processed |
+| 'total_evidences' | int | Count of evidence records processed |
+| 'error_code' / 'error_message' | varchar | On any error |
+| 'created_by' | varchar | 'WPFLEPR' |
+
+#### 'wdp.chbk_outbox_row'[^40]
+The primary outbox consumed by downstream services.
+
+| Column | Description |
+|--------|-------------|
+| 'id' | bigint PK auto-increment |
+| 'file_job_id' | FK to file_job |
+| 'row_number' | Integer sequence within the file (for resume) |
+| 'parent_row_number' | For evidence rows: points to the CHARGEBACK_PROCESS row |
+| 'event_type' | 'CHARGEBACK_PROCESS' or 'EVIDENCE_ATTACH' |
+| 'i_case' | WDP internal case number (formatted) |
+| 'c_acq_platform' | Source system: 'CORE' or 'PIN' |
+| 'i_acq_refnce_num' | Acquirer Reference Number (ARN) |
+| 'c_reason' | Reason code |
+| 'i_ntwk_tran_id' | Network transaction ID |
+| 'c_case_ntwk' | Card network identifier |
+| 'c_ntwk_case_id' | Network case number |
+| 'c_case_stage' | Dispute stage ('REQ', 'CH1', etc.) |
+| 'c_levell_entity' | Merchant ID |
+| 'c_migration_sta' | Migration status flag |
+| 'payload' | JSON: full 'RowDetail' (evidence) or 'CommonEvent' (chargeback) object |
+| 'record_detail' | JSON: source-specific raw record detail |
+| 'discover_payload' | JSON: 'DiscoverPayload' (Discover network records only) |
+| 'network_notes' | JSON: 'DiscoverNotes' (Discover network records only) |
+| 'status' | 'LOADING' (during batch write) → 'PENDING' (after bulk update) or 'ERROR' / 'BLOCKED' |
+| 'error_code' / 'error_message' | Per-record errors |
+| 'source_event' | AcroEnum value string (e.g., 'WALMART_SIG_CAP') |
+| 'document_type' | 'RESPDOC', 'ISSRDOC', 'DSNOTDOC', or null |
+| 'c_ntwk_phase_id' | Network phase ID |
+| 'i_action_seq' | Action sequence (last 2 digits of case number) |
+| 'created_by' / 'updated_by' | 'WPFLEPR' |
+
+**Initial status for new rows is 'LOADING'** ('setLoadingStatus()' in 'CommonServiceImpl'[^41]). After all records for the file are inserted, a bulk 'UPDATE ... SET status = PENDING WHERE status = LOADING AND file_job_id = ?'
+
+Image 9
+'c_ntwk_phase_id' | Network phase ID |
+'i_action_seq' | Action sequence (last 2 digits of case number) |
+'created_by' / 'updated_by' | WPFLEPR |
+
+**Initial status for new rows is 'LOADING'** ('setLoadingStatus()' in 'CommonServiceImpl'[^41]). After all records for the file are inserted, a bulk 'UPDATE ... SET status = PENDING WHERE status = LOADING AND file_job_id = ?' is executed[^42].
+
+**Exception**: For Capone (DCPO) chargeback rows, 'chbkOutboxRowRepository.save()' is called directly without going through 'insertEvidenceOutBox' and starts 'BLOCKED' — status is left null (falls through to '@PrePersist' default 'PENDING')[^43]. Capone evidence rows
+
+#### 'wdp.file_evidence'[^44]
+| Column | Description |
+|--------|-------------|
+| 'id' | bigint PK |
+| 'file_job_id' | FK to file_job |
+| 'chbk_outbox_row_id' | FK to the corresponding chbk_outbox_row |
+| 'file_name' | Image filename (e.g., 'C123456789.RD.1234.0101.123456789012.tiff') |
+| 's3_key' | Staging S3 key of image, or 'IMAGE NOT FOUND IN S3' |
+| 's3_bucket' | Source S3 bucket name |
+| 'attachment_status' | 'ATTACHED' (if SUCCESS), else from RowDetail status, or 'PENDING' default |
+| 'l_case' | WDP internal case number |
+| 'c_ntwk_case_id' | Network case number |
+| 'failed_s3_key' | Key in failed-evidence bucket if moved on ERROR |
+| 'appended_file_name' | (Column present, never set in current code) |
+| 'created_by' / 'updated_by' | WPFLEPR |
+
+### No Kafka, No REST Output
+**No Kafka producer** is in the codebase (no Kafka dependency in 'pom.xml'). The outbox table ('chbk_outbox_row') is the sole output channel. No downstream REST API is called as output.
+
+### S3 Operations (Outbound)
+1. **Document staging** — extracted images uploaded to '<ACRO>/STAGING/<date>/<zipName>/<imageName>' in the same S3 bucket.
+2. **ZIP archival** — inbound ZIP moved to '<ACRO>/ARCHIVED/<MMYYYY>/<filename>.zip'.
+3. **Failed evidence move** — ERROR-status evidence images with a STAGING path moved to 'wdp-evidence-failed-files-prod' under '<sourceEvent>/<YYYY-MM-DD>/<imageName>'.
+4. **PIN document move** — DWSG PIN indicator images moved to '<ACRO>/PINDISPUTE/<date>/<pinNetwork>/<imageName>'.
+5. **Staging cleanup** — after successful processing, 'deleteImageFilesFromS3Staging()' deletes any image in the staging map that does not appear in 'file_evidence' (i.e., was not matched to a valid index record)[^45].
+
+### Spring Batch Metadata Tables
+**Not applicable** — Spring Batch is not used.
+
+### Logstash
+Logs are shipped to Logstash via 'LogstashTcpSocketAppender' at '${logstash.server.host.port}'[^46]. JSON-structured logs include 'Environment' and 'AppName' custom fields.
+
+---
+
+## 9. EVIDENCE HANDLING
+
+### Separation of Chargeback vs. Evidence Data
+- For **DWSG, DBLK, DISR, MFAD**: Every record IS an evidence record (eventType = 'EVIDENCE_ATTACH'). There are no chargeback records in these files. A ZIP contains a flat index file listing image names plus the image files themselves.
+- For **DCPO (Capone XML)**: Each 'Message' element creates one 'CHARGEBACK_PROCESS' row and N 'EVIDENCE_ATTACH' rows (one per '<Image>' element). The chargeback row is created first; the evidence rows reference it via
+
+Image 10
+'parentRowNumber'.
+- For **DNWK**: Every record is a 'CHARGEBACK_PROCESS' row. No evidence rows are created.
+
+### Evidence Staging S3 Path
+
+<ACRO>/STAGING/<YYYY-MM-DD>/<zipFileNameWithoutExtension>/<imageName>
+
+E.g.: 'DWSG/STAGING/2024-03-15/AUE2_DWSG_POBCDWLJ_WMSIG20240315.zip_without_ext/C123456789.tiff'
+
+### Evidence Linkage to Chargeback Case
+- **DWSG / DBLK**: 'i_case' (WDP case number) is extracted from the index file record. The downstream consumer uses 'i_case' to look up the dispute case.
+- **DISR**: 'c_ntwk_case_id' is set from formatted 'caseNumber' in the index. 'i_case' is NOT set (remains null).
+- **MFAD**: 'i_case' set from formatted 'caseNumber' from the notice line.
+- **DCPO**: Evidence 'i_case' = parent chargeback row's 'iCase' (= 'acquirerClaimId'). Linked via 'parentRowNumber'.
+
+### BLOCKED Status Pattern
+For **DCPO only**: all evidence rows are written with 'status = BLOCKED'[^47]. This prevents the downstream consumer from attempting to attach evidence before the chargeback case has been created by the consumer processing the parent 'CHARGEBACK_PROCESS' row.
+
+The question of **which component unblocks evidence** is **not visible in this codebase**. The 'wdp-file-processor' only writes BLOCKED; the consumer (a separate service not in this repo) is responsible for querying and unblocking evidence rows after processing the parent chargeback row.
+
+---
+
+## 10. ERROR HANDLING AND FAILURE MODES
+
+### Transaction Boundary
+'CommonServiceImpl.insertEvidenceOutBox()' is annotated '@Transactional'[^48]. The two writes ('chbkOutboxRowRepository.saveAndFlush()' and 'fileEvidenceRepository.saveAndFlush()') are inside a single transaction. If either fails, both are rolled back.
+
+However, the outer record loop in each 'AcroService' has a try/catch that catches 'Exception' and **logs but does not re-throw** — processing continues to the next record[^49]. **A single record failure does not stop the file.**
+
+### Retry Strategy
+- **PAN encryption REST calls**: '@Retryable(retryFor = Exception.class, maxAttempts = 3, backoff = @Backoff(delay = 2000ms))'[^50] — 3 attempts, 2-second fixed backoff. If all fail, exception propagates — record written as ERROR.
+- **No retry** on S3 read, S3 write, or database operations.
+- **No retry** on IDP token retrieval.
+
+### File-Level Failure
+If the entire 'processDataFromMessage()' method throws at the top level, the ZIP is archived and 'file_job' updated to ERROR[^51]. The SQS message is NOT deleted, so it will reappear after the visibility timeout. However, upon reappearance, the idempotency check ('IsProcessedMessage') will detect the 'file_job' record with non-PENDING status and delete the message[^52].
+
+### Dead Letter Mechanism
+**No DLQ**, no error table, no S3 error path for file-level failures. The only error mechanisms are:
+1. 'file_job.status = ERROR' with 'error_code' and 'error_message'.
+2. 'chbk_outbox_row.status = ERROR' per record.
+3. 'file_evidence.failed_s3_key' for ERROR-status image files moved to the failed-evidence bucket.
+
+Image 11
+- **No retry** on IDP token retrieval.
+
+### Partial File Restart
+Resume logic exists in all 'AcroService' implementations: on startup of processing for a 'fileJobId', the service queries 'findTopByFileJobIdOrderByRowNumberDesc(fileJobId)' to find the last successfully inserted row[^53]. If found, processing resumes at 'rowNumber + 1'. **This means processing is idempotent at the record level within a file** — if a pod restarts mid-file, it resumes from where it left off (assuming the 'file_job' record still has 'PENDING' status).
+
+---
+
+## 11. IDEMPOTENCY
+
+### File-Level Idempotency
+In 'IsProcessedMessage()' / 'ProcessDataFromMessage()'[^54]:
+```java
+fileJobRepository.findByFileNameAndS3KeyAndStatusNot(zipFileName, key, StatusEnum.PENDING.name()).isPresent()
+```
+If a 'file_job' record exists with the same 'fileName' + 's3Key' AND status ≠ 'PENDING', the SQS message is deleted immediately and the file is NOT reprocessed. This covers duplicate SQS delivery after successful processing.
+
+**Gap**: If the file is currently in status 'PENDING' (e.g., a previous run inserted the file_job row but crashed before processing), the file will be reprocessed from row 0 unless records already exist in 'chbk_outbox_row' (in which case the resume logic skips ahead). If 'chbk_outbox_row' has partial records but 'file_job.status = PENDING', a duplicate of records 1 through last-recorded-row will NOT be inserted (resume skips them), but the 'file_job' row will be inserted as a duplicate — actually no: 'insertFileJobTable' also checks 'findOneByFileNameAndS3Key' and returns the existing ID if found[^55].
+
+**Full duplicate risk per source**: Low for most sources due to the dual guard (file_job unique check + record resume). The main unguarded scenario is if two pods receive the same SQS message simultaneously — both may pass the 'IsProcessedMessage' check before either writes the 'file_job' row. Since 'maxConcurrentMessages = 1' and 'maxMessagesPerPoll = 1', this is mitigated by design but not by a database unique constraint.
+
+---
+
+## 12. VOLUME AND THROUGHPUT
+
+No explicit configuration of maximum file size, record count, or rate limiting was found in source. Observed values from code:
+
+| Metric | Value / Source |
+|--------|---------------|
+| Max concurrent messages | 1 (SQS listener config)[^10] |
+| DNWK record length | 5700 bytes fixed[^28] |
+| DWSG detail record length | 99 bytes[^36] |
+| DBLK detail record length | >102 bytes[^57] |
+| DISR detail record length | 105 bytes[^58] |
+| MFAD minimum detail length | 28 chars after quote-split[^23] |
+| S3 buffer size (image extraction) | 4096 bytes[^17] |
+
+Image 12
+| DNWK record length | 5700 bytes fixed[^28] |
+| DWSG detail record length | 99 bytes[^56] |
+| DBLK detail record length | >102 bytes[^57] |
+| DISR detail record length | 105 bytes[^58] |
+| MFAD minimum detail length | 28 chars after quote-split[^23] |
+| S3 buffer size (image extraction) | 4096 bytes[^17] |
+| XML buffer size (Capone) | 1024 bytes[^24] |
+| Encryption retry count | 3[^50] |
+| Encryption retry delay | 2000 ms[^50] |
+
+Files per run, records per file, and polling frequency are not hardcoded. SQS polling frequency is managed by the 'io.awspring.cloud' SQS starter with defaults (typically long-polling at 20s intervals). No rate limiting code was found.
+
+---
+
+## 13. SCALING AND DEPLOYMENT
+
+### Kubernetes Resource Type
+**Deployment** (not CronJob) — 'resources.yaml' uses 'apiVersion: {{ deploymentApiVersion }}' and 'kind: Deployment'[^59].
+
+### Replica Count
+XL Deploy placeholder: '{{ replicas-wdp-file-processor }}'[^59]. Exact production count is **not visible in source**.
+
+### Memory / CPU
+| Resource | Value |
+|----------|-------|
+| Memory limit | '2048Mi' |
+| Memory request | '1024Mi' |
+| CPU limit | **Not set** |
+| CPU request | **Not set** |
+
+### Rolling Update Strategy
+```yaml
+strategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+  type: RollingUpdate
+```
+With 'minReadySeconds: 50'[^59].
+
+### HPA
+**Not present** in 'resources.yaml'.
+
+### PodDisruptionBudget
+**Not present** in 'resources.yaml'.
+
+### Topology Spread Constraints
+**Not present**.
+
+### Concurrency
+
+Image 13
+**Not present** in 'resources.yaml'.
+
+### Topology Spread Constraints
+**Not present**.
+
+### Concurrency
+'maxConcurrentMessages = "1"' and 'maxMessagesPerPoll = "1"' on the SQS listener means **one file at a time, fully sequential**. Multiple replicas would each process one file simultaneously (from the same SQS queue), but SQS visibility timeout prevents double-processing.
+
+### Observability
+- **OpenTelemetry**: Java auto-instrumentation via annotation 'instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default'[^59]. No manual OTel code in source.
+- **Logstash**: TCP appender ships structured JSON logs[^46].
+- **Spring Actuator**: Spring Boot Web is included ('spring-boot-starter-web'), which includes Actuator by default, but no explicit Actuator configuration or custom endpoints were found.
+- **No Micrometer/Prometheus metrics** configuration found beyond what Spring Boot auto-configures.
+
+---
+
+## 14. CONFIGURATION
+
+All environment-specific values are externalized. The active profile is '${gcp_env}'.
+
+| Property Key | Prod Value | Source |
+|-------------|-----------|--------|
+| 'cloud.aws.sqs.queue.name' | 'wdp-file-arrivals' | 'application-prod.yml'[^60] |
+| 'cloud.aws.sqs.queue.url' | 'https://sqs.us-east-2.amazonaws.com/713582017757/wdp-file-arrivals' | 'application-prod.yml' |
+| 'cloud.aws.sqs.timeout' | '${extend_timeout}' | Env-var / K8s secret |
+| 'cloud.aws.region.static' | 'us-east-2' | 'application-prod.yml' |
+| 'cloud.aws.credentials.isanswer' | 'true' | 'application-prod.yml' |
+| 'cloud.s3.wdp-bucket-name' | 'wdp-files' | 'application-prod.yml' |
+| 'cloud.s3.wdp-failed-evidence-bucket-name' | 'wdp-evidence-failed-files-prod' | 'application-prod.yml' |
+| 'pan-encryption-url' | 'http://wdp-encryption-service.wdp-micro:8082/merchant/gcp/encryption/v1/pan/encrypt' | 'application-prod.yml' |
+| 'token-url' | 'http://wdp-idp-token-service.wdp-micro:8082/merchant/gcp/idp/token/token' | 'application-prod.yml' |
+| 'spring.datasource.wdp-jdbc-url' | '${wdp_datasource_jdbc_url}' | K8s secret 'wdp-file-processor-secrets' |
+| 'spring.datasource.wdp.username' | '${wdp_datasource_username}' | K8s secret |
+| 'spring.datasource.wdp.password' | '${wdp_datasource_password}' | K8s secret |
+| 'spring.profiles.active' | '${gcp_env}' | Env-var |
+| 'logger.level' | '${log_level}' | Env-var |
+| 'logstash.server.host.port' | '${logstash_server_host_port}' | Env-var |
+
+**K8s Secrets** referenced via 'secretRef' in 'resources.yaml'[^59]:
+- 'wdp-file-processor-secrets'
+- 'wdp-common-secrets'
+- '{{ ingressTLSSecretName }}'
+
+**No feature flags** were found. No toggles or conditional processing switches beyond hard routing by AcroEnum.
+
+Image 14
+- '{{ ingressTLSSecretName }}'
+
+**No feature flags** were found. No toggles or conditional processing switches beyond hard routing by AcroEnum.
+
+---
+
+## 15. PLANNED CHANGES AND IN-PROGRESS WORK
+
+### Commented-Out Code
+
+**1. AWS SDK v2 S3 direct dependency removed in favour of Spring Cloud AWS Starter**[^61]:
+```xml
+<!--<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>s3</artifactId>
+    <version>2.36.0</version>
+</dependency>-->
+```
+Spring Cloud AWS 4.0.0 brings its own S3 SDK — this was a migration remnant.
+
+**2. DNWK decryption TODO** in 'FileProcessingServiceImpl.processDataFromMessage()'[^62]:
+```java
+// Todo if required do the decryption here before processing the file
+//BufferedReader reader = new BufferedReader(new java.io.InputStreamReader(s3InputStream, StandardCharsets.UTF_8));
+//processStatus = processFlatFile(reader, fileJobId, sourceAcro, fileName, bucketName);
+```
+The commented-out code suggests a **direct (non-zip) flat file read path for DNWK** was considered or was previously active. Currently, DNWK always goes through 'processZipContainingFlatFile'. The comment suggests decryption of the flat file was considered but deferred.
+
+**3. Image size check commented out in DWSG**[^63]:
+```java
+//else if (sImage.getImageSize() > 3000000) {
+//    rowDetail.setStatus(StatusEnum.ERROR.name());
+//    ...error code 34...
+//}
+```
+The 3 MB size cap was moved to the downstream consumer. The constant 'DOCUMENT_SIZE_EXCEEDS_ERROR_CODE = "34"' and message remain in 'WalmartSignatureCapConstants'.
+
+**4. Occurrence number commented out in DWSG and DBLK**[^20]:
+```java
+// this.occurenceNumber = values.substring(11, 13); // WWChargebackInfo
+// this.occurrenceNumber = values.substring(19, 21); // CoreMerchantBulkResponseInfo
+```
+These fields are parsed but never used. The action sequence instead comes from 'caseNumber.substring(10, 12)'.
+
+**5. CoreMerchantBulkResponseInfo unused field extractions**[^20]:
+```java
+//this.disputeCaseNumber = values.substring(11, 21);
+//this.accountNumber = values.substring(21, 40);
+//this.transAmount = values.substring(62, 85);
+```
+
+Image 15
+//this.occurrenceNumber = values.substring(19, 21); // CoreMerchantBulkResponseInfo
+
+These fields are parsed but never used. The action sequence instead comes from 'caseNumber.substring(10, 12)'.
+
+**5. CoreMerchantBulkResponseInfo unused field extractions**[^20]:
+```java
+//this.disputeCaseNumber = values.substring(11, 21);
+//this.accountNumber = values.substring(21, 40);
+//this.transAmount = values.substring(62, 85);
+//this.refNumber = values.substring(37, 43);
+```
+These fields were intended but are not currently extracted or used.
+
+**6. 'processFlatFile' exception handler commented out**[^64]:
+```java
+//status = archiveZipFileAndUpdateStatus(fileJobId, key, ...) ;
+```
+On flat file processing error, archival does not occur — a silent failure mode.
+
+**7. 'DiscoverMapIncomingServiceImpl' record detail commented out**[^65]:
+```java
+//rowDetail.setRecordDetail(mapDetail.getOriginalRecordString());
+```
+The raw record string was intended for the detail field but is not currently saved.
+
+**8. 'DiscoverMapNoticeProcessorServiceImpl' record detail commented out**[^66]:
+```java
+// .recordDetail(discoverMapNoticeInfo.getOriginalRecordString())
+```
+Same pattern as DISR.
+
+**9. 'logback-spring.xml' destination comments**[^46]:
+```xml
+<!-- <destination>10.43.145.125:5044</destination> -->
+<!-- <destination>10.43.145.125:5044</destination> -->
+```
+Old hardcoded Logstash IP addresses replaced by '${LOGSTASH_SERVER_HOST_PORT}'.
+
+### Unused / Incomplete Implementations
+
+**'AMEXOPTB_NETWORK_INCOMING'**: 'NetworkFileEnum.AMEXOPTB' is declared and routed in 'getSourceAcroName()'[^8], but there is **no '@Service("AMEXOPTB_NETWORK_INCOMING")' class** in the codebase. Arrival of an 'AMEXOPTB' file will cause 'NetworkServiceImpl.processRecords()' to return 'null'[^9] — silent no-op with null 'IndexRecordInfo'.
+
+**'MC_REVREJ'**: Similarly, 'NetworkFileEnum.MC_REVREJ' is routed but there is **no 'MC_REVREJ_NETWORK_INCOMING' service implementation** visible in the source file list.
+
+**'DISCHYB'**: 'NetworkFileEnum.DISCHYB' is routed, but there is **no 'DISCHYB_NETWORK_INCOMING' service implementation** in source.
+
+**'CoreBulkResponseConstants.DETAIL_RECORD_LENGTH = 102'**: Comment says '//134;// need to check the size in prod' — production record length is uncertain[^21].
+
+Image 16
+**'CoreBulkResponseConstants.DETAIL_RECORD_LENGTH = 102'**: Comment says '//134;// need to check the size in prod' — production record length is uncertain[^21].
+
+**'DiscoverMapIncomingConstants' error codes blank**: Several error codes are empty strings:
+```java
+public static final String DETAIL_ROW_INVALID_ERROR_CODE = "";
+public static final String DOCUMENT_SIZE_ZERO_KB_ERROR_CODE = "";
+public static final String DOCUMENT_NOT_FOUND_ERROR_CODE = "";
+```
+These will write empty strings to the 'error_code' column for DISR-source errors.
+
+**'FileEvidence.appendedFileName'**: Column exists in the entity, never set in any service.
+
+**'ChbkOutboxRow.iActionId'**: Field declared with comment '// not required', never set.
+
+**'CoreBulkResponseConstants' commented error codes**:
+```java
+//public static final String DETAIL_ROW_INVALID_ERROR_MESSAGE = ...
+//public static final String DETAIL_ROW_INVALID_ERROR_CODE = "35";
+```
+These were deactivated, suggesting the DBLK detail-invalid error handling path was changed.
+
+---
+
+## 16. CONFIDENCE ASSESSMENT
+
+| Section | Confidence | Basis |
+|---------|-----------|-------|
+| 1. Primary Responsibility | **High** | Direct source: 'FileProcessorApplication', 'SqsMessageListener', 'pom.xml' — Spring Batch absent |
+| 2. File Sources | **High** | Direct source: 'AcroEnum', 'FileAcroEnum', 'NetworkFileEnum' |
+| 3. Trigger Mechanism | **High** | Direct source: 'SqsMessageListener.java', 'application-prod.yml' |
+| 4. File Reading and Parsing | **High** | Direct source: All service impls and model classes with exact byte offsets |
+| 5. Inbound Dependencies | **High** | Direct source: 'RestInvoker', 'IdpTokenServiceImpl', '@Value' URL properties |
+| 6. PAN Handling | **High** | Direct source: 'NetworkFileSupport.encrypt()', 'EncryptionRequest/Response' |
+| 7. Processing Logic Per File Type | **High** | Direct source: All 'AcroService' implementations |
+| 8. Outbound — What It Writes | **High** | Direct source: All entity classes, 'ChbkOutboxRowRepository', 'FileEvidenceRepository' |
+| 9. Evidence Handling | **High** for write side; **Low** for unblocking | Unblocking is in a separate (unseen) service |
+| 10. Error Handling | **High** | Direct source: try/catch blocks, '@Retryable' annotations |
+| 11. Idempotency | **High** | Direct source: 'IsProcessedMessage()', 'findByFileNameAndS3KeyAndStatusNot()' |
+| 12. Volume and Throughput | **Low** | No volume/capacity configuration in source; operational data not determinable from code alone |
+| 13. Scaling and Deployment | **Medium** | 'resources.yaml' is authoritative for what's present; HPA/PDB absence confirmed; replica count is a placeholder |
+| 14. Configuration | **High** for structure; **Medium** for prod values | Prod YAMLs visible but sensitive values are env-var placeholders |
+| 15. Planned Changes | **High** | All findings directly from commented code and missing implementations in source |
+
+Image 17
+| 11. Idempotency | **High** | Direct source: 'IsProcessedMessage()', 'findByFileNameAndS3KeyAndStatusNot()' |
+| 12. Volume and Throughput | **Low** | No volume/capacity configuration in source; operational data not determinable from code alone |
+| 13. Scaling and Deployment | **Medium** | 'resources.yaml' is authoritative for what's present; HPA/PDB absence confirmed; replica count is a placeholder |
+| 14. Configuration | **High** for structure; **Medium** for prod values | Prod YAMLs visible but sensitive values are env-var placeholders |
+| 15. Planned Changes | **High** | All findings directly from commented code and missing implementations in source |
+
+---
+
+## Key Repositories Summary
+
+| Repository | Purpose | Key Files |
+|-----------|---------|----------|
+| 'wdp-file-processor' (this repo) | Inbound file ingestion — SQS listener, ZIP/XML/flat file parsing, outbox write | 'FileProcessingServiceImpl.java', 'SqsMessageListener.java', 'CommonServiceImpl.java', 'NetworkFileSupport.java', all 'AcroService' impls |
+
+Downstream consumer (not in this repo — unblocks BLOCKED evidence rows, reads 'chbk_outbox_row') and the 'wdp-encryption-service' / 'wdp-idp-token-service' are referenced by URL only.
+
+---
+
+## Architecture Diagram
+                AWS SQS
+            "wdp-file-arrivals"
+                    |
+           S3 ObjectCreated event JSON
+                    |
+        SqsMessageListener  maxConcurrent=1, maxPerPoll=1
+                    |
+              message.body()
+                    |
+        FileProcessingServiceImpl
+        1. IsProcessedMessage?  —yes—> delete SQS msg
+        2. insertFileJobTable
+        3. getS3Stream
+        4. route by AcroEnum
+
+      /           |            \
+processIndexZipFile  processXmlZipFile  processZipContainingFlatFile
+(DWSG/DBLK/DISR/MFAD)  (DCPO)              (DNWK)
+|              |                    |
+AcroService map lookup (by bean name string)
+WALMART_SIG_CAP  CORE_BULK_RESP   DISCOVER_MAP_INCOMING
+DISCOVER_MAP_NOTICE_PROCESSOR  CAPONE_DISPUTES_INCOMING
+DNWK_NETWORK_INCOMING —> NetworkFileService sub-dispatch
+    AMEX_NETWORK_INCOMING  | AMEXHYB_NETWORK_INCOMING
+    DISCOVER_NETWORK_INCOMING | NYCE_NETWORK_INCOMING
+
+
+Image 18
+            SqsMessageListener  maxConcurrent=1, maxPerPoll=1
+                        |
+                  message.body()
+                        |
+            FileProcessingServiceImpl
+            1. IsProcessedMessage?  —yes—> delete SQS msg
+            2. insertFileJobTable
+            3. getS3Stream
+            4. route by AcroEnum
+
+          /           |            \
+processIndexZipFile  processXmlZipFile  processZipContainingFlatFile
+(DWSG/DBLK/DISR/MFAD)  (DCPO)              (DNWK)
+         |              |                    |
+                   AcroService map lookup (by bean name string)
+
+    WALMART_SIG_CAP  CORE_BULK_RESP   DISCOVER_MAP_INCOMING
+    DISCOVER_MAP_NOTICE_PROCESSOR  CAPONE_DISPUTES_INCOMING
+    DNWK_NETWORK_INCOMING —> NetworkFileService sub-dispatch
+        AMEX_NETWORK_INCOMING  | AMEXHYB_NETWORK_INCOMING
+        DISCOVER_NETWORK_INCOMING | NYCE_NETWORK_INCOMING
+
+                        |
+              per-record loop (resume-aware)
+                        |
+              ——(DNWK only)——> NetworkFileSupport.encrypt(PAN)
+                                    | POST /pan/encrypt
+                                    v
+                         wdp-encryption-service
+                         (Bearer token from wdp-idp-token-service)
+                        |
+                        v
+    CommonServiceImpl.insertEvidenceOutBox()
+    (or chbkOutboxRowRepository.save() for DCPO chargebacks)
+                        |
+                        v
+           PostgreSQL (wdp schema)
+      +------------------+------------------+
+      |    file_job       |   chbk_outbox   |
+      |                   |      _row       |
+      +------------------+------------------+
+                        |
+                        v
+                   file_evidence
+                        |
+                        v
+    S3: archive ZIP, stage images, move failed evidence
+
+---
+
+## Image 19
+                    |
+                    v
+S3: archive ZIP, stage images, move failed evidence
+
+---
+
+## Footnotes
+
+[^1]: 'src/main/java/com/wp/wdp/file/processor/FileProcessorApplication.java:7-11'
+[^2]: 'src/main/java/com/wp/wdp/file/processor/enums/AcroEnum.java:4-11'
+[^3]: 'src/main/java/com/wp/wdp/file/processor/enums/FileAcroEnum.java:9-16'
+[^4]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:415-434'
+[^5]: 'src/main/java/com/wp/wdp/file/processor/enums/NetworkFileEnum.java:3-11'
+[^6]: 'src/main/java/com/wp/wdp/file/processor/utils/FileJobUtils.java:43-48'
+[^7]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:138-143'
+[^8]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:415-434'
+[^9]: 'src/main/java/com/wp/wdp/file/processor/service/impl/NetworkServiceImpl.java:22-31'
+[^10]: 'src/main/java/com/wp/wdp/file/processor/listener/SqsMessageListener.java:33-49'
+[^11]: 'src/main/java/com/wp/wdp/file/processor/model/Event.java' (model for S3 event JSON)
+[^12]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:115-143'
+[^13]: 'src/main/java/com/wp/wdp/file/processor/listener/SqsMessageListener.java:43-48'
+[^14]: 'src/main/java/com/wp/wdp/file/processor/listener/SqsMessageListener.java:36-41'
+[^15]: 'src/main/java/com/wp/wdp/file/processor/service/impl/S3ServiceImpl.java:121-136'
+[^16]: 'src/main/resources/application-prod.yml:17-18'
+[^17]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:276-317'
+[^18]: 'src/main/java/com/wp/wdp/file/processor/model/WWChargebackInfo.java:52-64'
+[^19]: 'src/main/java/com/wp/wdp/file/processor/service/impl/CoreBulkResponseServiceImpl.java:174-176'
+[^20]: 'src/main/java/com/wp/wdp/file/processor/model/CoreMerchantBulkResponseInfo.java:47-57'
+[^21]: 'src/main/java/com/wp/wdp/file/processor/utils/CoreBulkResponseConstants.java:5'
+[^22]: 'src/main/java/com/wp/wdp/file/processor/model/MapDetail.java:37-40'
+[^23]: 'src/main/java/com/wp/wdp/file/processor/model/DiscoverMapNoticeInfo.java:31-46'
+[^24]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:320-368'
+[^25]: 'src/main/java/com/wp/wdp/file/processor/service/impl/CaponeDisputesIncomingServiceImpl.java:57-60'
+[^26]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:576-610'
+[^27]: 'src/main/java/com/wp/wdp/file/processor/utils/NetworkFileSupport.java:318-326'
+[^28]: 'src/main/java/com/wp/wdp/file/processor/model/NetworkRecordLayout.java:97-164'
+[^29]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:341-343'
+[^30]: 'src/main/java/com/wp/wdp/file/processor/service/impl/FileProcessingServiceImpl.java:145-150'
+[^31]: 'src/main/java/com/wp/wdp/file/processor/utils/NetworkFileSupport.java:122-133, 328-343'
+[^32]: 'src/main/java/com/wp/wdp/file/processor/restclient/RestInvoker.java:37'
+[^33]: 'src/main/java/com/wp/wdp/file/processor/service/impl/IdpTokenServiceImpl.java:20-34'
+[^34]: 'src/main/java/com/wp/wdp/file/processor/utils/CaponeChargebackSupport.java:73'
+[^35]: 'src/main/java/com/wp/wdp/file/processor/utils/CaponeChargebackNetworkFileServiceImpl.java:88-95'
+
+That's the complete extracted text across all 19 images. This is a deep technical research report on the wdp-file-processor microservice — highly relevant to completing the 2.3.2 FileProcessor component entry in WDP-COMPONENTS.md.
+Shall I now process this into the architecture-level component entry for WDP-COMPONENTS.md, stripping implementation detail per our ground rules?Sonnet 4.6ExtendedClaude is AI and can make mistake

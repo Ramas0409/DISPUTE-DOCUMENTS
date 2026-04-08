@@ -1,0 +1,52 @@
+You are my senior architecture partner for WDP
+(Worldpay Dispute Platform).
+
+Read these project documents before responding:
+WDP-HANDOVER.md, WDP-COMP-INDEX.md,
+WDP-COMP-TEMPLATE.md, WDP-COMPONENTS.md,
+WDP-ARCHITECTURE.md, WDP-DECISIONS.md,
+WDP-KAFKA.md, WDP-DB.md
+
+Today's component: 06 — NAPDisputeDeclineBatch
+
+⚠️ DECOMMISSION-SCOPED COMPONENT
+This component is on the NAP/WPG inbound path
+which is planned for decommission. No new
+development or design work is planned for it.
+
+DO NOT generate a Copilot research prompt.
+DO NOT ask for Copilot output.
+
+Use ONLY the content already in WDP-COMPONENTS.md
+to produce the following:
+
+1. COMPLETE COMPONENT FILE
+   Using WDP-COMP-TEMPLATE.md as the structure.
+   Apply only the type blocks that apply.
+   For the Internal Processing Flow — draw the
+   Mermaid flowchart from what is already documented
+   in WDP-COMPONENTS.md. Where information is
+   genuinely absent from WDP-COMPONENTS.md, mark
+   the field as ⚠️ NOT DOCUMENTED rather than
+   leaving a placeholder or guessing.
+   Architecture level only — no code or config.
+
+2. WDP-KAFKA.md UPDATE
+   Exact rows to add or update from this component.
+   State explicitly if no Kafka involvement.
+
+3. WDP-DB.md UPDATE
+   Exact rows to add or update from this component.
+   Flag any shared table risk.
+
+4. DEVIATION FLAGS
+   Any confirmed deviations from DEC-001, 003,
+   004, 005, 014 already documented in
+   WDP-COMPONENTS.md.
+
+5. REMAINING GAPS
+   Anything absent from WDP-COMPONENTS.md that
+   leaves a section incomplete. Since no Copilot
+   pass is planned, note these as ACCEPTED GAPS
+   — known unknowns that will not be resolved
+   unless the component scope changes.

@@ -1,0 +1,469 @@
+I Deep Technical Research Report: `wdp-evidence-ack-scheduler`
+
+**Repository:** `wdp-evidence-ack-scheduler`
+**Artifact:** `com.wp.wdp.evidence.ack.scheduler:wdp-evidence-ack-scheduler:1.0.3`
+**Stack:** Java 17   Spring Boot 3.5.11   Spring Data JPA   AWS SDK v2   JAXB
+**Team:** frauddispute / globalswitch (MerchantDisputes value stream)
+
+---
+
+## Executive Summary
+
+`wdp-evidence-ack-scheduler` is a Spring Boot long-running process deployed as a Kubernetes **Deployment** that periodically polls a shared PostgreSQL database for inbound file-processing jobs that have completed (successfully or with errors) and have not yet had an acknowledgement file generated. For each qualifying job it generates a format-specific ACK file and uploads it to AWS S3. Three merchant/source types are supported: **Walmart SigCap** (fixed-width `.txt`), **Meijer / Core Bulk Response** (fixed-width `.txt`), and **CapitalOne** (XML-in-ZIP). No SFTP, API, or messaging layer is involved. The application is version `1.0.3` and the CapitalOne XSD schema is stamped "Version 1.0.0 – 05/02/2026", indicating this component is recently released.
+
+---
+
+## Architecture Overview
+
+    wdp-evidence-ack-scheduler (K8s Deployment)
+
+ScheduledTasks (@Scheduled cron)
+    ↓
+AckFileProcessorServiceImpl.performTask()
+    |
+    |— FileJobRepository
+    |   (SELECT file_job WHERE status IN
+    |   [COMPLETED,ERROR], ack_status=PENDING,
+    |   ack_required=true ORDER BY id ASC)
+    |
+    |—[source=WALMART_SIG_CAP]——► WalmartSigCapAckServiceImpl
+    |—[source=CORE_BULK_RESP]——► BulkResponseAckServiceImpl
+    |—[source=CAPONE_BJWC|CMRTR]——► CapitalOneAckServiceImpl
+    |
+    |   ChbkOutboxRowRepository
+    |   (SELECT chbk_outbox_row WHERE
+    |   file_job_id = ?, ORDER BY row_number ASC)
+    |
+    |   CommonAckService (shared)
+    |
+    ↓                   ↓
+uploadAckFileToS3()   updateAckStatus()
+
+Image 2
+    ↓                   ↓
+uploadAckFileToS3()   updateAckStatus()
+    |
+    ↓                        ↓
+AWS S3 (us-east-2)      PostgreSQL wdp.file_job
+(wdp-files / wdp-files-dev)   (ack_status = COMPLETED)
+
+---
+
+## 1. Primary Responsibility
+
+### What it does
+
+`wdp-evidence-ack-scheduler` is a **scheduled batch processor** that generates outbound acknowledgement files for three merchant sources and uploads them to AWS S3. On every scheduled run it queries the `wdp.file_job` table for jobs that have been processed (status `COMPLETED` or `ERROR`), have `ack_required = true`, and have `ack_status = PENDING`. For each match it reads per-row detail records from `wdp.chbk_outbox_row`, formats them into the merchant-specific file layout, uploads the result to S3, and updates the `file_job` row to `ack_status = COMPLETED`.[^1][^2]
+
+### What it explicitly does NOT do
+
+- It does **not** receive or parse inbound files. Inbound processing is handled by a separate upstream service that populates `file_job` and `chbk_outbox_row`.
+- It does **not** deliver ACK files via SFTP, MQ, or API — only S3.
+- It does **not** process every `file_job` row indiscriminately; `ack_required = false` rows are silently skipped.[^3]
+- It does **not** handle Meijer directly by name — the source code identifier is `CORE_BULK_RESP`, but the file-name pattern `DBLK_MEJR_CHRGRESP_CONF_` confirms this is the Meijer chargeback bulk-response channel.[^4]
+
+### Which Merchants/sources receive ACKs
+
+| Source constant | Value in DB | Merchant / Program | File format |
+|---|---|---|---|
+| `SOURCE_WALMARTSIGCAP` | `WALMART_SIG_CAP` | Walmart Signature Capture | Fixed-width `.txt` |
+| `SOURCE_COREBULKRESP` | `CORE_BULK_RESP` | Meijer (Core Bulk Response) | Fixed-width `.txt` |
+| `SOURCE_CMRTR` | `CAPONE_CMRTR` | CapitalOne Commercial (CMRTR) | XML-in-ZIP |
+| `SOURCE_BJWC` | `CAPONE_BJWC` | CapitalOne BJWC | XML-in-ZIP |
+
+Any `file_job.source` value not matching these four constants is logged as "Unidentified source" and skipped.[^5]
+
+---
+
+## 2. Trigger and Schedule
+
+### Trigger mechanism
+
+The trigger is a Spring `@Scheduled` cron job. The `ScheduledTasks` class is annotated with `@Scheduled(cron = "${app.scheduler.cron}")`. The cron expression is not hard-coded in any deployed profile — it is injected at runtime from the environment variable `cron_scheduler` via a Kubernetes Secret reference (`wdp-evidence-ack-scheduler-secrets`).[^6][^7]
+
+The only hard-coded cron expression appears in `application-local.yml`:
+
+app.scheduler.cron: 0 */1 * * * *    # every minute (local/dev only)
+
+Image 3
+[^8]
+
+In all deployed environments (dev, stg, uat, cert, prod) the cron value is `${cron_scheduler}` — the **actual production schedule is not visible in source code** and must be looked up in the Kubernetes Secret or deployment tooling.[^9]
+
+### Is this a Kubernetes Deployment or CronJob?
+
+**Kubernetes Deployment.** `resources.yaml` declares `kind: Deployment`, not `kind: CronJob`. The scheduling is handled inside the JVM by Spring's `@EnableScheduling` mechanism — the pod runs continuously and the cron fires internally.[^10][^11]
+
+---
+
+## 3. What Triggers an ACK File
+
+### Trigger condition
+
+ACK generation is **schedule-driven**, not event-driven. On each cron fire the processor unconditionally queries the database. If no eligible `file_job` rows exist, it logs "No pending fileJobs found for processing" and exits cleanly.[^2]
+
+### Which inbound files need an ACK
+
+The query in `FileJobRepository` is:
+```sql
+SELECT f FROM FileJob f
+WHERE f.status IN :status        -- ('COMPLETED', 'ERROR')
+  AND f.ackStatus = :ackStatus   -- 'PENDING'
+  AND f.ackRequired = true
+ORDER BY f.id ASC
+```
+
+[^3]
+
+This means:
+- **Per-inbound-file tracking** — each `file_job` row represents one inbound file.
+- `ack_required = true` must be set on the record (by the upstream inbound processor) before this scheduler will touch it.
+- `ack_status = PENDING` is the "not yet acknowledged" sentinel. Once this scheduler succeeds it flips it to `COMPLETED`.[^12]
+
+### Tracking table
+
+The **`wdp.file_job`** table is the ACK-tracking table. Key columns relevant to this scheduler:
+
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | Long (PK) | File job identifier |
+| `status` | String | `COMPLETED` or `ERROR` (set by upstream) |
+| `source` | String | Merchant/source identifier |
+| `ack_required` | Boolean | Must be `true` for ACK to be generated |
+
+Image 4
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | Long (PK) | File job identifier |
+| `status` | String | `COMPLETED` or `ERROR` (set by upstream) |
+| `source` | String | Merchant/source identifier |
+| `ack_required` | Boolean | Must be `true` for ACK to be generated |
+| `ack_status` | String | `PENDING` → `COMPLETED` lifecycle |
+| `ack_generated_at` | Timestamp | Set on successful ACK generation |
+| `total_rows` | Integer | Row count in original inbound file |
+| `total_evidences` | Integer | Evidence count (used by Walmart formatter) |
+| `error_code` | String | Job-level error code (used by BulkResponse formatter) |
+| `updated_by` | String | Set to `WPACKSD` (constant `EVIDENCE_ACK_SCHEDULER`) after update |
+
+[^13][^14]
+
+The **`wdp.chbk_outbox_row`** table holds per-row results from inbound processing and is the source of per-record detail for all three ACK formatters.[^15]
+
+---
+
+## 4. ACK File Generation
+
+### 4a. Walmart SigCap (`WALMART_SIG_CAP`)
+
+**File format:** Fixed-width text (`.txt`)
+**Encoding:** UTF-8
+
+**Structure:**
+H<yyyyMMdd>\n
+D<record_data padded to 78 chars><2-char return code>\n
+...repeat for each row...
+T<zero-padded total_evidences, 9 digits>
+
+| Section | Indicator | Length | Content |
+|---|---|---|---|
+| Header | `H` | 9 chars | `H` + date `yyyyMMdd` |
+| Detail | (raw) | 80 chars | 78-char padded `recordData` + 2-char return code |
+| Trailer | `T` | 10 chars | `T` + zero-padded `totalEvidences` (9 digits) |
+
+**Return code mapping (detail records):**
+
+| Return Code | Meaning | Trigger condition |
+|---|---|---|
+| `00` | Successfully Processed Record | `row.status = SUCCESS` |
+| `30` | Internal Error | Default / unrecognised error code |
+| `31` | Document not found | `errorCode = "31"` |
+| `32` | Charts(Reference) number not found | `errorCode = "32"` or `errorMessage` contains `CASE_NOT_FOUND` |
+| `33` | Server Error | `errorCode = "33"` |
+| `34` | Image File exceeds limit of 3 MB | `errorCode = "34"` or `errorMessage` contains `Image Size` or `DOC_SIZE_LIMIT_EXCEEDED` |
+| `35` | Invalid Index File Detail Record | `errorCode = "35"` |
+
+Image 5
+| `30` | Internal Error | Default / unrecognised error code |
+| `31` | Document not found | `errorCode = "31"` |
+| `32` | Charts(Reference) number not found | `errorCode = "32"` or `errorMessage` contains `CASE_NOT_FOUND` |
+| `33` | Server Error | `errorCode = "33"` |
+| `34` | Image File exceeds limit of 3 MB | `errorCode = "34"` or `errorMessage` contains `Image Size` or `DOC_SIZE_LIMIT_EXCEEDED` |
+| `35` | Invalid Index File Detail Record | `errorCode = "35"` |
+| `40` | Image File has 0 KB | `errorCode = "40"` |
+
+[^16][^17]
+
+**Detail content derivation:** The `chbk_outbox_row.record_detail` JSONB column is parsed as a `RecordDetailModel`. The nested `walmartSigCap.recordData` string is extracted as the 78-char padded body of each detail line.[^18]
+
+**Null-guard:** If `detailLines` is empty or `fileJob.totalEvidences` is null, ACK generation is skipped and the `file_job` row is left with `ack_status = PENDING`.[^19]
+
+---
+
+### 4b. Meijer / Core Bulk Response (`CORE_BULK_RESP`)
+
+**File format:** Fixed-width text (`.txt`)
+**Encoding:** UTF-8
+
+**Structure:**
+1<yyyyMMddHHmmSS>[optional structural-error detail lines]\n
+2<imageName right-padded to 55 chars><3-char return code>\n
+...repeat for each row...
+[optional structural-error detail lines]
+3<zero-padded total_rows, 9 digits>
+
+| Section | Indicator | Content |
+|---|---|---|
+| Header | `1` | `1` + datetime `yyyyMMddHHmmSS` |
+| Detail | `2` | `2` + 55-char right-padded `fileName` + 3-char code |
+| Trailer | `3` | `3` + zero-padded count (9 digits) |
+
+**Note on date format:** `BulkResponseConstants.ACK_FILE_DATE_TIME_FORMAT` is `yyyyMMddHHmmSS` — capital `SS` means fractional seconds (nanoseconds), not plain seconds. This is unusual and may be a deliberate format requirement or a latent bug.[^20]
+
+**Return code mapping:**
+
+| Code | Meaning |
+|---|---|
+| `00` | Successful |
+| `20` | Images are NOT received |
+| `21` | No Detail Records Provided |
+| `22` | Index Reader Record not found |
+| `32` | Case Not Found |
+| `30` | Internal Error |
+| `33` | Server Error |
+| `99` | No Trailer record Provided |
+
+Image 6
+| `30` | Internal Error |
+| `33` | Server Error |
+| `99` | No Trailer record Provided |
+
+[^21]
+
+**Structural error handling:** When the upstream inbound processor sets `file_job.error_code` to specific compound codes (`901`, `902`, `903`), the formatter inserts synthetic "header not found" or "trailer not found" detail lines into the ACK. This means the ACK explicitly reports structural defects in the original inbound file.[^22]
+
+| Job-level `error_code` | Synthetic lines injected |
+|---|---|
+| `22` (NO_HEADER_RECORD) | Header detail line (code 22) in header section |
+| `21` (NO_DETAIL_RECORDS) | Detail detail line (code 21) in header section |
+| `99` (NO_TRAILER_RECORD) | Trailer detail line (code 99) in trailer section |
+| `901` (NO_HEADER_NO_TRAILER) | Both 22 and 99 injected |
+| `902` (NO_HEADER_NO_DETAIL) | Both 22 and 21 injected |
+| `903` (NO_DETAIL_NO_TRAILER) | Both 21 and 99 injected |
+
+[^22]
+
+**Detail content derivation:** `chbk_outbox_row.record_detail` → `coreBulkResp.fileName` used as the padded 55-char detail body.[^23]
+
+---
+
+### 4c. CapitalOne CMRTR and BJWC (`CAPONE_CMRTR`, `CAPONE_BJWC`)
+
+**File format:** XML serialised from JAXB-generated classes, then wrapped in a ZIP archive.
+**XML namespace:** `https://capitalone.com/transactiontrouble/chargeback/wp`
+**XML namespace prefix:** `wp` (set by `WpPrefixMapper`)[^24]
+**Schema version:** `worldpay-cbpackage.xsd` v0.7.0 (schema annotation says "Version 1.0.0 – 05/02/2026")[^25]
+
+**XML structure (from XSD):**
+```xml
+<?xml
+<wp:package>
+  <batch-header>
+    <batch-file-name>...</batch-file-name>    <!-- original inbound file name -->
+    <region>PROD</region>                     <!-- hard-coded constant -->
+    <issuer-id>C06</issuer-id>               <!-- CapitalOne -->
+    <acquirer-id>WP</acquirer-id>            <!-- WorldPay -->
+    <acknowledgement-file-name>...</acknowledgement-file-name>
+  </batch-header>
+  <acknowledgement>  <!-- 0..2000 per XSD; 1 per chbk_outbox_row row -->
+    <message-type>claim-request | outcome-chargeback | ...</message-type>
+    <issuer-claim-id>...</issuer-claim-id>           <!-- 15 chars exact -->
+    <issuer-claim-transaction-id> ...</issuer-claim-transaction-id> <!-- 19 chars exact -->
+    <status>Accepted | Rejected</status>
+    <status-reason>...</status-reason>               <!-- optional, on reject -->
+    <acquirer-claim-id>...</acquirer-claim-id>       <!-- optional, on accept -->
+    <valid-reject>true|false</valid-reject>           <!-- optional -->
+  </acknowledgement>
+  ...
+```
+
+---
+
+## Image 7
+<valid-reject>true|false</valid-reject>    <!-- optional -->
+  </acknowledgement>
+  ...
+  <batch-footer>
+    <record-count>N</record-count>
+  </batch-footer>
+</wp:package>
+````
+[^25][^26]
+Field derivation from chbk_outbox_row:
+XML fieldSourcemessage-typerecord_detail.caponebjwc.messageTypeissuer-claim-idrecord_detail.caponeBjwc.issuerClaimId (15 chars)issuer-claim-transaction-idrecord_detail.caponeBjwc.issuerClaimTransactionId (19 chars)statusAccepted if chbk_outbox_row.status = SUCCESS; Rejected if ERRORacquirer-claim-idchbk_outbox_row.a_case (for claim-request); record_detail.acquirerClaimId (for outcome-chargeback)status-reasonError message text (known error patterns only)valid-rejecttrue for recognised errors; false for unrecognised
+[^27]
+Known "valid reject" reasons:
+Message typeValid reject reasonoutcome-chargeback"Acquirer-claim-id is unavailable for outcome-chargeback request"outcome-chargeback"Outcome chargeback already present"claim-requestError message containing: "transaction"+"not found", "merchant"+"not found", "existing case"+"found" (case-insensitive)
+[^28]
+Row filter: Only rows with event_type = CHARGEBACK_PROCESS AND status IN (SUCCESS, ERROR) are included. EVIDENCE_ATTACH event type rows are excluded.[^29]
+ZIP structure: The XML file is written as a single entry inside a ZIP archive. The entry path is the XML file name:
+
+CMRTR source: entry = WP.C1.COMMTRANTROUBLE.ACK.PROD.<timestamp>.xml
+BJWC source: entry = WP_BJWC.C1.TRANTROUBLE.ACK.PROD.<timestamp>.xml
+
+[^30]
+
+5. Outbound Delivery
+Target location — S3
+All ACK files are delivered exclusively to AWS S3 in region us-east-2. No SFTP, no API, no message queue.
+
+---
+
+## Image 8
+5. Outbound Delivery
+Target location — S3
+All ACK files are delivered exclusively to AWS S3 in region us-east-2. No SFTP, no API, no message queue.
+SourceS3 Bucket (prod)S3 Key PatternWALMART_SIG_CAPwdp-filesDWSG/OUTBOUND/ACK/AUF2_DWSG_ROBCDWL1_WMSIG_CONF_<yyyyMMddHHmmss>.txtCORE_BULK_RESPwdp-filesDBLK/OUTBOUND/ACK/DBLK_MEJR_CHRGRESP_CONF_<yyyyMMddHHmmSS>.txtCAPONE_CMRTRwdp-filesDCPO/OUTBOUND/ACK/DCPO_RODMRDOA.WP01.ACK.<yyyyMMddHHmm>.zipCAPONE_BJWCwdp-filesDCPO/OUTBOUND/ACK/DCPO_RODMRDOA.WP01.ACK.<yyyyMMddHHmm>.zip
+Non-production environments use wdp-files-dev bucket.[^31][^32][^33]
+Note on timestamp precision per source:
+
+Walmart SigCap: yyyyMMddHHmmss (second precision)
+Core Bulk Response: yyyyMMddHHmmSS (fractional second / nanosecond precision — may be intentional)
+CapitalOne: yyyyMMddHHmm (minute precision)
+
+[^20]
+Encryption and signing
+Not implemented. No client-side encryption, no SSE-KMS configuration, no signing is applied in code. IAM-based access control is used (the pod uses the EC2 instance profile / EKS IRSA mechanism when iamuser = true).[^34]
+Delivery confirmation
+CommonAckServiceImpl.uploadAckFileToS3() returns true only on a successful putObject call. The calling service checks this boolean before invoking updateAckStatus(). There is no additional delivery receipt, callback, or checksum verification.[^35]
+Idempotency guard on upload: Before uploading, headObject is called. If the key already exists in S3 (HTTP 200), the upload is skipped and false is returned — which prevents both re-upload and ack_status update. If headObject throws NoSuchKeyException (key does not exist), the upload proceeds.[^35]
+
+6. Inbound Dependencies
+DependencyConfig key / identifierPurposePostgreSQL (AWS RDS)spring.datasource.jdbc-url = ${wdp_datasource_jdbc_url}Primary database — reads wdp.file_job and wdp.chbk_outbox_row; writes ack_status, ack_generated_atAWS S3spring.cloud.aws.s3.bucket-name / region us-east-2Uploads generated ACK files
+No external HTTP services, message brokers, or other microservices are called.[^36]
+Database access details
+
+wdp.file_job: queried at start of each run to find eligible jobs; updated with ack_status=COMPLETED, ack_generated_at, updated_at, updated_by=WPACKSD after successful upload.[^13][^14]
+wdp.chbk_outbox_row: read per file_job_id to retrieve per-row processing results. The record_detail column is JSONB. No writes to this table.[^15]
+Connection: HikariCP (Spring Boot default); configured through DataSourceConfig with explicit EntityManagerFactory and TransactionManager beans named "EntityManagerFactory" and "TransactionManager".[^37]
+DDL: spring.jpa.hibernate.ddl-auto = false — schema is managed externally, not by Hibernate.[^37]
+
+
+---
+
+## Image 9
+7. Error Handling
+Scheduler-level error handling
+AckFileProcessorServiceImpl.performTask() wraps the entire loop in a try/catch (Exception e). On exception it logs "Unable to proceed" with no stack trace, no re-throw, and no alerting. The scheduler will simply try again on the next cron fire.[^2]
+Critical gap: Exceptions inside the per-fileJob loop are also silently swallowed at the individual service level. There is no propagation of per-job errors to any dead-letter mechanism.
+Per-service error handling
+Each of the three generateAck() implementations has its own try/catch (Exception e) that logs a warning message and returns without updating ack_status. The file_job row remains in ack_status = PENDING, so it will be picked up again on the next run.[^38][^39][^40]
+ACK generation failure
+If file content generation returns null (no detail records, missing evidence count, null batch header), the service skips the job — logs an informational message and returns. ack_status remains PENDING. The job will be re-evaluated on the next cron fire.[^19][^41]
+ACK delivery failure
+If uploadAckFileToS3 returns false, the updateAckStatus() call is not made. ack_status stays PENDING. No retry is attempted within the current cron execution.[^35]
+Retry strategy
+De facto retry via repeated polling. There is no explicit retry library (e.g., Spring Retry, Resilience4j). The retry mechanism is entirely implicit: since failed jobs remain ack_status = PENDING, they will be picked up again on the next scheduled run. The maximum number of retries is unlimited and bounded only by the cron schedule.
+Risk: If a job consistently fails (e.g., malformed record_detail data), it will be re-attempted on every cron fire indefinitely. There is no poison-pill detection or maximum-retry counter.
+Dead letter mechanism
+Not implemented. No DLQ, no error queue, no dedicated error table. Failures are log-only.
+
+8. Idempotency
+ACK generation level
+Partially idempotent. If the scheduler runs twice (e.g., two pods due to a deployment overlap), the following protections exist:
+
+S3 pre-check: uploadAckFileToS3 calls headObject before putObject. If the file already exists at the exact S3 key, the upload is skipped and ack_status is not updated.[^35]
+ack_status guard: The DB query only retrieves rows with ack_status = PENDING. Once a job is successfully processed and ack_status is set to COMPLETED, it is never re-selected.[^3]
+
+
+---
+
+## Image 10
+
+S3 pre-check: uploadAckFileToS3 calls headObject before putObject. If the file already exists at the exact S3 key, the upload is skipped and ack_status is not updated.[^35]
+ack_status guard: The DB query only retrieves rows with ack_status = PENDING. Once a job is successfully processed and ack_status is set to COMPLETED, it is never re-selected.[^3]
+
+Race condition risk
+The UniqueTimestampGenerator uses a JVM-level synchronized block with an AtomicReference<LocalDateTime>. This ensures unique timestamps within a single JVM, but provides no cross-JVM uniqueness guarantee. If two pods run simultaneously (possible during a rolling update), they could generate ACK files for the same file_job row with different timestamps, leading to two S3 objects and only one ack_status update (the first one to complete would claim COMPLETED; the second would also try to upload a different filename and update status again).[^42]
+Summary
+ScenarioHandled?Same pod, same JVM, repeated invocations✅ — DB ack_status guardSame pod, duplicate S3 key✅ — headObject pre-checkTwo pods running simultaneously⚠️ Partial — different file names likely generated; race on DB update possiblePermanent failure loop❌ — No max-retry counter or circuit breaker
+
+9. Scaling and Deployment
+Kubernetes resource type
+Deployment — not a CronJob.[^10]
+yamlkind: Deployment
+strategy:
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+  type: RollingUpdate
+The rolling update strategy with maxUnavailable: 0 ensures zero downtime during deployments but means there is a window during a rolling update where two pods may be running concurrently.
+Replica count
+{{ replicas-wdp-evidence-ack-scheduler }} — a placeholder resolved at deploy time by the XL Deploy / Release toolchain. The actual replica count is not visible in source code.[^10]
+Memory and CPU
+ResourceLimitRequestMemory2048Mi1024MiCPUNot configuredNot configured
+No CPU limits or requests are defined. This is a notable gap — unbounded CPU usage is possible.[^10]
+HPA
+
+---
+
+## Image 11
+HPA
+Absent. No Horizontal Pod Autoscaler is defined in resources.yaml.[^10]
+Container port
+Port 8062 is declared as a container port. There is no Service or Ingress defined in resources.yaml — this application does not expose an HTTP endpoint for external traffic. The port declaration is likely for OpenTelemetry or health-check purposes.[^10]
+OpenTelemetry
+Auto-instrumentation is enabled via the pod annotation:
+yamlinstrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default
+[^10]
+minReadySeconds
+Set to 30. A newly started pod must be healthy for 30 seconds before it is considered available, preventing premature routing.[^10]
+
+10. Configuration
+All key configuration parameters with their injection method:
+Property KeyProfileValue / PlaceholderInjection Methodspring.profiles.activebase${gcp_env}Environment variablespring.datasource.jdbc-urlall deployed${wdp_datasource_jdbc_url}K8s Secret (wdp-evidence-ack-scheduler-secrets)spring.datasource.usernameall deployed${wdp_datasource_username}K8s Secretspring.datasource.passwordall deployed${wdp_datasource_password}K8s Secretspring.datasource.jdbc-urllocaljdbc:postgresql://wdp-disputes-dev-postgres-cluster.cluster-cql8raklwshr.us-east-2.rds.amazonaws.com:5432/globaldisputedatabaseHard-coded in application-local.ymlspring.cloud.aws.s3.bucket-namedev/stg/uat/cert/testwdp-files-devProfile-specific ymlspring.cloud.aws.s3.bucket-nameall deployedtrueProfile ymlspring.cloud.aws.credentials.iamuserlocalfalseapplication-local.ymlspring.cloud.aws.credentials.accesskeylocal${access_key}Environment variable (local only)spring.cloud.aws.credentials.secretkeylocal${secret_key}Environment variable (local only)
+
+---
+
+## Image 12
+| spring.cloud.aws.credentials.accesskey | local | ${access_key} | Environment variable (local only) |
+| spring.cloud.aws.credentials.secretkey | local | ${secret_key} | Environment variable (local only) |
+| spring.cloud.aws.region.static | all | us-east-2 | Hard-coded in profile yml (source value not in source) |
+| app.scheduler.cron | all deployed | ${cron_scheduler} | K8s Secret (cron expression) |
+| app.scheduler.cron | local | 0 */1 * * * * | Hard-coded in application-local.yml |
+| logger.level | base | ${log_level} | Environment variable |
+| logstash.server.host.port | base | ${logstash_server_host_port} | Environment variable |
+[^6][^7][^8][^9][^33][^36]
+Secret names in resources.yaml
+SecretContains{{ ingressTLSsecretName }}TLS certificates (placeholder)wdp-evidence-ack-scheduler-secretsApp-specific secrets (DB credentials, cron expression)wdp-common-secretsShared secrets across WDP services
+[^7]
+
+11. Planned Changes and In-Progress Work
+Commented-out code
+None found. No commented-out code blocks are present in any source file.
+TODOs / FIXMEs
+None found. No TODO, FIXME, HACK, or XXX markers are present in any source file.
+Feature Flags
+None present. No feature flag framework is used.
+New merchants being added
+No evidence of in-progress merchant additions. The four source constants (WALMART_SIG_CAP, CORE_BULK_RESP, CAPONE_BJWC, CAPONE_CMRTR) are the complete active set.[^5]
+XSD schema freshness
+worldpay-cbpackage.xsd carries the annotation:
+Version 1.0.0 – 05/02/2026 * Created for Ack File Generation
+This is dated two months after the report date (April 2026), suggesting the XSD and CapitalOne ACK support is a very recently delivered feature or the date annotation is a target release date.[^25]
+JAXB-generated sources
+
+---
+
+## Image 13
+Version 1.0.0 – 05/02/2026 * Created for Ack File Generation
+This is dated two months after the report date (April 2026), suggesting the XSD and CapitalOne ACK support is a very recently delivered feature or the date annotation is a target release date.[^25]
+JAXB-generated sources
+The generated Java package (com.wp.wdp.evidence.ack.scheduler.generated) is produced by the jaxb2-maven-plugin during the Maven generate-sources phase from worldpay-cbpackage.xsd. The generated directory does not exist in the working tree, meaning it is created only at build time and is excluded from version control (consistent with .gitignore patterns).[^43]
+Unused dependencies
+spring-cloud-aws-starter-s3 (version 3.1.0) is declared as a dependency but the application constructs its own S3Client bean manually in S3ClientConfig. The starter's auto-configuration is effectively overridden. This is a minor redundancy but not harmful.[^44][^45]
+
+12. Confidence Assessment
+SectionConfidenceBasis1. Primary ResponsibilityHighFull source code reviewed; all service implementations, entity definitions, and constant files directly observed2. Trigger and ScheduleHigh for mechanism; Low for production cron value@Scheduled annotation and profile YMLs directly observed. Actual prod cron value is ${cron_scheduler} from a K8s Secret not in source3. What Triggers an ACK FileHighJPQL query in FileJobRepository and calling code in AckFileProcessorServiceImpl and WalmartSigCapAckConstants all directly observed4. ACK File Generation — WalmartHighWalmartSigCapAckFormatter, WalmartSigCapAckReturnCode, WalmartSigCapAckConstants all directly reviewed4. ACK File Generation — BulkRespHighBulkResponseAckFormatter, BulkResponseAckReturnCode, BulkResponseConstants all directly reviewed4. ACK File Generation — CapitalOneHighCapitalOneAckServiceImpl, CapitalOneAckFormatter, CapitalOneAckConstants, and the XSD directly reviewed5. Outbound DeliveryHighCommonAckServiceImpl directly reviewed; S3 paths composed from constants6. Inbound DependenciesHighOnly PostgreSQL and S3 are used; no other clients exist in the source tree7. Error HandlingHighAll exception handling paths directly reviewed; absence of retry/DLQ confirmed by full source search8. IdempotencyHigh for what is present; Medium for multi-pod analysisheadObject logic directly observed; multi-pod race condition is an inference based on Deployment type and UniqueTimestampGenerator scope9. Scaling and DeploymentHigh for what is present; Low for production valuesAll config files reviewed; actual secret values not in source10. ConfigurationHigh for keys and injection method; Low for production valuesAll config files reviewed; actual secret values not in source11. Planned ChangesHigh (nothing found)Full source tree scanned; no TODOs, no commented code, no feature flags found
+Key Repositories Summary
+RepositoryPurposeKey Fileswdp-evidence-ack-scheduler (current)ACK file generation and S3 uploadAckFileProcessorServiceImpl.java, WalmartSigCapAckServiceImpl.java, CapitalOneAckServiceImpl.java, BulkResponseAckServiceImpl.java, CommonAckServiceImpl.java, worldpay-cbpackage.xsd, resources.yaml
+The upstream service that performs inbound processing and populates wdp.file_job and wdp.chbk_outbox_row is a separate repository (not present in the current working tree). Its identity is not determinable from this codebase alone.
