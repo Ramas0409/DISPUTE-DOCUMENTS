@@ -1,7 +1,7 @@
 # WDP-COMP-18 — NotificationOrchestrator
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: wdp-outgoing-consumer (wp-mfd/wdp-outgoing-consumer) using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 2.0 DRAFT | April 2026 — source-verified 2026-04-18*
+*Repository: `wp-mfd/wdp-outgoing-consumer` | Architect-confirmed: PENDING*
 
 ---
 
@@ -17,10 +17,9 @@
 | **Also known as** | `NOTIFICATION-ORCHESTRATOR-CONSUMER` (README title), `wdp-outgoing-consumer` (Maven artifact) |
 | **Type** | Kafka Consumer + Kafka Producer |
 | **Repository** | `wp-mfd/wdp-outgoing-consumer` |
-| **Maven artifact** | `com.wp.gcp:wdp-outgoing-consumer:1.0.0` |
 | **Framework** | Spring Boot 3.5.7 / Java 17 / Spring Kafka |
 | **Status** | ✅ Production |
-| **Doc status** | 📝 DRAFT — Copilot CLI complete, architect confirmation pending |
+| **Doc status** | 📝 DRAFT — source-verified 2026-04-18, architect confirmation pending |
 | **Sections present** | Core \| Block B (Kafka Consumer) \| Block C (Kafka Producer) |
 
 ---
@@ -29,24 +28,23 @@
 
 **What it does**
 
-NotificationOrchestrator is the central outbound routing component for WDP. It consumes dispute lifecycle events from the `outgoing-events` topic and fans each event out to up to four simultaneous destinations based on a code-defined routing decision. Outputs are **not mutually exclusive** — a single inbound event can trigger all three Kafka publishes and a DB write in the same processing cycle.
+NotificationOrchestrator is the central outbound routing component for WDP. It consumes dispute lifecycle events from the `outgoing-events` topic and fans each event out to up to four non-mutually-exclusive destinations based on a code-defined routing decision. A single inbound event can trigger all three Kafka publishes AND a database INSERT in the same processing cycle.
 
-Routing is determined by four independent filter methods that evaluate a combination of `platform`, `eventType`, `migrationStatus`, and two active production feature flags (`coreMigration`, `disputesAPIMigration`). There is no routing configuration table — all logic is code-defined.
+Routing is determined by four independent filter methods that evaluate a combination of `platform`, `eventType`, `migrationStatus`, and two active production feature flags (`coreMigration`, `disputesAPIMigration`). There is no routing configuration table — all logic is code-defined. Flag state is read per-event, not once at startup.
 
-An outbox table (`WDP.bre_orchestration_outbox`, component = `NOTIFICATION_ORCHESTRATOR`) tracks idempotency state, processing progress, and error recovery. The outbox is the handoff point for the COMP-12 InboundDisputeEventScheduler Scheduler4 retry loop, which re-drives FAILED and PENDING_DEFERRED rows back to `outgoing-events`.
+An outbox table (`WDP.bre_orchestration_outbox`, `component = NOTIFICATION_ORCHESTRATOR`) tracks idempotency state, processing progress, and error recovery. The outbox is the sole handoff point for the COMP-12 InboundDisputeEventScheduler Scheduler4 retry loop, which re-drives FAILED and PENDING_DEFERRED rows back to `outgoing-events`. PUBLISHED-status rows are **not** re-driven by Scheduler4.
 
-This component also writes to `wdp.file_generation_event` to stage requests for downstream file-based output batch components (CapitalOne Response, Dialogu Issuer, NetworkResponse, NYCE-planned). For `ACTION_CREATED` events where no document names are pre-populated, the component makes a conditional REST call to Document Management Service to retrieve them before writing.
-
-⚠️ **CRITICAL — TABLE NAME CORRECTION:** All existing WDP platform documents reference `file_notifications` as the DB write target of this component. The actual table name confirmed from source is `wdp.file_generation_event`. The name `file_notifications` does not exist in the codebase. WDP-ARCHITECTURE.md (§8.4, §8.5), WDP-KAFKA.md, and WDP-COMP-INDEX.md must all be corrected.
+This component also writes to `wdp.file_generation_event` to stage requests for downstream file-based output batch components (CapitalOne Response, Dialogu Issuer, NetworkResponse, NYCE-planned). For `ACTION_CREATED` events where no document names are pre-populated, the component makes a conditional REST call to Document Management Service (DMS) to retrieve them before writing.
 
 **What it does NOT do**
 
-- Does not publish to `internal-integration-events` — that topic is published exclusively by AcceptService (COMP-19) and ContestService (COMP-20)
-- Does not publish to `business-rules` — that is published by COMP-12 Scheduler4 for BRE orchestration rows
-- Does not perform any card-network-level routing (BEN vs third-party vs EDIA distinction is handled by the downstream consumers of `external-request-events`)
-- Does not perform PAN handling or encryption — no PAN fields are present in any event model
-- Does not implement circuit breakers — Resilience4j is absent from the codebase
-- Does not use Spring Batch — scheduling is internal Spring Kafka listener, not a batch framework
+- Does not publish to `internal-integration-events` — that topic is published exclusively by AcceptService (COMP-19) and ContestService (COMP-20).
+- Does not publish to `business-rules` — that is published by COMP-12 Scheduler4 (BRE orchestration rows) and by COMP-15, COMP-16, COMP-23, COMP-24, COMP-25.
+- Does not write to `wdp.outgoing_event_outbox`. Only `wdp.bre_orchestration_outbox` and `wdp.file_generation_event` are written. ⚠️ **WDP-DB.md is incorrect — correction required.**
+- Does not perform card-network-level routing within `external-request-events` (BEN vs third-party vs EDIA distinction is handled by the downstream consumers of that topic).
+- Does not handle PAN data — no PAN fields are present on `NotificationEvent`, `PublishedNotificationEvent`, or any owned entity.
+- Does not implement circuit breakers — Resilience4j is absent from the codebase (DEC-014 VOID platform-wide).
+- Does not use Spring Batch — no batch dependency in `pom.xml`; all processing is per-message on the Kafka listener thread.
 
 ---
 
@@ -54,174 +52,162 @@ This component also writes to `wdp.file_generation_event` to stage requests for 
 
 ```mermaid
 flowchart TD
-    IN([outgoing-events\nKafka topic]) --> S1
+    IN([outgoing-events<br/>Kafka topic]) --> S1
 
-    S1["Step 1: Consume & wrap\nNotificationMessageEvent envelope\nHeaders captured: RECEIVED_KEY,\nidempotency-key, event-timestamp"]
+    S1["Step 1 — Consume & wrap<br/>NotificationMessageEvent envelope<br/>Captures: RECEIVED_KEY,<br/>idempotency-key, event-timestamp"]
 
-    S1 --> S2{"Step 2: eventId null?\nnotificationEvent.getEventId()"}
+    S1 --> S2{"Step 2<br/>eventId null?"}
 
-    S2 -->|"Not null\nskip pipeline"| ACK
+    S2 -->|"Not null<br/>(skip filter/save)"| ACK
+    S2 -->|"Null"| S3A{"Step 3a<br/>idempotencyId OR<br/>eventTimeStamp blank?"}
 
-    S2 -->|"Null\nenter filterAndSaveNotification"| S3A
-
-    S3A{"Step 3a: idempotencyId OR\neventTimeStamp header blank?"}
-
-    S3A -->|"Blank"| ERR_HDR["Write bre_orchestration_outbox\nstatus=ERROR\nerrorOccured=true\nPipeline terminates"]
+    S3A -->|"Blank"| ERR_HDR["Write outbox status=ERROR<br/>errorOccured=true<br/>retry_count=0"]
     ERR_HDR --> ACK
 
-    S3A -->|"Both present"| S3B["Step 3b: Idempotency lookup\nQuery bre_orchestration_outbox\nby {idempotencyId,\ncomponent=NOTIFICATION_ORCHESTRATOR,\neventTimeStamp}"]
+    S3A -->|"Both present"| S3B{"Step 3b<br/>Idempotency lookup<br/>(idempotencyId, component,<br/>eventTimeStamp)"}
 
-    S3B -->|"Found — status=PUBLISHED\n⚠️ Crash-window duplicate gap\nsee Risk R2"| DUP_PUB["Set eventId from existing row\ntargetAction NOT re-derived\nerrorOccured=false\nPipeline terminates"]
-    DUP_PUB --> ACK
+    S3B -->|"Found — status=PUBLISHED<br/>⚠️ Crash-window duplicate"| DUP_PUB["Reuse existing eventId<br/>targetAction NOT re-derived<br/>errorOccured stays false"]
 
-    S3B -->|"Found — status≠PUBLISHED\nSUCCESS / FAILED / ERROR"| DUP_OTHER["errorOccured=true\nPipeline terminates"]
+    S3B -->|"Found — status≠PUBLISHED<br/>SUCCESS/FAILED/ERROR"| DUP_OTHER["Set errorOccured=true"]
     DUP_OTHER --> ACK
 
-    S3B -->|"Not found\nnew event"| S3C["Step 3c: Derive targetAction list\nRun four independent filter methods:\n1. filterExpiryEventInfo\n2. filterCoreEvent\n3. filterExternalEvent\n4. filterFileGenerationEvent\n(see routing table below)"]
+    S3B -->|"Not found<br/>(new event)"| S3C["Step 3c — Derive targetAction<br/>4 filter methods:<br/>filterExpiryEventInfo<br/>filterCoreEvent<br/>filterExternalEvent<br/>filterFileGenerationEvent"]
 
-    S3C --> S3D["Step 3d: INSERT bre_orchestration_outbox\nstatus=PUBLISHED\ncomponent=NOTIFICATION_ORCHESTRATOR\nretryCount=0\ntargetAction=[derived list]\npublishedAction=[]"]
+    S3C --> S3D["Step 3d — INSERT outbox<br/>status=PUBLISHED<br/>component=NOTIFICATION_ORCHESTRATOR<br/>retry_count=0<br/>target_action=derived"]
 
     S3D --> ACK
+    DUP_PUB --> ACK
 
-    ACK["⚠️ DEC-005 DEVIATION — Step 4: Commit Kafka Offset\nacknowledgment.acknowledge() fires HERE\nAFTER outbox INSERT\nBEFORE Kafka publishes and file_generation_event writes\nCrash after ACK = Kafka will NOT redeliver\nRecovery path = outbox retry via COMP-12 Scheduler4 only"]
+    ACK["⚠️ DEC-005 DEVIATION<br/>Step 4 — ACK Kafka offset<br/>acknowledge() fires here<br/>BEFORE all Step 7 writes"]
 
-    ACK --> S5{"Step 5: errorOccured?"}
+    ACK --> S5{"Step 5<br/>errorOccured?"}
 
-    S5 -->|"true"| SKIP([End — no downstream publishes])
+    S5 -->|"true"| END_SKIP([End — no downstream])
 
-    S5 -->|"false"| S6["Step 6: Previous-event guard\nQuery bre_orchestration_outbox:\ncaseId=caseNumber, id < eventId\nstatus NOT IN (SUCCESS, SKIPPED)"]
+    S5 -->|"false"| S6_SQL["Step 6 — Previous-event guard<br/>⚠️ Two-stage query:<br/>1 SQL: SELECT WHERE caseId=?<br/>2 Java: filter by id&lt;eventId,<br/>component, status NOT IN<br/>SUCCESS/SKIPPED"]
 
-    S6 -->|"Prior ERROR row found"| BLK_ERR["Update current row: ERROR\nstop"]
-    BLK_ERR --> STOP1([End])
+    S6_SQL --> S6_DEC{"Filtered list<br/>outcome?"}
 
-    S6 -->|"Prior non-success row found\nFAILED, PENDING_DEFERRED etc."| BLK_DEF["Update current row: PENDING_DEFERRED\nstop — Scheduler4 will retry"]
-    BLK_DEF --> STOP2([End])
+    S6_DEC -->|"Empty<br/>(no blocking prior)"| S7
+    S6_DEC -->|"Contains ERROR row"| BLK_ERR["UPDATE current row<br/>status=ERROR<br/>publishOutgoingEvent NOT called"]
+    BLK_ERR --> END_BLK_E([End])
 
-    S6 -->|"No blocking prior rows"| S7["Step 7: publishOutgoingEvent\nSequential chain — fixed order\nEach step is pass-through if\naction absent from targetAction"]
+    S6_DEC -->|"Non-empty, no ERROR"| BLK_DEF["UPDATE current row<br/>status=PENDING_DEFERRED<br/>publishOutgoingEvent NOT called"]
+    BLK_DEF --> END_BLK_D([End])
 
-    S7 --> S7A{"EXPIRY_EVENT\nin targetAction?"}
-    S7A -->|"Yes"| PUB_EXP["Publish to case-action-events\nSync blocking\nSuccess: remove from targetAction\nadd to publishedAction"]
-    S7A -->|"No — pass through"| S7B
-    PUB_EXP -->|"Success"| S7B
-    PUB_EXP -->|"Failure"| F1["errorOccured=true\nretain EXPIRY_EVENT in targetAction"]
+    S7["Step 7 — publishOutgoingEvent<br/>Sequential chain 7a→7b→7c→7d<br/>Each: pass-through if action<br/>absent from targetAction"]
+
+    S7 --> S7A{"EXPIRY_EVENT<br/>in targetAction?"}
+    S7A -->|"No"| S7B
+    S7A -->|"Yes"| PUB_EXP["7a — Publish to<br/>case-action-events<br/>sync blocking .get()"]
+    PUB_EXP -->|"Success"| MOV_EXP["Remove from targetAction<br/>Add to publishedAction"]
+    MOV_EXP --> S7B
+    PUB_EXP -->|"Exception"| F1["errorOccured=true<br/>EXPIRY_EVENT retained<br/>in targetAction"]
     F1 --> S7B
 
-    S7B{"CORE_EVENT\nin targetAction?"}
-    S7B -->|"Yes"| PUB_CORE["Publish to core-request-events\nSync blocking"]
-    S7B -->|"No — pass through"| S7C
-    PUB_CORE -->|"Success"| S7C
-    PUB_CORE -->|"Failure"| F2["errorOccured=true\nretain CORE_EVENT"]
+    S7B{"CORE_EVENT<br/>in targetAction?"}
+    S7B -->|"No"| S7C
+    S7B -->|"Yes"| PUB_CORE["7b — Publish to<br/>core-request-events<br/>sync blocking .get()"]
+    PUB_CORE -->|"Success"| MOV_CORE["Move to publishedAction"]
+    MOV_CORE --> S7C
+    PUB_CORE -->|"Exception"| F2["errorOccured=true<br/>CORE_EVENT retained"]
     F2 --> S7C
 
-    S7C{"EXTERNAL_EVENT\nin targetAction?"}
-    S7C -->|"Yes"| PUB_EXT["Publish to external-request-events\nSync blocking"]
-    S7C -->|"No — pass through"| S7D
-    PUB_EXT -->|"Success"| S7D
-    PUB_EXT -->|"Failure"| F3["errorOccured=true\nretain EXTERNAL_EVENT"]
+    S7C{"EXTERNAL_EVENT<br/>in targetAction?"}
+    S7C -->|"No"| S7D
+    S7C -->|"Yes"| PUB_EXT["7c — Publish to<br/>external-request-events<br/>sync blocking .get()"]
+    PUB_EXT -->|"Success"| MOV_EXT["Move to publishedAction"]
+    MOV_EXT --> S7D
+    PUB_EXT -->|"Exception"| F3["errorOccured=true<br/>EXTERNAL_EVENT retained"]
     F3 --> S7D
 
-    S7D{"FILE_GENERATION_EVENT\nin targetAction?"}
-    S7D -->|"No — pass through"| S7E
-    S7D -->|"Yes"| FCHK{"ACTION_CREATED AND\ndocumentNameList empty?"}
-    FCHK -->|"No\nlist already populated"| FW
-    FCHK -->|"Yes"| DMS["Call Document Mgmt Service\nGET documents per caseNumber\nBearer token from IDP Token Service\n@Retryable: 3 attempts, 2000ms fixed delay"]
-    DMS -->|"List returned"| FW["INSERT wdp.file_generation_event\n1 row per document name\nstatus=STAGED hardcoded\nfileType set in filter step"]
-    DMS -->|"Empty after all retries"| FERR["errorOccured=true\nskip file_generation_event write"]
-    FW --> S7E
-    FERR --> S7E
+    S7D{"FILE_GENERATION_EVENT<br/>in targetAction?"}
+    S7D -->|"No"| S7E
+    S7D -->|"Yes"| FCHK{"ACTION_CREATED AND<br/>documentNameList empty?"}
 
-    S7E["Step 7e: Update bre_orchestration_outbox"]
-    S7E --> FINAL{"errorOccured=true\nOR targetAction non-empty?"}
-    FINAL -->|"Yes — partial or full failure"| FAIL_STAT["status=FAILED\nauto-escalates to ERROR\nwhen retryCount > 2"]
-    FINAL -->|"No — all succeeded"| OK_STAT["status=SUCCESS"]
-    FAIL_STAT --> DONE1([End])
-    OK_STAT --> DONE2([End])
+    FCHK -->|"No<br/>(list pre-populated)"| FW
+    FCHK -->|"Yes"| IDP["Call IDP Token Service<br/>GET Bearer token<br/>⚠️ no timeout, no retry"]
+
+    IDP -->|"Exception"| FERR1["errorOccured=true<br/>FILE_GENERATION_EVENT retained<br/>skip INSERT"]
+    FERR1 --> S7E
+
+    IDP -->|"Success"| DMS["Call Document Mgmt Service<br/>GET documents<br/>@Retryable 3 × 2000ms<br/>(no @Recover)"]
+
+    DMS -->|"Retry exhausted<br/>(exception thrown)"| FERR2["errorOccured=true<br/>errorReason set<br/>skip INSERT"]
+    FERR2 --> S7E
+
+    DMS -->|"Empty list<br/>(after retries)"| FERR3["errorOccured=true<br/>errorReason=no valid name<br/>skip INSERT"]
+    FERR3 --> S7E
+
+    DMS -->|"Non-empty list"| FW["INSERT wdp.file_generation_event<br/>1 row per document_name<br/>status=STAGED hardcoded"]
+
+    FW -->|"Exception"| FERR4["errorOccured=true<br/>FILE_GENERATION_EVENT retained"]
+    FERR4 --> S7E
+    FW -->|"Success"| MOV_FILE["Move to publishedAction"]
+    MOV_FILE --> S7E
+
+    S7E{"Step 7e<br/>errorOccured OR<br/>targetAction non-empty?"}
+
+    S7E -->|"No — all succeeded"| OK_STAT["UPDATE outbox<br/>status=SUCCESS<br/>error_code=200"]
+    OK_STAT --> END_OK([End])
+
+    S7E -->|"Yes — partial/full failure"| FAIL_STAT{"retry_count + 1<br/>&gt; 2?"}
+    FAIL_STAT -->|"No"| SET_FAIL["UPDATE outbox<br/>status=FAILED<br/>retry_count incremented<br/>next_retry_at set"]
+    SET_FAIL --> END_FAIL([End])
+    FAIL_STAT -->|"Yes"| SET_ERR["UPDATE outbox<br/>status=ERROR<br/>terminal — no auto-redrive"]
+    SET_ERR --> END_ERR([End])
 ```
 
----
+**Flow notes (architecturally significant):**
+
+- **Duplicate PUBLISHED branch (Step 3b) does NOT terminate.** Control flows through ACK → Step 5 (errorOccured=false) → Step 6 → Step 7. Because `targetAction` was never derived for this branch, all four publish gates (7a–7d) pass through as no-ops. Step 7e then evaluates: `targetAction.isEmpty() && !errorOccured` → writes `status=SUCCESS` on the existing outbox row. Net effect: duplicate PUBLISHED events are safe at-most-once (no re-publish) but **overwrite the existing row's `updated_at`, `retry_count`, and `error_code`**.
+
+- **Step 6 previous-event guard is two-stage.** The JPA query selects **all** outbox rows for the `caseNumber` (`WHERE caseId = ? ORDER BY id ASC`). Java-side filtering then applies the `id < eventId`, `component = NOTIFICATION_ORCHESTRATOR`, and `status NOT IN (SUCCESS, SKIPPED)` predicates in-process. For long-lived cases, this fetches the entire case history into memory per event — scaling risk flagged in the risks table.
+
+- **No ACK deferral path exists.** The `acknowledgment.acknowledge()` call is unconditional at the single call site, executed after Step 3d and before any Step 7 activity. If Steps 1–3d throw, ACK is skipped and the event will be redelivered. Any throw from Step 4 onwards leaves the offset already committed.
+
+- **DMS empty-list response is treated as an error**, not as a zero-row INSERT. The file_generation_event write is skipped; `errorOccured=true`; `errorReason` set; retry escalation follows.
 
 ### Routing Decision — targetAction Derivation (Step 3c detail)
 
-Four independent filter methods build the `targetAction` list. A single event can satisfy multiple filters simultaneously — all matched actions are added and all corresponding outputs fire in Step 7.
+Four independent filter methods build the `targetAction` list. A single event can satisfy multiple filters simultaneously.
 
-#### Filter 1 — `case-action-events` topic → action: `EXPIRY_EVENT`
+#### Filter 1 — `case-action-events` → action: `EXPIRY_EVENT`
 
-| eventType | platform | migrationStatus | coreMigration flag | Result |
-|-----------|---------|----------------|---------------------|--------|
+| eventType | platform | migrationStatus | coreMigration | Result |
+|-----------|----------|-----------------|---------------|--------|
 | ACTION_CREATED, CASE_CREATED, ACTION_UPDATED, CASE_UPDATED | NOT CORE | Y | any | ✅ Add EXPIRY_EVENT |
 | ACTION_CREATED, CASE_CREATED, ACTION_UPDATED, CASE_UPDATED | CORE | any | true | ✅ Add EXPIRY_EVENT |
 | Any other combination | — | — | — | ❌ Skip |
 
-#### Filter 2 — `core-request-events` topic → action: `CORE_EVENT`
+#### Filter 2 — `core-request-events` → action: `CORE_EVENT`
 
-| eventType | platform | coreMigration flag | Result |
-|-----------|---------|---------------------|--------|
+| eventType | platform | coreMigration | Result |
+|-----------|----------|---------------|--------|
 | ACTION_CREATED, CASE_CREATED, ACTION_UPDATED, CASE_UPDATED | PIN | any | ✅ Add CORE_EVENT |
 | ACTION_CREATED, CASE_CREATED, ACTION_UPDATED, CASE_UPDATED | CORE | true | ✅ Add CORE_EVENT |
 | Any other combination | — | — | ❌ Skip |
 
-#### Filter 3 — `external-request-events` topic → action: `EXTERNAL_EVENT`
+#### Filter 3 — `external-request-events` → action: `EXTERNAL_EVENT`
 
-| eventType | platform | migrationStatus | disputesAPIMigration flag | Result |
-|-----------|---------|----------------|--------------------------|--------|
+| eventType | platform | migrationStatus | disputesAPIMigration | Result |
+|-----------|----------|-----------------|----------------------|--------|
 | ACTION_CREATED, CASE_CREATED, ACTION_UPDATED, CASE_UPDATED, DOC_ATTACHED, NOTE_ADDED | PIN | any | any | ✅ Add EXTERNAL_EVENT |
 | ACTION_CREATED, CASE_CREATED, ACTION_UPDATED, CASE_UPDATED, DOC_ATTACHED, NOTE_ADDED | CORE | any | true | ✅ Add EXTERNAL_EVENT |
 | ACTION_CREATED, CASE_CREATED, ACTION_UPDATED, CASE_UPDATED, DOC_ATTACHED, NOTE_ADDED | NAP | Y | any | ✅ Add EXTERNAL_EVENT |
 | Any other combination | — | — | — | ❌ Skip |
 
-#### Filter 4 — `wdp.file_generation_event` table → action: `FILE_GENERATION_EVENT`
+#### Filter 4 — `wdp.file_generation_event` → action: `FILE_GENERATION_EVENT`
 
-**Gate condition:** `(platform=CORE AND coreMigration=true) OR (platform=PIN)`
+**Gate:** `(platform = CORE AND coreMigration = true) OR platform = PIN`
 
 Within gate — **Sub-condition A (ISSUER_DOCS):**
-- eventType=`DOC_ATTACHED` AND type in `{ISSRDOC, ISSRQDOC}` AND caseNetwork NOT IN `{AMEX, PRIVATELABEL, COBRAND}`
-- → fileType = `ISSUER_DOCS`
+- `eventType = DOC_ATTACHED` AND `type IN {ISSRDOC, ISSRQDOC}` AND `caseNetwork NOT IN {AMEX, PRIVATELABEL, COBRAND}` → fileType = `ISSUER_DOCS`
 
 Within gate — **Sub-condition B (RESPONSE_DOCS by network):**
-- eventType=`ACTION_CREATED` AND (disputeStage + actionCode) in: `{RE2+REFR}`, `{PAB+MDCL}`, `{REQ+RRSP}`, `{ARB+MDCL}`
-- AND documentIndicator=`Y` AND caseNetwork NOT IN `{MASTERCARD, MAESTRO, VISA}`
-- fileType resolved by caseNetwork / caseType:
-  - AMEX + hybridMerchant=true → `AMEX_HYBRID`
-  - AMEX + hybridMerchant=false → `AMEX`
-  - DISCOVER + hybridMerchant=true → `DISCOVER_RMO`
-  - DISCOVER + hybridMerchant=false → `DISCOVER`
-  - caseType=BJPLCC → `BJS_PLCC`
-  - type in `{ISSRDOC, ISSRQDOC}` → `ISSUER_DOCS`
+- `eventType = ACTION_CREATED` AND `(disputeStage + actionCode) IN { RE2+REPR, PAB+MDCL, REQ+RRSP, ARB+MDCL }` AND `documentIndicator = Y` AND `caseNetwork NOT IN {MASTERCARD, MAESTRO, VISA}` → fileType set by network resolution (AMEX vs AMEX_HYBRID, DISCOVER vs DISCOVER_RMO based on `hybridMerchant` flag)
 
-If neither sub-condition met within gate → ❌ Skip (FILE_GENERATION_EVENT not added)
-
----
-
-### Outbox Status Lifecycle (`WDP.bre_orchestration_outbox`)
-
-```
-Step 3a (missing headers)      → ERROR    (terminal — no automatic recovery)
-Step 3d (new event, first)     → PUBLISHED
-Step 6 (prior ERROR guard)     → ERROR    (current row updated, terminal)
-Step 6 (prior FAILED guard)    → PENDING_DEFERRED  (Scheduler4 will retry)
-Step 7e (any publish fails)    → FAILED   (Scheduler4 will retry)
-  retryCount > 2               → ERROR    (terminal)
-Step 7e (all succeed)          → SUCCESS  (terminal)
-```
-
-⚠️ **PUBLISHED-status orphan gap:** If COMP-18 crashes after Step 4 (ACK) but before Step 7e completes, the outbox row remains at PUBLISHED. COMP-12 Scheduler4 queries only FAILED and PENDING_DEFERRED — it does not pick up PUBLISHED rows. These rows have no automatic re-drive path. Manual intervention is required.
-
----
-
-### Data Transformation
-
-| Field | Source | Destination | Notes |
-|-------|--------|-------------|-------|
-| All event fields | `NotificationEvent` (Kafka JSON) | `PublishedNotificationEvent` (outbound Kafka payload) | Mapped via ModelMapper — subset only |
-| `idempotencyId` | Inbound Kafka header | NOT published to Kafka or DB | Used for outbox idempotency check only |
-| `networkCaseId` | `NotificationEvent` field | NOT in `PublishedNotificationEvent` | IS written to `wdp.file_generation_event.c_ntwk_case_id` |
-| `hybridMerchant` | `NotificationEvent` field | NOT published | Used for fileType derivation in Filter 4 only |
-| `documentNameList` | `NotificationEvent` or DMS REST call | NOT published | Drives `file_generation_event` row count |
-| `fileType` | Derived in Filter 4 | NOT published | Written to `wdp.file_generation_event.file_type` |
-| `eventTimeStamp` | Inbound Kafka header | NOT in Kafka payload | Forwarded as `event-timestamp` header on all outbound publishes |
-| `idempotency-key` | Inbound Kafka header | NOT in Kafka payload | Forwarded as `idempotency-key` header on all outbound publishes |
-| `actionSeq` | Set from `eventType` value before publish | Published in `PublishedNotificationEvent` | |
-| `targetAction`, `publishedAction` | Internal tracking only | NOT published | Written to `bre_orchestration_outbox` only |
+*(Corrected from v1.0 DRAFT: stage+action set uses `REPR` not `REFR`.)*
 
 ---
 
@@ -230,21 +216,25 @@ Step 7e (all succeed)          → SUCCESS  (terminal)
 ### Inbound Interfaces
 
 | Source | Protocol | Topic / Trigger | Payload |
-|--------|----------|----------------|---------|
+|--------|----------|-----------------|---------|
 | COMP-16 BusinessRulesProcessor | Kafka | `outgoing-events` | `NotificationEvent` JSON |
-| COMP-12 InboundDisputeEventScheduler (Scheduler4) | Kafka (retry path) | `outgoing-events` | `NotificationEvent` JSON — re-published from `bre_orchestration_outbox` rows with component=NOTIFICATION_ORCHESTRATOR |
+| COMP-12 InboundDisputeEventScheduler (Scheduler4 — retry path) | Kafka (indirect) | `outgoing-events` | `NotificationEvent` JSON — re-published from `bre_orchestration_outbox` rows where `component = NOTIFICATION_ORCHESTRATOR` and status is FAILED or PENDING_DEFERRED |
 
 ### Outbound Interfaces
 
 | Target | Protocol | Topic / Resource | Purpose | On failure |
-|--------|----------|-----------------|---------|------------|
-| `case-action-events` topic | Kafka (synchronous blocking) | `case-action-events` | Case expiry lifecycle events — EXPIRY_EVENT path | errorOccured=true; outbox → FAILED; retried by Scheduler4 |
-| `core-request-events` topic | Kafka (synchronous blocking) | `core-request-events` | CORE platform money movement notifications — CORE_EVENT path | Same |
-| `external-request-events` topic | Kafka (synchronous blocking) | `external-request-events` | Third-party notifications, BEN, EDIA — EXTERNAL_EVENT path | Same |
-| `wdp.file_generation_event` | PostgreSQL (JPA write) | `wdp.file_generation_event` | Stage file generation requests — FILE_GENERATION_EVENT path | errorOccured=true; outbox → FAILED |
-| `WDP.bre_orchestration_outbox` | PostgreSQL (JPA read+write) | `WDP.bre_orchestration_outbox` | Idempotency check and processing state tracking | Exception caught per-call; consumer continues |
-| IDP Token Service | HTTP REST (cluster-internal) | `/merchant/gcp/idp-token/token` | Retrieve Bearer token for DMS auth (Step 7d only) | Exception propagates; errorOccured=true; file write skipped |
-| Document Management Service | HTTP GET (cluster-internal) | `/merchant/gcp/document-management/{platform}/documents/{caseNumber}` | Fetch document names for file gen events (ACTION_CREATED, empty list only) | @Retryable 3 attempts, 2000ms; on exhaustion: errorOccured=true; file write skipped |
+|--------|----------|------------------|---------|------------|
+| `case-action-events` | Kafka (sync blocking) | Topic | EXPIRY_EVENT fan-out | errorOccured=true; EXPIRY_EVENT retained; outbox → FAILED; COMP-12 Scheduler4 re-drives |
+| `core-request-events` | Kafka (sync blocking) | Topic | CORE_EVENT fan-out | Same pattern |
+| `external-request-events` | Kafka (sync blocking) | Topic | EXTERNAL_EVENT fan-out | Same pattern |
+| `wdp.file_generation_event` | PostgreSQL JPA INSERT | Table | Stage file-gen requests for downstream file batches | errorOccured=true; outbox → FAILED |
+| `WDP.bre_orchestration_outbox` | PostgreSQL JPA read + write | Table | Idempotency lookup, previous-event guard, processing-state tracking | Exception caught; ACK not reached if before Step 4; after Step 4 → falls through to Step 7e FAILED |
+| IDP Token Service | REST GET (cluster-internal) | `/merchant/gcp/idp-token/token` | Bearer token for DMS call (Step 7d only) | `WebServiceException` propagates; errorOccured=true; file write skipped |
+| Document Management Service (COMP-37) | REST GET (cluster-internal) | `/merchant/gcp/document-management/{platform}/documents/{caseNumber}` | Fetch document names for FILE_GENERATION_EVENT when `ACTION_CREATED` with empty `documentNameList` | `@Retryable` 3 attempts / 2000ms fixed delay; no `@Recover`; on exhaustion errorOccured=true, file write skipped |
+
+**Outbound REST headers:** DMS call carries `Authorization: Bearer <idp-token>`, `v-correlation-id: <idempotencyId>`, `idempotency-key: <idempotencyId>`, plus content/accept JSON. IDP call carries only `Content-Type`/`Accept` — no correlation header.
+
+**Outbound Kafka headers (all three topics):** `KafkaHeaders.KEY` (pass-through of inbound RECEIVED_KEY), `event-timestamp` (pass-through), `idempotency-key` (pass-through of inbound `idempotencyId`). No correlation header on Kafka publishes.
 
 ---
 
@@ -254,14 +244,20 @@ Step 7e (all succeed)          → SUCCESS  (terminal)
 
 | Schema.Table | Purpose | Key columns written | Notes |
 |--------------|---------|---------------------|-------|
-| `WDP.bre_orchestration_outbox` | Idempotency state and processing lifecycle tracking | `idempotency_id`, `component`, `status`, `i_case`, `target_action`, `published_action`, `retry_count`, `error_code`, `error_message`, `event_time_stamp` | Also read (idempotency lookup, previous-event guard). No `@Transactional` — each write is independent commit. |
-| `wdp.file_generation_event` | Stage file generation requests for downstream batch file producers | `idempotency_id`, `i_case`, `i_action_seq`, `c_case_ntwk`, `c_acq_platform`, `c_ntwk_case_id`, `document_name`, `file_type`, `status` | Write only. Initial status hardcoded `STAGED`. No `@Transactional`. One row per document name. |
+| `WDP.bre_orchestration_outbox` | Idempotency state and processing lifecycle tracking | `idempotency_id`, `component`, `event_timestamp`, `status`, `i_case`, `i_action_seq`, `target_action`, `published_action`, `retry_count`, `error_code`, `error_message`, `next_retry_at`, `original_event`, `created_by`/`updated_by` = `WDPOUCU` | Also read (idempotency lookup at Step 3b, previous-event guard at Step 6). No `@Transactional` on any write — each `save` is an independent auto-commit. No `SELECT FOR UPDATE`. `component` is a String constant. |
+| `wdp.file_generation_event` | Stage file generation requests for downstream batch file producers | `idempotency_id`, `i_case`, `i_action_seq`, `c_case_ntwk`, `c_acq_platform`, `c_ntwk_case_id`, `document_name`, `file_type`, `event_payload` (JSON), `status`, `created_by`/`updated_by` = `WDPOUCU` | INSERT-only (no UPDATE path from this component). One row per document name. Status hardcoded to `STAGED` via entity field initializer. No `@Transactional`. Columns left NULL: `batch_id`, `next_retry_at`, `error_code`, `error_message`. |
 
-⚠️ **Schema inconsistency:** `bre_orchestration_outbox` entity declares `schema="WDP"` (uppercase); `file_generation_event` entity declares `schema="wdp"` (lowercase). PostgreSQL folds unquoted identifiers to lowercase — functionally harmless but inconsistent.
+⚠️ **Schema annotation inconsistency:** `bre_orchestration_outbox` entity declares `schema="WDP"` (uppercase); `file_generation_event` entity declares `schema="wdp"` (lowercase). Functional resolution depends on how the schema was created on the cluster — not determinable from source. PostgreSQL folds unquoted identifiers to lowercase, so the inconsistency is likely harmless but fragile.
+
+⚠️ **WDP-DB.md correction required:** `wdp.outgoing_event_outbox` is **not** written by this component. Grep across the entire repository returns zero matches. WDP-DB.md currently lists COMP-18 as a writer of that table — this is incorrect.
 
 ### Tables Read (not owned by this component)
 
 This component reads only from tables it also writes to (`WDP.bre_orchestration_outbox`). No read-only tables.
+
+### DB unique constraints
+
+No DDL, Flyway, Liquibase, or `schema.sql` exists in this repository. Whether a UNIQUE index backs the idempotency lookup key `(idempotency_id, component, event_timestamp)` is **not determinable from source** — requires DBA confirmation on the actual PostgreSQL cluster.
 
 ---
 
@@ -269,27 +265,49 @@ This component reads only from tables it also writes to (`WDP.bre_orchestration_
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Replica count | `{{replicas-wdp-outgoing-consumer}}` — XL Deploy placeholder | Actual value not in source |
-| HPA | None | No `HorizontalPodAutoscaler` in `resources.yaml` |
+| Replica count | `{{replicas-wdp-outgoing-consumer}}` — XL Deploy placeholder | Actual value not in source. Any value > 1 compounds the SELECT-then-INSERT race window on idempotency. |
+| HPA | None | No `HorizontalPodAutoscaler` resource present. |
 | Memory request | 256Mi | |
 | Memory limit | 2048Mi | |
-| CPU request | Not configured | Only memory is specified in `resources.yaml` |
+| CPU request | Not configured | Burstable QoS. |
 | CPU limit | Not configured | |
-| Deployment type | Kubernetes Deployment | Not StatefulSet |
-| Rollout strategy | RollingUpdate — maxSurge:1, maxUnavailable:0 | |
-| PodDisruptionBudget | None | Absent from `resources.yaml` |
-| Topology spread | None | Absent from `resources.yaml` |
-| Observability | OpenTelemetry Java agent (injected via annotation) + Spring Actuator (`/merchant/gcp/outgoing-event/actuator/health`) + Logstash (`LogstashTcpSocketAppender`, destination: `${LOGSTASH_SERVER_HOST_PORT}`) | |
-| Kafka consumer concurrency | 1 thread (Spring default) | `setConcurrency()` not called on factory |
-| Max poll records | `${max_poll_records}` — K8s secret | Value not in source |
-| Max poll interval | `${max_poll_interval}` — K8s secret | Value not in source |
+| Deployment type | Kubernetes Deployment | Not StatefulSet. |
+| Rollout strategy | RollingUpdate — maxSurge:1, maxUnavailable:0, minReadySeconds:30 | |
+| PodDisruptionBudget | None | |
+| Topology spread | None | |
+| Liveness probe | ✅ Configured — HTTP GET `/merchant/gcp/outgoing-event/actuator/health` port 8082, initialDelay=120s, period=10s, timeout=5s, failureThreshold=3 | |
+| Readiness probe | ✅ Configured — same path/port/params as liveness | |
+| Startup probe | ❌ Not configured | |
+| Actuator exposure | Default only (`health`, `info`) | `management.endpoints.web.exposure.include` not set — no custom exposure. |
+| Observability | OpenTelemetry Java agent (annotation-injected) + Spring Actuator + Logstash (`LogstashTcpSocketAppender` → `${LOGSTASH_SERVER_HOST_PORT}`) | |
+| Port | 8082 | Container and service both 8082. Servlet context path `/merchant/gcp/outgoing-event`. |
+| Kafka consumer concurrency | 1 thread | Spring default — `setConcurrency()` not called. |
+| `max.poll.records` | `${max_poll_records}` env var — **no YAML default** | Startup fails if env var absent. |
+| `max.poll.interval.ms` | `${max_poll_interval}` env var — **no YAML default** | Startup fails if env var absent. |
+| `session.timeout.ms`, `heartbeat.interval.ms` | Env vars — no defaults | Same. |
+| `fetch.min.bytes`, `fetch.max.wait.ms` | Not set | Kafka client defaults apply. |
+| K8s Secret | `wdp-outgoing-consumer-secrets` | Mounted via envFrom. |
 
 ### Active Production Feature Flags
 
 | Flag | Config key | Env var | Effect when true | Effect when false |
-|------|-----------|---------|-----------------|------------------|
+|------|------------|---------|------------------|-------------------|
 | `coreMigration` | `app.properties.coreMigration` | `${core_migration}` | CORE platform events routed to `core-request-events`, `case-action-events`, and `file_generation_event` | CORE events not routed to those destinations |
 | `disputesAPIMigration` | `app.properties.disputesAPIMigration` | `${disputes_api_migration}` | CORE platform events also routed to `external-request-events` | CORE events skip `external-request-events` |
+
+Both flags have **no Java default** (`@Value` with no fallback) and **no YAML default** (env var passthrough only). Startup fails if either env var is absent. Flags are read **per event** via instance-field access inside the filter methods — not read once at startup.
+
+### Kafka Producer Configuration
+
+| Setting | Value |
+|---------|-------|
+| `enable.idempotence` | `true` |
+| `acks` | `all` |
+| `max.in.flight.requests.per.connection` | 5 |
+| Key serializer | `StringSerializer` |
+| Value serializer | `JsonSerializer` |
+| `retries`, `delivery.timeout.ms`, `request.timeout.ms`, `linger.ms`, `batch.size` | Not set — Kafka client defaults apply |
+| Broker auth | SASL_SSL + `AWS_MSK_IAM` (Amazon MSK) |
 
 ---
 
@@ -298,12 +316,15 @@ This component reads only from tables it also writes to (`WDP.bre_orchestration_
 | Decision | ADR reference | Notes |
 |----------|---------------|-------|
 | Routing logic is code-defined — no configuration table | Local decision | Platform, eventType, migrationStatus, and feature flags evaluated in four filter methods. Adding a new platform requires a code change. |
-| `wdp.bre_orchestration_outbox` used as idempotency and state store | DEC-001 (partial compliance) | Outbox exists but critical gap: no `@Transactional` on writes; offset committed between outbox INSERT and Kafka publishes |
-| Offset committed AFTER outbox INSERT but BEFORE Kafka publishes | DEC-005 — CONFIRMED DEVIATION | Significant deviation. Recovery after crash depends entirely on Scheduler4 outbox retry. PUBLISHED-status orphan rows have no automatic re-drive path. |
-| No Resilience4j circuit breakers on any outbound dependency | DEC-014 — CONFIRMED DEVIATION | Consistent with platform-wide absence. IDP Token Service has no timeout at all — unbounded thread block risk. |
-| Message key is pass-through of inbound RECEIVED_KEY | DEC-003 — LIKELY DEVIATION (unconfirmed) | This component does not set merchantId explicitly. Key identity depends on COMP-16 upstream. |
-| No `@Transactional` on any service method | Local decision | Each DB write is an independent commit. No rollback possible across write boundaries. |
-| CommonErrorHandler is a no-op empty implementation | Local decision | Deserialization failures produce a null event, caught by outer try/catch, offset committed, event silently lost. No DLT, no alerting. |
+| `wdp.bre_orchestration_outbox` used as idempotency and state store | DEC-001 — ⚠️ PARTIAL | Outbox exists but no `@Transactional` on writes; Kafka offset committed between outbox INSERT and Kafka publishes (see DEC-005). |
+| Offset committed AFTER outbox INSERT, BEFORE Kafka publishes and file_generation_event write | DEC-005 — ⛔ CONFIRMED DEVIATION | 🔴 HIGH. Recovery after crash between ACK and Step 7e depends entirely on COMP-12 Scheduler4 — which does NOT re-drive PUBLISHED rows. PUBLISHED-status orphan rows are only recoverable manually. |
+| Message key on all three outbound topics is pass-through of inbound `RECEIVED_KEY` | DEC-003 — ⛔ DEVIATION | No `merchantId` reference anywhere in source. Key identity entirely inherited from upstream COMP-16 publish key. |
+| No Resilience4j circuit breakers on any outbound dependency | DEC-014 — ⛔ VOID platform-wide | IDP Token Service has no timeout, no retry, no breaker — unbounded thread-block risk on any IDP latency. |
+| `CommonErrorHandler` is a no-op empty anonymous implementation | Local decision | Deserialisation failures produce a null payload; NullPointerException caught by outer try/catch; offset behaviour is Spring-Kafka-internal and not fully determinable from source. Consistent characterisation: event silently lost with no DLT and no alerting. |
+| No `@Transactional` on any service method | Local decision | Each DB write is an independent auto-commit. No rollback possible across write boundaries. Four distinct outbox write points (3a ERROR, 3d PUBLISHED, 6 ERROR/PENDING_DEFERRED, 7e SUCCESS/FAILED) are all independent transactions. |
+| Previous-event guard is two-stage (SQL selects all rows per case, Java filters in-memory) | Local decision | Scales poorly for long-lived cases — entire case history loaded per event. |
+| `retry_count > 2` auto-escalates FAILED → ERROR | Local decision | Only fires when UPDATE status is being written as FAILED; SUCCESS writes do not touch retry_count. ERROR is a terminal state with no automatic re-drive path. |
+| Plain `RestTemplate` with `SimpleClientHttpRequestFactory` — no pool, no timeouts | Local decision — ⚠️ risk | New socket per call; no keep-alive pool; TCP OS-level timeout only. |
 
 ---
 
@@ -311,29 +332,34 @@ This component reads only from tables it also writes to (`WDP.bre_orchestration_
 
 | Severity | Risk | Consequence |
 |----------|------|-------------|
-| 🔴 HIGH | DEC-005 violation — offset committed before Kafka publishes and file_generation_event writes | If COMP-18 crashes after Step 4 (ACK), Kafka will not redeliver. All recovery depends on outbox retry. Events where Step 7e never writes FAILED to the outbox (crash between ACK and Step 7e) are permanently lost. |
-| 🔴 HIGH | PUBLISHED-status orphan gap — no automatic re-drive path | Rows stuck at PUBLISHED after an ACK-to-Step7e crash are invisible to COMP-12 Scheduler4 (which queries only FAILED and PENDING_DEFERRED). Manual runbook required. No current mechanism identified. |
-| 🔴 HIGH | IDP Token Service — no timeout configured | Default RestTemplate with no timeout. If IDP is slow or unavailable, the consumer thread blocks indefinitely. Can stall the single consumer thread for this topic. |
-| 🟡 MEDIUM | No-op CommonErrorHandler — deserialization errors silently lost | A malformed event on `outgoing-events` produces a null payload. The NullPointerException is caught and swallowed. No DLT, no alerting, no recovery. Event is permanently skipped. |
-| 🟡 MEDIUM | DEC-003 — partition key identity unconfirmed | Message key is pass-through from inbound `outgoing-events`. Whether downstream topic consumers receive merchantId-scoped ordering depends on COMP-16's publish key. If COMP-16 does not use merchantId, ordering guarantees on all three outbound topics are undefined. |
-| 🟡 MEDIUM | No `@Transactional` on any service method | A crash between two DB writes in the same step leaves partial state. For example: outbox INSERT succeeds, consumer crashes before ACK — on redeliver, idempotency check finds PUBLISHED row, sets eventId, processes normally. This path is safe. But a crash mid-Step 7 leaving some publish steps done and others not is only detectable via outbox FAILED status on retry. |
-| 🟡 MEDIUM | No HPA — single-threaded consumer with undefined replica count | Throughput is capped at one event at a time. Replica count is an XL Deploy placeholder. If replica count > 1, job uniqueness for idempotency depends entirely on outbox dedup — which has the PUBLISHED-status gap noted above. |
-| 🟡 MEDIUM | DEC-014 — no Resilience4j on any outbound dependency | Consistent with platform-wide absence. Dependency failures do not trip a circuit breaker, causing repeated slow failures that block the consumer thread. |
-| 🟢 LOW | Schema name inconsistency in entity annotations | WDP vs wdp case mismatch between `bre_orchestration_outbox` and `file_generation_event` entities. Harmless on standard PostgreSQL but fragile. |
-| 🟢 LOW | Unused repository method `findByIdempotencyIdAndComponent` | Defined in `BreOrchestrationOutboxRepository` but never called. Actual dedup uses the three-argument version including `eventTimeStamp`. Dead code — no runtime risk. |
-| 🟢 LOW | `httpclient` dependency potentially unused | `org.apache.httpcomponents:httpclient` in pom.xml; `RestTemplate` uses `SimpleClientHttpRequestFactory` — httpclient not wired in. |
+| 🔴 HIGH | **DEC-005 violation** — offset committed before Kafka publishes and before the file_generation_event write | Any crash between ACK (Step 4) and Step 7e leaves an outbox row at `PUBLISHED` with empty `publishedAction`. Kafka will not redeliver. COMP-12 Scheduler4 reads only FAILED/PENDING_DEFERRED rows — **not PUBLISHED**. Row is permanently orphaned without manual intervention. |
+| 🔴 HIGH | **PUBLISHED-status orphan gap** — no automatic re-drive | Same crash window as above. No in-component recovery job, no startup sweep, no @Scheduled method. Manual runbook required; runbook owner not identified. (Captured as platform RISK-015.) |
+| 🔴 HIGH | **IDP Token Service — no timeout configured** | Default `RestTemplate` with no connect/read timeout. IDP slowness blocks the single consumer thread indefinitely. With concurrency=1, one hung IDP call stalls all `outgoing-events` processing for that replica. |
+| 🟠 MEDIUM-HIGH | **Silent deserialisation loss + no-op CommonErrorHandler** | Malformed payloads produce null events and swallowed NPEs. No DLT, no alerting, no audit row. Event is skipped without trace. |
+| 🟡 MEDIUM | **DEC-003 deviation** — partition key identity unconfirmed | Message key is pass-through from inbound `outgoing-events`. Whether downstream consumers receive merchantId-scoped ordering depends entirely on COMP-16's publish key. If COMP-16 does not use merchantId, ordering guarantees on all three outbound topics are undefined. Cross-component deviation — already documented on COMP-12, COMP-15, COMP-22, COMP-25, COMP-41, COMP-42. |
+| 🟡 MEDIUM | **Previous-event guard — unbounded in-memory filter** | Step 6 SQL returns ALL outbox rows for a caseNumber; filtering is in-memory Java. For long-lived cases with large event histories, memory pressure and latency per event grow unboundedly. |
+| 🟡 MEDIUM | **No `@Transactional` on any service method** | A crash mid-Step 7 leaves some publishes done and others not, detectable only via the Step 7e outbox UPDATE on next retry. Partial-success state is the normal terminal state, not an exception. |
+| 🟡 MEDIUM | **Single-threaded consumer + undefined replica count** | Throughput capped at one event at a time per replica. Replica count is an XL Deploy placeholder. If replicas > 1, concurrent processing of the same idempotencyId across replicas depends on Kafka consumer group partition-assignment + outbox SELECT-then-INSERT. No `@Transactional`, no `SELECT FOR UPDATE`, no advisory lock — replica race window exists. |
+| 🟡 MEDIUM | **DEC-014 violation** — no Resilience4j anywhere | Platform-wide VOID. Dependency failures do not trip a breaker; slow failures repeat and block the consumer thread. |
+| 🟡 MEDIUM | **Duplicate PUBLISHED re-entry overwrites existing row** | A re-delivered message with a PUBLISHED idempotency match still flows through Step 7e and issues a SUCCESS update on the existing row, overwriting `updated_at`, `retry_count`, and `error_code`. Safe at-most-once (no re-publish) but audit-trail impact. |
+| 🟢 LOW | **Schema annotation inconsistency** `WDP` vs `wdp` across entities | Functionally harmless on standard PostgreSQL identifier folding, but fragile and inconsistent. |
+| 🟢 LOW | **Dead code** — `findByIdempotencyIdAndComponent` repository method, `HttpInterceptor` class, `RequestCorrelation` ThreadLocal (set but never read), unused `httpclient` dependency in pom.xml | No runtime risk; noise in codebase. MDC correlation is effectively not wired anywhere — log lines do not carry per-event correlation context. |
+| 🟢 LOW | **No startup probe configured** | Liveness and readiness probes present. Startup probe absent — on slow start (long JVM warm-up) liveness may trip before application is ready. `initialDelaySeconds=120` provides some cushion. |
 
 ---
 
-## Planned Changes
+## Planned and Incomplete Work
 
-- **EDIA route for NAP outbound:** `disputesAPIMigration=true` routes NAP platform events to `external-request-events` → EDIA Consumer (COMP-44). Logic is already coded — awaiting production flag enablement.
-- **CORE migration completion:** `coreMigration=true` is the gate for routing CORE platform events. Full enablement brings CORE fully onto this component's routing paths.
-- **LATAM and VAP integration:** Not present in any filter method. Will require new platform conditions when those platforms are onboarded.
-- ⚠️ OPEN QUESTION: Is `coreMigration` currently `true` in production? What is the current value of `disputesAPIMigration`? The routing table changes significantly depending on these values.
-- ⚠️ OPEN QUESTION: What is the actual production replica count? Undefined from source.
-- ⚠️ OPEN QUESTION: Who owns the manual re-drive process for PUBLISHED-status orphan rows? Is there a runbook? Should COMP-12 Scheduler4 be extended to cover PUBLISHED rows?
-- ⚠️ OPEN QUESTION: Does COMP-16 BusinessRulesProcessor set `merchantId` as the Kafka message key when publishing to `outgoing-events`? This resolves DEC-003 compliance on all three outbound topics from this component.
+- **EDIA route for NAP outbound:** Filter 3 already routes `platform=NAP` with `migrationStatus=Y` to `external-request-events` (EDIA Consumer path). Code is live — awaiting downstream COMP-44 EDIA Consumer to be built.
+- **CORE migration completion:** `coreMigration=true` is the master gate for routing CORE platform events to `case-action-events`, `core-request-events`, and `file_generation_event`. Full enablement brings CORE onto this component's routing paths.
+- **Dead code to remove:** `findByIdempotencyIdAndComponent`, `HttpInterceptor` class, `RequestCorrelation` ThreadLocal, `org.apache.httpcomponents:httpclient` dependency in pom.xml. Two unused imports in `FileGenerationEventServiceImpl`.
+- **MDC correlation not wired.** `HttpInterceptor` puts MDC but is never registered. `NotificationServiceImpl` does not call `MDC.put`. Log lines lack per-event correlation context despite `v-correlation-id` being propagated on outbound REST.
+- ⚠️ **OPEN QUESTION:** Production values of `coreMigration` and `disputesAPIMigration`. Routing table changes significantly depending on these values. Team confirmation required.
+- ⚠️ **OPEN QUESTION:** Production replica count. Any value > 1 activates the SELECT-then-INSERT race window across replicas.
+- ⚠️ **OPEN QUESTION:** Owner of manual re-drive runbook for PUBLISHED-status orphan rows. RISK-015 captured at platform level but runbook not identified.
+- ⚠️ **OPEN QUESTION:** Production values of `max_poll_records`, `max_poll_interval`, `session_timeout_ms`, `heartbeat_interval_ms` — all env-var passthroughs with no defaults.
+- ⚠️ **OPEN QUESTION:** UNIQUE constraint on `wdp.bre_orchestration_outbox(idempotency_id, component, event_timestamp)` — DBA confirmation required; no DDL in this repo.
+- ⚠️ **OPEN QUESTION:** Upstream COMP-16 publish key on `outgoing-events`. Determines whether DEC-003 deviation is `caseNumber`-scoped or otherwise.
 
 ---
 
@@ -345,9 +371,9 @@ This component reads only from tables it also writes to (`WDP.bre_orchestration_
 
 ## Kafka Consumer Contracts
 
-**Consumer framework:** Spring Kafka `@KafkaListener` (`KafkaConsumer.java`)
-**Offset commit strategy:** ⚠️ At-most-once deviation — ACK committed AFTER outbox INSERT but BEFORE Kafka publishes. Confirmed DEC-005 violation.
-**Error handling strategy:** Outer try/catch swallows all exceptions; offset already committed; consumer continues. No DLT topic. Deserialization errors produce null event — silently lost.
+**Consumer framework:** Spring Kafka `@KafkaListener` on `ConcurrentKafkaListenerContainerFactory`
+**Offset commit strategy:** `MANUAL_IMMEDIATE` with `syncCommits=true` — ACK fires at a fixed point after outbox INSERT and before downstream writes (DEC-005 deviation)
+**Error handling strategy:** No-op `CommonErrorHandler`. No DLT. No `DefaultErrorHandler`. No `DeadLetterPublishingRecoverer`. Deserialisation failures are silently swallowed.
 
 ---
 
@@ -360,48 +386,57 @@ This component reads only from tables it also writes to (`WDP.bre_orchestration_
 | **Env-suffix pattern** | `outgoing-events-{env}` (dev, uat, stg, cert) |
 | **Consumer group** | `outgoing-events-group` (prod) |
 | **Consumer group config key** | `spring.kafka.consumer.groupId` |
-| **AckMode** | `MANUAL_IMMEDIATE` — explicitly configured. `syncCommits=true`. |
-| **Offset commit** | ⚠️ After Step 3d (outbox INSERT) but BEFORE Step 7 (Kafka publishes). DEC-005 deviation. |
+| **AckMode** | `MANUAL_IMMEDIATE` with `syncCommits=true` |
+| **Offset commit timing** | After Step 3d outbox INSERT, before all Step 7 writes. Single ACK call site; no profile-specific override. |
 | **Concurrency** | 1 thread (Spring default — `setConcurrency()` not called) |
-| **Max poll records** | `${max_poll_records}` — K8s secret, value unknown |
-| **Max poll interval** | `${max_poll_interval}` — K8s secret, value unknown |
+| **Max poll records** | `${max_poll_records}` — env var, no default |
+| **Max poll interval** | `${max_poll_interval}` — env var, no default |
+| **Session timeout / heartbeat** | Env var, no default |
 | **Auto offset reset** | `latest` |
 | **Auto commit** | `false` |
 | **Value deserializer** | `ErrorHandlingDeserializer<NotificationEvent>` wrapping `JsonDeserializer<NotificationEvent>` |
 | **Key deserializer** | `StringDeserializer` |
 | **Ordering guarantee** | Depends on upstream publisher key — not set by this component |
-| **Kafka broker** | Amazon MSK — SASL_SSL + AWS IAM auth |
+| **Kafka broker** | Amazon MSK — SASL_SSL + AWS_MSK_IAM auth |
+| **`@KafkaListener` errorHandler attribute** | Not set — falls back to factory-level no-op `CommonErrorHandler` |
 
 **Inbound payload: `NotificationEvent`**
 
 Key fields used in routing and writes:
 
 | Field | Type | Used for |
-|-------|------|---------|
-| `eventId` | Long (nullable) | Step 2 gate — null triggers the full filterAndSaveNotification pipeline |
-| `platform` | String | Routing filter conditions — all four filters evaluate this |
-| `eventType` | String | Routing filter conditions — all four filters evaluate this |
+|-------|------|----------|
+| `eventId` | Long (nullable) | Step 2 null-gate — null triggers the full `filterAndSaveNotification` pipeline |
+| `platform` | String | All four filter methods evaluate this |
+| `eventType` | String | All four filter methods evaluate this |
 | `migrationStatus` | String | Filter 1 (EXPIRY) and Filter 3 (EXTERNAL) conditions |
 | `caseNumber` | String | Written to outbox `i_case`; previous-event guard query key |
 | `actionSequence` | String | Written to outbox `i_action_seq`; written to `file_generation_event` |
 | `caseNetwork` | String | Filter 4 exclusion conditions and fileType derivation |
 | `disputeStage`, `actionCode` | String | Filter 4 sub-condition B gate |
 | `documentIndicator` | String | Filter 4 sub-condition B gate — must be `Y` |
-| `documentNameList` | List | Filter 4 — if empty on ACTION_CREATED, triggers DMS REST call |
+| `documentNameList` | List | Filter 4 — if empty on `ACTION_CREATED`, triggers DMS REST call. **Also published on `PublishedNotificationEvent` when set.** |
 | `type` | String | Filter 4 sub-conditions — ISSRDOC, ISSRQDOC detection |
 | `hybridMerchant` | Boolean | Filter 4 — fileType AMEX_HYBRID vs AMEX, DISCOVER_RMO vs DISCOVER |
 | `networkCaseId` | String | Written to `wdp.file_generation_event.c_ntwk_case_id` only |
+| `idempotencyId` | String | Outbox idempotency lookup key; forwarded as `idempotency-key` header; used as REST `v-correlation-id` |
+| `eventTimeStamp` | String | Outbox idempotency lookup key; forwarded as `event-timestamp` header |
 
 **On processing failure**
 
-| Failure scenario | Behaviour |
-|----------------|-----------|
-| Deserialization error | `ErrorHandlingDeserializer` returns null event; NullPointerException caught by outer try/catch; offset committed; event silently lost. No DLT, no alerting. |
-| Missing idempotency headers (Step 3a) | ERROR written to outbox; offset committed; downstream skipped |
-| DB failure on outbox INSERT (Step 3d) | Exception propagates to outer try/catch; offset committed; downstream skipped. Outbox row not written — event is permanently lost from outbox perspective. |
-| Kafka publish failure (Step 7a-7c) | Per-method catch; `errorOccured=true`; item retained in targetAction; Step 7e writes FAILED to outbox; retryCount incremented; escalates to ERROR after retryCount > 2. Scheduler4 will retry. |
-| Document Management Service failure (Step 7d) | @Retryable: 3 attempts, 2000ms; on exhaustion: `errorOccured=true`; file_generation_event write skipped; Step 7e writes FAILED. |
-| Consumer halt | Never. Outer try/catch in `KafkaConsumer.listener()` swallows all exceptions and the consumer continues. Offset was already committed before the exception. |
+| Failure scenario | Behaviour | Offset committed? |
+|------------------|-----------|-------------------|
+| Deserialisation error (malformed JSON) | `ErrorHandlingDeserializer` returns null event; NullPointerException on subsequent access; caught by outer try/catch. No DLT. No audit row. Event silently dropped. Exact broker-side offset commit sequencing is not determinable from source — depends on Spring Kafka container semantics for handler-raised exceptions with a no-op `CommonErrorHandler`. | Ambiguous |
+| Missing idempotency headers (Step 3a) | ERROR row written to outbox; ACK fires; downstream skipped via Step 5 gate | ✅ Yes |
+| Idempotency lookup DB failure (Step 3b) | Exception propagates to outer try/catch; ACK skipped; event redelivered | ❌ No |
+| Outbox INSERT failure (Step 3d) | Exception propagates to outer try/catch; ACK skipped; event redelivered. Outbox row not written — no audit trail of the attempt. | ❌ No |
+| Previous-event guard failure (Step 6) | Exception caught in `processKafkaNotificationEvent` outer catch; errorOccured=true; outbox UPDATE to FAILED | ✅ Yes — already committed at Step 4 |
+| Kafka publish failure (Step 7a-7c) | Per-method catch; errorOccured=true; action retained in `targetAction`; flow continues to next sub-step; Step 7e writes FAILED; `retry_count > 2` escalates to ERROR | ✅ Yes |
+| IDP Token Service failure (Step 7d IDP call) | `WebServiceException` propagates up through DMS call; caught in `insertInfoToFileGenerationEventTable`; errorOccured=true; file write skipped; Step 7e writes FAILED | ✅ Yes |
+| DMS retry exhaustion (Step 7d DMS call) | `@Retryable` 3 attempts / 2000ms fixed delay; `retryFor=Exception`, `exclude=RestTemplateCustomException`; no `@Recover`; on exhaustion exception propagates; caught; errorOccured=true; file write skipped | ✅ Yes |
+| DMS returns empty list (Step 7d) | Treated as error — errorOccured=true, errorReason set; file INSERT skipped entirely (not a zero-row INSERT) | ✅ Yes |
+| file_generation_event INSERT failure (Step 7d write) | Exception caught in `insertInfoToFileGenerationEventTable`; errorOccured=true; FILE_GENERATION_EVENT retained in targetAction | ✅ Yes |
+| Consumer halt | Never — outer try/catch in `KafkaConsumer.listener()` swallows all exceptions and the listener continues | — |
 
 ---
 
@@ -413,15 +448,17 @@ Key fields used in routing and writes:
 
 ## Kafka Producer Contracts
 
-**Producer framework:** Spring Kafka `KafkaTemplate<String, Event>` — single `kafkaOutgoingTemplate` bean for all three topics
-**Payload type:** `PublishedNotificationEvent` (implements `Event`)
-**Idempotent producer:** Yes — `ENABLE_IDEMPOTENCE_CONFIG=true`, `ACKS_CONFIG=all`, `MAX_IN_FLIGHT=5`
-**Publish mode:** Synchronous blocking (`kafkaTemplate.send(message).get()`)
-**Retry on publish failure:** No producer-level retry — exception caught per-method; `errorOccured=true`; outbox written FAILED; COMP-12 Scheduler4 re-drives via outgoing-events on next retry cycle
+**Producer framework:** Spring Kafka `KafkaTemplate<String, Event>` — single `kafkaOutgoingTemplate` bean shared across all three outbound topics
+**Payload type:** `PublishedNotificationEvent` — single instance built once per event via `ModelMapper.map()` from `NotificationEvent`, sent to all three topics
+**Idempotent producer:** `enable.idempotence=true`, `acks=all`, `max.in.flight.requests.per.connection=5`
+**Publish mode:** Synchronous blocking — `kafkaTemplate.send(message).get()`
+**Retry on publish failure:** No producer-level `@Retryable` and no application-level retry on send. Exception caught per publish method; `errorOccured=true`; outbox UPDATE writes FAILED; COMP-12 Scheduler4 re-drives via `outgoing-events` on its retry cycle.
 
-**Headers forwarded on all outbound publishes:** `event-timestamp` (from inbound), `idempotency-key` (from inbound)
+**Headers forwarded on all outbound publishes:** `event-timestamp` (from inbound), `idempotency-key` (from inbound `idempotencyId`). No correlation-id header on Kafka publishes.
 
-⚠️ **DEC-003 note — message key:** The Kafka message key on all three topics is a pass-through of `KafkaHeaders.RECEIVED_KEY` from the inbound `outgoing-events` message. This component does NOT set `merchantId` explicitly. The actual partition key identity depends on what COMP-16 BusinessRulesProcessor sets when publishing to `outgoing-events`. Confidence: Medium. Confirm during COMP-16 documentation.
+⚠️ **DEC-003 note:** The Kafka message key on all three outbound topics is pass-through of inbound `KafkaHeaders.RECEIVED_KEY`. No `merchantId` reference exists anywhere in source. Partition-key identity is entirely inherited from what COMP-16 BusinessRulesProcessor sets when publishing to `outgoing-events`.
+
+**Unused producer settings:** `retries`, `delivery.timeout.ms`, `request.timeout.ms`, `linger.ms`, `batch.size` are not configured — Kafka client defaults apply.
 
 ---
 
@@ -431,16 +468,15 @@ Key fields used in routing and writes:
 |-----------|-------|
 | **Topic name** | `case-action-events` (prod) |
 | **Config key** | `spring.kafka.producer.caseActionEventTopic` |
-| **Message key** | Pass-through of `KafkaHeaders.RECEIVED_KEY` from inbound — ⚠️ DEC-003 likely deviation |
+| **Message key** | Pass-through of `KafkaHeaders.RECEIVED_KEY` — ⚠️ DEC-003 deviation |
 | **Ordering guarantee** | Depends on upstream key identity |
 | **Published on** | `EXPIRY_EVENT` present in `targetAction` — Step 7a |
-| **Triggered by** | platform/eventType conditions per Filter 1 routing table above |
+| **Triggered by** | Filter 1 routing table (platform/eventType/migrationStatus/coreMigration combinations) |
 | **Consumed by** | COMP-17 CaseExpiryUpdateConsumer |
 
-**Payload notes:**
-`PublishedNotificationEvent` — same schema as the other two outbound topics. No secondary dispatch within this topic — consumers receive the full event and determine their own action. Fields `idempotencyId`, `hybridMerchant`, `documentNameList`, `fileType`, `eventTimeStamp`, `targetAction`, `publishedAction` are absent from the published payload.
+**Payload notes:** `PublishedNotificationEvent` — 28 fields mapped via `ModelMapper` from `NotificationEvent`. Fields **absent** from the published payload: `idempotencyId`, `hybridMerchant`, `networkCaseId`, `eventId`, `targetAction`, `publishedAction`, `errorOccured`, `errorReason`, `fileType`, `eventTimeStamp`. Field `documentNameList` **is present** on `PublishedNotificationEvent` and is published if set (corrected from v1.0 DRAFT).
 
-**On failure:** Exception caught; `errorOccured=true`; `EXPIRY_EVENT` retained in `targetAction`; outbox written FAILED; retryCount incremented; escalates to ERROR after retryCount > 2.
+**On failure:** Exception caught; `errorOccured=true`; `EXPIRY_EVENT` retained in `targetAction`; outbox written FAILED at Step 7e; `retry_count` incremented; escalates to ERROR after `retry_count > 2`.
 
 ---
 
@@ -450,13 +486,13 @@ Key fields used in routing and writes:
 |-----------|-------|
 | **Topic name** | `core-request-events` (prod) |
 | **Config key** | `spring.kafka.producer.coreRequestEventTopic` |
-| **Message key** | Pass-through of `KafkaHeaders.RECEIVED_KEY` — ⚠️ DEC-003 likely deviation |
+| **Message key** | Pass-through of `KafkaHeaders.RECEIVED_KEY` — ⚠️ DEC-003 deviation |
 | **Ordering guarantee** | Depends on upstream key identity |
 | **Published on** | `CORE_EVENT` present in `targetAction` — Step 7b |
-| **Triggered by** | platform=PIN (any) or platform=CORE with coreMigration=true — per Filter 2 routing table |
+| **Triggered by** | platform=PIN (any) or platform=CORE with coreMigration=true — Filter 2 routing table |
 | **Consumed by** | COMP-43 CoreNotificationConsumer |
 
-**Payload notes:** Same `PublishedNotificationEvent` schema. Platform=CORE events only reach this topic when `coreMigration=true`. Platform=PIN events always reach this topic regardless of flag.
+**Payload notes:** Same `PublishedNotificationEvent` instance as the other two outbound topics. Platform=CORE events only reach this topic when `coreMigration=true`. Platform=PIN events always reach this topic regardless of flag.
 
 **On failure:** Same pattern as `case-action-events`.
 
@@ -468,14 +504,17 @@ Key fields used in routing and writes:
 |-----------|-------|
 | **Topic name** | `external-request-events` (prod) |
 | **Config key** | `spring.kafka.producer.externalEventTopic` |
-| **Message key** | Pass-through of `KafkaHeaders.RECEIVED_KEY` — ⚠️ DEC-003 likely deviation |
+| **Message key** | Pass-through of `KafkaHeaders.RECEIVED_KEY` — ⚠️ DEC-003 deviation |
 | **Ordering guarantee** | Depends on upstream key identity |
 | **Published on** | `EXTERNAL_EVENT` present in `targetAction` — Step 7c |
-| **Triggered by** | platform=PIN, or platform=CORE with disputesAPIMigration=true, or platform=NAP with migrationStatus=Y — per Filter 3 routing table |
+| **Triggered by** | platform=PIN, or platform=CORE with disputesAPIMigration=true, or platform=NAP with migrationStatus=Y — Filter 3 routing table |
 | **Consumed by** | COMP-41 ThirdPartyNotificationConsumer, COMP-42 BENConsumer, COMP-44 EDIAConsumer (🔴 Planned) |
 
-**Payload notes:** Single `PublishedNotificationEvent` publish. This component applies NO secondary routing within `external-request-events` — there is no BEN vs third-party vs EDIA distinction at publish time. The downstream consumers each consume this topic with their own consumer group and apply their own filtering. The NAP route via EDIA Consumer is a planned future path — currently NAP outcomes go via `internal-integration-events` (AcceptService / ContestService → NAPOutcomeProcessor).
+**Payload notes:** Single `PublishedNotificationEvent` publish — this component applies no secondary routing. The NAP route via EDIA Consumer is a planned future path; currently NAP outcomes also flow via `internal-integration-events` (AcceptService / ContestService → NAPOutcomeProcessor).
 
 **On failure:** Same pattern as `case-action-events`.
 
 ---
+
+*End of WDP-COMP-18-NOTIFICATION-ORCHESTRATOR.md*
+*Version 2.0 DRAFT — source-verified 2026-04-18 — architect confirmation pending.*

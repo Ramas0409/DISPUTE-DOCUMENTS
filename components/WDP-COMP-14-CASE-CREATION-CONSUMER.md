@@ -1,7 +1,8 @@
 # WDP-COMP-14-CASE-CREATION-CONSUMER
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: gcp-case-creation-consumer (v1.3.7) using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 2.0 DRAFT | April 2026*
+*Extracted from: gcp-case-creation-consumer (v1.3.7) — source-verified by Claude Code 2026-04-18 | Architect-confirmed: PENDING*
+*Supersedes v1.0 DRAFT. See WDP-CHANGE-LOG.md entry for 2026-04-18 COMP-14 for the full correction set.*
 
 ---
 
@@ -11,15 +12,17 @@
 
 ## Identity
 
-| Field | Value |
-|---|---|
-| **Name** | `CaseCreationConsumer` |
-| **Type** | `Kafka Consumer` |
-| **Repository** | `gcp-case-creation-consumer` |
-| **Version** | 1.3.7 |
-| **Status** | ✅ Production |
-| **Doc status** | 📝 DRAFT |
-| **Sections present** | `Core | Block B` |
+| Field             | Value                                                        |
+|-------------------|--------------------------------------------------------------|
+| **Name**          | `CaseCreationConsumer`                                       |
+| **Type**          | `Kafka Consumer`                                             |
+| **Repository**    | `gcp-case-creation-consumer`                                 |
+| **Version**       | 1.3.7                                                        |
+| **Status**        | ✅ Production                                                 |
+| **Doc status**    | 📝 DRAFT — source-verified 2026-04-18, architect confirmation pending |
+| **Sections present** | `Core \| Block B`                                         |
+| **Context path**  | `/merchant/gcp/case-creation`                                |
+| **Port**          | 8082                                                         |
 
 ---
 
@@ -27,178 +30,216 @@
 
 **What it does**
 
-CaseCreationConsumer is the primary dispute case creation component for all non-NAP acquiring
-platforms. It consumes from the `new-case-events` Kafka topic and orchestrates a sequential chain
-of downstream REST calls to enrich dispute events with merchant and transaction data, then create
-or update dispute cases in WDP Core. The component handles CORE, LATAM, VAP, and PIN acquiring
-platforms.
+CaseCreationConsumer is the primary dispute case creation component for all **non-NAP**
+acquiring platforms. It consumes from the `new-case-events` Kafka topic and orchestrates a
+sequential chain of downstream REST calls to enrich dispute events with merchant and
+transaction data, then creates or updates dispute cases in WDP Core. The component is the
+intended processing path for CORE, LATAM, VAP, and PIN acquiring platforms — NAP events
+have their own dedicated processor (COMP-05), but no guard in this component prevents a
+NAP-tagged event from being processed if one arrives on this topic.
 
-The component operates as a sequential state machine. Each processing step determines the next API
-name to call. If any step fails, the chain halts and the `chbk_outbox_row` record is written to
-FAILED or ERROR status. All error outcomes — transient and permanent — are recorded in
-`wdp.chbk_outbox_row`. There is no separate error table and no Kafka DLQ.
+The component operates as a sequential state machine driven by an `apiName` transition
+token. Each step determines the next API to call. If any step returns a terminal failure,
+the chain halts and the `wdp.chbk_outbox_row` row is moved to `FAILED` or `ERROR`. All error
+outcomes — transient and permanent — are recorded on the existing outbox row. There is no
+separate error table and no Kafka DLQ. Four of the enrichment `@Recover` methods absorb
+failures silently by returning `null` and do not write a FAILED row — see Risks.
 
-PAN handling follows a two-step cycle: if the event carries an HPAN, it is decrypted transiently
-to extract the `issuerBIN` (first 6 digits) and then a fresh HPAN is obtained by encrypting the
-clear PAN returned from the transaction enrichment service. Clear PAN exists in memory only during
-this cycle and is explicitly excluded from logging. HPAN is stored in the case record by the case
-management service — never in a table owned by this component.
+Two logical flows are selected by the `notificationType` field on the inbound event: a NEW
+case-creation path (≥10 sequential REST calls) and an UPDATE action-insertion path (≥5
+sequential REST calls). The flow is re-routed at the Case Lookup step: if the inbound
+`notificationType = "Update"` but Case Lookup returns no case, processing switches to NEW.
 
-The component handles two logical flows determined by the `notificationType` field in the inbound
-event: NEW case creation and UPDATE action insertion. The flow may be overridden at the Case Lookup
-step — if notificationType is "Update" but no case is found, the flow is rerouted to NEW case
-creation.
+PAN handling follows a decrypt-then-re-encrypt cycle. If the event carries an HPAN, the
+component calls the encryption service to decrypt it transiently, extracts `issuerBIN` from
+the clear PAN, and the transaction-enrichment service returns a fresh clear PAN which is
+re-encrypted back to HPAN before any persistence. Clear PAN exists in memory only during
+this cycle and is explicitly excluded from every log line via a `@ToString(exclude=…)` rule
+on the PAN-carrying field. HPAN is stored in the case record by the downstream case
+management service — never in any table owned by this component.
 
-The Kafka offset is acknowledged immediately on receipt — before any downstream processing begins.
-This is an at-most-once delivery pattern and a confirmed deviation from the platform DEC-005
-standard.
+The Kafka offset is acknowledged immediately on receipt — **before** any downstream
+processing begins. This is at-most-once delivery and a confirmed 🔴 HIGH deviation from
+DEC-005. A second 🔴 HIGH deviation is that no `@Transactional` annotation exists anywhere
+in the component: the parent outbox `SUCCESS` write and the EVIDENCE_ATTACH child update
+auto-commit as independent statements and are therefore not atomic with each other or with
+the upstream case-creation REST call.
 
 **What it does NOT do**
 
-- Does not process NAP acquiring platform events by design — however, no code guard prevents NAP
-  events from arriving at this topic and being processed if they do. This is a confirmed gap.
-- Does not publish to any Kafka topic. No outbound Kafka producer is configured in this codebase.
-- Does not use a Kafka DLQ topic. All error outcomes land in `wdp.chbk_outbox_row`.
-- Does not implement a transactional outbox. The `chbk_outbox_row` row pre-exists (created
-  upstream by COMP-12). This component only updates the status of pre-existing rows. The outbox
-  status update and the downstream REST case creation call are not atomic — they are separate JPA
-  saves with no encompassing transaction.
-- Does not configure REST connection or read timeouts. A plain `new RestTemplate()` with no timeout
-  is created in CommonConfig. All 11+ downstream REST calls can hang indefinitely, which with a
-  single consumer thread effectively halts all consumption.
-- Does not apply Resilience4j circuit breakers. Spring Retry `@Retryable` is used for
-  retry-with-backoff only.
-- Does not store HPAN locally. HPAN is stored only by `mdvs-gcp-case-management-service`.
-- Does not own the creation of `chbk_outbox_row` rows. Rows are created by upstream batch
-  components and published via COMP-12 InboundDisputeEventScheduler. This component updates
-  those rows.
-- Does not perform NAP platform authorization — that is COMP-02 UAMS.
+- Does not publish to any Kafka topic. No `KafkaTemplate`, no `ProducerFactory`, no reference
+  to `business-rules` topic anywhere in the source. The earlier DRAFT implied a downstream
+  publish — that was incorrect. This closes Observability open question OQ-02.
+- Does not guard against NAP events. `NAP` is accepted by the platform-to-URL mapper and
+  will flow through the same lookups as CORE/LATAM/VAP/PIN. If a NAP event ever arrives on
+  `new-case-events`, it will be processed. The behavioural guarantee is operational (COMP-04
+  does not publish NAP events to this topic), not code-level.
+- Does not insert new rows into `wdp.chbk_outbox_row`. Rows are created upstream by
+  COMP-07/08/09/11 and published by COMP-12. This component only transitions the status of
+  pre-existing rows.
+- Does not apply transactional outbox semantics. There is no outbox INSERT inside a shared
+  transaction with a business write; there is no transaction at all. Every DB write
+  auto-commits.
+- Does not use a Kafka DLQ topic. All error outcomes that reach the database land on the
+  same `wdp.chbk_outbox_row` row the event was published from. Deserialization errors,
+  poison payloads, and unhandled application exceptions are silently swallowed by an empty
+  `CommonErrorHandler` — no DLT, no log, no counter.
+- Does not apply circuit-breaker logic. Resilience4j is absent from the classpath (platform
+  VOID per DEC-014).
+- Does not configure any REST timeout or connection pool. `RestTemplate` is bare-constructed;
+  a hung downstream blocks the single consumer thread indefinitely, and readiness probes on
+  Actuator do not detect the stall.
+- Does not set MDC on the Kafka listener thread. MDC correlation context is populated only
+  on the inbound HTTP path (which this component does not expose). Log lines emitted during
+  Kafka processing do not carry a correlation ID in MDC. Correlation is propagated to
+  downstream REST calls via a `ThreadLocal` and `V_CORRELATION_ID` HTTP header — not MDC.
 
 ---
 
 ## Internal Processing Flow
 
+*This diagram shows how each inbound Kafka message moves through the consumer. It captures
+the pre-ACK at-most-once boundary, all three duplicate-detection layers, every branch in
+the NEW and UPDATE paths, and every distinct failure path.*
+
 ```mermaid
 flowchart TD
-    IN["Kafka message received\nnew-case-events / AWS MSK\nSASL_SSL / IAM\nNotificationEvent payload"]
+    IN["📨 Inbound Kafka message\nnew-case-events topic\nNotificationEvent payload\nKey: keyNetworkCaseCardNetworkId\nHeader: idempotency-key"]
 
-    ACK["⚠️ DEC-005 DEVIATION\nMANUAL_IMMEDIATE offset commit\nOffset ACK'd BEFORE any downstream\nprocessing or DB write"]
+    ACK["⚠️ acknowledgment.acknowledge()\nMANUAL_IMMEDIATE — pre-ACK\n🔴 DEC-005 DEVIATION\nAt-most-once from this point"]
 
-    CORR["Assign correlationId / idempotencyId\nif absent from event or Kafka header\nidempotencyId delegated downstream\nas HTTP header on every REST call"]
+    CORR["Set RequestCorrelation ThreadLocal\ncorrelationId from event or new UUID\n(not MDC — HTTP-only pattern)"]
 
-    PRIOR["Prior chargeback check\nwdp.chbk_outbox_row (DB read)\nnetworkCaseId + cardNetwork\nwhere id < current_id\nstatus NOT IN SUCCESS/SKIPPED"]
+    PRIOR["Prior chargeback check\nwdp.chbk_outbox_row\nFilter: networkCaseId + cardNetwork\nStatus filter applied in-memory\n⚠️ No DB lock, no SELECT FOR UPDATE"]
 
-    P1{{"Prior rows found?"}}
-
+    P1{{"Any prior row?"}}
     ERR_PRIOR["Set status = ERROR\nHalt ⛔"]
-    DEFER["Set status = PENDING_DEFERRED\nHalt — prior event still in-flight ⛔"]
+    DEFER["Set status = PENDING_DEFERRED\nSet next_retry_at\nHalt ⛔\nCOMP-12 reprocesses on retry"]
 
-    HIST{{"historicalDeptDetail\n!= null?"}}
-
-    VALIDATE["Validate notification\nnetworkRuling value check\nnote type allowlist check\nCapone platform and stage rules\nskipStageList check"]
-
-    VOUT{{"Validation outcome?"}}
+    HIST{{"Historical event\n(dsCaseLookup triggered path)?"}}
+    VALIDATE["validateNotificationEvent\nnetworkRuling value check\nnote.type allowlist check\nCapone platform / stage check\nskipStageList check"]
+    VOUT{{"Validation outcome"}}
     ERR_VAL["Set status = ERROR\nHalt ⛔"]
     SKIP_VAL["Set status = SKIPPED\nHalt ⛔"]
 
-    IDP["Fetch IDP Bearer token\nwdp-idp-token-service (GET)\n/merchant/gcp/idp-token/token\nNo @Retryable — 1 attempt only"]
+    IDP["IDP token fetch\nwdp-idp-token-service GET\n1 attempt — no @Retryable"]
 
-    CASE_LOOKUP["Case Lookup\nmdvs-gcp-case-search-service (GET)\n/{platform}/case/lookup\n3 retries, 2s backoff"]
+    CASE_LOOKUP["Case Lookup\nmdvs-gcp-case-search-service GET\n3 retries / 2s backoff"]
 
-    NT{{"notificationType\n(may override to New\nif case not found)?"}}
+    NT{{"notificationType\n(override to NEW if\ncase not found)"}}
 
-    FAILED["Set status = FAILED\nwdp.chbk_outbox_row\nretryCount++\n⚠️ retryCount > 2 → auto-promote to ERROR"]
+    FAILED["Set status = FAILED\nretry_count += 1\n⚠️ If retry_count > 2\nauto-promote to ERROR"]
 
-    subgraph NEW ["NEW CASE PATH"]
+    subgraph NEW_PATH ["NEW CASE PATH"]
         EF{{"enrichmentFailure\n= true?"}}
 
-        PAN_DEC["PAN Decrypt\nwdp-encryption-service (POST)\n/v1/pan/decrypt\ndPan in memory only\nexcluded from all logging\n1 attempt"]
+        PAN_DEC["PAN decrypt\nwdp-encryption-service POST\nClear PAN in memory only\n@ToString exclusion\n1 attempt"]
 
-        FRAUD["Fraud Switch Lookup\n${fraud_transaction_url} (GET)\n3 retries\n@Recover → null\nNo FAILED write at this step"]
+        FRAUD["Fraud Switch lookup\nexternal — env URL\n3 retries → @Recover → null\n⚠️ No FAILED write (silent)"]
 
-        TXN["Transaction Lookup\ngcp-merchant-transaction-service (POST)\n/{platform}/transaction/search\n1 attempt\n@Recover → null\nNo FAILED write at this step"]
+        TXN["Transaction Lookup\ngcp-merchant-transaction-service POST\n1 attempt → @Recover → null\n⚠️ No FAILED write (silent)"]
 
-        PAN_ENC["PAN Encrypt\nwdp-encryption-service (POST)\n/v1/pan/encrypt\nePan (HPAN) stored on event\n1 attempt"]
+        PAN_ENC["PAN encrypt\nwdp-encryption-service POST\nClear PAN → HPAN\n1 attempt"]
 
-        PROD_ENT["Product Entitlement\ncore-hierarchy-authorization-service (GET)\n/productentitlement\n3 retries\nnull @Recover → FAILED"]
+        CAPONE_DUP{{"Capone REQ\ndisputeStage?"}}
+        CAPONE_CHECK["wdp.case direct query\nmerchantId + trDate + acctCdhLst\n+ purchaseAmt + originalDisputeAmount\nNo @Query — method-name derivation"]
+        CAPONE_MATCH{{"Match\nfound?"}}
+        ERR_CAPONE["Set status = ERROR\nHalt ⛔"]
 
-        WF_CAT{{"schemeRef.category\n= COMP or PRECOMP?"}}
-        WF_HARD["workflowName = VISA_COMPLIANCE\nhardcoded — rules service bypassed"]
-        WF_SVC["Workflow Rule Lookup\nmdvs-gcp-rules-service (POST)\n/rules/workflow\n3 retries\nnull @Recover → FAILED"]
+        PROD_ENT["Product Entitlement\ncore-hierarchy-authorization-service GET\nCORE/PIN platforms only\n3 retries → @Recover → null\n⚠️ No FAILED write (silent)"]
 
-        FIRST_ACT["First Action Rule Lookup\nmdvs-gcp-rules-service (POST)\n/rules/firstaction\n3 retries\n@Recover → FAILED"]
+        WF_SWITCH{{"QueueName =\nCOMP or PRECOMP?"}}
+        WF_HARD["workflowName =\nVISA_COMPLIANCE hardcode\nRules service bypassed"]
+        WF_SVC["Workflow Rule Lookup\nmdvs-gcp-rules-service POST\n3 retries → @Recover null → FAILED"]
 
-        DISP["Display Code Lookup\nmdvs-gcp-display-code-service (POST)\n/display-code/search\nCurrency ISO conversion\nReason category derivation\n1 attempt — null @Recover → FAILED"]
+        FIRST_ACT["First Action Rule Lookup\nmdvs-gcp-rules-service POST\n3 retries → @Recover → FAILED"]
 
-        CREATE["Create Case\nmdvs-gcp-case-management-service (POST)\n/{platform}/case\n3 retries\n@Recover → FAILED"]
+        DISP["Display Code Lookup\nmdvs-gcp-display-code-service POST\nCurrency ISO alpha conversion\n1 attempt → @Recover → null\n⚠️ No FAILED write (silent)"]
 
-        ATTACH["Update EVIDENCE_ATTACH rows\nwdp.chbk_outbox_row (DB write)\nstatus = PENDING"]
+        CREATE["Create Case\nmdvs-gcp-case-management-service POST\n/{platform}/case\n3 retries\nOn failure → FAILED"]
+
+        ATTACH["Update EVIDENCE_ATTACH children\nwdp.chbk_outbox_row saveAll\nstatus = PENDING\nMatch: parentRowNumber + networkCaseId\n+ cardNetwork + fileJobId + platform\n⚠️ Soft failure — logged only"]
     end
 
-    subgraph UPDATE ["UPDATE PATH (case already exists)"]
-        PRE["Pre-Action Status Lookup\nmdvs-gcp-rules-service (POST)\n/rules/pre-action\n1 attempt"]
-        DUSER["Display UserId Lookup\nAID user-detail service (GET)\nhttps://ws-int.infoftps.com/...\n3 retries"]
-        NEW_ACT["New Action Rule Lookup\nmdvs-gcp-rules-service (POST)\n/rules/newactions\n3 retries"]
-        PROD_U["Product Entitlement\ncore-hierarchy-authorization-service (GET)\n/productentitlement\n3 retries"]
-        INS_ACT["Insert Action\nmdvs-gcp-case-actions-service (POST)\n/{platform}/case/lookup\n3 retries\n@Recover → FAILED"]
-        UPD_ACT["Update Action\nmdvs-gcp-case-actions-service (POST)\n/{platform}/case/{caseNumber}/actions\n1 attempt\nnull response → FAILED"]
-        INS_NOTES["Insert Notes\nmdvs-gcp-notes-service (PUT/POST)\n/{platform}/case/{caseNumber}\n1 attempt\nSoft failure — exception logged only\nDoes NOT write FAILED"]
-        MOD_EV["Modify Evidence Event Status\nwdp.chbk_outbox_row (DB write)\n1 attempt\nSoft failure — exception logged only"]
+    subgraph UPDATE_PATH ["UPDATE CASE PATH"]
+        PRE["Pre-Action Status Lookup\nmdvs-gcp-rules-service POST\n1 attempt"]
+        DUSER["Display UserId Lookup\nAID external HTTPS GET\n3 retries"]
+        NEW_ACT["New Action Rule Lookup\nmdvs-gcp-rules-service POST\n3 retries"]
+        PROD_U["Product Entitlement\ncore-hierarchy-authorization-service GET\n3 retries → null → FAILED"]
+        INS_ACT["Insert Action\nmdvs-gcp-case-actions-service POST\n3 retries → @Recover → FAILED"]
+        UPD_ACT["Update Action\nmdvs-gcp-case-actions-service POST\n1 attempt\nnull response → FAILED"]
+        INS_NOTES["Insert Notes\nmdvs-gcp-notes-service PUT/POST\n1 attempt\n⚠️ Soft failure — logged only"]
+        MOD_EV["Modify Evidence Event Status\nwdp.chbk_outbox_row\n⚠️ Soft failure — logged only"]
     end
 
-    SUCCESS["Set outbox row status = SUCCESS\nwdp.chbk_outbox_row\nSet via ChkbOutbox object\nin case management service response"]
+    SUCCESS["Write status = SUCCESS\nchbkOutboxRepository.save()\n⚠️ AUTO-COMMIT — no @Transactional\n🔴 DEC-001 DEVIATION\nEVIDENCE_ATTACH children saveAll\nis separate auto-commit"]
+
+    DESER["Deserialization exception\ncaught by ErrorHandlingDeserializer"]
+    SWALLOW["⚠️ Silent swallow\nEmpty CommonErrorHandler\nNo DLT, no log, no counter"]
 
     IN --> ACK --> CORR --> PRIOR --> P1
     P1 -->|"Prior row in ERROR"| ERR_PRIOR
     P1 -->|"Prior row in-flight\nnon-SUCCESS/SKIPPED"| DEFER
-    P1 -->|"No blocking prior rows"| HIST
+    P1 -->|"No blocking prior row"| HIST
 
-    HIST -->|"Yes — historical\nskip validate step"| IDP
+    HIST -->|"Yes — skip validate"| IDP
     HIST -->|"No — live event"| VALIDATE
     VALIDATE --> VOUT
-    VOUT -->|"networkRuling invalid\nnote type invalid\nCapone invalid platform"| ERR_VAL
-    VOUT -->|"Capone invalid stage\ndisputeStage in skipStageList"| SKIP_VAL
+    VOUT -->|"networkRuling invalid\nnote.type invalid\nCapone platform invalid"| ERR_VAL
+    VOUT -->|"Capone stage invalid\ndisputeStage ∈ skipStageList"| SKIP_VAL
     VOUT -->|"Pass"| IDP
 
-    IDP -->|"Throws exception\n→ errorHandler → FAILED"| FAILED
+    IDP -->|"Exception →\nerrorHandler → FAILED"| FAILED
     IDP --> CASE_LOOKUP
-    CASE_LOOKUP -->|"All retries exhausted\n→ errorHandler → chain halts"| FAILED
+    CASE_LOOKUP -->|"All retries exhausted →\n@Recover → chain halts"| FAILED
     CASE_LOOKUP --> NT
 
     NT -->|"New (or Update overridden\nbecause case not found)"| EF
     NT -->|"Update (case exists)"| PRE
 
-    EF -->|"false — HPAN on event\nstandard enrichment path"| PAN_DEC
-    EF -->|"true — no HPAN\nenrichment failed upstream"| TXN
+    EF -->|"false — standard path\nHPAN present"| PAN_DEC
+    EF -->|"true — upstream enrich failed"| TXN
 
-    PAN_DEC -->|"Fails → FAILED"| FAILED
-    PAN_DEC --> FRAUD --> PROD_ENT
+    PAN_DEC -->|"Failure → FAILED"| FAILED
+    PAN_DEC --> FRAUD
+
+    FRAUD --> CAPONE_DUP
 
     TXN --> PAN_ENC
-    PAN_ENC -->|"Fails → FAILED"| FAILED
-    PAN_ENC --> PROD_ENT
+    PAN_ENC -->|"Failure → FAILED"| FAILED
+    PAN_ENC --> CAPONE_DUP
 
-    PROD_ENT -->|"Fails → null → FAILED"| FAILED
-    PROD_ENT --> WF_CAT
-    WF_CAT -->|"Yes"| WF_HARD
-    WF_CAT -->|"No"| WF_SVC
+    CAPONE_DUP -->|"Yes"| CAPONE_CHECK
+    CAPONE_DUP -->|"No"| PROD_ENT
+    CAPONE_CHECK --> CAPONE_MATCH
+    CAPONE_MATCH -->|"Match"| ERR_CAPONE
+    CAPONE_MATCH -->|"No match"| PROD_ENT
+
+    PROD_ENT --> WF_SWITCH
+    WF_SWITCH -->|"Yes — hardcode"| WF_HARD
+    WF_SWITCH -->|"No — call rules"| WF_SVC
+    WF_SVC -->|"null → FAILED"| FAILED
     WF_HARD --> FIRST_ACT
-    WF_SVC -->|"Fails → null → FAILED"| FAILED
     WF_SVC --> FIRST_ACT
-    FIRST_ACT -->|"Fails → FAILED"| FAILED
+    FIRST_ACT -->|"Failure → FAILED"| FAILED
     FIRST_ACT --> DISP
-    DISP -->|"Fails → null → FAILED"| FAILED
     DISP --> CREATE
-    CREATE -->|"Fails → FAILED"| FAILED
-    CREATE --> ATTACH --> SUCCESS
+    CREATE -->|"Failure → FAILED"| FAILED
+    CREATE --> ATTACH
+    ATTACH --> SUCCESS
 
     PRE --> DUSER --> NEW_ACT --> PROD_U
-    PROD_U -->|"Fails → FAILED"| FAILED
+    PROD_U -->|"null → FAILED"| FAILED
     PROD_U --> INS_ACT
-    INS_ACT -->|"Fails → FAILED"| FAILED
+    INS_ACT -->|"Failure → FAILED"| FAILED
     INS_ACT --> UPD_ACT
     UPD_ACT -->|"null response → FAILED"| FAILED
-    UPD_ACT --> INS_NOTES --> MOD_EV --> SUCCESS
+    UPD_ACT --> INS_NOTES
+    INS_NOTES --> MOD_EV
+    MOD_EV --> SUCCESS
+
+    IN -.->|"Poison payload"| DESER
+    DESER --> SWALLOW
 ```
 
 ---
@@ -209,40 +250,46 @@ flowchart TD
 
 | Source | Protocol | Topic / Trigger | Payload |
 |---|---|---|---|
-| COMP-12 InboundDisputeEventScheduler | Kafka / AWS MSK | `new-case-events` | `NotificationEvent` — dispute event for CORE, LATAM, VAP, PIN platforms |
+| COMP-12 InboundDisputeEventScheduler | Kafka / AWS MSK (IAM) | `new-case-events` / `new-case-events-cert` | `NotificationEvent` — dispute event for CORE, LATAM, VAP, PIN platforms. NAP accepted by code but not intended. |
+
+This component exposes no REST endpoints, has no SQS listener, no webhook, and no second `@KafkaListener`.
 
 ### Outbound Interfaces
 
 | Target | Protocol | Endpoint | Purpose | On failure |
 |---|---|---|---|---|
-| `wdp-idp-token-service` | REST GET | `/merchant/gcp/idp-token/token` | Bearer token for all downstream calls | Propagates to errorHandler → FAILED |
-| `wdp-encryption-service` | REST POST | `/v1/pan/decrypt` | Decrypt HPAN to clear PAN (in memory only) | 1 attempt → @Recover → FAILED |
-| `wdp-encryption-service` | REST POST | `/v1/pan/encrypt` | Re-encrypt clear PAN from transaction lookup to HPAN | 1 attempt → @Recover → FAILED |
-| `gcp-merchant-transaction-service` | REST POST | `/{platform}/transaction/search` | Enrich event with transaction data and clear PAN | 1 attempt → @Recover → null (no error write) |
-| `mdvs-gcp-case-search-service` | REST GET | `/{platform}/case/lookup` | Check if case already exists | 3 retries → @Recover → FAILED, chain halts |
-| `mdvs-gcp-case-management-service` | REST POST | `/{platform}/case` | Create new dispute case | 3 retries → @Recover → FAILED |
-| `mdvs-gcp-rules-service` | REST POST | `/rules/workflow` | Determine workflow name for new case | 3 retries → null → FAILED |
-| `mdvs-gcp-rules-service` | REST POST | `/rules/firstaction` | Determine first action rule for new case | 3 retries → FAILED |
+| `wdp-idp-token-service` | REST GET | `/merchant/gcp/idp-token/token` | Bearer token for all downstream calls | 1 attempt → exception → FAILED |
+| `wdp-encryption-service` | REST POST | `/v1/pan/decrypt` | Decrypt HPAN to clear PAN (transient, in-memory) | 1 attempt → @Recover → FAILED |
+| `wdp-encryption-service` | REST POST | `/v1/pan/encrypt` | Re-encrypt clear PAN to HPAN | 1 attempt → @Recover → FAILED |
+| `gcp-merchant-transaction-service` | REST POST | `/{platform}/transaction/search` | Enrich event with transaction data and clear PAN | 1 attempt → @Recover → **null** (silent, no FAILED) |
+| Fraud Switch (external) | REST GET | `${fraud_transaction_url}` | Fraud indemnity / switch data | 3 retries → @Recover → **null** (silent, no FAILED) |
+| `mdvs-gcp-case-search-service` | REST GET | `/{platform}/case/lookup` | Existing case lookup | 3 retries → @Recover → FAILED, chain halts |
+| `mdvs-gcp-case-management-service` | REST POST | `/{platform}/case` | Create new dispute case | 3 retries → on failure → FAILED |
+| `mdvs-gcp-rules-service` | REST POST | `/rules/workflow` | Workflow name for new case | 3 retries → @Recover → null → FAILED |
+| `mdvs-gcp-rules-service` | REST POST | `/rules/firstaction` | First-action rule for new case | 3 retries → @Recover → FAILED |
 | `mdvs-gcp-rules-service` | REST POST | `/rules/pre-action` | Pre-action status for UPDATE path | 1 attempt |
-| `mdvs-gcp-rules-service` | REST POST | `/rules/newactions` | New action rule for UPDATE path | 3 retries |
-| `mdvs-gcp-display-code-service` | REST POST | `/display-code/search` | Convert numeric currency ISO to alpha; derive reason category | 1 attempt → null → FAILED |
+| `mdvs-gcp-rules-service` | REST POST | `/rules/newactions` | New-action rule for UPDATE path | 3 retries |
+| `mdvs-gcp-display-code-service` | REST POST | `/display-code/search` | Currency ISO alpha conversion; reason category | 1 attempt → @Recover → **null** (silent, no FAILED) |
 | `mdvs-gcp-case-actions-service` | REST POST | `/{platform}/case/lookup` | Insert action on UPDATE path | 3 retries → @Recover → FAILED |
-| `mdvs-gcp-case-actions-service` | REST POST | `/{platform}/case/{caseNumber}/actions` | Update action on UPDATE path | 1 attempt → null → FAILED |
-| `mdvs-gcp-notes-service` | REST PUT/POST | `/{platform}/case/{caseNumber}` | Insert case notes | 1 attempt → soft failure, logged only |
-| `core-hierarchy-authorization-service` | REST GET | `/productentitlement` | Product entitlement — fraud indemnity, productType, teamId | 3 retries → null → FAILED |
-| AID user-detail service (external) | HTTPS REST GET | `https://ws-int.infoftps.com/IDPUserFirmMapping/search/{userId}` | Display UserId lookup for historical and UPDATE path | 3 retries |
-| Fraud Switch (external) | REST GET | `${fraud_transaction_url}` (env var) | Fraud/indemnity fields | 3 retries → null returned, no FAILED write |
-| `dataservice` (historical, conditional) | REST GET | `${ds_search_case_number_url}` (env var) | Historical case lookup when dsCaseLookup = true | 1 attempt |
-| `wdp.chbk_outbox_row` | PostgreSQL (JPA) | `wdp` schema | Outbox/error table — read for prior check, write for all status transitions | Individual JPA saves — no transaction wrapping |
-| `wdp.case` | PostgreSQL (JPA) | `wdp` schema | Duplicate case check for Capone REQ events — read only | — |
+| `mdvs-gcp-case-actions-service` | REST POST | `/{platform}/case/{caseNumber}/actions` | Update action on UPDATE path | 1 attempt → null response → FAILED |
+| `mdvs-gcp-notes-service` | REST PUT/POST | `/{platform}/case/{caseNumber}` | Insert case notes | 1 attempt → ⚠️ soft failure (logged only, no FAILED) |
+| `core-hierarchy-authorization-service` | REST GET | `/productentitlement` | Product entitlement — fraud indemnity, productType, teamId | 3 retries → @Recover → **null** (silent, no FAILED on NEW path; null → FAILED on UPDATE path) |
+| AID user-detail (external) | HTTPS REST GET | `https://ws-int.infoftps.com/IDPUserFirmMapping/search/{userId}` | Display UserId lookup (historical / UPDATE path) | 3 retries |
+| `dataservice` (conditional historical) | REST GET | `${ds_search_case_number_url}` | Historical case lookup when `dsCaseLookup = true` | 1 attempt |
+| `wdp.chbk_outbox_row` | PostgreSQL (JPA) | `wdp` schema | Status transitions — UPDATE only (no INSERT) | Auto-commit, no @Transactional |
+| `wdp.case` | PostgreSQL (JPA) | `wdp` schema | Capone REQ duplicate check — read only | — |
 
-⚠️ **No timeouts configured on any REST call.** A plain `new RestTemplate()` with no connection
-or read timeout is used for all outbound HTTP calls. With a single consumer thread, any hanging
-call halts the entire consumer.
+> ⚠️ **All REST calls share a single bare `RestTemplate`** constructed with the default
+> `SimpleClientHttpRequestFactory`. **No connect timeout, no read timeout, no connection
+> pool, no keep-alive pool management, no circuit breaker.** A hung downstream on the
+> single consumer thread (concurrency = 1) blocks the entire consumer for that partition.
+> The readiness probe hits `/actuator/health` — it does not detect listener-thread stalls.
 
-All internal service URLs follow the pattern:
-`http://{service-name}.wdp-micro:8082/merchant/gcp/{service-path}`
-All calls use Bearer IDP token authentication.
+All internal WDP service URLs follow the pattern
+`http://{service-name}.wdp-micro:8082/merchant/gcp/{service-path}` and carry a Bearer IDP
+token. Correlation flows outbound as the `V_CORRELATION_ID` HTTP header and the
+`IDEMPOTENCY_KEY` HTTP header is also propagated on every call from the
+`RequestCorrelation` `ThreadLocal`.
 
 ---
 
@@ -252,145 +299,106 @@ All calls use Bearer IDP token authentication.
 
 | Schema.Table | Purpose | Key columns | Notes |
 |---|---|---|---|
-| `wdp.chbk_outbox_row` | Outbox and error state for all inbound dispute events | `id` (PK), `c_ntwk_case_id`, `c_case_ntwk`, `c_acq_platform`, `status`, `retry_count`, `error_message`, `updated_at`, `next_retry_at`, `i_case` (caseNumber) | ⚠️ Shared write table — rows created by COMP-07/08/09/11 and published by COMP-12. This component only updates status of pre-existing rows. Status lifecycle: FAILED → ERROR (retryCount > 2), PENDING_DEFERRED, SKIPPED, SUCCESS, PENDING (EVIDENCE_ATTACH rows). |
+| `wdp.chbk_outbox_row` | Status state machine for inbound dispute events — **UPDATE only**, no INSERT | `id` (PK), `network_case_id`, `card_network`, `status`, `retry_count`, `next_retry_at`, `updated_at` | ⚠️ Shared writer — rows inserted by COMP-07/08/09/11, published by COMP-12, status read-updated by COMP-14/15/23. Status lifecycle written by this component: `FAILED` (auto-promotes to `ERROR` when `retry_count > 2` — logic is Java-side, not DB-side), `PENDING_DEFERRED`, `SKIPPED`, `SUCCESS`, and `PENDING` (for EVIDENCE_ATTACH child rows on the NEW path). **Every save auto-commits — no `@Transactional` annotation anywhere in this component.** |
 
 ### Tables Read (not owned by this component)
 
 | Schema.Table | Owned by | Why accessed |
 |---|---|---|
-| `wdp.case` | `mdvs-gcp-case-management-service` | Capone REQ stage duplicate check — queries by merchantId, transactionDate, accountNumberLast4, transactionAmount, disputeAmount. Read only. |
+| `wdp.case` | COMP-23 CaseManagementService | Capone REQ stage duplicate check — JPA method-name derivation over (`level1Entity` + `tr` date + `acctCdhLst` + `purchaseAmt` + `originalDisputeAmount`). Read-only. |
+
+### Transactional boundary — explicit statement
+
+- `grep @Transactional src/main/java` returns zero hits across the entire repository.
+- `@EnableTransactionManagement` is declared and a `JpaTransactionManager` bean is
+  wired — **but no service or repository method is annotated**. Every `save()` /
+  `saveAll()` auto-commits as an independent statement.
+- The parent SUCCESS write and the EVIDENCE_ATTACH child `saveAll()` are therefore two
+  separate auto-commits. A crash between them leaves the outbox in an inconsistent state
+  that the Kafka offset (committed pre-processing) will not cause to be redelivered.
+- No row-level locks anywhere — no `@Lock`, no `SELECT ... FOR UPDATE`, no PostgreSQL
+  advisory lock calls.
 
 ---
 
 ## Reliability and Recovery Scenarios
 
-### Duplicate Case Detection
+### Duplicate-detection topology — three independent layers
 
-This component applies three layers of duplicate detection. They are independent — no single
-mechanism covers all scenarios.
-
-**Layer 1 — Prior chargeback outbox check (within COMP-14)**
-
-Before any enrichment begins, the component reads `wdp.chbk_outbox_row` for any existing rows
-with the same `networkCaseId + cardNetwork` where `id < current_id` and `eventType =
-CHARGEBACKS_PROCESS` and `status NOT IN (SUCCESS, SKIPPED)`.
-
-| Outcome | Action |
-|---|---|
-| Prior row in ERROR status | Current row set to ERROR. Processing halts. No case creation attempted. |
-| Prior row in any other non-terminal status (in-flight) | Current row set to PENDING_DEFERRED. Processing halts. Reprocessed by COMP-12 scheduler based on `next_retry_at`. |
-| No blocking prior rows | Processing continues normally. |
-
-This check prevents a later event from racing ahead of an earlier event for the same dispute.
-
-**Layer 2 — idempotency-key HTTP header delegation**
-
-The `idempotency-key` Kafka message header is extracted and stored as `idempotencyId` on the
-`NotificationEvent`. It is passed as the HTTP header `idempotency-key` on every outbound REST
-call. Deduplication at the downstream service level depends entirely on those services implementing
-idempotent endpoints — no local deduplication table exists in this component.
-
-**Layer 3 — Capone REQ explicit case existence check**
-
-For Capone REQ stage events only, the component queries `wdp.case` directly by
-`merchantId + transactionDate + accountNumberLast4 + transactionAmount + disputeAmount` before
-case creation. If a match is found, the outbox row is set to ERROR and processing halts.
-
-**Known gaps in duplicate protection**
-
-| Gap | Scenario | Consequence |
-|---|---|---|
-| Pre-ACK crash window | JVM crashes after `acknowledgment.acknowledge()` but before the `chbk_outbox_row` status write | Event permanently lost — no row in outbox, no redelivery. No duplicate but silent data loss. |
-| Non-atomic outbox and case creation | Outbox row written to SUCCESS but case creation REST call fails | Outbox shows SUCCESS, no case in WDP Core. Inconsistent state, no auto-reconciliation. |
-| Non-atomic outbox and case creation (inverse) | Case created in WDP Core but pod crashes before outbox status update | Case exists in WDP Core, outbox row stays in prior status. If redelivered (only possible if crash was pre-ACK), a duplicate case creation attempt is made. |
-| idempotency-key delegation gap | Downstream services do not implement idempotent endpoints | No local guard — duplicates can slip through at the case creation layer. |
-| No local deduplication table | No table owned by COMP-14 tracks processed eventIds | Crash-and-redeliver scenarios (pre-ACK only) have no deduplication backstop in this component. |
-
----
-
-### PENDING_DEFERRED — Hold and Recovery
-
-A dispute event is placed in PENDING_DEFERRED when a prior event for the same dispute
-(`networkCaseId + cardNetwork`) is still in-flight — i.e. not yet in SUCCESS or SKIPPED status.
-
-**What COMP-14 does:**
-- Writes `status = PENDING_DEFERRED` and sets `next_retry_at` on the `chbk_outbox_row` record
-- Halts all further processing for the current event
-- Does NOT attempt any enrichment or case creation
-
-**What reprocesses PENDING_DEFERRED rows:**
-- COMP-12 InboundDisputeEventScheduler — polls `chbk_outbox_row` for rows where
-  `status = PENDING_DEFERRED` and `next_retry_at <= now()`
-- When the retry window elapses, COMP-12 republishes the event to `new-case-events`
-- COMP-14 then re-evaluates the prior chargeback check on re-receipt
-- If the prior event has since resolved (status = SUCCESS or SKIPPED), processing proceeds
-- If the prior event is still in-flight, the current event is deferred again with a new
-  `next_retry_at`
-
-**Ownership boundary:** COMP-14 owns writing PENDING_DEFERRED. COMP-12 owns the retry
-scheduling and republication. Neither component owns the resolution of the prior event — that
-depends on independent processing of the earlier event completing successfully.
-
-**Risk:** If the prior event is permanently stuck in ERROR, PENDING_DEFERRED rows for the
-same dispute will be retried by COMP-12 indefinitely. Each retry will find the prior row still
-in ERROR and write PENDING_DEFERRED again — or may now set ERROR depending on error detection
-logic. The maximum deferral depth and any circuit-break on repeated deferral is not confirmed.
-
----
-
-### Crash Recovery — Scenarios by Crash Window
-
-There is no checkpoint or resume mechanism in COMP-14. Recovery behaviour depends entirely on
-when the crash occurs relative to the offset commit.
-
-| Crash window | Kafka offset state | chbk_outbox_row state | Case in WDP Core | Recovery path |
-|---|---|---|---|---|
-| **Window 1:** After message received, before `acknowledgment.acknowledge()` | Not committed | Unchanged (COMP-12 set it before publish) | Does not exist | Kafka redelivers on consumer restart. Processing retries from scratch. This is the only window where redelivery occurs. |
-| **Window 2:** After `acknowledgment.acknowledge()`, before `chbk_outbox_row` status write | Committed ⚠️ | Unchanged — row stays in original status | Does not exist | No redelivery. Event permanently lost. No error record created. Silent data loss. |
-| **Window 3:** After `chbk_outbox_row` written to FAILED/ERROR, before case creation REST call | Committed | FAILED or ERROR | Does not exist | No redelivery. Row is in error state — visible to operations. Manual reprocessing required if applicable. |
-| **Window 4:** After case creation REST call succeeds, before `chbk_outbox_row` SUCCESS write | Committed | Unchanged (prior to SUCCESS) | ✅ Created | No redelivery. Case exists in WDP Core. Outbox row not updated to SUCCESS — inconsistent state. No auto-reconciliation. Operations must manually align. |
-| **Window 5:** After `chbk_outbox_row` SUCCESS write completes | Committed | SUCCESS ✅ | ✅ Created | Fully consistent. No action needed. |
-
-**Key conclusions:**
-- Only Window 1 produces automatic recovery via Kafka redelivery.
-- Windows 2–4 require either manual intervention or are silently lost.
-- Window 2 (the most dangerous) is a direct consequence of the DEC-005 pre-ACK deviation.
-- Window 4 leaves the platform in an inconsistent state that is not self-healing.
-
----
-
-### Partial Failure — Mid-Chain Crash on NEW Case Path
-
-The NEW case path makes 11+ sequential REST calls. A failure at any point beyond IDP token
-fetch halts the chain and writes FAILED to the outbox. The `retryCount` is incremented on each
-FAILED write. When `retryCount > 2`, the row is automatically promoted to ERROR.
-
-**There is no step-level checkpoint.** On FAILED status, COMP-12 republishes the full event
-and COMP-14 reprocesses from the beginning of the chain — including re-fetching IDP token,
-re-running PAN decrypt, re-running all enrichment calls, and re-attempting case creation.
-
-**Re-entrant case creation risk:** If the case creation REST call (`/{platform}/case`) succeeded
-before the crash but the subsequent `chbk_outbox_row` SUCCESS write failed, the event will be
-retried from the start. On retry, Case Lookup will find the existing case and route to the UPDATE
-path instead of creating a duplicate. This is the one scenario where the Case Lookup acts as an
-implicit deduplication guard on retry.
-
----
-
-## Key Architectural Decisions
-
-| ID | Decision / Finding | Severity | Notes |
+| Layer | Mechanism | Keys | Outcome on match |
 |---|---|---|---|
-| DEC-005 DEVIATION | Kafka offset committed via `acknowledgment.acknowledge()` at the very start of processing — **before** any DB write or REST call. If the JVM crashes after ACK but before the `chbk_outbox_row` write, the event is permanently lost without any error record. | 🔴 HIGH | Matches the deliberate pattern in COMP-05 NAPDisputeEventProcessor. `MANUAL_IMMEDIATE` explicitly configured. Known event loss window exists on every pod restart during processing. |
-| DEC-001 DEVIATION | No transactional outbox pattern. The `chbk_outbox_row` update and the downstream REST call to `mdvs-gcp-case-management-service` are separate, non-atomic JPA saves using `wdpTransactionManager`. The `ChkbOutbox` object in the case management request body partially delegates outbox closure to the downstream service — an inverted data integrity dependency. | 🔴 HIGH | A crash between the outbox write and the case creation REST response leaves the outbox in an inconsistent state. |
-| DEC-003 UNCONFIRMED | The partition key on `new-case-events` is logged on receipt as `keyNetworkCaseCardNetworkId` but not used for routing within this consumer. What the upstream publisher sets as the key cannot be determined from this codebase alone. | 🟡 MEDIUM | Must confirm against COMP-12 publisher. No formal deviation note in the code. |
-| DEC-004 COMPLIANT | Clear PAN (`dPan`) is never written to any persistent store, S3 bucket, or log line. Excluded from `toString()` via `@ToString(exclude = "dPan")`. `wdp-encryption-service` is used for both EPAN-to-clear and clear-to-HPAN conversion — the same service as COMP-11 FileProcessor. HPAN stored only in the case management service's data store. | ✅ — | Confirmed from source. |
-| DEC-014 DEVIATION | No Resilience4j circuit breakers anywhere in this codebase. `pom.xml` contains no Resilience4j dependency. Spring Retry `@Retryable` provides retry-with-backoff only — no fast-fail after threshold, no half-open probe. | 🟡 MEDIUM | Consistent with platform-wide pattern confirmed in COMP-04 and COMP-05. |
-| RISK — No REST timeouts | No connection or read timeout is set on the `RestTemplate` bean (`new RestTemplate()` in `CommonConfig`). Default Java `HttpURLConnection` timeouts apply — effectively infinite. With a single consumer thread (concurrency=1), any hanging downstream call halts the entire consumer. 11+ sequential REST calls are made per event on the NEW case path. | 🔴 HIGH | Not covered by any existing DEC. Candidate for new ADR. |
-| RISK — Silent deserialiser swallow | `ErrorHandlingDeserializer` wraps `JsonDeserializer<NotificationEvent>`. The `CommonErrorHandler` is a no-op empty implementation — deserialization failures are silently swallowed. Because the offset is pre-ACK'd, a malformed message is permanently lost with no record in `chbk_outbox_row`. | 🔴 HIGH | Two compounding risks: pre-ACK + silent deserialiser = undetectable message loss. |
-| RISK — No NAP guard | NAP is not the intended scope, but no code guard prevents a NAP event from entering and being processed by this component if it arrives at `new-case-events`. `SourceSystemName` enum includes `NAP`. | 🟡 MEDIUM | If NAP inbound migration (planned work) publishes to `new-case-events`, this component will process those events. Intentional or accidental overlap must be resolved before migration. |
-| RISK — COMP/PRECOMP workflow bypass | When `schemeRef.category = COMP` or `PRECOMP`, the component hardcodes `workflowName = "VISA_COMPLIANCE"` and bypasses the rules service entirely. | 🟡 MEDIUM | Business rule embedded in code — changes require a deployment, not a rules configuration change. |
-| RISK — Incomplete error handling stubs | Multiple `@Recover` methods in `EventProcessingServiceImpl` return `null` with only a `// Error handling -- todo` comment. Failures on `transactionLookup` and `productEntitlementLookup` are absorbed silently with no FAILED outbox write. Acknowledged as incomplete at time of writing. | 🟡 MEDIUM | `fraudSwitch @Recover` also returns null with no error write. Transactions can proceed without complete enrichment data. |
+| **1** — Prior-chargeback outbox check | `ChbkOutboxRepository` 2-column query on `(networkCaseId, cardNetwork)` + **in-memory Java-stream filter** on status and eventType | `networkCaseId`, `cardNetwork` in DB; in-memory filter for `status NOT IN (SUCCESS, SKIPPED)` and `eventType = CHARGEBACKS_PROCESS` | Prior in `ERROR` → current → `ERROR` halt. Prior in-flight non-terminal → current → `PENDING_DEFERRED` halt. No blocking → proceed. |
+| **2** — `idempotency-key` header delegation | HTTP header extracted from Kafka message and propagated on every outbound REST call | `idempotencyId` on `NotificationEvent` | Dedup enforcement delegated to downstream services. No local dedup table. |
+| **3** — Capone REQ explicit case-existence check | Direct JPA query against `wdp.case` | `level1Entity + tr + acctCdhLst + purchaseAmt + originalDisputeAmount` | Match → `ERROR` halt. No case creation attempted. |
+
+> ⚠️ **Layer 1 is not a locking dedup.** The DB query is 2-column only; the status filter
+> runs in application memory after the fetch. There is no `SELECT ... FOR UPDATE`. Two
+> replicas processing the same `(networkCaseId, cardNetwork)` concurrently — for example
+> during a rolling-update replica overlap — can both read "no blocking prior" and both
+> proceed to create cases. The current deployment is safe only because concurrency = 1 and
+> the Kafka consumer group assigns each partition to exactly one replica. Any configuration
+> change that raises concurrency or routes the same network case across partitions breaks
+> this guarantee.
+
+### PENDING_DEFERRED hold and recovery
+
+- COMP-14 writes `PENDING_DEFERRED` on the current row and halts; sets `next_retry_at`.
+- COMP-12 InboundDisputeEventScheduler polls the outbox for rows where
+  `status = PENDING_DEFERRED AND next_retry_at <= now()` and republishes them to
+  `new-case-events`.
+- On redelivery, Layer 1 is re-evaluated. If the prior event has since resolved to
+  `SUCCESS` or `SKIPPED`, processing proceeds; otherwise another deferral window is set.
+- **Risk:** if the prior event is permanently stuck in `ERROR`, deferred rows for the
+  same dispute will be re-deferred by COMP-12 indefinitely. No maximum-deferral counter
+  or circuit-break is present in either component.
+
+### Crash-window table — at-most-once consequences
+
+| Crash window | Kafka offset | `chbk_outbox_row` state | Case in WDP Core | Recovery path |
+|---|---|---|---|---|
+| **W1** — Before `acknowledgment.acknowledge()` | Not committed | Unchanged | None | Kafka redelivers on consumer restart. **The only window with automatic recovery.** |
+| **W2** — After ACK, before any outbox write | Committed | Unchanged | None | No redelivery. **Event permanently lost. No error record.** |
+| **W3** — After `FAILED` / `ERROR` write, before `CREATE` REST call | Committed | FAILED or ERROR | None | No redelivery. Row is error-visible. Manual reprocessing required. |
+| **W4** — After `CREATE` REST succeeds, before parent `SUCCESS` save | Committed | Prior status | Case created ✅ | No redelivery. **Inconsistent state — case exists, outbox row does not reflect it.** Not self-healing. |
+| **W5** — After parent `SUCCESS` save, before child EVIDENCE_ATTACH `saveAll` | Committed | Parent SUCCESS | Case created ✅ | No redelivery. **Child EVIDENCE_ATTACH rows remain in prior state.** Downstream evidence processing may not trigger. |
+| **W6** — After all writes | Committed | SUCCESS | Case created ✅ | Fully consistent. |
+
+- Only W1 is automatically recovered.
+- W2 is the direct consequence of DEC-005 pre-ACK.
+- W4 and W5 are direct consequences of DEC-001 deviation (no transaction).
+- Neither W2 nor the non-atomic writes produce any log line, metric, or counter —
+  they are silent-failure classes.
+
+### Partial failure — mid-chain on NEW path
+
+- The NEW path makes up to 12+ sequential REST calls.
+- There is no step-level checkpoint. On `FAILED` status, COMP-12 republishes the event
+  and COMP-14 restarts from the first step (IDP token fetch).
+- Re-entrant case creation is guarded only by Case Lookup on retry — if the first attempt
+  succeeded in creating a case but crashed before parent SUCCESS save (W4), the retry
+  finds the existing case and routes to the UPDATE path instead of creating a duplicate.
+  This is the one implicit recovery mechanism.
+
+---
+
+## Key Architectural Decisions and Deviations
+
+| ID | Finding | Severity | Notes |
+|---|---|---|---|
+| **DEC-005 DEVIATION** | `acknowledgment.acknowledge()` is called at the very start of the listener, **before** `processKafkaNotificationEvent(...)` is invoked. `MANUAL_IMMEDIATE` configured; pre-ACK at-most-once. Any crash or unhandled exception after ACK produces silent loss. | 🔴 HIGH | Same pattern as COMP-05, COMP-15, COMP-16. Structural — no remediation without a platform-level delivery-model change. |
+| **DEC-001 DEVIATION** | Zero `@Transactional` annotations in the entire component source. Parent SUCCESS save, EVIDENCE_ATTACH child `saveAll`, and the upstream case-creation REST call are three independent operations with no atomicity. A crash between any two leaves the outbox and WDP Core in an inconsistent state that is not self-healing. | 🔴 HIGH | `ChkbOutbox` block on the case-creation request body partially delegates outbox closure to COMP-23, making data-integrity ownership unclear. |
+| **DEC-003 DEVIATION** | Inbound Kafka record key is logged as `keyNetworkCaseCardNetworkId` — a compound key (not `merchantId`). Key is logged only; no routing use inside this consumer. Producer-side deviation already recorded against COMP-12. | 🟡 MEDIUM | Per-partition ordering is scoped to the compound key, not to a merchant. Cross-merchant events for one dispute are ordered correctly; unrelated disputes for the same merchant may interleave across partitions. |
+| **DEC-004 COMPLIES** | Clear PAN exists only in memory between decrypt and re-encrypt calls. The PAN-carrying field excludes itself from `toString` via `@ToString(exclude=...)`. No clear PAN is written to any persistent store, S3 object, or log line. | ✅ | Verified by source inspection of the PAN-handling path. |
+| **DEC-014 VOID (platform-wide)** | No Resilience4j dependency. No `@CircuitBreaker`, no `@Retry` (in the Resilience4j sense), no `@RateLimiter`. Retry is Spring-Retry `@Retryable` with per-method `@Recover`; four `@Recover` methods absorb failures silently by returning `null` without writing a FAILED row. | 🔴 HIGH | Platform-wide VOID recorded against DEC-014. Silent-null recovers are an additional compound risk. |
+| **DEC-019 COMPLIES** | No clear PAN written to any persistent store from this component. | ✅ | Cleared via DEC-004 compliance. |
+| **DEC-020 DEVIATION** | Full at-least-once idempotency is not implemented. Pre-ACK (W2), non-atomic writes (W4/W5), in-memory-filter Layer-1 dedup without DB lock, silent-null recovers, and empty `CommonErrorHandler` each individually produce silent-loss or inconsistent-state paths. | 🔴 HIGH | Downstream service idempotency is delegated via the `idempotency-key` HTTP header — verification of downstream compliance is out of scope for this component. |
+| **FINDING — `auto.offset.reset = latest`** | On cold start with no committed offset, messages are **skipped**, not replayed. The v1.0 DRAFT claimed `earliest` — corrected by source. | 🟡 MEDIUM | Behaviour change only at initial deployment / group-reset. Operational concern during incident recovery. |
+| **FINDING — Empty `CommonErrorHandler`** | Registered error handler is an empty anonymous subclass. Combined with `ErrorHandlingDeserializer` and MANUAL_IMMEDIATE pre-ACK, any deserialization exception or unhandled application exception is swallowed with no log, no DLT, no counter. | 🔴 HIGH | Silent-loss class distinct from the pre-ACK window. |
+| **FINDING — Bare `RestTemplate`** | `new RestTemplate()` with no `ClientHttpRequestFactory` override, no pool, no connect/read timeout. Concurrency = 1 + hung downstream = full consumer stall with Ready pod. | 🔴 HIGH | Affects all 16+ outbound REST dependencies. |
+| **FINDING — Silent-null `@Recover` methods** | `transactionLookup`, `productEntitleMentLookup` (NEW path), `fraudtransactionLookup`, and `displayCodeDescription` return `null` on exhausted retries with no outbox write. Processing continues with null fields and may reach SUCCESS on an under-enriched case. | 🟡 MEDIUM | Acknowledged-incomplete in code comments (`// Error handling -- todo`). |
+| **FINDING — MDC not set on listener thread** | MDC correlation context is populated only by `HttpInterceptor` on inbound HTTP — this component exposes no HTTP, so MDC is never populated for Kafka-path log lines. Outbound correlation is via `ThreadLocal` + `V_CORRELATION_ID` header, not MDC. | 🟡 MEDIUM | Log correlation across the consumer path is weaker than across HTTP services. |
+| **FINDING — No liveness or startup probes** | Only the readiness probe is configured. A stuck consumer thread (e.g. hung REST call) is not detected by Kubernetes — the pod stays Ready indefinitely. | 🟡 MEDIUM | Compound with the bare `RestTemplate` finding. |
+| **FINDING — Feature flags have no defaults** | Every `@Value` reference is env-var only; `grep '@Value("\${[^"]*:'` returns zero hits. Missing secrets fail at context-load time. | 🟢 LOW | Fails safe — container does not start — but production defaults are opaque from source alone. |
 
 ---
 
@@ -399,27 +407,33 @@ implicit deduplication guard on retry.
 | Parameter | Value | Confidence |
 |---|---|---|
 | Kubernetes resource type | `Deployment` | High |
-| Replica count | `{{ replicas-gcp-case-creation-consumer }}` — Helm/Spinnaker placeholder; actual value not in repo | High (placeholder confirmed); Low (actual value) |
-| Memory limit | `2048Mi` | High |
-| Memory request | `256Mi` | High |
-| CPU limit | Not specified in `resources.yaml` — Kubernetes best-effort QoS for CPU | High |
-| CPU request | Not specified | High |
-| HPA | Absent | High |
+| Replica count | `{{ replicas-gcp-case-creation-consumer }}` — Helm/Jinja placeholder; actual value lives outside the repository | High (placeholder confirmed); Low (production value) |
+| Memory limit | 2048Mi | High |
+| Memory request | 256Mi | High |
+| CPU limit | **Not configured** — best-effort QoS for CPU | High |
+| CPU request | **Not configured** | High |
+| HPA | **Absent** | High |
 | Rolling update strategy | `maxSurge: 1, maxUnavailable: 0, minReadySeconds: 30` | High |
-| PodDisruptionBudget | Absent | High |
-| Topology spread constraints | Absent — not configured in `resources.yaml` | High |
-| OpenTelemetry agent | **Not injected** — no OTel annotation or init-container in `resources.yaml` | High |
-| Spring Actuator | Present — healthcheck at `/merchant/gcp/case-creation/actuator/health` | High |
-| Readiness probe | HTTP GET `/actuator/health:8082`, `initialDelaySeconds: 120`, `periodSeconds: 10`, `failureThreshold: 3` | High |
-| Logstash appender | Present — `LogstashTcpSocketAppender` to `${logstash_server_host_port}` (env var) | High |
+| PodDisruptionBudget | **Absent** | High |
+| Topology spread constraints | **Absent** | High |
+| OpenTelemetry Java agent | **Not injected** — no OTel annotation or init-container | High |
+| Spring Actuator | Present — `/merchant/gcp/case-creation/actuator/health` | High |
+| Readiness probe | HTTP GET `/actuator/health` on port 8082, initialDelay 120s, period 10s, failureThreshold 3 | High |
+| **Liveness probe** | **Absent** | High |
+| **Startup probe** | **Absent** | High |
+| Logstash appender | Present — `LogstashTcpSocketAppender` to `${logstash_server_host_port}` | High |
+| Micrometer / Prometheus | **Absent** — no `micrometer-*` dependency, no `MeterRegistry`, no custom meters | High |
+| Container port | 8202 (service port 8082 — verify with ingress config) | High |
 
-⚠️ `maxSurge: 1, maxUnavailable: 0` means a two-replica overlap exists during every rolling
-update. With MANUAL_IMMEDIATE pre-ACK and a single consumer thread per replica, a second replica
-can pick up and ACK a message the first has already ACK'd but not yet processed, creating a
-duplicate case creation risk on every deployment.
+> ⚠️ `maxSurge: 1, maxUnavailable: 0` produces a two-replica overlap during every rolling
+> update. Combined with MANUAL_IMMEDIATE pre-ACK and the in-memory-only Layer-1 dedup, a
+> rebalance window could allow two replicas to process the same `(networkCaseId,
+> cardNetwork)` concurrently. Kafka consumer-group partition assignment is the only
+> mechanism preventing this; there is no application-level guard.
 
-⚠️ OTel not injected — this component is not covered by distributed tracing via the OTel
-operator. Logstash appender provides log shipping only.
+> ⚠️ **No liveness probe** — a stuck consumer thread will not restart the pod. Combined
+> with the bare `RestTemplate` (no timeouts), a single unresponsive downstream can cause a
+> silent stall where the pod is Ready but unable to process.
 
 ---
 
@@ -427,47 +441,54 @@ operator. Logstash appender provides log shipping only.
 
 ### Feature Flags
 
-| Flag | Config key | Effect |
-|---|---|---|
-| `dsCaseLookup` | `app.properties.dsCaseLookup` / `${ds_case_lookup}` | `true` = call DS service for historical case lookup; `false` = skip DS lookup, set `notifyToBr = true` and proceed directly to fraud switch / workflow rule |
-| `skipStageList` | `app.properties.skipStageList` / `${skip_stage_list}` | List of `disputeStage` values that cause SKIPPED status without processing on new-case events where no case exists |
+| Flag | Config key | Effect | Default in source |
+|---|---|---|---|
+| `dsCaseLookup` | `app.properties.dsCaseLookup` → `${ds_case_lookup}` | `true` = call dataservice for historical case lookup; `false` = skip, set `notifyToBr = true`, continue | **No YAML default — env-var only** |
+| `skipStageList` | `app.properties.skipStageList` → `${skip_stage_list}` | List of `disputeStage` values that cause `SKIPPED` status on new-case events where no case exists | **No YAML default — env-var only** |
+| `creditMerchantActionCode` | `${credit_merchant_action_code}` | Credit-merchant action-code value | **No YAML default — env-var only** |
+| `complianceRecordType` | `${compliance_record_type}` | Compliance record-type value | **No YAML default — env-var only** |
+| `precomplianceRecordType` | `${pre_compliance_record_type}` | Pre-compliance record-type value | **No YAML default — env-var only** |
+| `apcCaseLookupDisputeStages` | `${apc_dispute_stages}` | APC dispute stages for case lookup | **No YAML default — env-var only** |
+| `acfCaseLookupDisputeStages` | `${acf_dispute_stages}` | ACF dispute stages for case lookup | **No YAML default — env-var only** |
 
-### Commented-out Code
+**Dead or underused dependencies (POM):**
 
-1. `USCaseEntity.java` lines 91–95: `C_ISSUER_REF_NUMBER` and `C_DEPOSIT_ID` columns commented
-   out then reinstated at lines 315–319 as separate `@Column` mappings. Suggests a mid-development
-   refactor — both column definitions now coexist.
-2. `USCaseEntity.java` lines 120–151: Four currency columns (`C_SOURCE_CCY_EXP`, `C_SOURCE_CCY`,
-   `C_DEST_CCY_EXP`, `C_DEST_CCY`) commented out. Schema columns exist but are not mapped —
-   planned work deprioritised.
-3. `logback-spring.xml` lines 15–16: Two hardcoded Logstash IP addresses (`10.43.145.125:5044`)
-   commented out, replaced by env-var-driven destination. Suggests an environment migration.
-4. `EventProcessingServiceImpl.java` (multiple `@Recover` methods): Error handling comment
-   `// Error handling -- todo` appears in several recover methods. These return `null` only —
-   acknowledged as incomplete at time of writing.
-5. `RestInvoker.java`: Multiple `throw new Exception(...)` blocks are commented out — richer error
-   propagation with HTTP status code details was planned but disabled.
+| Dependency | Status |
+|---|---|
+| `modelmapper` | Bean declared; `modelMapper.map` never called. Dead. |
+| `spring-boot-starter-oauth2-client` | Not imported anywhere. OAuth is resource-server only (inbound JWT on the health path). |
+| `httpclient` (Apache 4.5.14) | No import; `RestTemplate` uses default factory. |
+| `springdoc-openapi-starter-webmvc-ui` | Swagger YAML paths only; no code usage. |
 
-### TODO / FIXME References
+**Silent-null `@Recover` stubs** (acknowledged-incomplete in code comments):
 
-- `// Error handling -- todo` — multiple occurrences in `EventProcessingServiceImpl`'s
-  `@Recover` methods.
+- `transactionLookup` — returns `null`, `// Error handling -- todo`
+- `productEntitleMentLookup` (NEW path) — returns `null`
+- `fraudtransactionLookup` — returns `null`
+- `displayCodeDescription` — returns `null`
 
-### Unused / Suspect pom.xml Dependencies
+**Fixed by source-verification pass (2026-04-18):**
 
-- `spring-boot-starter-oauth2-client` and `spring-boot-starter-oauth2-resource-server` — present
-  but auth is done via IDP token REST call, not Spring Security OAuth2 flows. Vestigial from an
-  earlier architecture.
-- `springdoc-openapi-starter-webmvc-ui` (Swagger) — present in a consumer application. Suggests
-  a REST endpoint was added or planned. Actuator health confirmed. Whether additional REST endpoints
-  exist requires investigation — if present, Block A must be added to this file.
-- `modelmapper` — `@Bean` declaration in `CommonConfig` but not visibly used in processing logic.
+- 14 syntax fixes in the REST invoker (broken multi-line comments leaking into live code)
+- 10 semantic typo fixes (IDEMPOTENGY → IDEMPOTENCY, Statue → Status, Precmpliance →
+  Precompliance, chargeBack → chargebackm Dapt → Dspt, CheckmarkUtil → CheckmarxUtil,
+  mapLiveTransaction → mapLivetransaction, missing argument, duplicate line)
+- User-applied `setBpan` fix in the decryption request model
 
-### Stub Implementations
+These are implementation-level fixes — not architectural changes. Raised for awareness.
 
-- All `@Recover` methods in `EventProcessingServiceImpl` that return `null` with
-  `// Error handling -- todo` are effectively stubs — they suppress errors rather than handling
-  them.
+**Items NOT determinable from source:**
+
+- Mastercard `RE2` / `reversal=Y` handling. The switch/branch was not located in files
+  inspected. Either lives in a class not reached by `grep` on `RE2`/`reversal`, or is
+  handled implicitly via a generic rule inside `firstActionRuleLookup`. Follow-up needed.
+- Actual runtime replica count — Helm/Jinja variables file outside the repo.
+- Env-var values for `skip_stage_list`, `ds_case_lookup`, `credit_merchant_action_code`,
+  etc. — injected via Kubernetes secrets.
+- `preActionStatusRule` lookup `@Recover` behaviour — recover wiring not fully traced in
+  this audit pass. Follow-up recommended.
+
+---
 
 ---
 
@@ -478,9 +499,8 @@ operator. Logstash appender provides log shipping only.
 ## Kafka Consumer Contracts
 
 **Consumer framework:** Spring Kafka `@KafkaListener` / `ConcurrentKafkaListenerContainerFactory`
-**Offset commit strategy:** `MANUAL_IMMEDIATE` — pre-ACK before all processing. ⚠️ Deviation from DEC-005.
-**Error handling strategy:** Database outbox table (`wdp.chbk_outbox_row`). No Kafka DLQ topic.
-Deserialization errors silently swallowed via no-op `CommonErrorHandler`.
+**Offset commit strategy:** `MANUAL_IMMEDIATE` with `syncCommits = true` — **pre-ACK before processing**. 🔴 DEC-005 DEVIATION.
+**Error handling strategy:** Empty anonymous `CommonErrorHandler` registered. No DLT topic. No retry at the Kafka layer. Deserialization exceptions and unhandled application exceptions are silently swallowed. Per-step failures land on `wdp.chbk_outbox_row` as `FAILED` / `ERROR` via the @Recover methods on the enrichment chain — four of those methods return `null` instead of writing a FAILED row.
 
 ---
 
@@ -489,108 +509,91 @@ Deserialization errors silently swallowed via no-op `CommonErrorHandler`.
 | Parameter | Value |
 |---|---|
 | **Topic name (prod)** | `new-case-events` |
-| **Topic name (dev)** | `new-case-events-dev` |
+| **Topic name (cert)** | `new-case-events-cert` |
 | **Config key** | `spring.kafka.consumer.topic` |
 | **Consumer group (prod)** | `new-case-events-group` |
-| **Consumer group (dev)** | `new-case-events-group-dev` |
-| **Config key** | `spring.kafka.consumer.groupId` |
-| **AckMode** | `MANUAL_IMMEDIATE` — offset committed at very start of processing, before any DB write or REST call |
-| **Offset commit timing** | **Pre-ACK** — `acknowledgment.acknowledge()` called at line 36 of `KafkaConsumer.java`, before `processKafkaNotificationEvent()` is invoked |
-| **Concurrency** | `1` — not configured in `ConcurrentKafkaListenerContainerFactory`; defaults to single thread |
-| **auto.offset.reset** | `earliest` |
+| **Consumer group (cert)** | `new-case-events-group-cert` |
+| **Consumer group config key** | `spring.kafka.consumer.groupId` |
+| **AckMode** | `MANUAL_IMMEDIATE` with `syncCommits = true` |
+| **Offset commit timing** | ⚠️ **Pre-ACK** — `acknowledgment.acknowledge()` called at the start of the listener, **before** `processKafkaNotificationEvent()` is invoked. 🔴 DEC-005 DEVIATION. At-most-once from this point. |
+| **Concurrency** | `1` — `setConcurrency()` never called; defaults to single thread per replica |
+| **auto.offset.reset** | `latest` — ⚠️ on cold start with no committed offset, messages are **skipped**, not replayed |
 | **enable.auto.commit** | `false` |
-| **Max poll records** | `${max_poll_records}` (environment variable) |
-| **Max poll interval** | `${max_poll_interval}` (environment variable) |
-| **Session timeout** | `${session_timeout_ms}` (environment variable) |
-| **Heartbeat interval** | `${heartbeat_interval_ms}` (environment variable) |
+| **allow.auto.create.topics** | `false` |
+| **Max poll records** | `${max_poll_records}` — env-injected, no YAML default |
+| **Max poll interval** | `${max_poll_interval}` — env-injected, no YAML default |
+| **Session timeout** | `${session_timeout_ms}` — env-injected, no YAML default |
+| **Heartbeat interval** | `${heartbeat_interval_ms}` — env-injected, no YAML default |
 | **Key deserialiser** | `StringDeserializer` |
-| **Value deserialiser** | `ErrorHandlingDeserializer` wrapping `JsonDeserializer<NotificationEvent>` |
-| **Security** | `SASL_SSL`, `AWS_MSK_IAM`, `IAMLoginModule` + `IAMClientCallbackHandler` |
-| **Ordering guarantee** | Per partition — partition key unconfirmed from this codebase (DEC-003 pending) |
+| **Value deserialiser** | `ErrorHandlingDeserializer` wrapping `JsonDeserializer<NotificationEvent>` with `setUseTypeMapperForKey(true)` and `setRemoveTypeHeaders(false)` |
+| **Error handler** | Empty anonymous `CommonErrorHandler{}` — no method overrides. Silent swallow. No DLT. |
+| **Security** | `SASL_SSL` + `AWS_MSK_IAM` (`IAMLoginModule` + `IAMClientCallbackHandler`) |
+| **Partition key (received)** | Compound — logged as `keyNetworkCaseCardNetworkId`. Not used for routing by the consumer; producer side compounds `networkCaseId + cardNetwork + platform` per COMP-12. 🟡 DEC-003 deviation — not `merchantId`. |
+| **Ordering guarantee** | Per partition by the compound key. Cross-merchant events for one dispute ordered correctly; unrelated disputes for the same merchant may interleave across partitions. |
 
-**Message payload structure — `NotificationEvent`**
+**Message payload structure — `NotificationEvent` (key fields)**
 
 | Field | Type | Description |
 |---|---|---|
 | `eventType` | String | Type of event |
 | `eventTimestamp` | String | When the event occurred |
-| `sourceSystem` | String | **Platform identifier** — `CORE`, `LATAM`, `VAP`, `PIN`, `NAP` (NAP not intended but no guard present) |
-| `eventId` | Long | PK of `chbk_outbox_row` — links event to its outbox record |
+| `sourceSystem` | String | Platform identifier — `CORE`, `LATAM`, `VAP`, `PIN`. `NAP` accepted by the enum but not intended on this topic. |
+| `eventId` | Long | PK of `wdp.chbk_outbox_row` — links event to its outbox row |
 | `correlationId` | String | Tracing ID — generated UUID if absent |
+| `idempotencyId` | String | From Kafka header `idempotency-key` — propagated as HTTP `IDEMPOTENCY_KEY` on every outbound call |
 | `sourceSystemCaseId` | String | Source system's case identifier |
+| `networkCaseId` | String | Used as compound-key component for Layer-1 dedup |
+| `cardNetwork` | String | Used as compound-key component for Layer-1 dedup |
 | `disputeAmount` | BigDecimal | Dispute amount |
-| `disputeCurrency` | String | Currency code (may be numeric ISO — converted to alpha by display code service) |
+| `disputeCurrency` | String | Currency code (may be numeric ISO — converted to alpha via display-code service) |
 | `reasonCode` | String | Network reason code |
-| `disputeStage` | String | Stage code: CHI, REQ, PAB, ARB, RE2, APC, others |
-| `notificationType` | String | `"New"` or `"Update"` — may be overridden to New at Case Lookup step if no case found |
-| `caseType` | String | e.g. `PLCC`, `BJPLCC`, `CMRCL` (Capone) |
-| `networkRuling` | String | Optional: `MERCHANT_FAVOR`, `ISSUER_FAVOR`, `SPLIT_RULING` |
-| `reversal` | String | `Y`/`N` — triggers Mastercard reversal edge case routing |
-| `schemeRef` | Object | `cardNetwork`, `networkCaseNumber`, `networkChargebackId`, `networkPhaseId`, `queueName`, `notes[]`, `category` |
-| `merchantDetail` | Object | `mid` and merchant info |
-| `originalTransIdentifier` | Object | `accountNumber` (HPAN — field name is misleading), `accountNumberLast4`, `arn`, `date`, `amount`, `currency`, `networkTransactionId`, `enrichmentFailure` flag |
-| `originalTransDetail` | Object | Original transaction detail fields |
-| `historicalDeptDetail` | Object | Present only for historical events — triggers historical processing path, skips validation step |
-| `ePan` | String | HPAN — set during processing (not on inbound message) |
-| `dPan` | String | Clear PAN — in memory only during processing; excluded from all logging via `@ToString(exclude = "dPan")` |
+| `disputeStage` | String | Stage code — CHI, REQ, PAB, ARB, RE2, APC, others |
+| `notificationType` | String | `"New"` or `"Update"` — may be overridden to `New` at Case Lookup step if no case is found |
+| `caseType` | String | Case classification |
+| `enrichmentFailure` | Boolean | `true` = upstream enrichment failed, skip decrypt and go direct to transaction lookup |
+| `hpan` / `dPan` | String | HPAN on inbound; clear PAN materialised transiently in memory only. `dPan` excluded from `toString`. |
+| `queueName` | String | `COMP` / `PRECOMP` trigger hardcoded `VISA_COMPLIANCE` workflow (bypasses rules service); any other value routes to `mdvs-gcp-rules-service /rules/workflow` |
 
-**Platform identifier field:** `sourceSystem` (JSON field name: `sourceSystem`).
-Used as the `{platform}` path variable in all downstream service URLs.
+**Event classification / routing**
 
-| sourceSystem value | Platform | Routing notes |
-|---|---|---|
-| `CORE` | CORE | Historical case lookup uses DS service; all standard enrichment paths apply |
-| `LATAM` | LATAM | No special code branches; same URL template as CORE |
-| `VAP` | VAP | Historical lookup same as non-CORE |
-| `PIN` | PIN | Extra validation fields required: `termSequence`, `fromAcro`, `toAcro` |
-| `NAP` | (unintended) | Present in `SourceSystemName` enum; no guard prevents processing if event arrives |
-
-**notificationType routing:**
-- `"New"` → `processNewNotificationEvent()` — case creation flow
-- `"Update"` → `processUpdateNotificationEvent()` — action insertion flow
-- Override: if `notificationType = "Update"` but Case Lookup finds no case → rerouted to NEW
-
-**Mastercard edge cases:**
-- `cardNetwork = MASTERCARD` AND `disputeStage = RE2` AND case exists → route to UPDATE_ACTION (reject MCM flow)
-- `cardNetwork = MASTERCARD` AND `reversal = Y` → complex action filtering by `networkChargebackId` or `networkPhaseId`
+- Platform mapping uses `sourceSystem` as the `{platform}` path variable on all downstream service URLs.
+- `notificationType = "New"` → NEW case-creation path (`processNewNotificationEvent`).
+- `notificationType = "Update"` → UPDATE action-insertion path (`processUpdateNotificationEvent`).
+- **Override:** `"Update"` + no case found at Case Lookup → reroute to NEW path.
+- **Mastercard edge cases** (existing DRAFT claimed `RE2 + case-exists` and `reversal = Y`
+  paths) — **not determinable from source in this audit pass.** Follow-up required.
+- **Capone REQ stage** triggers Layer-3 duplicate check against `wdp.case` before case
+  creation.
+- **PIN platform** uses the same enrichment URLs as CORE (shared `gcp-merchant-transaction-service`).
+  Extra validation fields — `termSequence`, `fromAcro`, `toAcro` — are required; missing
+  any sets the row to `ERROR` at the validation step.
 
 **On processing failure**
 
 | Failure scenario | Behaviour |
 |---|---|
-| Deserialization error | `ErrorHandlingDeserializer` catches; `CommonErrorHandler` is no-op — error silently swallowed; event permanently lost (offset already pre-ACK'd); no record in `chbk_outbox_row` |
-| IDP token fetch fails | Exception propagates to `errorHandler()` → outbox row = FAILED; retryCount incremented |
-| Case Lookup exhausts retries | `@Recover` → `errorHandler()` → FAILED; `errorOccured = true`; chain halts |
-| PAN Decrypt / Encrypt fails | `@Recover` → FAILED; chain halts |
-| Transaction Lookup fails | `@Recover` → returns null; logged only; no FAILED write; downstream null check may proceed |
-| Fraud Switch fails | `@Recover` → returns null; no FAILED write; processing continues |
-| Product Entitlement fails | `@Recover` → returns null; downstream null check → FAILED |
-| Workflow / First Action Rule fails | `@Recover` → FAILED |
-| Display Code fails | `@Recover` → null → FAILED |
-| Create Case fails | `@Recover` → FAILED |
-| Insert Action fails | `@Recover` → FAILED |
-| Update Action — null response | Null check → FAILED |
-| Insert Notes exception | Logged only — does NOT write FAILED (soft failure) |
-| Modify Evidence Event Status exception | Logged only — does NOT write FAILED (soft failure) |
-| retryCount > 2 on FAILED write | Status automatically promoted to ERROR — no further retry |
-| Prior row in ERROR found | Current row set to ERROR; halt — no processing |
-| Prior row in-flight found | Current row set to PENDING_DEFERRED; halt |
+| Deserialization error (poison payload) | `ErrorHandlingDeserializer` wraps into `DeserializationException`; empty `CommonErrorHandler` swallows. **No log, no DLT, no metric. Event permanently lost.** |
+| IDP token fetch fails | Exception propagates → errorHandler → outbox row `FAILED`; `retry_count += 1` |
+| Case Lookup exhausts retries | `@Recover` → outbox `FAILED`; chain halts |
+| PAN decrypt / encrypt fails | `@Recover` → outbox `FAILED`; chain halts |
+| Transaction Lookup fails | `@Recover` returns `null`. ⚠️ No FAILED write. Processing continues with null fields. |
+| Fraud Switch fails | `@Recover` returns `null`. ⚠️ No FAILED write. Processing continues. |
+| Display Code fails | `@Recover` returns `null`. ⚠️ No FAILED write. Downstream `null` handling may still fail. |
+| Product Entitlement fails (NEW path) | `@Recover` returns `null`. ⚠️ No FAILED write. |
+| Product Entitlement fails (UPDATE path) | `@Recover` returns `null`; downstream null-check → outbox `FAILED` |
+| Workflow / First-Action Rule fails | `@Recover` → outbox `FAILED` |
+| Create Case fails | Exception path → outbox `FAILED` |
+| Insert Action fails | `@Recover` → outbox `FAILED` |
+| Update Action returns null | Null-check → outbox `FAILED` |
+| Insert Notes fails | Logged only. ⚠️ Soft failure — no FAILED write. |
+| EVIDENCE_ATTACH child update fails | Logged only. ⚠️ Soft failure — no FAILED write. Parent may already be SUCCESS. |
+| `retry_count > 2` on next FAILED write | Auto-promoted to `ERROR` — no further retry. Logic is Java-side (`retryCount > 2`), not DB-side. |
+| Prior chargeback row in `ERROR` found | Current row → `ERROR`; halt. No processing. |
+| Prior chargeback row in in-flight non-terminal state | Current row → `PENDING_DEFERRED`; halt. COMP-12 retries via `next_retry_at`. |
+| Capone REQ duplicate match in `wdp.case` | Current row → `ERROR`; halt. No case creation attempted. |
 
 ---
 
-## Remaining Gaps
-
-| Gap | Detail | Action needed |
-|---|---|---|
-| DEC-003 — Partition key | Cannot confirm from consumer source whether `new-case-events` partition key is `merchantId`. Key logged on receipt but origin unknown. | **Follow-up Copilot question** in COMP-12 repo: *"What field is used as the Kafka message key when publishing to the `new-case-events` topic in InboundDisputeEventScheduler? Show the exact field and the KafkaTemplate send call."* |
-| Insert Action URL / retry discrepancy | `mdvs-gcp-case-actions-service (insert)` shows URL `/{platform}/case/lookup` (POST) with 3 retries, but retry config lists `insertAction` as 1 attempt. These may be two separate calls — Case Action Search then Insert. | **Follow-up Copilot question** in this repo: *"In EventProcessingServiceImpl, what is the full sequence of calls to `mdvs-gcp-case-actions-service` during the UPDATE path? Give exact URLs and @Retryable counts for each."* |
-| Display UserId scope | Labelled "historical flow only" in step table but included in UPDATE path narrative without qualification. Scope unclear. | **Follow-up Copilot question**: *"Is the Display UserId Lookup called on all Update events, or only when historicalDeptDetail is non-null on an Update event?"* |
-| Replica count | Helm placeholder `{{ replicas-gcp-case-creation-consumer }}` — actual production value unknown. | **Confirm from:** infrastructure team or Spinnaker/XL Deploy configuration. |
-| REST endpoints beyond Actuator | `springdoc-openapi-starter-webmvc-ui` in pom.xml suggests a REST endpoint may be present. If confirmed, Block A must be added to this file. | **Follow-up Copilot question**: *"Are there any Spring `@RestController` or `@Controller` classes in this codebase beyond the KafkaConsumer listener? If yes, list all endpoints, methods, and paths."* |
-| PIN platform coverage | PIN confirmed as a 4th platform but PIN-specific validation fields and enrichment path not fully documented. WDP-ARCHITECTURE.md lists only CORE, LATAM, VAP. | **Architect decision:** Update WDP-ARCHITECTURE.md §7.1 CaseCreationConsumer table to add PIN. Confirm whether PIN follows the same enrichment path as other platforms or has distinct behaviour. |
-
----
-
-*End of file.*
-*Doc status: 📝 DRAFT — architect confirmation pending.*
-*Remember to update WDP-COMP-INDEX.md, WDP-KAFKA.md, WDP-DB.md, and WDP-HANDOVER.md after confirmation.*
+*End of WDP-COMP-14-CASE-CREATION-CONSUMER.md*
+*File status: 📝 DRAFT v2.0 — source-verified 2026-04-18; architect confirmation pending*
+*Change log entry: see WDP-CHANGE-LOG.md Pending Entries for 2026-04-18 COMP-14*

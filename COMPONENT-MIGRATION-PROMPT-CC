@@ -1,0 +1,708 @@
+You are my senior architecture partner for WDP
+(Worldpay Dispute Platform).
+
+Read these project documents before responding:
+WDP-HANDOVER.md, WDP-COMP-INDEX.md,
+WDP-COMP-TEMPLATE.md, WDP-ARCHITECTURE.md,
+WDP-DECISIONS.md, WDP-KAFKA.md, WDP-DB.md
+
+Today's component: 18 — NotificationOrchestrator
+
+━━━ PHASE 1 — Generate Claude Code prompt ━━━
+
+Before I go to Claude Code, do the following:
+
+1. STATE what you already know about this component
+   from the project documents — type, responsibility,
+   what is confirmed, what is flagged as uncertain
+   or DRAFT, and what open questions exist.
+
+2. GENERATE a tailored Claude Code prompt for this
+   specific component.
+
+   The prompt must instruct Claude Code to read the
+   source repository directly and produce a research
+   report covering the areas below. Include only the
+   sections that apply to this component's type —
+   omit what does not apply.
+
+   Write it so I can paste it directly into Claude
+   Code without any editing. Claude Code has access
+   to the repository — it does not need instructions
+   on how to find files, only what to document.
+
+   ── SECTION: PROCESSING FLOW ──────────────────────
+   This section is MANDATORY for every component.
+   Ask Claude Code to describe the complete
+   processing flow as a numbered sequence.
+   For each step:
+
+   a) STEPS IN ORDER
+      Every processing step from trigger to final
+      output. For each step: what happens, which
+      service or table is called, what the output
+      of that step is.
+
+   b) DECISION POINTS
+      For every branch in the flow — the condition
+      evaluated and every possible outcome with the
+      path it leads to.
+
+   c) SKIP AND BYPASS CONDITIONS
+      Any condition that short-circuits processing
+      before it completes. What is checked, what
+      value triggers the skip, where does control
+      go after the skip.
+
+   d) FAILURE PATH PER STEP
+      For each step that calls an external
+      dependency — what specifically happens if
+      that call fails. Retry / skip / halt / DLQ.
+      State this per step, not globally.
+
+   e) MULTIPLE ENTRY PATHS
+      If the component has more than one inbound
+      trigger or endpoint — describe each path
+      separately. State where they converge or
+      confirm they are fully independent.
+
+   f) STATE AT EACH STEP
+      For stateful processing — the status of the
+      record at each step. What transitions happen
+      and what triggers them.
+
+   ── SECTION: FUNCTIONAL BEHAVIOUR ────────────────
+
+   a) CLASSIFICATION AND ROUTING LOGIC
+      How the component determines which processing
+      path to take. Which field, which value, which
+      branch. Every routing condition and outcome.
+
+   b) BUSINESS RULES APPLIED
+      Any validation, eligibility check, or rule
+      applied inside this component — not delegated
+      downstream. What is checked, what value is
+      expected, what happens on failure.
+
+   c) DATA TRANSFORMATIONS
+      What is mapped, enriched, or derived. Which
+      fields are copied from inbound to outbound.
+      Which fields are conditionally populated.
+
+   d) IDEMPOTENCY MECHANISM
+      Exact detection key fields. What happens on
+      duplicate detection. Any gaps — crash windows,
+      replica races, at-most-once scenarios.
+
+   ── SECTION: CONTRACTS ────────────────────────────
+   Include only the sub-sections that apply:
+
+   For REST API components:
+     Every endpoint: method, path, request fields,
+     response fields, every HTTP status code and
+     what triggers each, auth model, known callers,
+     error body structure.
+
+   For Kafka Consumer components:
+     Exact topic name, consumer group ID, AckMode,
+     offset commit timing relative to every write,
+     concurrency, max poll records, max poll
+     interval, deserialiser, bad payload behaviour.
+
+   For Kafka Producer components:
+     Every topic published to, message key field,
+     sync or async, idempotence setting, what
+     triggers each publish, failure behaviour.
+
+   For Batch/Scheduler components:
+     Trigger mechanism, cron expression or config
+     key, input source query and filters, chunk
+     size, pagination mechanism, job uniqueness.
+
+   ── SECTION: DEPENDENCIES ─────────────────────────
+   For every outbound call:
+     Service name
+     Protocol and auth method
+     Purpose — at which step in the flow
+     Timeout: connection and read separately
+     Retry: count, delay, backoff type
+     Circuit breaker: Resilience4j configured?
+       If yes — failure rate threshold, wait
+       duration, half-open permitted calls.
+       If no — state that explicitly.
+     Behaviour if unavailable: halt / skip / degrade
+
+   ── SECTION: DATABASE ─────────────────────────────
+   For every table read or written:
+     Schema and exact table name
+     Read or write — state clearly
+     Purpose — at which step in the flow
+     Key columns used in queries or writes
+     Whether writes are in the same transaction
+     as other writes at that step
+
+   ── SECTION: PLATFORM STANDARD DEVIATIONS ─────────
+   Check each standard and state COMPLIES or
+   DEVIATES with evidence from source:
+
+     DEC-001: Transactional outbox — used?
+       Which table? Outbox write in same
+       transaction as business write?
+
+     DEC-003: Kafka partition key — is it
+       merchantId? If not, what is it and why?
+
+     DEC-004: PAN encryption — encrypted before
+       any write? Clear PAN ever written anywhere?
+       Which service handles encryption?
+
+     DEC-005: Kafka offset — committed manually
+       after all processing? Or auto / pre-ACK?
+       State exactly when relative to each write.
+
+     DEC-019: Clear PAN — does this component
+       write clear PAN to any persistent store?
+
+     DEC-020: Idempotency — full at-least-once
+       implemented? If not, what gap exists?
+
+   ── SECTION: SCALING AND DEPLOYMENT ───────────────
+     Kubernetes resource type
+     Replica count — exact value or placeholder,
+     state which and which variable
+     Memory and CPU limits and requests
+     HPA — present or absent
+     Rolling update strategy
+     PodDisruptionBudget — present or absent
+     Topology spread — functional or label mismatch
+     Observability — OTel agent, Actuator, Logstash
+
+   ── SECTION: PLANNED AND INCOMPLETE WORK ──────────
+     Commented-out code — what it did and why
+     Unused dependencies in build file
+     Feature flags active in production —
+     exact flag names and behaviour
+     TODO / FIXME references and what they cover
+     Stub implementations returning fixed responses
+     Properties configured but never called
+
+   ── SECTION: CONFIDENCE ASSESSMENT ───────────────
+   For every section above:
+     Confidence: High / Medium / Low
+     Basis: direct source / inferred /
+     not determinable from source alone
+
+   Additional rules for the generated prompt:
+     For anything already confirmed in the project
+     documents, ask Claude Code to confirm or
+     correct — not rediscover from scratch.
+     Target what is missing or uncertain first.
+     Write the prompt so I can paste it directly
+     into Claude Code without any editing.
+
+Do not produce the component file yet.
+Paste the Claude Code report below when ready
+and I will ask you to proceed to Phase 2.
+
+
+HERE IS THE CLAUDE CODE PROMPT GENERATED FOR OTHER COMPONENT IN THE OTHER CHAT. Please refer to this to keep the structure, tone, and level of detail consistent across components.
+
+You are auditing the WDP component VisaDisputeBatch in the repository
+gcp-visa-disputes-processor-batch. A prior pass already produced a DRAFT
+architecture document. Your job is to CONFIRM OR CORRECT the items listed
+under "ALREADY DOCUMENTED" from source, and to CLOSE the items listed under
+"GAPS TO FILL" by reading the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that explicitly
+and label it "not determinable from source". Do NOT guess.
+
+═══════════════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT PROVIDED
+═══════════════════════════════════════════════════════════════════════
+
+Alongside this prompt you are given the existing DRAFT component
+document: WDP-COMP-07-VISA-DISPUTE-BATCH.md.
+
+Treat this document as a set of HYPOTHESES to verify against source,
+NOT as ground truth. It was extracted by a prior pass and may contain
+errors, stale facts, or items that have changed in the codebase since.
+
+How to use it:
+  - Before writing any section of your report, read the corresponding
+    section in the document.
+  - For each claim in the document, verify against source at file:line.
+  - If source CONFIRMS the document: in your report, state "Document
+    accurate — <file>:<lines>" and do NOT re-describe the claim.
+  - If source CONTRADICTS the document: in your report, write a
+    CORRECTION block stating:
+      (a) what the document says (quote briefly)
+      (b) what source actually shows, cited to file:line
+      (c) which section of the document needs updating
+  - If source NEITHER confirms nor contradicts (item is not visible in
+    source): state "not determinable from source" — do not resolve the
+    ambiguity by deferring to the document.
+  - At the end of your report, include a short "ITEMS IN DOCUMENT NOT
+    VERIFIABLE FROM SOURCE" list — every documented claim that you
+    could not cross-check against code or config.
+
+Do NOT copy prose from the document into your report. Your output is
+either a CONFIRMATION pointer, a CORRECTION block, or original content
+for the GAPS TO FILL below.
+
+═══════════════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — confirm or correct only
+═══════════════════════════════════════════════════════════════════════
+
+- Component is a Kubernetes Deployment (not CronJob), triggered by an
+  internal Spring @Scheduled cron, reading the cron expression from
+  env var ${scheduler_cron}.
+- Chunk size = 1, single Spring Batch step, commit-per-item, sequential
+  processing of seven Visa RTSI queues in one job execution.
+- Seven queues: FIRSTCHARGEBACK (AWAITING_ACTION_BQ_DISPUTE), PREARB
+  (AWAITING_ACTION_BQ_PRE_FILING), ARB (INCOMING_BQ_ARBITRATIONS),
+  ACCEPT (INCOMING_BQ_ACCEPTANCES_RECEIVED), RECALL (INCOMING_BQ_RECALLS),
+  PRECOMP (INCOMING_BQ_PRECOMPLIANCES), COMP (INCOMING_BQ_COMPLIANCES).
+- Queue order runtime-controlled by ${queue_name_list}. Exhaustion signal
+  is Visa status code I-300600000.
+- Pagination is page-number offset-based; all pages for a queue loaded
+  into memory before processing begins.
+- 9-step pipeline as: Platform mapping → IDP token fetch → Rules check →
+  HyperSearch → PIN validation (networkId=0002 only) → migrationStatus=Y
+  hardcoded → Case lookup (PRECOMP / COMP / generic variants) → PAN
+  encryption → Writer + MarkAsRead.
+- Null-return silent skip pattern at every enrichment failure. No DLQ.
+- Three feature flags from K8s Secret gcp-visa-disputes-processor-batch-
+  secrets: coreDataNeedToMigrate, removeItemFromQueueDisabled,
+  readSpecificItemFromQueue. Effects as previously documented.
+- MarkAsRead gate: PIN proceeds; CORE only if coreDataNeedToMigrate=true;
+  all suppressed if removeItemFromQueueDisabled=true. RECALL items map to
+  CORE platform (networkId=0002) — MarkAsRead behaviour depends entirely
+  on coreDataNeedToMigrate.
+- Writes only to wdp.chbk_outbox_row. Constants: event_type=
+  CHARGEBACK_PROCESS, c_case_ntwk=VISA, created_by=WVDPB, retry_count=0.
+  Payload is full CommonEvent JSON with HPAN (not clear PAN) in
+  accountNumber.
+- Duplicate check is application-level SELECT-before-INSERT on
+  (networkCaseId + networkPhaseId + disputeStage); RECALL items are
+  exempted from this check.
+- PAN is encrypted via wdp-encryption-service at step 8 before the outbox
+  write. No clear PAN is written anywhere persistent.
+- No @EnableKafka, no KafkaTemplate, no Kafka producer config class in
+  main source. spring-kafka / kafka-clients / aws-msk-iam-auth declared
+  in POM but not wired.
+- No Resilience4j dependency. No connection or read timeout on
+  RestTemplate (SimpleClientHttpRequestFactory default).
+- @Retryable with 3 attempts × 2s delay on: GetBatchQueue, HyperSearch,
+  VisaTransSearch, MarkAsRead, Rules Service, Encryption Service.
+  @Retryable is ABSENT on: IDP token GET, Case Search GET.
+- Resource profile: memory req 256Mi / limit 2048Mi; CPU not set
+  (burstable QoS); OTel Java agent injected; Spring Actuator present;
+  Logstash appender present; RollingUpdate maxSurge=1 maxUnavailable=0;
+  no HPA, no PDB, no topology spread.
+
+For every item in this block, EITHER:
+  (a) confirm "Still accurate — <file>:<lines>", or
+  (b) correct with the actual value from source, citing file:lines.
+
+Do not re-document items in this block from scratch. Target the gaps below.
+
+═══════════════════════════════════════════════════════════════════════
+GAPS TO FILL — prioritise these
+═══════════════════════════════════════════════════════════════════════
+
+1. WRITER FAILURE SEMANTICS (step 9)
+   - What specifically happens if the JPA save on wdp.chbk_outbox_row
+     throws an exception during the Writer step?
+   - Is the exception caught inside the Writer? Does the Spring Batch
+     step fail? Is the item retried by Spring Batch's default retry?
+   - Does MarkAsRead still fire after a writer exception? State the
+     ordering of the save call vs the MarkAsRead call.
+   - Is the chunk transaction rolled back, or is the save in a separate
+     @Transactional propagation (REQUIRES_NEW, etc.)?
+
+2. MARKASREAD FINAL-FAILURE BEHAVIOUR
+   - After 3 retries of MarkAsRead are exhausted with @Retryable, what
+     specifically happens?
+   - Is there a @Recover method? Where does control go?
+   - Is the item simply left in the Visa queue for the next cron fire,
+     or does the exception propagate and fail the entire step?
+   - Report the exact @Recover / exception-handler method if present.
+
+3. SKIPCASE PATH END-TO-END
+   - When Rules Service returns "no rule found" and skipCase=true is set,
+     trace the item all the way through the Writer.
+   - Does the Writer skip the outbox write entirely, or write a specific
+     status row? If it writes, what status?
+   - Is MarkAsRead called on skipCase items? Under which flag combination?
+
+4. ERROR-STATUS ROW WRITER BEHAVIOUR
+   - When the Writer writes a row with status=ERROR because of missing
+     key data (networkCaseId / networkPhaseId / disputeStage blank), is
+     MarkAsRead still called for that item? Confirm exact condition.
+   - When status=SKIPPED (duplicate), same question.
+
+5. SPRING BATCH METADATA SCHEMA
+   - What is the value of app.spring.batch.jdbc.table-prefix / equivalent
+     property?
+   - Is the table_prefix env var referenced anywhere with a default, or is
+     it expected purely from K8s Secret with no fallback?
+   - Confirm whether BATCH_JOB_INSTANCE, BATCH_JOB_EXECUTION, and
+     BATCH_STEP_EXECUTION run against the same datasource (wdpDataSource
+     @Primary) as wdp.chbk_outbox_row.
+   - If a default prefix is hardcoded anywhere, report it.
+
+6. CONCURRENT EXECUTION GUARD
+   - Is there any @SchedulerLock / ShedLock / database advisory lock /
+     synchronized block around the job runner method?
+   - If replica > 1 were to occur, what specifically prevents two replicas
+     from launching the Spring Batch job simultaneously? State "no guard
+     — relies on operational constraint of replica=1" if that is the case.
+   - Does JobLauncher use an async task executor? Report the TaskExecutor
+     bean configuration.
+
+7. DB UNIQUE CONSTRAINTS ON chbk_outbox_row
+   - Search for any DDL, Flyway migration, Liquibase change, or
+     schema.sql / data.sql file inside this repository defining or
+     referencing wdp.chbk_outbox_row.
+   - Report any UNIQUE constraint, index, or primary key beyond the
+     id sequence. If no DDL exists in this repo, state that explicitly.
+
+8. REST TEMPLATE / HTTP CLIENT POOLING
+   - Confirm that RestTemplate is constructed with
+     SimpleClientHttpRequestFactory (no pool).
+   - Is there ANY HttpClient, PoolingHttpClientConnectionManager, or
+     custom ClientHttpRequestFactory bean? Report configuration if yes.
+   - Per-call default connection behaviour is then: new socket per call,
+     no keep-alive pool management. Confirm or correct.
+
+9. KUBERNETES HEALTH CHECKS
+   - Are livenessProbe, readinessProbe, or startupProbe configured in
+     resources.yaml? Report exact probe config.
+   - If no probes exist, state that explicitly.
+   - What port is Actuator bound to, and which endpoints are exposed
+     via management.endpoints.web.exposure.include?
+
+10. OBSERVABILITY AND CORRELATION
+    - Is there an MDC-based correlation ID flowing through the pipeline?
+    - Is an idempotency-key / correlation-id header propagated on outbound
+      REST calls, or is each call un-correlated?
+    - Are there structured log fields (JSON) — business keys like
+      networkCaseId, disputeStage, queue name — emitted consistently per
+      item?
+    - What metrics are exposed? Any custom Micrometer meters for per-item
+      outcomes (skipped, error, duplicate, published)?
+
+11. DEAD CODE AND DEAD CONFIG — formal confirmation
+    - Confirm still present and unreachable:
+      (a) gcp-merchant-transaction-service call commented out in
+          BatchItemProcessor lines 105–139.
+      (b) DisputeService.saveApiLog() method never called from processor
+          or writer.
+      (c) prearbDetailUrl and prearbResponseDetailUrl configured but
+          never invoked; VisaDisputeDetail field always null at runtime.
+      (d) PAB-stage disputed amount calculation commented out in
+          ProcessorUtil.java:598–618.
+    - For each, state whether any profile, feature flag, or reflection-
+      based invocation could bring the code back to life.
+
+12. FEATURE-FLAG DEFAULTS AND PRODUCTION VALUES
+    - For coreDataNeedToMigrate, removeItemFromQueueDisabled, and
+      readSpecificItemFromQueue:
+      - What is the default value if the env var is unset? Report from
+        @Value default, application.yaml default, or profile-specific
+        override.
+      - Which production YAML profile is active, and what are the
+        default values that ship to production if a secret is absent?
+
+13. WRITER → OUTBOX FIELD MAPPING
+    - For every column written to wdp.chbk_outbox_row by the Writer,
+      confirm the source field on CommonEvent (or constant) and the
+      exact assignment line.
+    - Confirm the columns listed as NOT written: file_job_id, row_number,
+      parent_row_number, i_case, i_action_id, c_reason, kafka_*,
+      error_code, document_type, source_event, next_retry_at,
+      published_at, c_level1_entity, c_migration_sta.
+    - Any field assignments that are conditional (non-null guard,
+      flag-gated, queue-type-specific)?
+
+14. COMP-12 DOWNSTREAM CONTRACT
+    - Scheduler1 in COMP-12 reads chbk_outbox_row where status=PENDING
+      and publishes to new-case-events.
+    - Are there any rows this batch writes that COMP-12 Scheduler1 would
+      NOT pick up (e.g., specific c_case_ntwk, c_acq_platform, or
+      event_type filters applied on the producer side)?
+    - Identify the exact WHERE clause or specification used by Scheduler1
+      if it lives in a shared library / common module present in this
+      repo. If not in this repo, state "not in this repo".
+
+15. networkId=0002 BUSINESS MEANING
+    - Search for any comment, constant, enum, or config that documents
+      what networkId=0002 means in the Visa RTSI response.
+    - If a comment exists ("0002 = PIN debit transaction" or similar),
+      quote it. If nothing documents it, say so.
+
+═══════════════════════════════════════════════════════════════════════
+REPORT STRUCTURE
+═══════════════════════════════════════════════════════════════════════
+
+Organise the report under these section headings. Include only what
+applies to this Batch/Scheduler component.
+
+── SECTION 1 — PROCESSING FLOW ─────────────────────────────────────────
+   a) STEPS IN ORDER
+      List every step in the job from scheduler fire to job completion,
+      including the per-item 9-step pipeline. For each step: what happens,
+      which service or table is called, what the output of that step is.
+      Cite file:lines for each step's entry point.
+
+   b) DECISION POINTS
+      Every branch: queue type branching at Step 7, skipCase branch at
+      Step 3, PIN-validation outcome branch at Step 5, duplicate/error/
+      missing-key decision at Step 9, and the MarkAsRead gate at Step 9.
+      For each: condition evaluated, every possible outcome, path taken.
+
+   c) SKIP AND BYPASS CONDITIONS
+      Every short-circuit: null-return from any step, skipCase=true,
+      non-0002 skip under coreDataNeedToMigrate=false, MarkAsRead
+      suppression conditions, readSpecificItemFromQueue filter.
+      For each: what's checked, what value triggers the skip, where
+      control goes after the skip.
+
+   d) FAILURE PATH PER STEP
+      For every step that makes an external call (steps 2, 3, 4, 5, 7, 8,
+      and MarkAsRead):
+        - Number of retries and delay
+        - Exact exception type caught
+        - What happens after retries exhausted
+        - Whether an error record is written anywhere
+        - Whether the item is marked as read
+      State this per step, not globally.
+
+   e) MULTIPLE ENTRY PATHS
+      This component has ONE inbound trigger (cron). Confirm no REST
+      controller, no Kafka listener, no SQS listener, no webhook
+      exists. State explicitly.
+
+   f) STATE AT EACH STEP
+      For each item, track the evolving state: platform (PIN/CORE),
+      skipCase flag, createNewCase flag, accountNumber (clear vs HPAN),
+      caseNumber (lookup result). State how each field is set.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ────────────────────────────────────
+   a) CLASSIFICATION AND ROUTING LOGIC
+      - Platform mapping from networkId (Step 1 and Step 5 refinement)
+      - Queue-type routing at Step 7 (PRECOMP / COMP / other-5)
+      - create-vs-update decision at Step 7 (caseNumber blank check)
+
+   b) BUSINESS RULES APPLIED
+      - PIN validation rule (CardholderIdMethodCode=2)
+      - PRECOMP filter (stageCode=APC, error if >1 result)
+      - COMP ordering rule (open-first, max-action stageCode match to
+        recordType, fallback to CLOSED)
+      - Rules Service "no rule found" → skipCase
+      - Missing-key-data rule → ERROR row
+      - Duplicate detection rule → SKIPPED row
+      For each: what field, what expected value, what happens on failure.
+
+   c) DATA TRANSFORMATIONS
+      - Every field mapped from Visa RTSI response to CommonEvent
+      - Every field mapped from CommonEvent to chbk_outbox_row row
+      - Conditional population rules (fields populated only for certain
+        queue types or platforms)
+      - HPAN substitution at Step 8
+
+   d) IDEMPOTENCY MECHANISM
+      - Exact detection key fields (networkCaseId + networkPhaseId +
+        disputeStage)
+      - SELECT-before-INSERT nature
+      - RECALL exemption — why
+      - Gap: crash between Visa poll and DB write
+      - Gap: at-most-once on duplicate-check-race across replicas
+        (theoretical — replica=1 mitigates)
+      - No DB unique constraint reliance
+
+── SECTION 3 — CONTRACTS — Batch/Scheduler sub-section only ────────────
+   - Trigger mechanism: Spring @Scheduled cron, config key
+     app.scheduler.cron, env var ${scheduler_cron}, K8s Secret
+     gcp-visa-disputes-processor-batch-secrets
+   - Job uniqueness mechanism
+   - Input source: the seven Visa RTSI queues with exhaustion signal
+   - Pagination mechanism (all pages loaded into memory first)
+   - Chunk size (= 1)
+   - Reader / Processor / Writer wiring
+   - Spring Batch metadata tables and schema (see GAP 5)
+   - Restart behaviour — does a failed prior run block the next cron
+     fire? (JobParameters uniqueness via timestamp)
+
+   Do NOT include a REST API sub-section.
+   Do NOT include Kafka Consumer or Producer sub-sections —
+   confirm Kafka is not active and state so.
+
+── SECTION 4 — DEPENDENCIES ────────────────────────────────────────────
+   For every outbound call — GetBatchQueue, HyperSearch, MarkAsRead,
+   VisaTransSearch, IDP token, Rules Service, Case Search, Encryption
+   Service — report:
+     - Service name / logical target
+     - Protocol and auth method (header, Bearer, vantiveLicense, etc.)
+     - Purpose and the step in the pipeline
+     - Connection timeout (state "not configured" if absent)
+     - Read timeout (state "not configured" if absent)
+     - Retry: count, delay, backoff type (fixed / exponential / other)
+     - Circuit breaker: Resilience4j configured? State explicitly
+       "not configured — no dependency present" if so.
+     - Behaviour if unavailable: halt / skip / degrade / item lost
+
+── SECTION 5 — DATABASE ────────────────────────────────────────────────
+   For wdp.chbk_outbox_row (write, own):
+     - Purpose and lifecycle in this component
+     - Key columns used in the duplicate-check SELECT
+     - Every column written, with source field (see GAP 13)
+     - Every column NOT written (confirm list)
+     - Whether the SELECT (duplicate check) and INSERT are in the same
+       transaction
+     - Transaction manager used (@Primary wdpTransactionManager?
+       separate? REQUIRES_NEW?)
+
+   For wdp.chbk_outbox_row (read, duplicate check):
+     - Same table — how the SELECT is constructed
+     - Whether any row-level lock (SELECT FOR UPDATE) is used (likely
+       not — confirm)
+
+   Spring Batch metadata tables: see GAP 5.
+
+   Confirm explicitly: no other database reads, no other database writes
+   occur in this component.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ────────────────────────────
+   Evaluate each standard. Output: COMPLIES / DEVIATES / NOT APPLICABLE,
+   with evidence.
+
+     DEC-001 — Transactional outbox
+       Expected: COMPLIES. Confirm wdp.chbk_outbox_row used as outbox;
+       outbox write is sole domain write; same transaction semantics.
+
+     DEC-003 — Kafka partition key = merchantId
+       Expected: NOT APPLICABLE. Confirm no active Kafka producer;
+       Kafka deps staged but unused.
+
+     DEC-004 — PAN encryption before persistence
+       Expected: COMPLIES. Confirm encryption at step 8; clear PAN
+       never written anywhere.
+
+     DEC-005 — Kafka offset manual commit after processing
+       Expected: NOT APPLICABLE. Confirm no Kafka consumer.
+
+     DEC-019 — Clear PAN on any persistent store
+       Expected: COMPLIES (no clear PAN written). Confirm.
+
+     DEC-020 — Full at-least-once idempotency
+       Expected: PARTIAL. Confirm duplicate check protects non-RECALL
+       items; confirm gap on RECALL; confirm crash-window gap between
+       poll and write; confirm null-return path creates no audit record.
+
+── SECTION 7 — SCALING AND DEPLOYMENT ──────────────────────────────────
+   - Kubernetes resource type (Deployment confirmed)
+   - Replica count — exact value or placeholder, state which, and which
+     variable
+   - Memory limit and request (confirm 2048Mi / 256Mi)
+   - CPU limit and request (expected: not set — confirm)
+   - HPA — expected absent
+   - Rolling update strategy (maxSurge, maxUnavailable, minReadySeconds)
+   - PodDisruptionBudget — expected absent
+   - Topology spread — expected not configured
+   - Observability — OTel Java agent, Actuator, Logstash — confirm all
+   - Liveness / readiness / startup probes — see GAP 9
+   - Ports exposed (8082 confirmed)
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ─────────────────────────────
+   - Commented-out code blocks (merchant-transaction-service, PAB amount
+     calc, PreArbDetail call site at BatchItemProcessor)
+   - Unused POM dependencies (spring-kafka, kafka-clients,
+     aws-msk-iam-auth) — confirm unreachable
+   - Dead config (apiLogUrl, transactionUrl, prearbDetailUrl,
+     prearbResponseDetailUrl) — confirm configured but never called
+   - Feature flags active in production — exact flag names and behaviour
+   - TODO / FIXME references in source (list file:line and text)
+   - Stub implementations returning fixed responses
+   - Properties configured but never read (search for @Value or
+     application.yaml keys that don't resolve to any injection point)
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ───────────────────────────────────
+   For EACH of sections 1 through 8 above, state:
+     - Confidence: High / Medium / Low
+     - Basis: direct source reading / inferred from pattern / not
+       determinable from source alone
+
+═══════════════════════════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════════════════════════
+
+- Cite file paths and line ranges for every concrete claim.
+- State "not determinable from source" for any item the code does not
+  reveal — do not guess.
+- Use plain Markdown. No code blocks in the report except where quoting
+  a short annotation or config value.
+- No narrative preamble. Start at Section 1.
+- Target length: focus on correctness over completeness. If a section
+  confirms the existing documentation, a one-paragraph "still accurate —
+  file:lines" is acceptable.
+- If you find yourself about to restate something exactly as the
+  reference document already states it, replace that prose with
+  "Document accurate — <file>:<lines>". Do not restate verbatim.
+
+
+━━━ PHASE 2 — Build component file ━━━
+
+After I paste the Claude Code report, produce:
+
+1. COMPLETE COMPONENT FILE
+   Using WDP-COMP-TEMPLATE.md as the structure.
+   Apply only the type blocks that apply — omit
+   the rest entirely.
+
+   For the Internal Processing Flow section:
+   Draw the Mermaid flowchart using the step
+   sequence, decision points, branch conditions,
+   skip paths, and failure paths from the report.
+   Every decision node must show all branch
+   outcomes. Every failure path must be shown as
+   a distinct diagram path — not described in
+   prose below the diagram.
+
+   Architecture level only — no code, classes,
+   or config values. Where Claude Code says
+   something is not visible or not implemented,
+   state that explicitly — do not fill gaps with
+   assumptions. Give me downloadable markdown file to upload to the project folder to replace 
+   existing component file
+
+
+━━━ PHASE 3 — Build component file ━━━
+
+At the end of Phase 2, produce a new Pending Entry for WDP-CHANGE-LOG.md using the template at the bottom of that file. Output the entry as a plain markdown block inline in the chat — do not produce a downloadable file and do not attempt to update the uploaded change log. I maintain the change log locally and will paste the entry in myself.
+
+Include all changes related to below files in change log update text
+
+1. WDP-KAFKA.md UPDATE
+   Exact rows to add or update in sections 3
+   and 4. State explicitly if no Kafka
+   involvement.
+
+2. WDP-DB.md UPDATE
+   Exact rows to add or update in section 2.
+   Flag any new shared table risk immediately.
+
+3. DEVIATION FLAGS
+   Every confirmed deviation from DEC-001, 003,
+   004, 005, 019, 020 with the DEC reference
+   and severity: 🔴 HIGH / 🟡 MEDIUM / 🟢 LOW
+
+4. REMAINING GAPS
+   Anything Claude Code could not determine.
+   For each gap state whether it needs:
+     A follow-up Claude Code question — give
+     me the exact question to ask
+     An architect decision
+     Environment config or team confirmation

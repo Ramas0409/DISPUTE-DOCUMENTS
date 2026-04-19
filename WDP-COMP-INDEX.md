@@ -517,15 +517,19 @@ questionnaire, then stores via DocumentManagementService (S3 + DynamoDB).
 
 **41 — ThirdPartyNotificationConsumer**
 Consumes external-request-events and delivers dispute event notifications to
-SignifyD and JustAI via REST API. Applies own filtering to determine which
-events require third-party notification. After receiving notification those
-systems call back ChargebackService for dispute details.
+Signifyd via REST API. Applies own filtering to determine which events require
+third-party notification. After receiving notification Signifyd calls back
+ChargebackService for dispute details. ⚠️ JustAI is planned — no JustAI
+reference exists anywhere in the current codebase. Signifyd is the sole live
+vendor. Confirmed from WDP-INTEGRATIONS.md v2.0.
 
 **42 — BENConsumer**
 Consumes external-request-events and delivers dispute lifecycle notifications
-to BEN merchant notification platform via webhook. Merchants receive
-notifications via BEN and call back ChargebackService for dispute details
-and actions.
+to BEN merchant notification platform via Kafka publish to a BEN-owned MSK
+cluster (separate SASL/JAAS config from WDP MSK). ⚠️ There is no REST or
+webhook call to BEN — delivery is Kafka-only. Merchants receive notifications
+via BEN and call back ChargebackService for dispute details and actions.
+Confirmed from WDP-INTEGRATIONS.md v2.0.
 
 **43 — CoreNotificationConsumer**
 Consumes core-request-events and writes dispute case and occurrence records

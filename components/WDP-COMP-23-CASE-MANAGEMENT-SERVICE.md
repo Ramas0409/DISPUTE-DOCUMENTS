@@ -310,11 +310,11 @@ flowchart TD
 | Decision | Reference | Status |
 |---|---|---|
 | Single service owns the case record — authoritative source for all platforms | DEC-PLACEHOLDER → raise when WDP-DECISIONS.md rebuilt | Confirmed |
-| Kafka publish is synchronous and within the application unit of work — failure rolls back DB | DEC-001 non-compliant | ⚠️ Confirmed deviation |
-| Partition key is `caseNumber`, not `merchantId` | DEC-003 deviation | ⚠️ Confirmed deviation |
-| Clear PAN written to persistent storage on standard case creation | DEC-004 violation | ⚠️ Confirmed deviation |
-| No Resilience4j on any outbound dependency | DEC-014 non-compliant | ⚠️ Confirmed deviation |
-| No idempotency guard for case creation | Platform risk — raise ADR | ⚠️ Confirmed gap |
+| Kafka publish is synchronous and within the application unit of work — failure rolls back DB | DEC-001 non-compliant | ⚠️ Confirmed deviation — deviation map in WDP-DECISIONS.md v2.0 |
+| Partition key is `caseNumber`, not `merchantId` | DEC-003 deviation | ⚠️ Confirmed deviation — deviation map in WDP-DECISIONS.md v2.0 |
+| Clear PAN written to persistent storage on standard case creation | DEC-004 violation → formally recorded as DEC-019 in WDP-DECISIONS.md v2.0 | ⚠️ Accepted risk — see DEC-019 |
+| No Resilience4j on any outbound dependency | DEC-014 ⛔ VOID — confirmed absent platform-wide | ⚠️ Accepted platform condition — see WDP-DECISIONS.md v2.0 |
+| No idempotency guard for case creation | Formally recorded as DEC-020 in WDP-DECISIONS.md v2.0 | ⚠️ Accepted risk — see DEC-020 |
 
 ---
 
@@ -637,8 +637,8 @@ Throws `BusinessValidationException` (400) if any condition fails.
 | **Actual replica count in production** | XL Deploy variable — not in source | Environment config or ops team confirmation |
 | **Actual value of `kafka_retry_count`** | Configurable — value is environment secret | Environment config confirmation |
 | **Full field inventory of UpdateCaseRequest nested objects** | `Transaction`, `ActionDetails`, `Merchant` sub-types are large; Copilot flagged Medium confidence | Follow-up Copilot question: *"List every field in `UpdateCaseRequest` and all nested objects (`ActionRequest`, `Transaction`, `Merchant`) — field name, type, and required/optional."* |
-| **DEC-004 formal ADR** | Clear PAN stored on case creation — confirmed violation, no existing ADR | Architect decision required — raise formal ADR when WDP-DECISIONS.md is rebuilt. Assess remediation timeline. |
-| **No idempotency ADR** | Confirmed absent — no deduplication on case creation | Architect decision required — assess risk and whether unique constraint or deduplication layer is needed. |
+| **DEC-019 — Clear PAN on case creation** | Formally recorded in WDP-DECISIONS.md v2.0 as Accepted Risk (DEC-019). | Remediation timeline still TBC — confirm with team. |
+| **DEC-020 — No idempotency on case creation** | Formally recorded in WDP-DECISIONS.md v2.0 as Accepted Risk (DEC-020). | Assess whether DB unique constraint is needed — confirm with team. |
 | **Cross-datasource change-log write** | `wdp.dispute_event_change_log` written in separate transaction from NAP case save | Team confirmation — is this intentional? If audit-critical, this is a data integrity gap. |
 
 ---

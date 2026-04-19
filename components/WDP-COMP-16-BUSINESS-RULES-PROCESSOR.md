@@ -1,25 +1,25 @@
 # WDP-COMP-16-BUSINESS-RULES-PROCESSOR.md
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: gcp-business-rules-processor using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 1.1 | April 2026*
+*Source: gcp-business-rules-processor | Audit basis: direct source read 2026-04-18 | Architect-confirmed: PENDING*
 
 ---
 
-> ⚠️ **IMPORTANT FRAMING NOTE — READ BEFORE USING THIS FILE**
+> ⚠️ **FRAMING NOTE — READ BEFORE USING THIS FILE**
 >
-> The platform knowledge base (WDP-ARCHITECTURE-v1-ARCHIVED.md, WDP-DECISIONS.md,
-> WDP-KAFKA.md) previously described several features of this component as
+> Earlier platform documents (WDP-ARCHITECTURE v1, pre-rebuild WDP-DECISIONS,
+> pre-rebuild WDP-KAFKA) described several features of this component as
 > "current" or "planned":
 > — BRE named step checkpointing (VALIDATE, ENRICH, ATTACH_ISSUER_DOC)
 > — Transactional outbox for outgoing-events publish
 > — BREOutboxEvent payload type published by COMP-12
 > — `source` field routing to different processing paths
 >
-> **None of these exist in the current codebase.** This file documents what is
-> actually implemented in source as of 2026-04-07. The architectural features
-> above appear to be aspirational design, future planned work, or a prior
-> version of this component. They are explicitly marked NOT IMPLEMENTED
-> throughout this file. The knowledge base must be updated to reflect reality.
+> **None of these exist in the current codebase.** This file documents what
+> is actually implemented in source as of the 2026-04-18 audit. The
+> architectural features above are aspirational design, future planned
+> work, or a prior version. They are marked NOT IMPLEMENTED throughout.
+> DEC-011 and DEC-014 are formally VOID in WDP-DECISIONS.md v2.0.
 
 ---
 
@@ -31,11 +31,13 @@
 
 | Field | Value |
 |---|---|
-| **Name** | `BusinessRulesProcessor` |
-| **Type** | Kafka Consumer + Kafka Producer + REST API (admin/testing endpoint) |
+| **Name** | `BusinessRulesProcessor` (BRP) |
+| **Type** | Kafka Consumer + Kafka Producer + REST API (admin/testing) |
 | **Artefact** | `com.wp.wdp:business-rules-processor:2.1.1` |
 | **Repository** | `gcp-business-rules-processor` |
 | **Runtime** | Spring Boot 3.5.7 / Java 17 |
+| **Listening port** | 8082 |
+| **Servlet context path** | `/merchant/gcp/business-rules-processor` |
 | **Status** | ✅ Production |
 | **Doc status** | 📝 DRAFT |
 | **Sections present** | Core \| Block A (REST — admin only) \| Block B (Kafka Consumer) \| Block C (Kafka Producer) |
@@ -46,65 +48,84 @@
 
 **What it does**
 
-The BusinessRulesProcessor (BRP) is the business rules execution engine for
-the Worldpay Dispute Platform. It consumes dispute events from the
-`business-rules` Kafka topic, evaluates configured business rules against live
-case and action data read directly from Aurora PostgreSQL, executes the matched
-rule's actions by calling multiple downstream REST services, and publishes the
-resulting outgoing event to the `outgoing-events` Kafka topic. It is the
-central orchestrator of dispute lifecycle state changes for cases that have
-reached the rule-evaluation stage.
+The BusinessRulesProcessor (BRP) is the business rules **execution engine**
+for the Worldpay Dispute Platform. It consumes dispute events from the
+`business-rules` Kafka topic, evaluates configured rules against live case
+and action data read directly from Aurora PostgreSQL, executes the matched
+rule's actions by calling multiple downstream REST services, and publishes
+the resulting outgoing event to the `outgoing-events` Kafka topic. It is
+the central orchestrator of dispute lifecycle state changes for cases that
+have reached the rule-evaluation stage.
 
-BRP operates on two parallel platform paths: the UK path (platform = NAP,
-reading from the `nap` PostgreSQL schema) and the US path (platform = CORE,
-VAP, or PIN, reading from the `wdp` schema). The two paths have structurally
-identical logic but target different database schemas and slightly different
-REST service calls.
+BRP operates on two parallel platform paths with structurally similar but
+not identical logic:
+- **UK path** — `platform = NAP` → reads the `nap` schema via the
+  `ukDataSource` / `ukTransactionManager`.
+- **US path** — `platform ∈ {CORE, VAP, PIN}` → reads the `wdp` schema
+  via the `wdpdataSource` (Primary) / `wdpTransactionManager`.
 
-Business rules are fetched fresh from PostgreSQL on every message — there is
-no startup cache. Rules are evaluated in `sort_order` ascending; the first
-matching rule wins. Rule chaining allows a matched rule to trigger evaluation
-of a secondary rule group, accumulating actions across groups. All case and
-action state changes resulting from rule execution are applied via REST calls
-to downstream services — BRP writes nothing to case or action tables directly.
+The US path carries two US-only action types (`US_OUTGOING_PRE_ARB`,
+`MERCHANT_ACCEPT`) and a US-only recursive fallback rule-group
+(`DOCUMENT_ATTACHED_TO_OPEN_CASE`) that has no UK equivalent.
 
-The only direct database writes BRP makes are audit log entries recording
-which rules were evaluated (matched and not matched) for each message.
+Business rules are fetched fresh from PostgreSQL on every message — there
+is no startup cache. Rules are evaluated in `sort_order` ascending; all
+criteria within a rule must match (AND); the first matching rule wins.
+Rule chaining via the matched rule's `applyRuleGroup` field allows a match
+to trigger evaluation of a secondary rule group, accumulating actions
+across groups. All case and action state changes resulting from rule
+execution are applied via REST calls to downstream services — BRP writes
+nothing to case or action tables directly.
+
+The only direct database writes BRP performs are audit log entries
+(`nap.br_case_audit_log`, `wdp.br_case_audit_log`) recording which rules
+were evaluated (both matched and not-matched) per message.
+
+BRP also exposes a single admin/testing REST endpoint — `PUT /event` —
+that duplicates the Kafka consumer path. It is not a production ingress
+path.
 
 **What it does NOT do**
 
-- Does NOT implement BRE step checkpointing (DEC-011). No named processing
-  steps (VALIDATE, ENRICH, ATTACH_ISSUER_DOC) exist as processing steps in
-  the codebase. `ATTACH_ISSUER_DOC` exists only as an action type enum value.
-  On Kafka message redelivery, all processing restarts from the beginning.
-
-- Does NOT use the transactional outbox pattern (DEC-001). Both Kafka publishes
-  (`outgoing-events`, `internal-integration-events`) are direct synchronous
-  calls. If the Kafka broker is unavailable, events are permanently lost.
-
-- Does NOT call BusinessRulesService (COMP-31 / wdp-business-rules-service)
-  for rule retrieval. All rule reads are direct JPA queries to the `nap.rules`
-  or `wdp.rules` tables. The `rules.audit-log-uri` config property points to
-  that service but is never called in any service implementation.
-
-- Does NOT perform idempotency checks. The `idempotencyId` field extracted
-  from Kafka headers is logged and passed through to the outgoing event —
-  it is never checked against a processed-messages store.
-
+- Does NOT implement BRE step checkpointing. **DEC-011 ⛔ VOID.** No named
+  processing steps (VALIDATE, ENRICH, ATTACH_ISSUER_DOC) exist as
+  processing steps. `ATTACH_ISSUER_DOC` exists only as an action type
+  enum value. In practice, redelivery cannot occur anyway because the
+  offset is committed before processing begins.
+- Does NOT use the transactional outbox pattern (DEC-001). Both Kafka
+  publishes (`outgoing-events`, `internal-integration-events`) are direct
+  synchronous calls. If the Kafka broker is unavailable, events are
+  permanently lost.
+- Does NOT call BusinessRulesService (COMP-31) for rule retrieval.
+  **DEC-017** confirms all rule reads are direct JPA queries to
+  `nap.rules` / `wdp.rules`. The `rules.audit-log-url` config property
+  points to that service but is never read by any component in this
+  codebase.
+- Does NOT perform idempotency checks. The `idempotency-key` Kafka header
+  is logged and passed through to the outgoing event — it is never
+  checked against a processed-messages store.
 - Does NOT persist any error state to a database error table. The
-  `ErrorLogService` designed for this purpose is commented out in the codebase.
-  Errors surface as case action status `ERROR` with an owner of `WPAYOPS`
-  and a SNOTE note added via the Notes Service REST call.
-
-- Does NOT retry failed messages. All exceptions in the Kafka consumer listener
-  are caught and logged. No DLQ, no retry, no halt — the message is silently
-  dropped.
-
-- Does NOT apply any circuit breaker or timeout on any downstream dependency.
-  Resilience4j is not present in this component.
-
-- Does NOT route processing based on the `source` field of the inbound event
-  (BRISUP, BRMRUP, BRMCUP). The `source` field is logged only.
+  `ErrorLogService` designed for this purpose is absent from the source
+  tree — the autowire and call sites are commented out and the class
+  itself does not exist. Errors surface as case action status `ERROR`
+  with an owner of `WPAYOPS` and a SNOTE note added via the Notes Service
+  REST call.
+- Does NOT retry failed messages. All exceptions in the Kafka consumer
+  listener are caught and logged. No DLQ, no retry, no halt — the message
+  is silently dropped.
+- Does NOT apply any circuit breaker, connection timeout, or read timeout
+  on any downstream dependency. **DEC-014 ⛔ VOID** — Resilience4j is
+  absent from this component. `spring-retry` and `spring-aspects` are
+  declared in `pom.xml` but no `@Retryable` or `RetryTemplate` is wired
+  anywhere.
+- Does NOT route processing based on the `source` field of the inbound
+  event (BRISUP, BRMRUP, BRMCUP). The `source` field is logged only.
+- Does NOT propagate a populated `v-correlation-id` header to downstream
+  REST calls. The header is read from MDC, but no filter or interceptor
+  populates MDC from inbound Kafka headers — so the header value is
+  effectively `null` for all outbound REST calls in production.
+- Does NOT handle `LATAM` platform messages. `LATAM` is defined in
+  constants but has no routing branch — the message is silently dropped.
 
 ---
 
@@ -112,60 +133,90 @@ which rules were evaluated (matched and not matched) for each message.
 
 ```mermaid
 flowchart TD
-    IN["Kafka message received\nKafkaConsumer.onMessage()\nbusiness-rules topic\nBusinessRuleEvent deserialized from JSON\nHeaders: RECEIVED_KEY, OFFSET, RECEIVED_PARTITION, idempotency-key"]
-    LOG_SOURCE["Source field logged only\nlog.info - source value only\nBRISUP / BRMRUP / BRMCUP not used for routing"]
-    ACK["DEC-005 VIOLATION\nKafka offset committed BEFORE processing\nacknowledgment.acknowledge() on line 37\nprocessRulesEvent() called on line 40\nAt-most-once delivery - pod crash = message lost"]
+    %% Entry points
+    K_IN["Kafka message received<br/>@KafkaListener on business-rules topic<br/>KafkaConsumer.onMessage()<br/>Headers: RECEIVED_KEY, OFFSET,<br/>RECEIVED_PARTITION, idempotency-key, event-timestamp"]
+    R_IN["PUT /event<br/>BusinessRulesProcessorController<br/>JWT Bearer auth<br/>No ACK, no idempotency"]
+    LOG_SOURCE["Log source field only<br/>BRISUP / BRMRUP / BRMCUP<br/>not used for routing"]
+    ACK["⚠️ DEC-005 VIOLATION<br/>Kafka offset committed BEFORE processing<br/>acknowledgment.acknowledge() line 38<br/>processRulesEvent() line 41<br/>At-most-once — pod crash = message lost"]
+    ENTRY_REST["REST entry — no ACK<br/>calls processRulesEvent() directly"]
+
+    %% Platform routing
     DEC_PLATFORM{{"platform field?"}}
-    DROP_PLATFORM["Silent return\nNo processing, no outgoing event\nLATAM also silently dropped"]
-    UK["UK path\nNAPRulesProcessServiceImpl\nReads from nap schema"]
-    US["US path\nUSRulesProcessServiceImpl\nReads from wdp schema"]
-    IDP["IDP token fetch - lazy\nKafkaTokenHolder.getToken()\nGET wdp-idp-token-service\nBearer token in ThreadLocal\nNo timeout / No retry / No circuit breaker"]
+    DROP_PLATFORM["Silent return<br/>No processing, no outgoing event<br/>LATAM and unknown platforms dropped"]
+
+    %% Common pipeline up to case load
+    IDP["IDP token fetch — lazy<br/>First REST call triggers<br/>KafkaTokenHolder.getToken()<br/>GET wdp-idp-token-service<br/>Bearer token in ThreadLocal<br/>No timeout / No retry / No circuit breaker"]
     DEC_IDP{{"IDP call success?"}}
-    FAIL_IDP["WebServiceException propagates\ncaseDetails remains null\nNo outgoing event in finally"]
-    DB_CASE["Case + Action load - DB read\nnap.case or wdp.CASE via JPA\nEager load all actions\nFilter: caseNumber + platform + updatedTimestamp"]
+    FAIL_IDP["BusinessRulesException SYSTEM_ERROR<br/>propagates to outer catch<br/>caseDetails remains null<br/>finally runs — outgoing event skipped"]
+    DB_CASE["Case + Action load — DB read<br/>UK: nap.case + nap.ACTION via ukDataSource<br/>US: wdp.CASE + wdp.ACTION via wdpdataSource<br/>Eager load all actions<br/>Filter: caseNumber + platform + updatedTimestamp"]
     DEC_CASE{{"Case found?"}}
-    FAIL_CASE["BadRequestException caught\ncaseDetails = null\nProcessing continues to finally\nOutgoing event skipped in finally"]
-    ACTION_DERIVE["Action detail extraction - in memory\ncurrentActionDetails at actionSequence\npreviousActionDetails at actionSequence minus 1\nlatestActionDetails at highest sequence number"]
-    DEC_STAGE{{"disputeStage non-blank AND\nmismatches currentAction.caseStage?"}}
-    FAIL_STAGE["BadRequestException thrown\nCaught by outer catch\nOutgoing event attempted in finally"]
-    DEC_MIG{{"migrationStatus == y?"}}
-    MIG_UPDATE["REST PUT case-actions-service\nSet action DRAFT to OPEN\nExit processBusinessRules\nOutgoing event still sent in finally"]
-    DEC_FCMG{{"actionType == FCMG AND\nprior FCMG without RCAL?"}}
-    FCMG_UPDATE["REST PUT case-management-service\nSet queue to WEXQUE\nExit processBusinessRules\nOutgoing event still sent in finally"]
-    DB_RULES["Rule group fetch - DB read\nnap.rules or wdp.rules via JPA\nWHERE group_name = startRuleGroup AND is_enabled = true\nORDER BY sort_order ASC\nFresh query per message - no cache"]
+    FAIL_CASE["BadRequestException caught<br/>caseDetails = null<br/>Processing continues to finally<br/>Outgoing event skipped"]
+    ACTION_DERIVE["Action detail extraction — in memory<br/>currentActionDetails @ actionSequence<br/>previousActionDetails @ sequence-1<br/>latestActionDetails @ max sequence"]
+    DEC_STAGE{{"disputeStage non-blank AND<br/>mismatches currentAction.caseStage?"}}
+    FAIL_STAGE["BadRequestException thrown<br/>caught by outer catch<br/>Outgoing event attempted in finally"]
+    DEC_MIG{{"migrationStatus == 'y'?"}}
+    MIG_UPDATE["REST PUT case-actions-service<br/>Set action DRAFT to OPEN<br/>Exit processBusinessRules<br/>Outgoing event still sent in finally"]
+
+    %% FCHG/RCAL guard — CORRECTED from audit
+    DEC_FCHG{{"actionType == FCHG AND<br/>prior FCHG without paired RCAL?"}}
+    FCHG_FAIL["updateCase called (NAP line 207)<br/>Case update via REST<br/>Exit processBusinessRules<br/>Outgoing event still sent in finally<br/>(no WEXQUE claim — unverified)"]
+
+    %% Rules
+    DB_RULES["Rule group fetch — DB read<br/>UK: nap.rules / US: wdp.rules<br/>WHERE rule_group_name = startRuleGroup<br/>AND active = true ORDER BY sort_order ASC<br/>Fresh query per message — no cache"]
     DEC_RULES_FOUND{{"Rules found?"}}
-    FAIL_NO_RULES["REST PUT case-actions-service to OPEN\nBadRequestException thrown\nOutgoing event attempted in finally"]
-    EVAL["Rule criteria evaluation - in memory\nIterate rules in sort_order ascending\nAll criteria per rule must pass - AND logic\nFirst match wins - loop breaks\nAudit list built for matched and not-matched rules"]
+    FAIL_NO_RULES["REST PUT action to OPEN<br/>BadRequestException thrown<br/>Outgoing event attempted in finally"]
+    EVAL["Rule criteria evaluation — in memory<br/>Iterate rules in sort_order ASC<br/>AND logic within rule — all criteria must match<br/>First-match-wins — loop breaks<br/>Audit list built for matched + not-matched"]
     DEC_MATCH{{"Rule matched?"}}
     DEC_ISSUER_GRP{{"group == ISSUER_DOCUMENTS?"}}
-    NO_MATCH_FALLBACK["Recursive retry\nwith CASE_RESPONSE group"]
-    NO_MATCH_OTHER["REST PUT action to OPEN\nSave audit log\nBadRequestException thrown\nOutgoing event attempted in finally"]
+    NO_MATCH_FALLBACK["Recursive retry<br/>with CASE_RESPONSE group"]
+    NO_MATCH_OTHER["REST PUT action to OPEN<br/>Save audit log<br/>BadRequestException thrown<br/>Outgoing event attempted in finally"]
     CHAIN{{"applyRuleGroup non-blank?"}}
-    CHAIN_NEXT["Fetch next rule group\nAccumulate actions via mapActions\nLoop continues"]
-    DEC_ISSUER_DOC{{"pend action with fieldValue1 AND\ncaseNetwork in VISA, MASTERCARD, MAESTRO?"}}
-    ISSUER_DOC["POST document-management-service\nCheck or add issuer documents\nNo timeout / No retry / No circuit breaker"]
-    DEC_ISSUER_FAIL{{"Issuer doc call success?"}}
-    ISSUER_SWALLOW["Exception caught and swallowed\nLogged as Failed - Issuer Document API\nProcessing continues with null response"]
-    AUDIT_LOG["Audit log write - JPA\nnap.br_case_audit_log or wdp.br_case_audit_log\nAll evaluated rules written - matched and not-matched\nStandalone JPA transaction\nIf fails: updateErrorStatus called then re-thrown"]
-    DEC_SKIP{{"action.skipToProcess non-blank AND\nall other action fields blank?"}}
-    SKIP_EXIT["REST PUT action to OPEN\nExit processRuleActions\nOutgoing event still sent in finally"]
-    RULE_ACTIONS["Rule action execution - multiple REST calls\nAdd action: POST case-actions-service\nQuestionnaire: PUT questionnaire-service\nDocument update: PUT document-management-service\nContest: POST contest-service\nAccept: POST accept-service - US only"]
-    CASE_UPDATE["Case + action update - REST\nFresh DB read of case\nPUT case-actions-service - action status and owner\nPUT case-management-service - case status and pend dates\nFailures on update: swallowed"]
-    DEC_DMT001{{"sendMerchantCommunication == DMT001?"}}
-    DMT001_PUB["Publish ActionEvent\ninternal-integration-events topic\nSynchronous blocking get\ncaseNumber as message key\nOn failure: logs + SNOTE via REST - NOT re-thrown"]
-    FINALLY["finally block entered\nalways - even on exception"]
-    DEC_OUTGOING{{"caseDetails != null AND\ncurrentActionDetails != null?"}}
-    NO_OUTGOING["No outgoing event published\nCase load had failed"]
-    MAP_EVENT["Build OutgoingEvent\nBusinessRuleEvent fields passed through\nDB-loaded entity fields enriched\nactionStatus reflects state at initial load time\nnot post-rule-execution state"]
-    PUB_OUTGOING["Publish OutgoingEvent\noutgoing-events topic\nSynchronous blocking get\ncaseNumber as message key\nHeaders: idempotency-key and event-timestamp forwarded\nOn failure: logs + SNOTE via NotesService - swallowed"]
-    IDP_CLEAR["IDP token cleanup\ntokenService.clear\nRemoves ThreadLocal token"]
+    CHAIN_NEXT["Fetch next rule group<br/>Accumulate actions via mapActions<br/>Loop continues"]
 
-    IN --> LOG_SOURCE --> ACK --> DEC_PLATFORM
-    DEC_PLATFORM -->|"NAP"| UK
-    DEC_PLATFORM -->|"CORE / VAP / PIN"| US
-    DEC_PLATFORM -->|"anything else"| DROP_PLATFORM
-    UK --> IDP
-    US --> IDP
+    %% Issuer doc
+    DEC_ISSUER_DOC{{"Pend action with fieldValue1 AND<br/>caseNetwork in VISA/MASTERCARD/MAESTRO?"}}
+    ISSUER_DOC["POST document-management-service<br/>Check / add issuer documents<br/>No timeout / retry / circuit breaker"]
+    DEC_ISSUER_FAIL{{"Issuer doc call success?"}}
+    ISSUER_SWALLOW["Exception caught and swallowed<br/>Logged 'Failed: Issuer Document API'<br/>Processing continues with null response"]
+
+    %% US-only DOCUMENT_ATTACHED_TO_OPEN_CASE fallback
+    DEC_DOC_ATTACHED{{"US only:<br/>issuerDocAddedToCase == true AND<br/>applyRuleGroup blank?"}}
+    DOC_ATTACHED_FALLBACK["US only — recursive evaluate<br/>group DOCUMENT_ATTACHED_TO_OPEN_CASE<br/>NAP path has no equivalent"]
+
+    %% Audit + actions
+    AUDIT_LOG["Audit log write — JPA<br/>UK: nap.br_case_audit_log<br/>US: wdp.br_case_audit_log<br/>All evaluated rules written (matched + not-matched)<br/>Standalone Spring-Data JPA transaction<br/>No @Transactional on save<br/>On failure: exception re-thrown to outer catch"]
+    DEC_SKIP{{"action.skipToProcess non-blank AND<br/>all other action fields blank?"}}
+    SKIP_EXIT["REST PUT action to OPEN<br/>Exit processRuleActions<br/>Outgoing event still sent in finally"]
+    US_PRE_UPDATE["US only — updateCaseAction isActionUpdate=true<br/>(pre-action-write case/action update)"]
+    RULE_ACTIONS["Rule action execution — multiple REST calls<br/>Add: POST case-actions-service<br/>Questionnaire: PUT questionnaire-service<br/>Document update: PUT document-management-service<br/>Contest: POST contest-service<br/>Accept: POST accept-service<br/>US only: US_OUTGOING_PRE_ARB, MERCHANT_ACCEPT"]
+    CASE_UPDATE["Case + action update — REST<br/>PUT case-actions-service (status, owner)<br/>PUT case-management-service (status, pend dates)<br/>UK: single call / US: second updateCaseAction isActionUpdate=false<br/>Failures on update: swallowed"]
+
+    %% DMT001 conditional publish
+    DEC_DMT001{{"sendMerchantCommunication == DMT001?"}}
+    DMT001_PUB["Publish ActionEvent<br/>internal-integration-events topic<br/>Synchronous blocking .get()<br/>caseNumber as message key<br/>On failure: SNOTE via REST — swallowed"]
+
+    %% Finally
+    FINALLY["finally block entered — always"]
+    DEC_OUTGOING{{"caseDetails != null AND<br/>currentActionDetails != null?"}}
+    NO_OUTGOING["No outgoing event published<br/>Case load had failed"]
+    MAP_EVENT["Build OutgoingEvent<br/>BusinessRuleEvent fields passed through<br/>DB-loaded entity fields enriched<br/>⚠️ actionStatus reflects initial-load state<br/>NOT post-rule-execution state"]
+    PUB_OUTGOING["Publish OutgoingEvent<br/>outgoing-events topic<br/>Synchronous blocking .get()<br/>caseNumber as message key<br/>Headers: idempotency-key + event-timestamp<br/>On failure: SNOTE via REST — swallowed"]
+
+    %% Token cleanup — UK vs US asymmetry
+    UK_IDP_CLEAR["UK: tokenService.clear()<br/>INSIDE finally block<br/>NAPRulesProcessServiceImpl line 157"]
+    US_IDP_CLEAR["US: tokenService.clear()<br/>OUTSIDE finally block<br/>USRulesProcessServiceImpl line 144<br/>🟡 ThreadLocal leak risk if finally throws"]
+
+    %% Edges
+    K_IN --> LOG_SOURCE
+    LOG_SOURCE --> ACK
+    ACK --> DEC_PLATFORM
+    R_IN --> ENTRY_REST
+    ENTRY_REST --> DEC_PLATFORM
+
+    DEC_PLATFORM -->|"NAP (UK)"| IDP
+    DEC_PLATFORM -->|"CORE / VAP / PIN (US)"| IDP
+    DEC_PLATFORM -->|"LATAM / unknown"| DROP_PLATFORM
+
     IDP --> DEC_IDP
     DEC_IDP -->|"fail"| FAIL_IDP
     DEC_IDP -->|"success"| DB_CASE
@@ -175,10 +226,10 @@ flowchart TD
     ACTION_DERIVE --> DEC_STAGE
     DEC_STAGE -->|"stage mismatch"| FAIL_STAGE
     DEC_STAGE -->|"match or blank"| DEC_MIG
-    DEC_MIG -->|"null or not y"| MIG_UPDATE
-    DEC_MIG -->|"y"| DEC_FCMG
-    DEC_FCMG -->|"unmatched FCMG"| FCMG_UPDATE
-    DEC_FCMG -->|"guard passed"| DB_RULES
+    DEC_MIG -->|"null or not 'y'"| MIG_UPDATE
+    DEC_MIG -->|"y"| DEC_FCHG
+    DEC_FCHG -->|"unpaired FCHG"| FCHG_FAIL
+    DEC_FCHG -->|"guard passed"| DB_RULES
     DB_RULES --> DEC_RULES_FOUND
     DEC_RULES_FOUND -->|"null or empty"| FAIL_NO_RULES
     DEC_RULES_FOUND -->|"found"| EVAL
@@ -190,79 +241,316 @@ flowchart TD
     DEC_MATCH -->|"match"| CHAIN
     CHAIN -->|"non-blank"| CHAIN_NEXT
     CHAIN_NEXT --> DB_RULES
-    CHAIN -->|"blank - chain ends"| DEC_ISSUER_DOC
+    CHAIN -->|"blank — chain ends"| DEC_ISSUER_DOC
+
     DEC_ISSUER_DOC -->|"condition met"| ISSUER_DOC
     ISSUER_DOC --> DEC_ISSUER_FAIL
     DEC_ISSUER_FAIL -->|"fail"| ISSUER_SWALLOW
-    DEC_ISSUER_FAIL -->|"success"| AUDIT_LOG
-    ISSUER_SWALLOW --> AUDIT_LOG
-    DEC_ISSUER_DOC -->|"condition not met"| AUDIT_LOG
+    DEC_ISSUER_FAIL -->|"success"| DEC_DOC_ATTACHED
+    ISSUER_SWALLOW --> DEC_DOC_ATTACHED
+    DEC_ISSUER_DOC -->|"condition not met"| DEC_DOC_ATTACHED
+    DEC_DOC_ATTACHED -->|"US yes"| DOC_ATTACHED_FALLBACK
+    DOC_ATTACHED_FALLBACK --> AUDIT_LOG
+    DEC_DOC_ATTACHED -->|"UK or US no"| AUDIT_LOG
+
     AUDIT_LOG --> DEC_SKIP
     DEC_SKIP -->|"skip-to-process"| SKIP_EXIT
-    DEC_SKIP -->|"normal"| RULE_ACTIONS
+    DEC_SKIP -->|"normal — US"| US_PRE_UPDATE
+    DEC_SKIP -->|"normal — UK"| RULE_ACTIONS
+    US_PRE_UPDATE --> RULE_ACTIONS
     RULE_ACTIONS --> CASE_UPDATE
     CASE_UPDATE --> DEC_DMT001
     DEC_DMT001 -->|"DMT001"| DMT001_PUB
     DEC_DMT001 -->|"other"| FINALLY
     DMT001_PUB --> FINALLY
+
     FAIL_IDP --> FINALLY
     FAIL_CASE --> FINALLY
     FAIL_STAGE --> FINALLY
     MIG_UPDATE --> FINALLY
-    FCMG_UPDATE --> FINALLY
+    FCHG_FAIL --> FINALLY
     FAIL_NO_RULES --> FINALLY
     NO_MATCH_OTHER --> FINALLY
     SKIP_EXIT --> FINALLY
+
     FINALLY --> DEC_OUTGOING
     DEC_OUTGOING -->|"either null"| NO_OUTGOING
     DEC_OUTGOING -->|"both non-null"| MAP_EVENT
     MAP_EVENT --> PUB_OUTGOING
-    PUB_OUTGOING --> IDP_CLEAR
-    NO_OUTGOING --> IDP_CLEAR
+
+    %% Token cleanup asymmetry
+    PUB_OUTGOING --> UK_IDP_CLEAR
+    PUB_OUTGOING --> US_IDP_CLEAR
+    NO_OUTGOING --> UK_IDP_CLEAR
+    NO_OUTGOING --> US_IDP_CLEAR
 ```
 
 **Flow notes**
 
-- **⚠️ Pre-ACK (DEC-005 violation):** The offset is committed on line 37 of `KafkaConsumer.java` before `processRulesEvent()` is called on line 40. At-most-once delivery. If the pod dies after the commit and before processing completes, the message is permanently lost.
-- **DEC-011 NOT implemented:** There are no named BRE steps, no checkpoint table, no checkpoint writes, and no checkpoint reads on redelivery. On redelivery, all processing restarts from the beginning. In practice, redelivery cannot occur because the offset is committed before processing.
-- **`source` field:** Present on the inbound event and logged. Not used for routing or branching anywhere in the flow. Values BRISUP, BRMRUP, BRMCUP are referenced only in upstream publisher code, not in this component.
-- **Finally block:** The `outgoing-events` publish always executes in a `finally` block — regardless of whether rules matched, whether actions succeeded, or whether exceptions were thrown. The only suppression condition is `caseDetails == null OR currentActionDetails == null`.
-- **`actionStatus` in outgoing event:** Reflects the action state at the time of the initial DB load (step: Case + Action load). The case/action REST updates happen after this load. The outgoing event may not reflect the final post-rule state.
+- **⚠️ Pre-ACK (DEC-005 violation):** The offset is committed on line 38
+  of `KafkaConsumer.java` before `processRulesEvent()` is called on line 41.
+  At-most-once delivery. If the pod dies after the commit and before
+  processing completes, the message is permanently lost.
+- **DEC-011 ⛔ VOID — not implemented:** There are no named BRE steps,
+  no checkpoint table, no checkpoint writes, and no checkpoint reads on
+  redelivery. On redelivery, all processing restarts from the beginning.
+  In practice, redelivery cannot occur because the offset is committed
+  before processing.
+- **FCHG / RCAL guard (corrected):** The guard checks for FirstChargeback
+  action types (`FCHG`) paired with a following RecAll (`RCAL`). When the
+  guard fails (unpaired FCHG), the UK code path calls `updateCase(...)` —
+  it does NOT route the case to a WEXQUE queue. Earlier documentation
+  using the label "FCMG" and the "Set queue to WEXQUE" behaviour was
+  incorrect.
+- **US-only recursive fallback:** When the issuer-doc check returns
+  `issuerDocAddedToCase=true` and the matched rule's `applyRuleGroup` is
+  blank, the US path recursively evaluates rules under
+  `DOCUMENT_ATTACHED_TO_OPEN_CASE`. The UK path has no equivalent branch.
+- **US-only action handling:** `US_OUTGOING_PRE_ARB` and `MERCHANT_ACCEPT`
+  action types are dispatched only on the US path. In addition, the US
+  path calls `updateCaseAction` twice per rule action — once before and
+  once after — whereas the UK path calls it once after.
+- **`source` field:** Present on the inbound event and logged. Not used
+  for routing or branching anywhere in the flow.
+- **Finally block:** The `outgoing-events` publish always executes in a
+  `finally` block — regardless of whether rules matched, whether actions
+  succeeded, or whether exceptions were thrown. The only suppression
+  condition is `caseDetails == null OR currentActionDetails == null`.
+- **`actionStatus` in outgoing event:** Reflects the action state at the
+  time of the initial DB load. The case/action REST updates happen after
+  this load. The outgoing event may not reflect the final post-rule state
+  that COMP-18 NotificationOrchestrator consumes.
+- **Token cleanup asymmetry:** UK clears the IDP token inside the finally
+  block (`NAPRulesProcessServiceImpl` line 157). US clears it outside the
+  finally block (`USRulesProcessServiceImpl` line 144). If anything in
+  the US finally block throws an unchecked exception that escapes the
+  inner try/catch, the ThreadLocal token leaks to the next message on
+  the same thread.
+
+---
+
+## Boundaries
+
+### Inbound Interfaces
+
+| Source | Protocol | Endpoint / Topic / Trigger | Payload |
+|---|---|---|---|
+| COMP-12 InboundDisputeEventScheduler (Scheduler4, `component=BUSINESS_RULES` rows) | Kafka | `business-rules` topic | `BusinessRuleEvent` |
+| COMP-15 EvidenceConsumer (WDP path, `isMultiDocPending=false`) | Kafka | `business-rules` topic | `BusinessRuleEvent` |
+| COMP-23 CaseManagementService (after material case writes) | Kafka | `business-rules` topic | `BusinessRuleEvent` |
+| COMP-24 CaseActionService (after action create/update) | Kafka | `business-rules` topic | `BusinessRuleEvent` |
+| COMP-25 NotesService (non-SNOTE writes only) | Kafka | `business-rules` topic | `BusinessRuleEvent` |
+| ⚠️ COMP-14 CaseCreationConsumer candidacy | Kafka | `business-rules` topic | Unverified — open question |
+| Admin / test caller | REST | `PUT /merchant/gcp/business-rules-processor/event` | `BusinessRuleEvent` |
+
+### Outbound Interfaces
+
+| Target | Protocol | Endpoint / Topic / Resource | Purpose | On failure |
+|---|---|---|---|---|
+| COMP-18 NotificationOrchestrator | Kafka | `outgoing-events` topic | Primary output — published in finally | Log + SNOTE via REST — swallowed |
+| COMP-39 NAPOutcomeProcessor; COMP-40 VisaResponseQuestionnaire | Kafka | `internal-integration-events` topic | DMT001-only publish | Log + SNOTE via REST — swallowed (`isErrorOccured` flag ignored by caller) |
+| IDP Token Service (wdp-idp-token-service) | REST GET | `/merchant/gcp/idp-token/token` | Bearer token for all downstream calls | `BusinessRulesException(SYSTEM_ERROR)` — propagates, outgoing event skipped |
+| Case Management Service (COMP-23) | REST PUT | `/merchant/gcp/case-management/{platform}/case/{caseNumber}` | Case status, pend dates, liability updates | Swallowed; SNOTE added |
+| Case Actions Service (COMP-24) | REST POST / PUT | `/merchant/gcp/case-actions/{platform}/case/{caseNumber}/internal-actions` + `.../action` | Add / update actions | POST failure: re-throws `BusinessRulesException`. PUT failure: swallowed |
+| Contest Service (COMP-20) | REST POST | `/merchant/gcp/contest/{platform}/case/{caseNumber}` | Pre-arb / reject / represent | 400: `updateErrorStatus` + re-throw. Other: re-throw |
+| Accept Service (COMP-19) | REST POST | `/merchant/gcp/accept/{platform}/case/{caseNumber}/accept` | AcceptFull / MerchantAccept (US) | Exception propagates uncaught to outer catch |
+| Questionnaire Service (COMP-26) | REST PUT | `/merchant/gcp/questionnaire/...` | Save questionnaire for pre-arb / represent / reject | Re-throw; `updateErrorStatus` called |
+| Document Management Service (COMP-37) | REST POST / PUT | `.../documents/{caseNumber}/issuerdoc` + `.../document/{caseNumber}/action/{actionSequence}` | Issuer-doc check; document update | Issuer-doc: swallowed. Update: re-throw + `updateErrorStatus` |
+| Notes Service (COMP-25) | REST POST | `/merchant/gcp/notes/{platform}/case/{caseNumber}` | Add SNOTE on error paths | Propagates; may be silently caught by caller |
+| Aurora PostgreSQL (UK — `nap` schema) | JDBC | `ukDataSource` / `ukEntityManagerFactory` / `ukTransactionManager` | Case + rule reads, audit log write | Exception re-thrown to outer catch — swallowed |
+| Aurora PostgreSQL (US — `wdp` schema) | JDBC | `wdpdataSource` (Primary) / `wdpEntityManagerFactory` / `wdpTransactionManager` | Case + rule reads, audit log write | Exception re-thrown to outer catch — swallowed |
+
+---
+
+## Database Ownership
+
+### Tables Owned (written by this component)
+
+| Schema.Table | Purpose | Key columns | Notes |
+|---|---|---|---|
+| `nap.br_case_audit_log` | Audit log of every rule evaluated (matched and not-matched) for each UK/NAP message | `id` (PK, seq `nap.br_case_audit_log_id_seq` allocationSize=1), `i_case`, `c_action_seq`, `rule_grp_name`, `rule_id`, `rule_name`, `is_valid`, `created_at` | No `@Transactional` on save — implicit Spring-Data JPA transaction per `saveAll`. No unique constraint — duplicate rows possible if DEC-005 is fixed without adding dedup |
+| `wdp.br_case_audit_log` | Same for US (CORE/VAP/PIN) messages | Same columns, sequence `wdp.br_case_audit_log_id_seq` allocationSize=1 | Same semantics as UK audit log |
+
+No outbox tables (`bre_orchestration_outbox`, `outgoing_event_outbox`,
+`notification_orchestration_outbox`) are read or written by this component.
+
+No database error table exists — `ErrorLogService` is absent from the
+source tree.
+
+### Tables Read (not owned by this component)
+
+| Schema.Table | Owned by | Why accessed |
+|---|---|---|
+| `nap.case` | COMP-23 CaseManagementService | Load full case entity for UK processing |
+| `nap.ACTION` | COMP-23 / COMP-24 | Eager-loaded with `nap.case` — all actions for the case |
+| `nap.rules` | COMP-31 BusinessRulesService | Fetch active rules by group name (fresh per message) |
+| `nap.rule_criterion` | COMP-31 | Eager-loaded with `nap.rules` — criteria per rule |
+| `nap.rule_action` | COMP-31 | Eager-loaded with `nap.rules` — actions to execute on match |
+| `nap.rule_group` | ⚠️ Owner TBC | Lazy-loaded rule group metadata |
+| `wdp.CASE` | COMP-23 CaseManagementService | Load full case entity for US processing |
+| `wdp.ACTION` | COMP-23 / COMP-24 | Eager-loaded with `wdp.CASE` |
+| `wdp.rules` | COMP-31 BusinessRulesService | Fetch active rules by group name (fresh per message) |
+| `wdp.rule_criterion` | COMP-31 | Eager-loaded with `wdp.rules` |
+| `wdp.rule_action` | COMP-31 | Eager-loaded with `wdp.rules` |
+| `wdp.rule_group` | ⚠️ Owner TBC | Lazy-loaded rule group metadata |
+
+Rule query (identical pattern UK / US):
+`WHERE rule_group_name = :ruleGroupName AND active = true ORDER BY sort_order ASC`
+
+---
+
+## Configuration and Scaling
+
+| Parameter | Value | Notes |
+|---|---|---|
+| Deployment type | Kubernetes `Deployment` | Continuously running JVM |
+| Replica count | `{{ replicas-gcp-business-rules-processor }}` | XL-Deploy placeholder — numeric value lives outside repo |
+| HPA | None | No `HorizontalPodAutoscaler` resource defined |
+| PodDisruptionBudget | None | No `PodDisruptionBudget` resource defined |
+| Memory request | 2048 Mi | |
+| Memory limit | 4096 Mi | |
+| CPU request | Not set | Burstable QoS class |
+| CPU limit | Not set | |
+| QoS class | Burstable | Derived from memory req<limit, no CPU constraints |
+| Rollout strategy | RollingUpdate — maxSurge=1, maxUnavailable=0 | |
+| minReadySeconds | 30 | |
+| Topology spread | maxSkew=1, topologyKey=`kubernetes.io/hostname`, whenUnsatisfiable=ScheduleAnyway | Soft placement preference |
+| Container port | 8082 | Application + Actuator on same port |
+| Service | ClusterIP, 8082 → 8082 | |
+| Ingress | nginx, CORS enabled, TLS via `{{ ingressTLSsecretName }}` | 3 rules: external, internal, default — all path `/merchant/gcp/business-rules-processor` |
+| Liveness probe | `GET /merchant/gcp/business-rules-processor/livez` on 8082 | initialDelay 40s, period 10s, timeout 5s, failureThreshold 3 |
+| Readiness probe | `GET /merchant/gcp/business-rules-processor/readyz` on 8082 | initialDelay 30s, period 10s, timeout 5s, failureThreshold 3 |
+| Startup probe | Not configured | |
+| Image pull policy | Always | |
+| Kafka consumer concurrency | 1 (Spring default) | `setConcurrency` never called |
+| Database connection pool | HikariCP defaults (not tuned) | Per datasource — UK and US |
+| Observability | OpenTelemetry Java agent injected (`opentelemetry-operator-system/default`) | Also Spring Actuator + Logstash appender |
+| Actuator endpoints | `info`, `health`, `prometheus` | Same port (8082) as application |
+| K8s secrets mounted | `business-rules-processor-secrets`, `wdp-common-secrets`, `{{ ingressTLSsecretName }}` | |
+| Security | OAuth2 Resource Server (JWT) | CSRF disabled; whitelist: `/actuator/health`, `/livez`, `/readyz` |
+
+---
+
+## Key Architectural Decisions
+
+| Decision | ADR reference | Notes |
+|---|---|---|
+| Rules read directly from DB — BusinessRulesService REST not called | DEC-017 — **ACTIVE** | Direct JPA to `nap.rules` / `wdp.rules`. The `rules.audit-log-url` config is a dead reference |
+| Offset committed BEFORE processing begins (line 38 ack, line 41 process) | DEC-005 — **DEVIATION** | At-most-once. Message lost if pod crashes after commit. In practice prevents duplicates but creates a data-loss window |
+| No BRE step checkpointing | DEC-011 — **⛔ VOID** | Architecture previously assumed this existed. It does not. Formally voided April 2026 |
+| No transactional outbox for Kafka publish | DEC-001 — **DEVIATION** | Both `outgoing-events` and `internal-integration-events` are direct synchronous calls. Broker unavailability = permanent event loss |
+| Partition key is `caseNumber` on both producer topics | DEC-003 — **DEVIATION (producer side)** | Consumer inbound key is `merchantId` — upstream-compliant |
+| No Resilience4j on any dependency | DEC-014 — **⛔ VOID** | Confirmed absent platform-wide. Accepted platform condition |
+| `outgoing-events` publish always in `finally` block | Local decision | Outgoing event published regardless of rule match or action success. Suppressed only if case/action load failed. `actionStatus` may be stale |
+| Error state via REST SNOTE — not a DB error table | Local decision | `ErrorLogService` class absent. Error visibility depends on SNOTE propagation through Notes Service, which can also fail silently |
+| UK audit-log cleanup in finally; US cleanup outside finally | Local decision — asymmetry | UK: `tokenService.clear()` inside finally. US: outside finally. ThreadLocal leak risk on US path |
+
+---
+
+## Risks and Constraints
+
+| Severity | Risk | Consequence |
+|---|---|---|
+| 🔴 HIGH | At-most-once delivery (DEC-005 deviation — line 38 ack precedes line 41 process) | Pod crash after commit, before outgoing publish, loses dispute event permanently. No DLQ, no error table, no redelivery. Violates platform at-least-once guarantee for financial events |
+| 🔴 HIGH | No transactional outbox (DEC-001 deviation) | Broker outage at publish loses the outgoing event. Case state may be updated via REST while the outgoing event to COMP-18 NotificationOrchestrator is never delivered — silent split-brain |
+| 🔴 HIGH | Inconsistent failure handling across rule actions | Add action failure re-throws (message dropped); Questionnaire / Case update / Issuer doc / Outgoing Kafka publish failures swallowed (silent inconsistency); Contest 400 re-throws; Accept failure propagates uncaught. Outcome depends on which action the matched rule triggers |
+| 🔴 HIGH | `ErrorLogService` absent — no DB error table | Failures recorded only as SNOTE via REST. If SNOTE itself fails, no persisted error trail. No audit for silent drops on deserialisation or post-ACK crash |
+| 🟡 MEDIUM | No timeouts on any REST dependency | Plain `new RestTemplate()` — no connection or read timeout. Hung downstream stalls consumer thread indefinitely. Consumer concurrency=1 means one hung thread stalls all message processing |
+| 🟡 MEDIUM | No circuit breakers (DEC-014 VOID — accepted platform condition) | Cascading failure from any downstream has no automatic isolation |
+| 🟡 MEDIUM | `actionStatus` staleness in outgoing event | COMP-18 NotificationOrchestrator routes on this field. Post-rule REST updates are not reflected in the finally-block publish. Downstream routing receives stale state |
+| 🟡 MEDIUM | `v-correlation-id` always null in production | `RestClientInvoker` reads the header from MDC but no filter / interceptor populates MDC from inbound Kafka or REST. All outbound correlation is effectively broken |
+| 🟡 MEDIUM | US path ThreadLocal token leak risk | `tokenService.clear()` is outside the finally block on the US path. If anything between finally close and that line throws (currently the inner try/catch swallows, so practically impossible today), the ThreadLocal token leaks to the next message on the same thread |
+| 🟡 MEDIUM | Admin `PUT /event` endpoint | Duplicates the Kafka consumer path with no throttling, no idempotency, no offset management. JWT-authenticated but no documented runbook. Could be invoked in ways that bypass Kafka ordering |
+| 🟡 MEDIUM | No unique constraint on `br_case_audit_log` | If DEC-005 is ever remediated (post-ACK), duplicate audit rows become possible without a DB-level guard |
+| 🟢 LOW | `source` field routing not implemented | Logged only. If future differentiation by BRISUP / BRMRUP / BRMCUP is needed, the field exists but requires code changes |
+| 🟢 LOW | LATAM platform silently dropped | Defined in constants, no routing branch. Any LATAM message produces no outgoing event and no error signal |
+| 🟢 LOW | `ATTACH_ISSUER_DOC` exists only as an action type enum | Not a processing step. DEC-011 documentation references are invalid |
+| 🟢 LOW | Dead pom dependencies | `org.apache.httpcomponents:httpclient:4.5.14` declared but never wired. `spring-boot-devtools` at compile scope. `spring-retry` / `spring-aspects` declared but no `@Retryable` or `RetryTemplate` |
+| 🟢 LOW | Dead configuration | `spring.kafka.show-sql: true` is under the wrong prefix (has no effect). `case.retry_count` / `case.retry_delay` never `@Value`-injected. `rules.audit-log-url` never read |
+
+---
+
+## Planned Changes
+
+- ⚠️ **OPEN QUESTION:** COMP-14 CaseCreationConsumer — does it publish to
+  `business-rules` topic after case creation? (Listed in WDP-HANDOVER
+  open questions.)
+- ⚠️ **OPEN QUESTION:** `v-correlation-id` propagation gap — architect
+  decision whether to add an MDC filter for inbound Kafka headers.
+- ⚠️ **OPEN QUESTION:** US-path token-cleanup asymmetry — defect or
+  intentional? Candidate for symmetry fix with UK.
+- ⚠️ **OPEN QUESTION:** FCHG guard failure path — current source calls
+  `updateCase(...)`; the prior "queue to WEXQUE" description is
+  unverified. Needs confirmation from the owning team whether the
+  `updateCase` behaviour is the intended final semantic.
+- ⚠️ **OPEN QUESTION:** Admin `PUT /event` runbook — should this endpoint
+  remain enabled in production, or be gated by profile?
+
+No planned work is confirmed for this component as of April 2026. Review
+quarterly.
+
+---
 
 ---
 
 ## ━━━ TYPE BLOCK A — REST API CONTRACTS ━━━━━━━━━━━━━━━━━━━
 
-> ⚠️ **Admin/testing endpoint only.** This REST endpoint duplicates the Kafka
-> consumer path but has no throttling, no idempotency check, and no offset
-> management. It appears to be a testing or admin interface, not a
-> production-grade path. It should not be called in normal platform operation.
+> ⚠️ **Admin / testing endpoint only.** This REST endpoint duplicates the
+> Kafka consumer path but has no throttling, no idempotency check, and no
+> offset management. It should not be called in normal platform operation.
 
 ---
 
 ## REST API Contracts
 
-**Framework:** Spring MVC
-**Auth model:** JWT validation active (`SecurityConfig.java`). OAuth2 resource server configured.
-**Base path:** `/merchant/gcp/business-rules-processor` (inferred from artefact naming — confirm)
+**Authentication model:** OAuth2 Resource Server (JWT). CSRF disabled.
+Whitelisted paths (no auth required): `/actuator/health`, `/livez`,
+`/readyz`. All other paths — including `PUT /event` — require a valid
+Bearer JWT.
+
+**Base URL pattern:** `https://<host>/merchant/gcp/business-rules-processor`
 
 ---
 
-### PUT /event
+### Endpoint: `PUT /event`
 
-| Property | Value |
-|---|---|
-| **Method** | PUT |
-| **Path** | `/event` |
-| **Purpose** | Trigger business rules processing directly, bypassing Kafka. Intended for testing and admin use. |
-| **Auth** | JWT Bearer token required |
-| **Request body** | `BusinessRuleEvent` (same payload as the Kafka consumer processes) |
-| **Response** | Not documented in Copilot report |
-| **Known callers** | Unknown — admin/testing use only |
-| **Idempotency** | None — no idempotency check, no offset management |
-| **Throttling** | None configured |
+**Purpose:** Trigger business rules processing directly, bypassing Kafka.
+Intended for testing and administrative use.
+**Caller(s):** Unknown — admin / testing use only. No documented
+production caller.
+**Auth required:** Bearer JWT
 
-**Architectural note:** This endpoint calls `processorService.processRulesEvent()` directly — the same method invoked by the Kafka consumer. The processing path is identical to the Kafka path, with one difference: there is no Kafka offset to commit before processing, so the DEC-005 at-most-once violation does not apply here. However, there is also no Kafka-level ordering guarantee and no dead-letter handling. This endpoint bypasses all Kafka consumer mechanics.
+**Request**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| Body | `BusinessRuleEvent` | Yes | Same payload schema as the Kafka consumer processes |
+
+**Response — Success**
+
+| HTTP Status | Condition | Body |
+|---|---|---|
+| 200 | Processing completed without exception propagating out of the controller | Not documented in source |
+
+**Response — Error**
+
+| HTTP Status | Condition | Body |
+|---|---|---|
+| 401 | Missing or invalid JWT | Spring Security default |
+| 4xx / 5xx | Mapped via `GlobalExceptionHandler` | Error body not enumerated in this audit |
+
+**Notes**
+
+- Calls `processorService.processRulesEvent()` directly — the same method
+  invoked by the Kafka consumer.
+- No Kafka offset to commit — the DEC-005 pre-ACK data-loss window does
+  not apply to this path.
+- No Kafka-level ordering or dead-letter handling — this endpoint
+  bypasses all Kafka consumer mechanics.
+- No idempotency check. No throttling. No rate limiting.
+- No documented runbook.
+
+---
 
 ---
 
@@ -272,10 +560,12 @@ flowchart TD
 
 ## Kafka Consumer Contracts
 
-**Consumer framework:** Spring Kafka `@KafkaListener` — single listener annotation on `KafkaConsumer.onMessage()`
+**Consumer framework:** Spring Kafka `@KafkaListener` — single listener
+annotation on `KafkaConsumer.onMessage()` (`KafkaConsumer.java:24`)
 **Container factory:** `businessRuleListener`
-**Concurrency:** 1 (default — no `factory.setConcurrency()` call in `KafkaConsumerConfig`)
-**Auth:** AWS MSK IAM (`SASL_SSL`)
+**Offset commit strategy:** Pre-ACK (at-most-once) — **DEC-005 deviation**
+**Error handling strategy:** No-op anonymous `CommonErrorHandler` —
+exceptions caught and logged; no DLQ, no retry, no halt
 
 ---
 
@@ -284,41 +574,69 @@ flowchart TD
 | Parameter | Value |
 |---|---|
 | **Topic name (prod)** | `business-rules` |
-| **Topic name (dev/local)** | `business-rules-dev` |
-| **Config key** | `spring.kafka.consumer.topic` |
-| **Consumer group ID (prod)** | `business-rules-group-prod` |
-| **Consumer group ID (dev)** | `business-rules-group` |
-| **Config key (group ID)** | `spring.kafka.consumer.groupId` |
-| **AckMode** | `MANUAL_IMMEDIATE` — `KafkaConsumerConfig.businessRulesContainerProperties().setAckMode(AckMode.MANUAL_IMMEDIATE)` |
-| **Sync commits** | `true` — `factory.getContainerProperties().setSyncCommits(true)` |
-| **⚠️ Offset commit timing** | **BEFORE processing** — `acknowledgment.acknowledge()` on line 37 of `KafkaConsumer.java` precedes `processRulesEvent()` on line 40. **DEC-005 VIOLATION — at-most-once delivery.** |
-| **Concurrency** | 1 (default) |
-| **Max poll records** | `${max_poll_records}` — environment-injected |
-| **Max poll interval** | `${session_timeout_ms}` — environment-injected |
-| **Heartbeat interval** | `${heartbeat_interval_ms}` — environment-injected |
-| **Auto offset reset** | `latest` |
-| **Auto commit** | `false` |
+| **Config key (topic)** | `spring.kafka.consumer.topic` |
+| **Consumer group (prod)** | `business-rules-group-prod` |
+| **Config key (group)** | `spring.kafka.consumer.groupId` |
+| **AckMode** | `MANUAL_IMMEDIATE` |
+| **syncCommits** | `true` |
+| **Offset commit timing** | ⚠️ **BEFORE processing** — `acknowledgment.acknowledge()` on line 38 precedes `processRulesEvent()` on line 41 of `KafkaConsumer.java`. **DEC-005 deviation — at-most-once delivery** |
+| **Concurrency** | 1 (Spring default — `setConcurrency` never called) |
+| **enable.auto.commit** | `false` |
+| **allow.auto.create.topics** | `false` |
+| **auto.offset.reset** | `latest` |
+| **max.poll.interval.ms** | `${max_poll_interval}` — env-injected |
+| **max.poll.records** | `${max_poll_records}` — env-injected |
+| **session.timeout.ms** | `${session_timeout_ms}` — env-injected |
+| **heartbeat.interval.ms** | `${heartbeat_interval_ms}` — env-injected |
 | **Key deserializer** | `StringDeserializer` |
-| **Value deserializer** | `ErrorHandlingDeserializer<BusinessRuleEvent>` wrapping `JsonDeserializer<BusinessRuleEvent>` |
-| **Error handler** | `new CommonErrorHandler(){}` — no-op handler registered |
-| **Auto-create topics** | `false` |
+| **Value deserializer** | `ErrorHandlingDeserializer<>(JsonDeserializer<BusinessRuleEvent>)` |
+| **Error handler** | `new CommonErrorHandler() {}` — anonymous no-op |
 | **Security** | `SASL_SSL` / `AWS_MSK_IAM` |
+| **Rebalance listener** | None — not determinable from current audit |
 
-**On deserialization failure:** `ErrorHandlingDeserializer` wraps the JSON deserializer. If deserialization fails, the registered `CommonErrorHandler` is a no-op. The message is **silently dropped** — no DLQ, no retry, no halt.
+**Message payload structure — `BusinessRuleEvent`**
 
-**On processing exception:** All exceptions in `processRulesEvent()` are caught by `try/catch(Exception e)` in `KafkaConsumer.onMessage()`, which only logs the stack trace. No DLQ, no halt, no retry. The message is silently dropped after logging.
-
-**Inbound Kafka headers processed:**
-
-| Header | Field populated | Usage |
+| Field | Type | Description |
 |---|---|---|
-| `RECEIVED_KEY` | `keyMerchantId` on `BusinessRuleEvent` | Logged only |
-| `OFFSET` | Set on event object | Logged only |
-| `RECEIVED_PARTITION` | Set on event object | Logged only |
-| `idempotency-key` | `idempotencyId` on `BusinessRuleEvent` | Passed through to outgoing event; NOT used for duplicate detection |
-| `event-timestamp` | `eventTimestamp` on `BusinessRuleEvent` | Passed through to outgoing event |
+| `eventType` | String | Event classifier (pass-through to outgoing event) |
+| `platform` | String | `NAP` / `CORE` / `VAP` / `PIN` — routing field |
+| `source` | String | `BRISUP` / `BRMRUP` / `BRMCUP` — **logged only, no routing** |
+| `caseNumber` | String | Used for DB lookups and as downstream Kafka message key |
+| `actionSequence` | Integer | Target action sequence within the case |
+| `previousActionSequence` | Integer | Previous action reference |
+| `disputeStage` | String | Validation gate against case action stage |
+| `migrationStatus` | String | Guard field — `'y'` allows normal flow |
+| `type` | String | Pass-through |
+| `documentNameList` | Array | Pass-through |
+| `updateType` | String | Pass-through |
+| `correlationId` | String | Pass-through |
 
-**Publisher identification:** This component cannot distinguish between messages from different publishers (COMP-15 EvidenceConsumer, COMP-12 InboundDisputeEventScheduler, or others). All messages from all publishers are handled identically. Routing is based solely on the `platform` field, not on the publishing source.
+**Inbound Kafka headers processed**
+
+| Header | Field populated on event | Usage |
+|---|---|---|
+| `RECEIVED_KEY` | `keyMerchantId` | Logged only |
+| `OFFSET` | Set on event | Logged only |
+| `RECEIVED_PARTITION` | Set on event | Logged only |
+| `idempotency-key` | `idempotencyId` | Pass-through to outgoing event; **NOT** used for duplicate detection |
+| `event-timestamp` | `eventTimestamp` | Pass-through to outgoing event |
+
+**Event classification / routing**
+
+Routing is based solely on the `platform` field (first-level decision in
+`RulesProcessorServiceImpl`). No branching on `source`, `eventType`, or
+publisher identity. The consumer cannot distinguish between messages from
+different publishers (COMP-12, COMP-15, COMP-23, COMP-24, COMP-25).
+
+**On processing failure**
+
+| Failure scenario | Behaviour |
+|---|---|
+| Deserialization error | `ErrorHandlingDeserializer` invokes the no-op `CommonErrorHandler`. Message silently dropped. Offset committed (pre-ACK) |
+| Any exception in `processRulesEvent()` | Caught by `try/catch(Exception e)` in `KafkaConsumer.onMessage()`; stack trace logged. No DLQ, no halt, no retry. Offset already committed. Message dropped |
+| Pod crash after ACK, before publish | Message permanently lost. No recovery path |
+
+---
 
 ---
 
@@ -328,29 +646,35 @@ flowchart TD
 
 ## Kafka Producer Contracts
 
-**Producer framework:** Spring Kafka `KafkaTemplate`
-**Idempotent producer:** Yes — `ENABLE_IDEMPOTENCE_CONFIG = true`, `ACKS_CONFIG = all`, `MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION = 5`
-**Publish mode:** Synchronous — blocking `.get()` on `CompletableFuture` for all publishes
-**Auth:** AWS MSK IAM (`SASL_SSL`)
+**Producer framework:** Spring Kafka `KafkaTemplate` (two bean instances:
+`kafkaTemplate` for ActionEvent, `kafkaOutgoingTemplate` for OutgoingEvent)
+**Idempotent producer:** Yes — `enable.idempotence=true`, `acks=all`,
+`max.in.flight.requests.per.connection=5`
+**Publish mode:** Synchronous — blocking `.get()` on
+`CompletableFuture` for all publishes
+**Retry on publish failure:** None wired. `retries`, `linger.ms`,
+`batch.size`, `compression.type`, `delivery.timeout.ms`,
+`request.timeout.ms`, `transactional.id` are NOT set — client defaults
+apply
+**Auth:** `SASL_SSL` / `AWS_MSK_IAM`
 
 ---
 
-### Topic 1: `outgoing-events` (primary output — always in finally block)
+### Topic: `outgoing-events` (primary output — always in finally)
 
 | Parameter | Value |
 |---|---|
 | **Topic name (prod)** | `outgoing-events` |
 | **Config key** | `spring.kafka.outgoing.topic` |
-| **Message key** | `outgoingEvent.getCaseNumber()` — **caseNumber, NOT merchantId** ⚠️ DEC-003 deviation |
-| **Serializer** | `JsonSerializer` |
-| **Publish mode** | Synchronous blocking `.get()` |
-| **@Transactional** | No — no transaction annotation on publish path |
-| **Transactional outbox (DEC-001)** | **NOT implemented** — direct Kafka publish; no outbox table. Kafka broker unavailable = event permanently lost. |
-| **Kafka headers forwarded** | `idempotency-key` (from inbound), `event-timestamp` (from inbound) |
-| **Published on** | Always in `finally` block, subject to `caseDetails != null && currentActionDetails != null` |
+| **Message key** | `outgoingEvent.getCaseNumber()` — **caseNumber, not merchantId** ⚠️ DEC-003 deviation |
+| **Ordering guarantee** | Per-partition by `caseNumber` (not per-merchant) |
+| **Published on** | Always in `finally` block, subject to `caseDetails != null AND currentActionDetails != null` |
 | **Consumed by** | COMP-18 NotificationOrchestrator |
-
-**Publish failure handling:** `handleOutgoingFailure()` logs the error and calls `notesService.addErrorNotes()` (REST POST to Notes Service) to add a SNOTE. Exception is swallowed — no re-throw, no DLQ.
+| **@Transactional** | No |
+| **Transactional outbox (DEC-001)** | **NOT implemented** — direct Kafka publish; no outbox table. Broker unavailable = event permanently lost |
+| **Serializer** | `JsonSerializer` |
+| **Headers forwarded** | `idempotency-key` (from inbound), `event-timestamp` (from inbound) |
+| **Failure handling** | `handleOutgoingFailure` logs + calls `notesService.addErrorNotes` (REST POST) for SNOTE. Outer `try/catch(Throwable)` swallows. `isErrorOccured` flag returned is ignored by the caller |
 
 **Message payload — `OutgoingEvent`**
 
@@ -358,7 +682,7 @@ flowchart TD
 |---|---|---|
 | `eventType` | `businessRuleEvent.eventType` | Pass-through |
 | `platform` | `businessRuleEvent.platform` | Pass-through |
-| `caseNumber` | `businessRuleEvent.caseNumber` | Pass-through; also the Kafka message key |
+| `caseNumber` | `businessRuleEvent.caseNumber` | Pass-through; also message key |
 | `actionSequence` | `businessRuleEvent.actionSequence` | Pass-through |
 | `previousActionSequence` | `businessRuleEvent.previousActionSequence` | Pass-through |
 | `type` | `businessRuleEvent.type` | Pass-through |
@@ -366,9 +690,9 @@ flowchart TD
 | `documentNameList` | `businessRuleEvent.documentNameList` | Pass-through |
 | `updateType` | `businessRuleEvent.updateType` | Pass-through |
 | `correlationId` | `businessRuleEvent.correlationId` | Pass-through |
-| `level1Entity` — `level5Entity` | `caseDetails.level1Entity` — `level5Entity` | DB-enriched |
+| `level1Entity` – `level5Entity` | `caseDetails.level1Entity` – `level5Entity` | DB-enriched |
 | `caseNetwork` | `caseDetails.caseNetwork` | DB-enriched |
-| `actionStatus` | `currentActionDetails.actionStatus` | DB-enriched — ⚠️ reflects state at initial DB load, NOT post-rule state |
+| `actionStatus` | `currentActionDetails.actionStatus` | **⚠️ STALE — reflects state at initial DB load, not post-rule state** |
 | `expirationDate` | `currentActionDetails.expiryDueDate` | DB-enriched |
 | `responseDueDate` | `currentActionDetails.responseDueDate` | DB-enriched |
 | `dateReceivedByAcquirer` | `currentActionDetails.actionProcessedDate` | DB-enriched |
@@ -379,301 +703,41 @@ flowchart TD
 | `networkCaseId` | `caseDetails.ntwkCaseId` | DB-enriched |
 | `hybridMerchant` | `caseDetails.ntwkProgramType` | DB-enriched |
 
-**⚠️ `actionStatus` staleness:** The outgoing event is built in the `finally` block using the case entity loaded at the start of processing. The case/action REST updates (step 18) modify state via REST calls to downstream services but the local entity is not reloaded. The `actionStatus` field in the outgoing event reflects the state at load time, not the final post-rule state. COMP-18 NotificationOrchestrator consumes this field for routing — any staleness here propagates downstream.
+**Payload notes**
+
+- The `actionStatus` field is the most operationally significant field
+  for COMP-18's downstream routing. Because the outgoing event is built
+  in the `finally` block from the initially-loaded entity (not reloaded
+  after rule-driven REST updates), any staleness here propagates to
+  COMP-18 routing.
+- `actionStatus` suppressed only when `caseDetails` or
+  `currentActionDetails` is null (case load failed). In that case no
+  event is published at all.
 
 ---
 
-### Topic 2: `internal-integration-events` (conditional — DMT001 only)
+### Topic: `internal-integration-events` (conditional — DMT001 only)
 
 | Parameter | Value |
 |---|---|
 | **Topic name (prod)** | `internal-integration-events` |
 | **Config key** | `spring.kafka.producer.topic` |
-| **Message key** | `event.getCaseNumber()` — **caseNumber, NOT merchantId** ⚠️ DEC-003 deviation |
-| **Publish mode** | Synchronous blocking `.get()` |
+| **Message key** | `event.getCaseNumber()` — **caseNumber, not merchantId** ⚠️ DEC-003 deviation |
+| **Ordering guarantee** | Per-partition by `caseNumber` |
+| **Published on** | Matched rule action has `sendMerchantCommunication == "DMT001"`. Can fire alongside the `outgoing-events` publish for the same message |
+| **Consumed by** | COMP-39 NAPOutcomeProcessor (NAP platform filter only); COMP-40 VisaResponseQuestionnaire (non-null `visaResponseIds` filter only) |
 | **@Transactional** | No |
 | **Transactional outbox (DEC-001)** | **NOT implemented** — direct Kafka publish |
-| **Published on** | Only when matched rule action has `sendMerchantCommunication == "DMT001"` |
-| **Consumed by** | COMP-39 NAPOutcomeProcessor, COMP-40 VisaResponseQuestionnaire |
+| **Serializer** | `JsonSerializer` |
+| **Failure handling** | `handleFailure` logs + SNOTE via REST. Outer `try/catch(Throwable)` swallows. Returns `isErrorOccured=true` flag — **not re-thrown** |
 
-**Publish failure handling:** `handleFailure()` logs the error and adds SNOTE via REST. Exception is NOT re-thrown — returns `isErrorOccured=true` flag.
+**Payload notes**
 
----
-
-## ━━━ DEPENDENCIES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-> ⚠️ **Platform-wide risk: No timeouts, no retries, no circuit breakers on any
-> dependency.** Resilience4j is absent from this component entirely (not in
-> pom.xml). `spring-retry` + `spring-aspects` are declared in pom.xml but no
-> `@Retryable` annotation or `RetryTemplate` is wired anywhere in the codebase.
-> `case.retry_count` and `case.retry_delay` config properties exist in YAML
-> but are never `@Value`-injected into any class.
+- Payload is `ActionEvent` — fields populated from the matched rule and
+  the case entity. Exact field list not enumerated in this audit.
+- DMT001 is a string literal from `ApplicationConstants`. Both UK and US
+  paths gate on the same literal.
 
 ---
 
-### IDP Token Service
-
-| Property | Value |
-|---|---|
-| **URL (prod)** | `http://wdp-idp-token-service.wdp-micro:8082/merchant/gcp/idp-token/token` |
-| **Protocol/auth** | HTTP GET — no auth headers on this call |
-| **Purpose** | Obtain Bearer token used for all subsequent downstream REST calls |
-| **Timing** | Lazy — fetched on first REST call per message, cached in `ThreadLocal` for message lifetime |
-| **Timeout** | None configured — plain `RestTemplate` |
-| **Retry** | None |
-| **Circuit breaker** | None (Resilience4j absent) — DEC-014 deviation |
-| **On failure** | `WebServiceException` thrown — propagates up — `caseDetails` remains null — no outgoing event |
-
-### Case Management Service
-
-| Property | Value |
-|---|---|
-| **URL (prod)** | `http://mdvs-gcp-case-management-service.wdp-micro:8082/merchant/gcp/case-management/{platform}/case/{casenumber}` |
-| **Protocol/auth** | HTTP PUT — Bearer token |
-| **Purpose** | Update case status, desk number, assignment reason, pend dates, case liability |
-| **Steps** | FCMG guard (step 10), case update (step 18), error paths |
-| **Timeout** | None configured |
-| **Retry** | Declared in YAML (`case.retry_count` / `case.retry_delay`) but **not wired** |
-| **Circuit breaker** | None — DEC-014 deviation |
-| **On failure** | Exception caught; attempt to set ERROR status (which will also fail); SNOTE added; **swallowed** |
-
-### Case Actions Service
-
-| Property | Value |
-|---|---|
-| **URL (prod) — add action** | `http://mdvs-gcp-case-actions-service.wdp-micro:8082/merchant/gcp/case-actions/{platform}/case/{casenumber}/internal-actions` |
-| **URL (prod) — update action** | `http://mdvs-gcp-case-actions-service.wdp-micro:8082/merchant/gcp/case-actions/{platform}/case/{casenumber}/action` |
-| **Protocol/auth** | HTTP POST (add), HTTP PUT (update) — Bearer token |
-| **Purpose** | Add new actions (ChargeToMerchant, Reverse, WriteOff); update action status and owner |
-| **Steps** | Migration update (step 9), rule actions (step 17), case update (step 18), error paths |
-| **Timeout** | None configured |
-| **Retry** | None |
-| **Circuit breaker** | None — DEC-014 deviation |
-| **On failure (add)** | Exception caught; REST PUT to set ERROR; SNOTE added; **re-throws `BusinessRulesException`** |
-| **On failure (update)** | Exception caught; REST PUT to set ERROR; SNOTE added; **swallowed** |
-
-### Contest Service
-
-| Property | Value |
-|---|---|
-| **URL (prod)** | `http://mdvs-gcp-disputes-contest-service.wdp-micro:8082/merchant/gcp/contest/{platform}/case/{casenumber}` |
-| **Protocol/auth** | HTTP POST — Bearer token |
-| **Purpose** | Submit contest action for pre-arb, reject, or represent outcomes |
-| **Step** | Step 17 (after questionnaire) |
-| **Timeout** | None configured |
-| **Retry** | None |
-| **Circuit breaker** | None — DEC-014 deviation |
-| **On 400** | `updateErrorStatus()` called + re-throw |
-| **On other error** | Re-thrown directly |
-
-### Accept Service
-
-| Property | Value |
-|---|---|
-| **URL (prod)** | `http://mdvs-gcp-disputes-accept-service.wdp-micro:8082/merchant/gcp/accept/{platform}/case/{casenumber}/accept` |
-| **Protocol/auth** | HTTP POST — Bearer token |
-| **Purpose** | Accept a dispute (AcceptFull, MerchantAccept — US only) |
-| **Step** | Step 17 |
-| **Timeout** | None configured |
-| **Retry** | None |
-| **Circuit breaker** | None — DEC-014 deviation |
-| **On failure** | Exception propagates **uncaught** through to outer catch block |
-
-### Questionnaire Service
-
-| Property | Value |
-|---|---|
-| **URL (prod)** | `http://mdvs-gcp-questionnaire-service.wdp-micro:8082/merchant/gcp/questionnaire` + path suffix |
-| **Protocol/auth** | HTTP PUT — Bearer token |
-| **Purpose** | Save questionnaire for pre-arb, represent, reject dispute outcomes |
-| **Step** | Step 17 |
-| **Timeout** | None configured |
-| **Retry** | None |
-| **Circuit breaker** | None — DEC-014 deviation |
-| **On failure** | Exception re-thrown; `updateErrorStatus()` called |
-
-### Document Management Service
-
-| Property | Value |
-|---|---|
-| **URLs (prod)** | Issuer doc: `.../{platform}/documents/{casenumber}/issuerdoc`; Update: `.../{platform}/document/{casenumber}/action/{actionSequence}` |
-| **Protocol/auth** | HTTP POST (issuer doc check), HTTP PUT (update) — Bearer token |
-| **Purpose** | Check/add issuer documents; update document records |
-| **Step** | Step 14 |
-| **Timeout** | None configured |
-| **Retry** | None |
-| **Circuit breaker** | None — DEC-014 deviation |
-| **On failure (issuer doc)** | Exception caught and **swallowed**; logged as "Failed : Issuer Document API"; processing continues |
-| **On failure (update doc)** | Exception re-thrown; `updateErrorStatus()` called |
-
-### Notes Service
-
-| Property | Value |
-|---|---|
-| **URL (prod)** | `http://mdvs-gcp-notes-service.wdp-micro:8082/merchant/gcp/notes/{platform}/case/{casenumber}` |
-| **Protocol/auth** | HTTP POST — Bearer token |
-| **Purpose** | Add SNOTE error notes on processing failures |
-| **Step** | Various error paths |
-| **Timeout** | None configured |
-| **Retry** | None |
-| **Circuit breaker** | None — DEC-014 deviation |
-| **On failure** | Exception propagates; may be silently caught by caller |
-
-### Aurora PostgreSQL (Direct DB — Two Datasources)
-
-| Datasource | Spring prefix | Schema | JPA persistence unit |
-|---|---|---|---|
-| `ukDataSource` | `spring.datasource.nap` | `nap` | `uk` |
-| `wdpDataSource` (Primary) | `spring.datasource.wdp` | `wdp` | `wdp` |
-
-| Property | Value |
-|---|---|
-| **Protocol** | JDBC (JPA/Hibernate over PostgreSQL driver) |
-| **Auth** | Username/password from K8s secrets (`nap_datasource_username`, `wdp_datasource_username`) |
-| **Timeout** | Not configured in `application.yaml`; connection pool defaults |
-| **Circuit breaker** | None |
-
----
-
-## ━━━ DATABASE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
----
-
-## Database Ownership
-
-### Tables Owned (written by this component)
-
-| Schema.Table | Purpose | Key columns | Notes |
-|---|---|---|---|
-| `nap.br_case_audit_log` | Record all rules evaluated (matched and not-matched) for UK disputes | `id` (seq), `i_case`, `c_action_seq`, `rule_grp_name`, `rule_id`, `rule_name`, `is_valid`, `created_at` | Standalone JPA transaction — not part of any outer transaction |
-| `wdp.br_case_audit_log` | Same for US disputes | Same columns | Standalone JPA transaction (WDP transaction manager) |
-
-### Tables Read (not owned by this component)
-
-| Schema.Table | Owned by | Why accessed | Step | Key columns in query |
-|---|---|---|---|---|
-| `nap.case` | Core platform | Load full case entity for UK processing | Step 6 | `i_case`, `c_acq_platform`, `z_updt` |
-| `nap.ACTION` | Core platform | Eager-loaded with `nap.case` — all actions for the case | Step 6 | Join on `I_CASE_ID` |
-| `nap.rules` | COMP-31 BusinessRulesService (owns definitions) | Fetch active rules by group name | Step 11 | `group_name`, `is_enabled=true`, `sort_order` |
-| `nap.rule_criterion` | COMP-31 | Eager-loaded with `nap.rules` — criteria for each rule | Step 11 | `rule_id`, `category`, `name`, `value`, `operator_symbol` |
-| `nap.rule_action` | COMP-31 | Eager-loaded with `nap.rules` — actions to execute on match | Step 11 | `rule_id`, `action_name`, `field_name1-3`, `field_value1-3` |
-| `nap.rule_group` | COMP-31 | Lazy-loaded with `nap.rules` — rule group metadata | Step 11 | `id`, `name` |
-| `wdp.CASE` | Core platform | Same for US | Step 6 | Same pattern |
-| `wdp.(action table)` | Core platform | Same for US | Step 6 | Same pattern |
-| `wdp.rules` | COMP-31 | Same for US | Step 11 | Same pattern |
-| `wdp.rule_criterion` | COMP-31 | Same for US | Step 11 | Same pattern |
-| `wdp.rule_action` | COMP-31 | Same for US | Step 11 | Same pattern |
-| `wdp.rule_group` | COMP-31 | Same for US | Step 11 | Same pattern |
-
-**No outbox tables are read or written.** `bre_orchestration_outbox`, `outgoing_event_outbox`, and `notification_orchestration_outbox` are not referenced anywhere in this codebase.
-
-**No error table exists.** `ErrorLogService` is commented out. No database table for failed consumer events.
-
----
-
-## Configuration and Scaling
-
-| Parameter | Value | Notes |
-|---|---|---|
-| Replica count | `{{ replicas-gcp-business-rules-processor }}` | XL Deploy placeholder — actual value not in source |
-| HPA | Unknown | Not confirmed from Copilot report |
-| Memory request | ⚠️ Not confirmed | From `resources.yaml` — not captured in report |
-| Memory limit | ⚠️ Not confirmed | From `resources.yaml` — not captured in report |
-| CPU request | ⚠️ Not confirmed | `resources.yaml` — CPU limits absent per report |
-| CPU limit | ⚠️ Not confirmed (possibly absent) | Copilot confirms CPU limits absent |
-| Deployment type | Kubernetes `Deployment` | Continuously running JVM |
-| Rollout strategy | ⚠️ Not confirmed | |
-| PodDisruptionBudget | ⚠️ Not confirmed | |
-| Topology spread | ⚠️ Not confirmed | |
-| Kafka consumer concurrency | 1 (default) | Single-threaded consumer per replica |
-| Observability | OpenTelemetry Java agent present | Confirmed from `resources.yaml` |
-| Security | JWT OAuth2 resource server active | `SecurityConfig.java` confirmed |
-
----
-
-## Key Architectural Decisions
-
-| Decision | ADR reference | Notes |
-|---|---|---|
-| Offset committed BEFORE processing begins | DEC-005 — **DEVIATION** | At-most-once delivery. Message lost if pod crashes after commit. In practice prevents duplicates but creates data-loss window. |
-| No BRE step checkpointing | DEC-011 — **NOT IMPLEMENTED** | Architecture assumed this existed. It does not. On redelivery (which cannot occur due to pre-ACK), all steps restart from scratch. |
-| No transactional outbox for Kafka publish | DEC-001 — **DEVIATION** | Both `outgoing-events` and `internal-integration-events` publishes are direct synchronous calls. Broker unavailability = permanent event loss. |
-| Partition key is `caseNumber` not `merchantId` | DEC-003 — **DEVIATION (producer side)** | Both outgoing topics use `caseNumber` as message key. Consumer inbound key is `merchantId` (upstream compliant). |
-| Rules read directly from DB — not via BusinessRulesService API | Local decision | Confirmed by Copilot. COMP-31 is not called. Direct JPA queries to `nap.rules` / `wdp.rules`. |
-| No Resilience4j on any dependency | DEC-014 — **DEVIATION** | All 7 downstream REST dependencies and both Kafka publishes have no circuit breaker, no timeout, no retry. |
-| `outgoing-events` publish always in `finally` block | Local decision | Outgoing event published regardless of rule match or action success. Only suppressed if case/action load failed. `actionStatus` in outgoing event may be stale. |
-| Error state written via REST SNOTE — not DB error table | Local decision | `ErrorLogService` commented out. Error visibility depends on SNOTE propagation through Notes Service, which can also fail silently. |
-
----
-
-## Risks and Constraints
-
-🔴 **CRITICAL — At-most-once delivery (DEC-005 violation)**
-The Kafka offset is committed before processing. If the pod crashes after the commit and before the outgoing event is published, the dispute event is permanently lost with no visibility. No DLQ, no error table, no redelivery. This violates the platform's stated guarantee of at-least-once delivery for financial events.
-
-🔴 **CRITICAL — DEC-011 not implemented**
-The platform knowledge base (WDP-ARCHITECTURE-v1-ARCHIVED.md, WDP-DECISIONS.md) describes BRE step checkpointing as a current feature of this component. It does not exist. Any architecture decisions, capacity planning, or runbook procedures based on this assumption are incorrect and must be updated.
-
-🔴 **CRITICAL — No transactional outbox (DEC-001 violation)**
-Both Kafka publishes are direct synchronous calls outside any transaction. A Kafka broker outage at the point of publish permanently loses the outgoing event with no recovery path. The case state may be updated via REST (step 18) while the outgoing event to COMP-18 NotificationOrchestrator is never delivered — creating a silent split-brain.
-
-🟠 **HIGH — No timeouts on any REST dependency**
-Seven downstream REST services are called with no connection or read timeout on the `RestTemplate`. A hung downstream service blocks the consumer thread indefinitely. Since concurrency is 1, a single hung thread stalls all message processing for this consumer. `spring-retry` is declared but not wired.
-
-🟠 **HIGH — No circuit breakers (DEC-014 violation)**
-Resilience4j is absent. Cascading failure from any downstream service has no automatic isolation. During a downstream outage, every message will attempt all REST calls, fail, and drop the outgoing event.
-
-🟠 **HIGH — Inconsistent failure handling across rule actions**
-- Add action failure: re-throws `BusinessRulesException` (message dropped)
-- Questionnaire failure: swallowed (processing continues silently)
-- Contest failure: re-thrown (message dropped)
-- Accept failure: propagates uncaught (unpredictable)
-- Case update failure: swallowed
-- Issuer doc failure: swallowed
-- Outgoing Kafka publish failure: swallowed
-
-This creates unpredictable outcomes depending on which action the matched rule triggers. Some failures produce a silent inconsistency; others halt processing entirely.
-
-🟠 **HIGH — `actionStatus` staleness in outgoing event**
-The `OutgoingEvent` published to COMP-18 NotificationOrchestrator includes `actionStatus` derived from the initially loaded case entity. Post-rule REST updates are not reflected. COMP-18 uses this field for routing. Any routing that depends on the post-rule action state will receive stale data.
-
-🟢 **LOW — `source` field routing not implemented**
-The `source` field (BRISUP, BRMRUP, BRMCUP) on the inbound event is logged but not used for routing. If future differentiation by event source is needed, this field is present and propagated but requires code changes to activate.
-
-🟢 **LOW — LATAM platform silently dropped**
-`LATAM` is defined in `ApplicationConstants` but has no routing branch in `RulesProcessorServiceImpl`. Any message with `platform = LATAM` is silently dropped with no outgoing event and no error signal.
-
-🟢 **LOW — `spring-boot-devtools` in compile scope**
-Should be `runtime` scope or excluded from production builds.
-
-🟢 **LOW — Unused pom.xml dependencies**
-`org.apache.httpcomponents:httpclient:4.5.14` declared but never configured. `spring-boot-devtools` scoped incorrectly. `spring.kafka.show-sql: true` in YAML has no effect (JPA property key, not Kafka).
-
----
-
-## Planned and Incomplete Work
-
-| Item | Status | Detail |
-|---|---|---|
-| `ErrorLogService` | Commented out | Designed to persist Kafka publish failures to a database error table. Never implemented. Class does not exist in codebase. Error visibility relies entirely on SNOTE via Notes Service. |
-| `updateErrorStatus()` in `getIssuerDoc()` | Commented out | Original design: set action to ERROR if issuer document API failed. Current behaviour: exception logged, processing continues silently. |
-| `setCaseStatus()` in `updateCaseAction()` | Commented out | Case status not preserved from the loaded entity during updates. |
-| `throw new BusinessRulesException(...)` in case/action update | Commented out | Failures in case/action REST updates are silently swallowed rather than surfaced as errors. |
-| Retry mechanism | Declared, not wired | `spring-retry` + `spring-aspects` in pom.xml; `case.retry_count` / `case.retry_delay` in YAML; no `@Retryable` or `RetryTemplate` present anywhere in source. |
-| BRE step checkpointing (DEC-011) | Not implemented | Architecture assumed this existed. Confirmed absent. No VALIDATE/ENRICH step names, no checkpoint table, no checkpoint writes/reads. |
-| Transactional outbox for Kafka publish | Not implemented | DEC-001 non-compliant. No outbox table referenced anywhere in codebase. |
-| `AcceptServiceImpl.accept()` error handling | Absent | Any exception propagates uncaught to the outer catch block in the calling service. |
-| `rules.audit-log-url` property | Unused | Configured in prod YAML; no code reads or uses this property. |
-| REST endpoint `PUT /event` | Present — admin/testing | Duplicates the Kafka consumer path with no throttling, idempotency, or offset management. No production runbook. Undocumented. |
-
----
-
-## Deviation Flags Summary
-
-| DEC | Requirement | Actual Behaviour | Severity |
-|---|---|---|---|
-| DEC-001 | Transactional outbox for Kafka publish | Direct synchronous publish for both topics — no outbox | 🔴 CRITICAL |
-| DEC-003 | Partition key = `merchantId` | Producer: `caseNumber` for both `outgoing-events` and `internal-integration-events` | 🟠 HIGH |
-| DEC-005 | Manual offset commit AFTER all processing | Offset committed BEFORE processing on line 37 | 🔴 CRITICAL |
-| DEC-011 | BRE step checkpointing | Not implemented — no step names, no checkpoint table, no checkpoint writes | 🔴 CRITICAL (assumption correction) |
-| DEC-014 | Resilience4j circuit breakers on outbound calls | No Resilience4j; no timeouts; no retries on any of 7 REST dependencies or 2 Kafka publishes | 🟠 HIGH |
+*End of file.*

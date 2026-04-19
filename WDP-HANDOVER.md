@@ -78,11 +78,11 @@ WDP-ARCHITECTURE.md first, then WDP-DECISIONS.md.
 | Document | Status | Notes |
 |----------|--------|-------|
 | WDP-ARCHITECTURE.md | ✅ Current — v2.0 | Fully rebuilt April 2026. 15 Mermaid diagrams confirmed. |
-| WDP-DECISIONS.md | ⚠️ Needs rebuild | Current version has outdated decisions. Rebuild now that component files are complete. |
-| WDP-INTEGRATIONS.md | ⚠️ Needs rebuild | Rebuild from confirmed component boundary sections. |
-| WDP-NFRS.md | ⚠️ Needs rebuild | Contains outdated NFRs. Never apply NFRs without confirming with Ram first. |
+| WDP-DECISIONS.md | ✅ Current — v2.0 | Rebuilt April 2026. DEC-011 and DEC-014 voided. DEC-019/020 recorded. Deviation maps added. |
+| WDP-INTEGRATIONS.md | ✅ Current — v2.0 | Rebuilt April 2026. BEN Kafka correction applied. JustAI planned status confirmed. |
+| WDP-NFRS.md | ✅ Current — v2.0 | Rebuilt April 2026. DEC-014/011 void references removed. Risk Register added (23 risks). |
 | WDP-HANDOVER.md | ✅ Current — v3.0 | This file. Updated April 2026. |
-| WDP-ARCHITECTURE-v1-ARCHIVED.md | 📦 Archived | Old architecture. ⚠️ Section 4.4 BRE Step Checkpointing describes aspirational design — NOT the current implementation. Do not treat as accurate. |
+| WDP-ARCHITECTURE-v1-ARCHIVED.md | 🗑️ Removed | Removed April 2026. Content superseded by individual component files and current Tier 1 documents. BRE checkpointing section was aspirational design only (DEC-011 VOID). |
 
 ### Tier 2 — Reference Indexes
 
@@ -105,7 +105,7 @@ WDP-ARCHITECTURE.md first, then WDP-DECISIONS.md.
 | 🔲 UI — separate action item | 2 | COMP-49 WDP Merchant Portal, COMP-50 WDP Ops Portal |
 
 **Component migration complete.** All 40 available component DRAFT files have been uploaded and verified.
-**Next phase:** Rebuild WDP-DECISIONS.md, WDP-INTEGRATIONS.md, WDP-NFRS.md from confirmed component data.
+**Next phase:** WDP-DECISIONS.md ✅, WDP-INTEGRATIONS.md ✅, WDP-NFRS.md ✅ all complete. Next: WDP-FLOW documents or Archive WDP-COMPONENTS.md.
 
 ### Tier 4 — Workflow Documents
 
@@ -126,18 +126,19 @@ Workflow documentation to be done as a parallel work stream.
 
 **Next work — Rebuild phase (in priority order):**
 
-1. **WDP-DECISIONS.md** — rebuild from component-level decision entries.
-   Critical: DEC-011 must be corrected (checkpointing NOT implemented).
-   DEC-004 violation in COMP-23 must be formally recorded.
-   Platform-wide DEC-005, DEC-001, DEC-003 deviation patterns must be documented.
+1. ~~**WDP-DECISIONS.md**~~ ✅ COMPLETE — rebuilt April 2026. DEC-011 and DEC-014
+   formally voided. DEC-019 (clear PAN) and DEC-020 (no idempotency) recorded.
+   Deviation maps added to DEC-001, DEC-003, DEC-005. WDP-DECISIONS-ARCHIVE.md
+   removed from project.
 
-2. **WDP-INTEGRATIONS.md** — rebuild external system contracts from
-   confirmed component boundary sections. COMP-19/20/39/40/43/34 are
-   the primary sources.
+2. ~~**WDP-INTEGRATIONS.md**~~ ✅ COMPLETE — rebuilt April 2026. BEN delivery
+   corrected to Kafka (BEN-owned MSK cluster, not webhook). JustAI confirmed
+   planned only — not in codebase. WDP-INTEGRATIONS-ARCHIVE.md removed.
 
-3. **WDP-NFRS.md** — rebuild from confirmed risk registers across all
-   component files. Platform-wide patterns (no circuit breakers, no
-   timeouts, no RBAC in COMP-24) are now fully visible.
+3. ~~**WDP-NFRS.md**~~ ✅ COMPLETE — rebuilt April 2026. Circuit breaker and
+   BRE checkpointing references removed (both void). Kafka delivery corrected
+   to at-most-once. Section 6 Platform Risk Register added — 23 confirmed
+   risks, all cross-referenced to WDP-DECISIONS.md v2.0.
 
 4. **WDP-FLOW-[NAME].md files** — document the 11 core flows identified
    in WDP-FLOW-INDEX.md. Can start in parallel with decisions rebuild.
@@ -245,19 +246,18 @@ Do not contradict these without explicit confirmation from Ram.
   IBM DB2 Core Platform (BC.TBC_DM_CASE, BC.TBC_DM_OCCUR, BC.TBC_DM_NOTES).
   All other DB2 access across the platform is read-only.
 
-**Confirmed DEC violations:**
-- DEC-011 BRE step checkpointing — NOT IMPLEMENTED in COMP-16. The named
-  steps (VALIDATE, ENRICH, ATTACH_ISSUER_DOC) and checkpoint mechanism
-  described in WDP-ARCHITECTURE-v1-ARCHIVED.md and WDP-DECISIONS.md are
-  aspirational design, not current code. Must be corrected when
-  WDP-DECISIONS.md is rebuilt. Do not reference DEC-011 as active.
-- DEC-004 violation confirmed in COMP-23 CaseManagementService — clear PAN
-  written directly to nap.case.I_ACCI_CDH and wdp.CASE.I_ACCT_CDH on
-  standard case creation. Encryption only occurs during the transaction
-  enrichment flow. Formal ADR required when WDP-DECISIONS.md is rebuilt.
+**Confirmed DEC violations and voids — all now formally recorded in WDP-DECISIONS.md v2.0:**
+- DEC-011 ⛔ VOID — BRE step checkpointing confirmed never implemented in COMP-16.
+  Formally voided in WDP-DECISIONS.md v2.0. Do not reference as active anywhere.
+- DEC-014 ⛔ VOID — Resilience4j confirmed absent across all 40 component files.
+  Formally voided in WDP-DECISIONS.md v2.0. Do not reference as active anywhere.
+- DEC-004 violation in COMP-23 — clear PAN written to persistent storage on standard
+  case creation. Formally recorded as DEC-019 (Accepted Risk) in WDP-DECISIONS.md v2.0.
 - DEC-001 (transactional outbox) — violated by COMP-04, COMP-15, COMP-16,
-  COMP-19, COMP-20, COMP-23, COMP-24, COMP-25. Direct synchronous Kafka
-  publish without outbox is the dominant pattern in WDP.
+  COMP-19, COMP-20, COMP-23, COMP-24, COMP-25. Deviation map recorded in
+  WDP-DECISIONS.md v2.0.
+- No idempotency on case creation (COMP-23) — formally recorded as DEC-020
+  (Accepted Risk) in WDP-DECISIONS.md v2.0.
 
 **Key confirmed platform facts:**
 - BusinessRulesProcessor (COMP-16) makes direct DB calls to nap.rules /
@@ -284,6 +284,14 @@ Do not contradict these without explicit confirmation from Ram.
   instead of napTransactionManager. All three NAP tables it writes are in the
   NAP schema. Rollback on failure is not guaranteed. Confirmed bug — assess
   production impact.
+- BEN notification is delivered via Kafka publish to a BEN-owned MSK cluster
+  using separate SASL/JAAS credentials — NOT via REST or webhook. Confirmed
+  from COMP-42 source and WDP-INTEGRATIONS.md v2.0. WDP-COMP-INDEX.md
+  description corrected.
+- JustAI integration is planned only — no JustAI reference exists anywhere in
+  the COMP-41 codebase. Signifyd is the sole live third-party vendor.
+  WDP-COMP-INDEX.md description corrected. WDP-INTEGRATIONS.md v2.0 records
+  JustAI as planned under Section 5.2.
 
 **Enterprise shared services (not WDP owned):**
 - Akamai — CDN and edge security (Merchant Portal only)
@@ -310,6 +318,7 @@ Do not contradict these without explicit confirmation from Ram.
 - LATAM full integration
 - VAP full integration
 - EDIA route migration for NAP Outcome Processor (COMP-39)
+- JustAI third-party notification integration (COMP-41 planned extension)
 
 ---
 
@@ -325,11 +334,11 @@ Do not contradict these without explicit confirmation from Ram.
 | Scheduler 3 topic routing via channelTypeTopicMap — confirm all topic mappings | COMP-12 gap | Confirm EXPIRY_EVENTS→case-action-events; confirm other channel types |
 | Discover vs DiscoverHybrid inbound/outbound differences | COMP-11/file gen | Architect confirmation needed |
 | Amex vs AmexHybrid differences | COMP-11/file gen | Architect confirmation needed |
-| COMP-23 non-atomic cross-datasource write (wdp.dispute_event_change_log within NAP create path) — accepted risk or gap? | COMP-23 risk | Architect decision required before WDP-DECISIONS.md rebuild |
+| COMP-23 non-atomic cross-datasource write (wdp.dispute_event_change_log within NAP create path) — accepted risk or gap? | COMP-23 risk | Architect decision required — WDP-DECISIONS.md rebuilt but this item not yet formally recorded |
 | COMP-23 no idempotency on case creation — accepted risk? | COMP-23 risk | Architect decision required — concurrent identical requests produce duplicate case records |
 | COMP-26 POST idempotency gap — duplicate POSTs insert new rows | COMP-26 risk | Architect decision — DB unique constraint on (I_CASE, I_ACTION_SEQ) needed? |
-| COMP-24 RBAC gap — RestInvoker.authorizeUser() never called | COMP-24 security | Formal ADR required when WDP-DECISIONS.md rebuilt |
-| COMP-03 validateOrgId() commented out on GET /orgentity | COMP-03 security | Formal ADR required when WDP-DECISIONS.md rebuilt |
+| COMP-24 RBAC gap — RestInvoker.authorizeUser() never called | COMP-24 security | Recorded as DEC-018 (Accepted Risk) in WDP-DECISIONS.md v2.0. Remediation timeline TBC with team. |
+| COMP-03 validateOrgId() commented out on GET /orgentity | COMP-03 security | Raise formal ADR — not yet recorded in WDP-DECISIONS.md v2.0. |
 | nap.rule_group, nap.rule_criteria, nap.rule_action_field write ownership | COMP-31 gap | Confirm whether COMP-32 RulesService or DBA scripts own these |
 | PIN platform enrichment path in COMP-14 — same as CORE (MerchantTransactionService) or distinct? | COMP-14 open question | Architect decision + Copilot follow-up |
 | COMP-29 FaxQueueService eViewer License proxy — is it documented and is there a production runbook? | COMP-29 gap | Team confirmation |
@@ -342,17 +351,14 @@ Do not contradict these without explicit confirmation from Ram.
 
 Rebuild in this order:
 
-1. **WDP-DECISIONS.md** — rebuild from component-level decision entries.
-   Priority corrections: DEC-011 (checkpointing not implemented), DEC-004
-   violation in COMP-23, DEC-005 platform-wide deviation pattern,
-   DEC-001 deviation pattern. ~50+ decisions now identified across all DRAFT files.
+1. ~~**WDP-DECISIONS.md**~~ ✅ COMPLETE — rebuilt April 2026. 29 decisions
+   registered. DEC-011 and DEC-014 voided. DEC-016 through DEC-023 added.
 
-2. **WDP-INTEGRATIONS.md** — rebuild external system contracts from
-   confirmed component boundary sections.
+2. ~~**WDP-INTEGRATIONS.md**~~ ✅ COMPLETE — rebuilt April 2026. All external
+   integration contracts confirmed from component files.
 
-3. **WDP-NFRS.md** — rebuild from confirmed risk registers across all
-   component files. Platform-wide gaps (no circuit breakers, no timeouts,
-   RBAC gaps) are now fully documented in component files.
+3. ~~**WDP-NFRS.md**~~ ✅ COMPLETE — rebuilt April 2026. 23 platform risks
+   documented in new Section 6 Risk Register.
 
 4. **WDP-FLOW-[NAME].md files** — document the 11 core flows identified
    in WDP-FLOW-INDEX.md. Can start in parallel.

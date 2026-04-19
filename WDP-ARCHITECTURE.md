@@ -49,9 +49,9 @@ toward the right source of truth.
 - WDP-DB.md — ✅ Skeleton (schema map, enrichment in progress)
 - WDP-FLOW-INDEX.md — ✅ Skeleton (11 flows identified, none documented yet)
 - WDP-COMP-[NN]-*.md — 📋 Migration in progress (13 complete, 37 pending)
-- WDP-DECISIONS.md — ⚠️ Needs rebuild
-- WDP-INTEGRATIONS.md — ⚠️ Needs rebuild
-- WDP-NFRS.md — ⚠️ Needs rebuild
+- WDP-DECISIONS.md — ✅ Current v2.0 (rebuilt April 2026 — DEC-011 and DEC-014 voided)
+- WDP-INTEGRATIONS.md — ✅ Current v2.0 (rebuilt April 2026)
+- WDP-NFRS.md — ✅ Current v2.0 (rebuilt April 2026 — Risk Register added)
 
 ---
 
@@ -1597,17 +1597,19 @@ WDP uses two tokens generated from every PAN, each serving a different purpose:
 
 ### 10.2 Resilience Patterns
 
-⚠️ **NOTE:** WDP does not currently implement circuit breakers or fallback mechanisms.
-
-⚠️ **Discussion point:** Circuit breaker strategy and fallback mechanisms to be evaluated as a future architectural decision.
+⚠️ **NOTE:** WDP does not implement circuit breakers or fallback mechanisms.
+DEC-014 (Resilience4j) is formally ⛔ VOID — confirmed absent across all 40
+component files as of April 2026. See WDP-DECISIONS.md v2.0 for the full void record.
+If circuit breakers are introduced in a future hardening sprint, a new ADR must be raised.
 
 Resilience in WDP is currently built around three patterns:
 
-**Idempotency & At-Least-Once Delivery:**
-- Manual Kafka offset commit — committed only after full processing completes
+**Idempotency & At-Most-Once Delivery:**
+- All confirmed Kafka consumers use pre-ACK or mid-flow ACK — offset committed
+  BEFORE full processing completes. DEC-005 (at-least-once) is aspirational;
+  the platform-wide pattern is at-most-once. See WDP-DECISIONS.md v2.0 DEC-005.
 - Per-consumer outbox tables track processing state and idempotency keys
 - Deduplication keys at every processing boundary
-- All consumers handle redelivery safely
 
 **Retry & Backoff:**
 - Exponential backoff with jitter applied to all external API calls

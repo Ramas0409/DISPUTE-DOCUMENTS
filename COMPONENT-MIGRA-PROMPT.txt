@@ -7,8 +7,7 @@ WDP-COMP-TEMPLATE.md, WDP-COMPONENTS.md,
 WDP-ARCHITECTURE.md, WDP-DECISIONS.md,
 WDP-KAFKA.md, WDP-DB.md
 
-Today's component: 17 — CaseExpiryUpdateConsumer
-
+Today's component: 01 — API Gateway
 ━━━ PHASE 1 — Generate Copilot research prompt ━━━
 
 Before I go to Copilot CLI, do the following:
