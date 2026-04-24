@@ -59,6 +59,899 @@ against which set of Pending Entries.*
 *New entries are appended here by per-component chats. Reconciliation sessions
 consume entries from this section and move them to **Reconciled** below.*
 
+### 2026-04-23 — COMP-20 ContestService · v1.0 DRAFT → v2.0 DRAFT
+
+**Source:** `gcp-disputes-contest-service` (dispute-contest-service v1.6.6) —
+source-verified by Claude Code 2026-04-23. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source plus headline new
+content — full Visa RTSI submission contracts documented per contest stage
+(five submission methods, stage→questionnaire mapping, field-level payload
+tables) and full MCM submission contract documented (CH1/RE2 chargeback and
+PAB updateCase paths). Six corrections to v1.0 DRAFT, eight new
+production-risk findings, one headline split-state risk on the CRMR
+pre-publish pattern surfaced during audit.
+
+#### Corrections to v1.0 DRAFT
+1. **Max Kafka publishes per request is 2, not 3.** CRMR branches are
+   `if / else if` — mutually exclusive.
+2. **Card-network failures return HTTP 400, not HTTP 500.** All MC and
+   Visa exceptions are wrapped in `BadRequestException` by the outer
+   catch. Only Kafka publish exhaustion and internal RuntimeException
+   paths return HTTP 500.
+3. **Liveness path is `/livez`, not `/lives`.**
+4. **ErrorLogService commented-out call sites: 8, not 6.**
+5. **CAD/USD commented-out currency blocks: 5, not 1.** Across all five
+   Visa submission methods.
+6. **DEC-014 reclassified.** Absence-of-library fact, not a deviation —
+   consistent with platform-voided DEC-014.
+
+#### Headline new content
+- **Visa RTSI submission contracts** fully documented per responseType
+  (`allocprearb` · `allocarb` · `representment` · `prearbresp` ·
+  `precomresp`) with stage→questionnaire mapping table and field-level
+  payload tables for each of the five submission methods.
+- **MasterCard MCM submission contract** fully documented for
+  `createSecondPresentmentChargeback` (CH1/RE2) and
+  `retrieveClaim + updateCase` (PAB).
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- No change. ContestService owns no tables and reads none — confirmed
+  unchanged from v1.0.
+
+**WDP-KAFKA.md · Section 3 (Topic Registry) — `internal-integration-events`**
+- Update **Notes** column for `internal-integration-events` row:
+  correct "Up to 3 publishes per ContestService request when CRMR action
+  code present" → **"Up to 2 publishes per ContestService request when
+  CRMR action code present (CRMR pre-publish + main; CRMR branches are
+  mutually exclusive)"**.
+- Confirm existing row otherwise accurate: Publishers `COMP-19 + COMP-20`,
+  Consumers `COMP-39 + COMP-40`, Key `merchantId`, No DLQ, No outbox.
+
+**WDP-KAFKA.md · Section 4 (Producer/Consumer Map) — COMP-20 row**
+- Correct "Up to 3 events per request" → **"Up to 2 events per request
+  (CRMR pre-publish + main)"** in Notes column.
+- Add: **"⚠️ Runtime topic resolution depends on env var `KAFKA_TOPICID`
+  (code reads `${kafka.topicId}` but YAML default is `kafka.topic` —
+  startup fails without the env var)."**
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: "COMP-20 ContestService emits **at most 2** Kafka publishes per
+  request (CRMR pre-publish + main; CRMR branches mutually exclusive)."
+- Add: "COMP-20 card-network failures return **HTTP 400**, not 500.
+  Only Kafka publish exhaustion returns HTTP 500."
+- Add: "COMP-20 calls five distinct Visa RTSI submission methods —
+  `createDisputePreCompResponse` (APC), `createDisputePreArb`
+  (CH1+VISA_ALLOCATION), `createDisputeResponse` (CH1+VISA_COLLABORATION),
+  `submitDisputeFilingRequest` (PAB+VISA_ALLOCATION),
+  `createDisputePreArbResponse` (PAB+VISA_COLLABORATION). These are
+  distinct from COMP-40's five retrieval methods."
+- Add: "COMP-20 MCM routes: CH1/RE2 → `createSecondPresentmentChargeback`;
+  PAB → `retrieveClaim + updateCase(action=REJECT)`; other stageCode →
+  HTTP 400."
+- Resolved open questions: (none from v1.0 — v1.0 gaps on
+  known-callers and replica count remain open, environment-config
+  category).
+- New open questions:
+    - **OQ: Does CaseManagement `POST insertActions` always place the
+      CRMR action sequence at `actionSequenceList[0]` when CRMR is the
+      second action code?** COMP-20 removes index 0 unconditionally in
+      both CRMR branches. Follow-up Claude Code question against the
+      COMP-23 repo: *"In `mdvs-gcp-case-management-service`, search the
+      `insertActions` endpoint handler. When the rules engine supplies
+      a CRMR action in any slot of the insert request, does the
+      response `actionSequenceList` place the CRMR sequence at index 0?
+      Report the ordering logic with file:lines."*
+    - **OQ: Is the Kafka topic property-path mismatch
+      (`${kafka.topicId}` in code vs `kafka.topic` in YAML)
+      intentional env-var-only override, or a wiring bug?** Team
+      confirmation.
+    - **OQ: Is the Visa PIN dispatch anomaly a bug?** URL selector
+      keyed on `platform != NAP`, invoker selector keyed on
+      `platform == PIN`. For CORE/VAP/LATAM the URL points at Visa
+      RTSI DataPower but the invoker attaches a Bearer IDP token.
+      Architect decision + team confirmation.
+    - **OQ: Should MCM and Visa retry count / delay be externalised
+      to environment variables, matching the Kafka retry pattern?**
+      Architect decision.
+    - **OQ: Should the Kafka `@Recover` blank-message-swallowing
+      behaviour be corrected?** Latent reliability gap — architect
+      decision.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **Candidate ADR — Direct Kafka Publish Pattern for Case-Level REST
+  Services.** Pattern confirmed on COMP-19, COMP-20, COMP-23, COMP-37.
+  Either document as an accepted platform position with a defined
+  recovery procedure or record as a cross-component DEC-001 remediation
+  item with a target release.
+- **Candidate ADR — CRMR Pre-Publish Split-State Risk.** Two-message
+  pattern on `internal-integration-events` (CRMR pre-publish +
+  subsequent main publish) can produce a permanently split broker
+  state if the main publish fails after the CRMR has been committed.
+  Requires either an outbox remediation or documented downstream
+  compensation procedure.
+
+**WDP-ARCHITECTURE.md**
+- No change. Topology and principles unchanged.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- Candidate new RISK rows (pending architect decision):
+    - **"COMP-20 CRMR pre-publish / main publish split-state — CRMR
+      event commits to broker, main publish fails after retry
+      exhaustion. Downstream consumers see unpaired CRMR event. No
+      retraction mechanism."** 🔴 HIGH.
+    - **"COMP-20 `@Recover` swallows blank-message exceptions — Kafka
+      publish failure with empty exception message returns HTTP 200
+      silently with no event delivered. Latent reliability gap."**
+      🟡 MEDIUM.
+    - **"COMP-20 no idempotency — replayed POST re-calls card-network
+      API (duplicate Visa / MC submission), inserts additional
+      actions, emits duplicate Kafka events. Only guard is
+      `actionStatus == CLOSED` which does not fire on mid-flight
+      retry."** 🔴 HIGH (DEC-020 deviation — consider covering under
+      a platform-wide risk since pattern repeats across case-level
+      REST services).
+    - **"COMP-20 Visa PIN dispatch anomaly — URL/invoker selector
+      mismatch for CORE/VAP/LATAM. Potential auth failure on those
+      platforms."** 🟡 MEDIUM.
+    - **"COMP-20 MCM/Visa retry counts hardcoded — not
+      env-configurable. Runtime retry tuning requires a build."**
+      🟡 MEDIUM.
+    - **"COMP-20 `v-correlation-id` not propagated on DataPower paths
+      (MCM non-NAP and Visa RTSI PIN). Log correlation broken on those
+      paths."** 🟡 MEDIUM.
+    - **"COMP-20 Kafka topic property-path mismatch
+      (`${kafka.topicId}` vs `kafka.topic`). Startup failure mode if
+      env var not supplied by K8s secret."** 🟡 MEDIUM.
+    - **"COMP-20 bare `RestTemplate` with no connection or read
+      timeouts — hung downstream blocks request thread indefinitely.
+      Thread-pool exhaustion risk."** 🟡 MEDIUM (may already be
+      covered by an existing platform-wide RISK — suggest consolidation
+      with similar findings in COMP-19 / COMP-23 / COMP-37).
+
+**WDP-INTEGRATIONS.md · Section 3.1 (Visa RTSI API)**
+- Confirm entry accurate. Add cross-reference to COMP-20 for the five
+  submission methods (currently only retrieval methods via COMP-40
+  are cross-referenced). Note that COMP-20 uses the submission set
+  (`createDispute*`, `submitDisputeFilingRequest`) and COMP-40 uses
+  the retrieval set (`getDispute*Details`).
+
+**WDP-INTEGRATIONS.md · Section 3.2 (Mastercard MCM API)**
+- Confirm existing entry accurate. Add detail: COMP-20 MCM path is
+  stage-dependent — CH1/RE2 uses `createSecondPresentmentChargeback`
+  (POST); PAB uses `retrieveClaim + updateCase(action=REJECT)` (GET
+  then PUT). The DataPower non-NAP path uses the same VANTIV license
+  header as Visa DataPower (shared `licenseKey` secret).
+
+#### Deviation flags for COMP-20
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-003 Kafka Partition Key = merchantId | ✅ COMPLIES | 🟢 |
+| DEC-004 PAN Encryption Before Persistence | ✅ NOT APPLICABLE | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE (producer only) | — |
+| DEC-014 Resilience4j Circuit Breakers | ℹ️ ABSENT (voided platform-wide) | — |
+| DEC-019 No Clear PAN in Persistent Store | ✅ NOT APPLICABLE | — |
+| DEC-020 Full At-Least-Once Idempotency | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-023 Replica = 1 Hard Constraint | ✅ NOT APPLICABLE (stateless REST) | — |
+
+**DEC-001 DEVIATES detail:** Direct publish inside HTTP request handler.
+CaseManagement `insertActions` commit is permanent regardless of Kafka
+outcome. Retry-exhaustion path writes an SNOTE but does not recover the
+event. Matches platform pattern on COMP-19 / COMP-23 / COMP-37 — candidate
+for platform-level ADR.
+
+**DEC-020 DEVIATES detail:** No idempotency-key read, no `(caseNumber +
+actionSequence)` dedup store. `actionStatus == CLOSED` guard does not
+fire on replay of mid-flight failures (input action set to ERROR, not
+CLOSED). Replay re-calls card-network API → duplicate Visa/MC submission,
+additional action inserts, duplicate Kafka events. Kafka idempotent
+producer guards within a single session only.
+
+#### Doc status after this change
+- `WDP-COMP-20-CONTEST-SERVICE.md` → `v2.0 DRAFT` — source-verified
+  2026-04-23 · architect confirmation pending
+---
+---
+### 2026-04-23 — COMP-19 AcceptService · v1.0 DRAFT → v2.0 DRAFT
+
+**Source:** `mdva-gcp-disputes-accept-service` v1.4.7 — source-verified by
+Claude Code 2026-04-23. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source. No functional change in
+production; six corrections to the v1.0 DRAFT plus three previously-undocumented
+production-risk findings surfaced during the audit. All three new findings rise
+to 🔴 HIGH severity. Closes 16 of 16 enumerated gaps; introduces 10 open
+questions (one inherited from v1.0 OCR limitations, three new architect
+decisions required, six environment / team confirmations).
+
+#### Corrections to v1.0 DRAFT
+
+1. Stage code is **CHI** (letter I) throughout all three validators — not
+   `CH1` as previously documented. Affects VISA, MASTERCARD/MAESTRO, and
+   OTHER rows of the stage/actionCode matrix.
+2. VISA PAB permits **WDNL** (in addition to IDCL/IPAB/CHGM). VISA APC uses
+   **PCMP** (not POMP).
+3. `expiryFlow=true` EACP override applies to the first action of the
+   outgoing `AddActionRequest` **for all card networks** (not Visa-only as
+   v1.0 stated). It mutates the AddActionRequest only — it does **not**
+   affect the Kafka publish gate, which reads actionCode from
+   `CaseLookupResponse`.
+4. MC CHI silent no-op applies to **both NAP and PIN** — not PIN only.
+   `MasterCardServiceImpl.accept` wraps the entire NAP+PIN flow in one
+   outer `if (PAB || ARB)`. Non-PAB/ARB returns void with no log.
+5. `errorLogService.saveErrorLog` — **2 of 9 call sites are ACTIVE**
+   (`CaseServiceImpl` Step 6 case-action-add; `MasterCardServiceImpl`
+   Step 5d MC PIN claim lookup). v1.0 incorrectly claimed all sites
+   were commented. `${errorlog.save}` config is reached on those two paths.
+6. Liveness/Readiness probe paths end in **`livez` / `readyz`** (with `z`),
+   not `liver` / `ready` as v1.0 stated. Spring Actuator health groups
+   `liveness` and `readiness` expose additional-paths matching.
+
+#### Newly-confirmed HIGH-severity findings
+
+1. **MC CHI on NAP can publish `AcceptEvent` without MC network
+   notification** (🔴 HIGH split-brain). `MasterCardServiceImpl.accept`
+   silently returns for CHI. The Step 8 Kafka gate still fires if
+   inbound actionCode is `FCHG/IPAB/IARB/IDCL`. Result: NAPOutcomeProcessor
+   delivers the acceptance to NAP-DPS while Mastercard was never asked.
+2. **AMEX/DISCOVER on NAP can publish `AcceptEvent` without network
+   notification** (🔴 HIGH split-brain). `cardNetwork` switch defaults to
+   `log.warn` for AMEX/DISCOVER. Case action is added; on NAP with
+   eligible actionCode, AcceptEvent is published. NAP-DPS receives an
+   outcome for a network that was never notified.
+3. **Compensation has no inner try/catch** (🟠 HIGH operability /
+   observability). `updateAction(ERROR)` and `addErrorNotes` are called
+   without defensive handling in every Step 5/6/4 catch block. A secondary
+   failure in compensation propagates and **replaces** the original
+   business exception in the HTTP response. Operators see a misleading
+   error; the original cause is lost.
+
+#### Other facts now pinned from source
+
+- **Add-case-action runs AFTER the network call** (not before).
+  Compensation `updateAction(ERROR)` targets the **original** action
+  sequence, not a newly-added row.
+- **Kafka gate actionCode** is read from `CaseLookupResponse`, not from
+  the rules response and not from `AddActionResponse`. EACP override does
+  not change the gate.
+- All outbound REST calls use single-attempt — no `@Retryable` on any
+  outbound REST. Only Kafka publish has Spring Retry.
+- No correlation-id propagation: `HttpInterceptor` puts `correlation-id`
+  on MDC, but no `ClientHttpRequestInterceptor`, no `RestTemplateCustomizer`,
+  no `ProducerInterceptor`, no Kafka record headers. End-to-end tracing is
+  broken at this hop.
+- No idempotency-key generated or propagated anywhere.
+- Plain `new RestTemplate()` with default `SimpleClientHttpRequestFactory` —
+  no pool, no keep-alive management, no connect/read timeout.
+- Kafka producer security: SASL_SSL + AWS_MSK_IAM via `IAMLoginModule` and
+  `IAMClientCallbackHandler`. Key serialiser `StringSerializer`; value
+  serialiser Spring `JsonSerializer`. `acks`, `linger.ms`, `batch.size`,
+  `compression.type`, `retries` all left untuned.
+- `validateDisputeAmount` defined but unused — `AmountCalculationUtil.amountValidation`
+  commented out is what severs the call chain.
+- Controller `correlationId` `@RequestHeader` parameter declared but never
+  read inside the method body.
+- `HttpRequestMethodNotSupportedException` annotation says 400 but runtime
+  returns 405 — flagged with `// TODO` in source.
+- `ACCEPT_RESPONSE_TYPE` is declared **once**, not duplicated as v1.0 claimed.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- No change. COMP-19 owns no database state and reads no tables.
+
+**WDP-KAFKA.md**
+- Section 3 Topic Registry, `internal-integration-events` row — no
+  publisher list change (COMP-19 + COMP-20 already listed). Confirm note
+  that COMP-19 partition key is `caseNumber` from `AddActionResponse`.
+- Section 2 Confirmed DEC-003 Deviations — no change (COMP-19 row already
+  reads `caseNumber` confirmed from source).
+- Section 2 Confirmed DEC-001 Deviations — no change (COMP-19 row already
+  reads "Direct synchronous publish — no outbox").
+- **New context to add at the topic-level note for `internal-integration-events`:**
+  AcceptEvent can be published in two split-brain scenarios where no
+  card-network notification actually occurred: (a) MC CHI on NAP, (b)
+  AMEX/DISCOVER on NAP with eligible inbound actionCode. NAPOutcomeProcessor
+  consumers should not assume that an AcceptEvent implies the network was
+  successfully notified.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: COMP-19 confirms (a) add-case-action ordering is AFTER the network
+  call, (b) Kafka gate actionCode is sourced from CaseLookupResponse not
+  from rules/AddActionResponse, (c) two new split-brain Kafka publish
+  paths (MC CHI on NAP, AMEX/DISCOVER on NAP), (d) compensation has no
+  inner try/catch — confirmed pattern likely shared with sibling
+  COMP-20 ContestService.
+- Resolved open questions: previous OQ-4 partition key open question
+  remains — confirmed deviation, awaiting architect decision.
+- New open questions: OQ-9 (architect decision on MC CHI / AMEX / DISCOVER
+  silent-publish behaviour); OQ-10 (re-fetch source for files missing from
+  OCR pass — `AcceptRequest`, `RestInvoker`, `NotFoundException`,
+  `EnumName`, `DisputeAmount`, plus the `getCaseActionDetais` typo).
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **ADR candidate (HIGH priority):** Document the AcceptService split-brain
+  publish behaviour formally — either (a) accept the risk and document a
+  manual recovery procedure for MC CHI / AMEX / DISCOVER NAP cases, or
+  (b) remediate by fail-closing those branches before they reach the
+  Kafka publish gate. This is the same severity class as DEC-019 and
+  DEC-020 risk-accepted ADRs.
+- DEC-001 deviation map for COMP-19 already present (no change). Severity
+  reaffirmed as 🔴 HIGH.
+- DEC-003 deviation map for COMP-19 already present (no change).
+- DEC-014 — voided platform-wide. COMP-19 is consistent with the void.
+
+**WDP-ARCHITECTURE.md**
+- No topology change. Section 8.1 "Card Network Direct API Calls"
+  diagram remains accurate at the system-context level. Worth noting in
+  prose that AMEX/DISCOVER show as targets in the diagram but in fact
+  fall through to no-op for AcceptService.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- Add **RISK-NEW-1 (🔴 HIGH):** AcceptService NAP split-brain on MC CHI
+  and AMEX/DISCOVER — `AcceptEvent` published to NAP-DPS without any
+  network notification. Affected components: COMP-19. ADR pending.
+- Add **RISK-NEW-2 (🟠 HIGH):** AcceptService compensation has no inner
+  try/catch — secondary failure replaces the original business exception
+  in HTTP response, masking root cause. Affected component: COMP-19.
+  Likely shared with COMP-20 ContestService — confirm in next pass.
+- Reaffirm RISK-001 (no circuit breakers) and RISK-002 (no REST
+  timeouts) for COMP-19 — 14 outbound REST calls, none with timeout
+  or breaker.
+
+**WDP-INTEGRATIONS.md**
+- Section 3.1 (Visa RTSI) and Section 3.2 (Mastercard MCM) — no contract
+  change. Update the "MC PIN PAB/ARB special case" note in 3.2 to read
+  "MC CHI silent no-op applies to **both NAP and PIN** — not PIN only.
+  Only PAB and ARB stages invoke an MCM network call on either platform."
+- Section 3.1 — the existing "AMEX and DISCOVER gap in AcceptService"
+  note can now be sharpened with the NAP-publish split-brain consequence.
+
+#### Deviation flags for COMP-19
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 | ⛔ DEVIATES | 🔴 |
+| DEC-003 | ⛔ DEVIATES | 🟡 |
+| DEC-004 | ✅ NOT APPLICABLE | — |
+| DEC-005 | ✅ NOT APPLICABLE | — |
+| DEC-019 | ✅ NOT APPLICABLE | — |
+| DEC-020 | ⚠️ PARTIAL | 🟡 |
+
+DEC-001 deviation confirmed — direct synchronous Kafka publish after
+case-action commit. HTTP 500 informs the caller but does not undo the
+case action; NAPOutcomeProcessor is not notified. State permanently
+inconsistent on Kafka final failure.
+
+DEC-003 deviation confirmed — partition key is `caseNumber` from
+`AddActionResponse`. `merchantId` exists on `CaseLookupResponse` but is
+never mapped into `AcceptEvent`. No documented reason in source.
+
+DEC-020 partial — no duplicate-detection on (caseNumber + actionSequence).
+Partial guard via Step 3 case/action status membership check only.
+Repeats that survive the membership guard re-execute the full flow,
+including a second network call and a second Kafka publish.
+
+#### Remaining gaps
+
+- **OQ-COMP-19-1** Literal value of `${kafka_nap_topic}` per environment
+  — environment config / K8s Secret. Confirmed `internal-integration-events`
+  in WDP-KAFKA.md but not in source.
+- **OQ-COMP-19-2** Production replica count and `deploymentApiVersion` —
+  XL Deploy / Deploy.it manifests. Not in repo.
+- **OQ-COMP-19-3** Architect confirmation of inferred logical-component
+  mappings (case-lookup → COMP-23/27, rules → COMP-32, action add/update
+  → COMP-24, notes → COMP-25, error log → COMP-38) — architect decision.
+- **OQ-COMP-19-4** Why `caseNumber` is used as Kafka partition key
+  instead of `merchantId` (DEC-003 deviation) — architect decision; ADR
+  candidate.
+- **OQ-COMP-19-5** Why 7 of 9 `saveErrorLog` calls are commented out —
+  team confirmation. Intentional rollback, deferred refactor, or stuck
+  mid-migration?
+- **OQ-COMP-19-6** AMEX / DISCOVER routing absence — intentional scope
+  boundary or production gap? Compounded by the new finding that NAP +
+  AMEX/DISCOVER + eligible inbound actionCode publishes `AcceptEvent` to
+  NAP-DPS — team / architect decision.
+- **OQ-COMP-19-7** Production exclusion of `spring-boot-devtools` — relies
+  on `spring-boot-maven-plugin` repackage being the deployed artefact.
+  CI/CD pipeline confirmation required.
+- **OQ-COMP-19-8** Confirmed list of callers (Merchant Portal, Ops Portal,
+  API Gateway, automated workflows) — caller-repo analysis required.
+- **OQ-COMP-19-9** Architect decision required on MC CHI silent no-op on
+  NAP and AMEX/DISCOVER on NAP — should these branches fail loud, write
+  a SNOTE, or block the Kafka publish? Blocks closing the two new HIGH
+  split-brain risks.
+- **OQ-COMP-19-10** Re-fetch source for files missing from OCR pass —
+  `AcceptRequest.java` (entire `model/request/` package), `RestInvoker.java`
+  (referenced from 7 service classes — its retry/header behaviour is
+  inferred), `NotFoundException.java`, `EnumName.java`, `DisputeAmount.java`,
+  plus the `getCaseActionDetais` (missing 'l') typo. Developer confirmation
+  on source state.
+
+#### Doc status after this change
+- `WDP-COMP-19-ACCEPT-SERVICE.md` → `v2.0 DRAFT` — source-verified
+  2026-04-23 · architect confirmation pending
+---
+### 2026-04-23 — COMP-37 DocumentManagementService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `gcp-document-management-service` (artifact `document-management-service` v2.2.8) — source-verified by Claude Code 2026-04-23. Architect confirmation pending.
+
+**Nature of change:** Correction pass. Source audit closed the "is this service Kafka-connected?" knowledge-base discrepancy, reframed DEC-003 from "inconsistent per code path" to "uniformly non-compliant with legacy dead code", corrected the primary-flow step order (Kafka BEFORE action-update, not after), corrected the Endpoint 11 HTTP verb (POST, not PUT) and transactional semantics (stronger than DRAFT claimed), and closed multiple DynamoDB attribute-name and payload-field inaccuracies.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- **Section 1 (Data store inventory) — Amazon DynamoDB row:** no ownership change. Clarify attribute set.
+- **Section 2 (Schema ownership map) — add rows:**
+  - `QuestionnaireEntity` (WDP/US datasource) — OWNED by COMP-37 DocumentManagementService — caseNumber + actionSequence PK. No unique constraint beyond PK.
+- **Section 2 — add shared-write flag (⚠️ shared table risk):**
+  - `USCaseEntity` and `UKCaseEntity` — COMP-37 is a column-level UPDATE co-writer on the desk-blanking branch. Likely owned (INSERT/DELETE) by COMP-22 DisputeService. Cross-component ownership review needed.
+- **Section on DynamoDB GSIs (new detail):** `WDP_PIN_DISPUTE_DOCUMENTS` and `NAP_DISPUTE_DOCUMENTS` declare five GSIs (`C_STAGE_CODE`, `I_ACTION_SEQ`, `C_DOC_TYPE`, `N_DOC_NAME`, `Z_UPDT`) — none queried from Java. Projection type not determinable from source — flag as external-config dependency.
+- **Retention table row for Evidence documents:** no change (still TBC pending AWS console review).
+
+**WDP-KAFKA.md**
+
+- **Section 3 — Topic Registry — `business-rules` row:** Add COMP-37 DocumentManagementService to the Publisher list with note: "caseNumber key — DEC-003 deviation — publishes on upload (Endpoints 1, 9, 10) and questionnaire (Endpoint 11) paths, gated by `notifyBRQueue` + `startRuleGroup`; Endpoint 8 NAP base64 path never publishes (controller override). DEC-001 deviation on upload path (direct sync publish post-DDB); questionnaire path wraps publish in `@Transactional(rollbackOn=Exception.class)` — stronger atomicity than other publishers on this topic."
+- **Section 2 — Confirmed DEC-001 Deviations table:** Add row for COMP-37 — topic `business-rules` — "Direct synchronous publish after DynamoDB write on primary upload path; no outbox. Questionnaire path is @Transactional(rollbackOn=Exception.class) — partial mitigation but still no outbox."
+- **Section 2 — Confirmed DEC-003 Deviations table:** Add row for COMP-37 — topic `business-rules` — "caseNumber on every reachable publish (legacy merchantId path is dead code, 0 callers)."
+- **Section 6 — Components Confirmed Kafka-Free:** ⚠️ **REMOVE** the COMP-37 row ("REST API. No Kafka dependency confirmed from source."). This row is factually incorrect and contradicts the component file, COMP-INDEX, and now-verified source.
+- **Section 2 — DEC-005 Deviations table:** no change (consumer-only decision — COMP-37 has no consumer).
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+- **Add:**
+  - COMP-37 DocumentManagementService is the fifth (sixth if COMP-14 is later confirmed) publisher of `business-rules` — caseNumber key, uniform DEC-003 deviation. Resolves the WDP-KAFKA.md discrepancy that had listed this component as Kafka-free.
+  - COMP-37 primary upload step order is `S3 → DDB → desk update → Kafka publish → action-indicator update`. Action-indicator update is the LAST step — making action-indicator staleness the terminal failure mode if Kafka succeeds but the final REST call fails.
+  - COMP-37 Endpoint 11 (POST questionnaire) is the only publish path in the platform that wraps the Kafka send inside `@Transactional(rollbackOn=Exception.class)`. Kafka failure rolls back the PostgreSQL save — stronger atomicity than the other five business-rules publishers.
+  - COMP-37 `USCaseEntity` and `UKCaseEntity` are column-level UPDATE co-writers only (desk blanking). INSERT/DELETE ownership likely belongs to COMP-22 DisputeService — requires cross-component confirmation.
+  - COMP-37 declares five DynamoDB GSIs but queries none of them from Java — either external consumer dependency or over-provisioning.
+- **Resolved open questions:** the WDP-KAFKA.md vs WDP-COMP-INDEX.md / WDP-COMP-37 discrepancy about Kafka dependency is now definitively resolved. COMP-37 IS a producer.
+- **New open questions (add to Open Questions table):**
+  - COMP-37 Endpoint 6 (`GET /download`) is missing `@PathVariable("platform")` — source defect or OCR-drop in snapshot? Runtime-impact verification needed.
+  - COMP-37 `BusinessRulesData` payload — `merchantId` field is declared in DTO but never populated; emitted as null on the wire. Does COMP-16 BusinessRulesProcessor handle `merchantId=null` safely?
+  - COMP-37 RESPDOC→source divergence: primary upload maps to `BRRSUP`; questionnaire path maps to `BRMRUP`. Intended behaviour or bug? Requires COMP-16 verification.
+  - COMP-37 five DynamoDB GSIs declared but unused from Java — which (if any) external consumer depends on them? Projection type on each?
+  - COMP-37 `user-access-management-service` + `core-hierarchy-authorization-service-url` URLs configured in prod YAML but zero Java references — confirm dead config for removal.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+
+- **Candidate ADR:** Standardise Kafka partition key across `business-rules` producers. Every current publisher (COMP-15, COMP-23, COMP-24, COMP-25, COMP-37 upload/questionnaire, COMP-12 Scheduler4) uniformly deviates from DEC-003 by using `caseNumber`. The decision is no longer "whether to deviate" — it is whether to formally update DEC-003 to recognise case-scoped ordering on this topic, or whether to undertake a platform-wide migration to `merchantId`. COMP-37 data point strengthens the case for updating DEC-003.
+- **Candidate ADR (related):** Formalise the `@Transactional(rollbackOn=Exception.class)` pattern used by COMP-37 Endpoint 11 as a stopgap atomicity pattern for components that cannot yet adopt an outbox. COMP-25 NotesService and COMP-15 EvidenceConsumer have similar shapes; platform could align on the pattern pending full outbox rollout.
+- **Candidate ADR:** DEC-020 idempotency — formalise that `idempotency-key` header is accepted platform-wide but not used for dedup. COMP-37 is consistent with this. Decide whether to make this an accepted risk ADR or to mandate header-driven dedup on all write endpoints.
+
+**WDP-ARCHITECTURE.md**
+
+- No topology change.
+- Minor clarification opportunity: COMP-37 is the only WDP component writing to AWS S3 and DynamoDB as primary data stores. Existing architecture diagram is accurate; add a note to the Data Storage section clarifying S3 + DynamoDB + dual PostgreSQL datasources are unique to this service.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+
+- **Add RISK:** "COMP-37 primary upload path has a 5-step non-atomic write chain (S3 → DDB → desk → Kafka → action-indicator) with no compensating action at any boundary. Failure at any step after the first leaves partial state; failure after Kafka is unrecoverable without manual BR re-drive or action-indicator correction." Severity 🔴 HIGH. Link to DEC-001.
+- **Add RISK:** "COMP-37 RestTemplate has no connect/read timeout on any outbound REST call (13+ call sites across 10 logical targets, plus a second inline `new RestTemplate()` in `RestInvoker.postData()`). Any hanging downstream blocks handler threads indefinitely." Severity 🔴 HIGH. Platform-wide RestTemplate timeout pattern should be revisited.
+- **Add RISK:** "COMP-37 DynamoDB duplicate-check race — two concurrent requests with identical `(caseNumber, actionSequence, documentName)` both pass the non-atomic application-level check; later `putItem` silently overwrites earlier row (including insert-audit fields); Kafka publishes both events." Severity 🟡 MEDIUM.
+- **Add RISK:** "COMP-37 `idempotency-key` header accepted and propagated as an outbound Kafka record header, but not used for deduplication at any write site. Client retries produce duplicate DDB rows, duplicate S3 writes, duplicate Kafka events." Severity 🟡 MEDIUM. Link to DEC-020.
+- **Update RISK (if existing):** "topology spread `matchLabels` uses `${BRANCH_NAME_PLACEHOLDER}`" — confirm this pattern also affects other components and is not COMP-37-specific before generalising.
+
+**WDP-INTEGRATIONS.md**
+
+- No external integration contract change. All AWS S3 / DynamoDB / MSK usage was already documented at platform level.
+- Minor clarification opportunity: if WDP-INTEGRATIONS.md has an AWS MSK section, note that COMP-37 shares the same MSK cluster as the other `business-rules` publishers — no separate cluster.
+
+#### Deviation flags for COMP-37
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 | ⛔ DEVIATES (primary upload path); ⚠️ PARTIAL (questionnaire path — @Transactional wraps Kafka publish) | 🔴 HIGH |
+| DEC-003 | ⛔ DEVIATES (uniform — `caseNumber` on every active path; legacy `merchantId` path is dead code) | 🔴 HIGH |
+| DEC-004 | ✅ COMPLIES | — |
+| DEC-005 | ✅ NOT APPLICABLE (producer only, no consumer) | — |
+| DEC-019 | ✅ COMPLIES | — |
+| DEC-020 | ⛔ PARTIAL DEVIATION (non-atomic dup check; idempotency-key accepted but unused; Endpoint 11 repeat-PUT overwrites state) | 🔴 HIGH |
+
+**DEC-001 narrative:** Primary upload path performs direct synchronous Kafka publish after DynamoDB write and desk-number update — no outbox table, no spanning transaction. Broker unavailability after DDB commit = permanent BR event loss. Questionnaire path (Endpoint 11) is materially stronger than DRAFT v1.0 claimed: the publish is inside `@Transactional(rollbackOn=Exception.class)` alongside the PostgreSQL save, so a Kafka exhaustion rolls back the save. Remaining leak: broker ACK followed by a later commit-time exception can emit a published-but-unpersisted event. Remediation: adopt outbox pattern (platform-wide DEC-001 enforcement) or formalise the `@Transactional`-wrap pattern as a stopgap.
+
+**DEC-003 narrative:** DRAFT v1.0 described the key as "inconsistent per code path" because two publish methods (legacy `sendBusinessRules(merchantId)` and newer `sendBusinessRulesToKafka(caseNumber)`) both appeared active. Source audit confirms zero callers of the legacy method. The runtime inconsistency does not exist — every message on `business-rules` from this service is keyed on `caseNumber`. The deviation from DEC-003 is uniform. Remediation options: (a) delete dead `sendBusinessRules()` and accept `caseNumber` as the de-facto standard across the five-plus producers on this topic; (b) migrate this service and the four other publishers to `merchantId`.
+
+**DEC-020 narrative:** Three distinct gaps: (1) DynamoDB duplicate check is application-level query + in-memory compare, non-atomic — concurrent identical uploads both land; (2) `idempotency-key` header accepted, logged, MDC-tagged, echoed, and propagated as an outbound Kafka record header but not used for deduplication at any write site; (3) Endpoint 11 `POST ...action/{actionSeq}` treats repeat submissions as last-write-wins on `QuestionnaireEntity` and republishes Kafka each time — no idempotency guard beyond the primary key. Accepted-risk register candidate alongside COMP-23 and COMP-26.
+
+#### Doc status after this change
+- `WDP-COMP-37-DOCUMENT-MANAGEMENT-SERVICE.md` → `v1.1 DRAFT` — source-verified 2026-04-23 · architect confirmation pending
+---
+### 2026-04-23 — COMP-24 CaseActionService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `gcp-cas-actions-service` (artifact `case-actions-service`) — source-verified by Claude Code 2026-04-23. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source. Thirteen corrections to the v1.0 DRAFT — most material: (1) BRE Kafka publish is INSIDE @Transactional (not post-commit split-brain as v1.0 claimed); (2) FULL_CTM action code is CHGM not CHMR; (3) NAP conditional outbox writes to `nap.DISPUTE_EVENT_CONSUMER_ERROR`, not `wdp.chbk_outbox_row`; (4) `wdp.dispute_event_change_log` does not exist in this repo — dormant-table row removed. Several new risks surfaced: open-action constraint race window, last-write-wins on shared case/action tables, NAP vs US EP 5 asymmetry on chbkOutbox handling, EP 9 three-transaction no-compensation sequence.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- 🟡 `wdp.dispute_event_change_log` row — **REMOVE** the COMP-24 reference (and the row itself if COMP-24 was the only listed writer/reader). Source grep confirms zero matches for `EventChangeLog`, `dispute_event_change_log`, or any ChangeLog repository in the `gcp-cas-actions-service` repo.
+- 🔴 **NEW ROW REQUIRED** in Shared Table Risk Register: `nap.DISPUTE_EVENT_CONSUMER_ERROR`. COMP-24 writes this table on NAP insert-path when `chbkOutbox` block present (same transaction as `nap.case` write). Not currently in WDP-DB.md. Follow-up needed on other writers — likely NAP-side consumers (COMP-04 / COMP-05). Suggested initial severity: 🟡 MEDIUM pending full writer confirmation. Note the US-vs-NAP asymmetry: NAP EP 5 does not touch this table even when `chbkOutbox` is present, so cross-component orchestration contracts that assume symmetric outbox acknowledgement are not upheld.
+- 🟢 `wdp.notes` row — clarify COMP-24's scope: insert-path endpoints (EP 1 / 2 / 8 / 9) only, US/PIN/CORE/VAP/LATAM only. EP 5 on the US path does not insert notes. NAP path writes `nap.notes` (already listed correctly — confirm scope is insert-path only).
+- 🟢 `wdp.case` and `wdp.action` rows — add note that COMP-24 has zero `@Version` annotations and zero pessimistic/optimistic locking. Last-write-wins semantics confirmed. Race window on the in-memory open-action constraint newly documented — supports existing 🔴 HIGH severity on `wdp.action` and 🟠 MEDIUM-HIGH on `wdp.case`.
+- 🟢 `nap.case` and `nap.action` rows — same note (zero locking) applies to the NAP path.
+- 🟢 `wdp.chbk_outbox_row` row — no change; COMP-24 remains a status-UPDATE-only writer, US/PIN/CORE/VAP/LATAM path only, conditional on `chbkOutbox` in request.
+
+**WDP-KAFKA.md**
+
+- **Section 2 — DEC-001 publisher deviation table**: correct COMP-24 row. v2.0 currently states *"Synchronous publish post-DB-commit — split-brain risk confirmed"*. Source shows the `BusinessRuleEvent` publish is inside the `@Transactional` service method — failure rolls back the DB. The split-brain applies only to the `ActionEvent` publish on EP 2 / 8 / 9. Revised text: *"BRE synchronous publish inside @Transactional — DB rolls back on send failure. ActionEvent post-commit publish — failures swallowed, genuine split-brain surface."*
+- **Section 2 — DEC-003 deviation table**: no change — COMP-24 row already correct (`business-rules, ActionEvent topic | caseNumber`).
+- **Section 3 — Topic Registry**: no change to topic rows. Both topics (`${kafka.business-rule-topic}` and `${kafka.topic}`) remain unresolved to literal names — resolution requires the K8s Secret values.
+- **Topic consumer for `${kafka.topic}` (ActionEvent)**: still TBC. Suggested consumer remains COMP-39 NAPOutcomeProcessor — unverified. Follow-up Claude Code question recorded below.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+Add / correct:
+- COMP-24 BusinessRuleEvent Kafka publish is inside the `@Transactional` service method. A Kafka send failure rolls back the domain write before commit. Corrects the v1.0 claim that it was post-commit.
+- COMP-24 ActionEvent Kafka publish (EP 2 / 8 / 9, conditional on `napUpdateEvent=true`) IS post-commit; failures are swallowed. This is a genuine split-brain surface.
+- COMP-24 action code for FULL_CTM / CTM is `CHGM` (not `CHMR` as v1.0 DRAFT said).
+- COMP-24 `recordTypeIndicator` default for FULL_CTM is `"1"` (not `"T"`).
+- COMP-24 historicalData migration path is US/PIN only. NAP always emits BRE on insert. `napCaseActionDao.insertHistoricalAction` exists but has no service-layer caller.
+- COMP-24 NAP conditional outbox writes `nap.DISPUTE_EVENT_CONSUMER_ERROR`, not `wdp.chbk_outbox_row`.
+- COMP-24 NAP EP 5 (`UKCaseActionDaoImpl.updateAction`) does NOT process `chbkOutbox` on any branch — functional asymmetry vs US DAO.
+- COMP-24 EP 5 reopen path writes `caseLiability = ApplicationConstants.SPACE` (single-space string), not null.
+- COMP-24 EP 5 close-case path does NOT update `I_CASE_ACTION_MAX_SEQ` at the call site (only insert-path `updateCaseEntity` mutates max-seq).
+- COMP-24 EP 9 runs three sequential independent transactions (insert + Document Service POST + indicator update + optional post-commit ActionEvent). No compensation between stages.
+- COMP-24 has no `@Version`, no `@Lock`, no `SELECT FOR UPDATE` — last-write-wins on all owned tables.
+- COMP-24 open-action constraint (≤ 1 non-REQ non-CLOSED action per case) is an in-memory check — race window exists across concurrent POSTs.
+- COMP-24 memory limit is `4096Mi` (v1.0 DRAFT OCR-read "409EM" was incorrect).
+- COMP-24 has Kubernetes liveness and readiness probes; startup probe absent; PodDisruptionBudget absent.
+- COMP-24 repository name is `gcp-cas-actions-service` (v1.0 DRAFT used `mdvs-gcp-case-actions-service`; the `mdvs-` prefix appears in K8s app-label only).
+- COMP-24 has no custom Micrometer meters — only a single `application` tag.
+- COMP-24 dead config keys `${auth_url}` and `${pin_auth_url}` wire to the unused `RestInvoker.authorizeUser` path — formal RBAC ADR candidate.
+- `wdp.dispute_event_change_log` / `EventChangeLogRepository` is not present in the `gcp-cas-actions-service` repository. Remove from platform-level references.
+
+Resolved open questions (remove from HANDOVER):
+- COMP-24 memory limit — now 4096Mi.
+- COMP-24 liveness / readiness probe configuration — now documented.
+- COMP-24 historicalData scope — US/PIN only.
+- COMP-24 BRE publish transactional coupling — inside @Transactional.
+- COMP-24 RestInvoker.authorizeUser caller confirmation — zero callers.
+- COMP-24 MDC / correlation ID propagation — documented.
+- COMP-24 Kafka producer config — documented (idempotent producer, retries=${kafka.retry-count}, all other timing/batch/compression configs default).
+
+New open questions (add to HANDOVER):
+- **OQ-COMP-24-1 Literal topic name for `${kafka.business-rule-topic}`** — env config. Confirm from K8s Secret `gcp-case-actions-service-secrets` or MSK configmap.
+- **OQ-COMP-24-2 Literal topic name for `${kafka.topic}` (ActionEvent)** — env config. Same.
+- **OQ-COMP-24-3 Consumer of `${kafka.topic}` (ActionEvent)** — follow-up Claude Code question: *"In the NAPOutcomeProcessor repository (COMP-39), search for any `@KafkaListener` on a topic resolved from `${kafka.topic}` or an env-var alias, consuming payloads with fields caseNumber, actionSequences, platform, currentActionSequence, networkCaseId. Report the topic property key, consumer group ID, and @KafkaListener file:line."*
+- **OQ-COMP-24-4 Effective production IDP token URI** — env config. `application.yml` line 42 holds a hardcoded UAT `fiscloudservices.com` URI; only client-id and client-secret are externalised. Confirm whether any production env-var override exists.
+- **OQ-COMP-24-5 Production replica count for COMP-24** — XL Deploy placeholder `{{replicas-gcp-case-actions-service}}`. Team confirmation.
+- **OQ-COMP-24-6 DB unique constraint on `wdp.action` / `nap.action`** — DBA confirmation. Determines severity of the open-action constraint race window. No DDL in this repo.
+- **OQ-COMP-24-7 Other writers of `nap.DISPUTE_EVENT_CONSUMER_ERROR`** — follow-up Claude Code pass on COMP-04 NAPDisputeEventService and COMP-05 NAPDisputeEventProcessor repos: *"Search for any JPA repository, entity, or native SQL that writes to `nap.DISPUTE_EVENT_CONSUMER_ERROR`. Report the entity class, repository, call sites, and transaction boundary."*
+- **OQ-COMP-24-8 UKCaseActionDaoImpl `updatePreviousNapActionEntity`** — follow-up Claude Code pass on this repo: *"Read the body of `updatePreviousNapActionEntity` in `UKCaseActionDaoImpl` and related service helper. Report every field written on the previous-action entity, including any `revrsl-ind` / `revrnlInd` style field, and the conditions under which each write fires."*
+- **OQ-COMP-24-9 NAP EP 5 chbkOutbox asymmetry** — architect decision. Is `UKCaseActionDaoImpl.updateAction` missing the `chbkOutbox` processing deliberately (NAP callers never signal via this field on update) or is it a gap?
+- **OQ-COMP-24-10 Aurora HikariCP pool sizes** — env config. `application.yml` does not set pool sizes; Spring Boot defaults apply but production sizing should be confirmed with the platform team.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+
+- 🟠 **HIGH candidate — "RBAC enforcement absent in CaseActionService"**: `RestInvoker.authorizeUser` defined with zero callers; no `@PreAuthorize` / `@RolesAllowed` / `@Secured` anywhere; dead config keys `${auth_url}` and `${pin_auth_url}` wire to this unused path. Formally record at next WDP-DECISIONS rebuild window. Links to RISK-005 already in WDP-NFRS.md Section 6.
+- 🟠 **MEDIUM-HIGH candidate — "Open-action constraint enforced in-memory only; no DB-level guard"**: Race window across concurrent POSTs on same `caseNumber`. Applies to COMP-24 insert endpoints and EP 5 update. Pairs with absence of `@Version` / `@Lock` on case/action entities.
+- 🟠 **MEDIUM-HIGH candidate — "ActionEvent post-commit publish with swallowed failures"**: Distinct from DEC-001 deviation map. Specifically names the ActionEvent topic surface on EP 2 / 8 / 9 as a genuine split-brain; BRE publish is NOT a split-brain in this component (already covered by DEC-001 deviation map).
+- 🟡 **MEDIUM candidate — "EP 9 retrieval-respond three-transaction sequence without compensation"**: Pattern-level risk — document-registration flow has no saga, no reconciliation job, no compensating delete/rollback. Applies to COMP-24 EP 9.
+- 🟡 **MEDIUM candidate — "NAP vs US functional asymmetry on EP 5 `chbkOutbox` processing"**: `UKCaseActionDaoImpl.updateAction` silently ignores `chbkOutbox` on all branches. If NAP callers are sending this field expecting outbox acknowledgement, signals are lost.
+
+**WDP-ARCHITECTURE.md**
+
+- No change. Topology and principles unchanged. COMP-24 remains an action-management REST + Kafka Producer on the Core Processing band.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+
+- RISK-005 (RBAC not enforced in CaseActionService) — already recorded. Consider adding the two dead config keys (`${auth_url}`, `${pin_auth_url}`) as additional evidence.
+- **New row candidate** — "COMP-24 open-action constraint in-memory only; race window on concurrent POSTs for same caseNumber". Severity 🟠 MEDIUM-HIGH. No mitigation in place — no DB unique constraint visible.
+- **New row candidate** — "COMP-24 ActionEvent post-commit split-brain on EP 2 / 8 / 9". Severity 🔴 HIGH. Distinct from RISK-003 (generic Kafka-failure event loss) because this is a component-specific, endpoint-specific deliberate swallow path.
+- **New row candidate** — "COMP-24 EP 9 three-transaction sequence — no compensation". Severity 🟠 MEDIUM-HIGH. RRSP action commits before Document Service POST and indicator update; any subsequent failure leaves the DB ahead of the business outcome.
+- **New row candidate** — "COMP-24 last-write-wins on `wdp.case` / `wdp.action` / `nap.case` / `nap.action` — no `@Version`, no pessimistic lock, no advisory lock". Severity 🟠 MEDIUM-HIGH. Cross-component concurrent update risk with COMP-23 CaseManagementService and COMP-15 EvidenceConsumer.
+
+**WDP-INTEGRATIONS.md**
+
+- No change. External integrations for COMP-24 are all internal WDP-to-WDP (Error Log, Notes, Document Service, IDP Token Service). No external-system contract affected.
+
+#### Deviation flags for COMP-24
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ⚠️ PARTIAL | 🟠 MEDIUM-HIGH (ActionEvent post-commit split-brain; BRE inside @Transactional — corrected) |
+| DEC-003 Kafka Partition Key = merchantId | ⛔ DEVIATES | 🟡 MEDIUM |
+| DEC-004 PAN Encryption Before Persistence | ✅ NOT APPLICABLE | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE | — |
+| DEC-014 Resilience4j Circuit Breakers | ⛔ DEVIATES (platform VOID) | 🔴 HIGH |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⛔ DEVIATES | 🟠 MEDIUM-HIGH |
+
+**DEC-001 PARTIAL detail:** `wdp.chbk_outbox_row` / `nap.DISPUTE_EVENT_CONSUMER_ERROR` inbound-outbox UPDATEs are inside the same `@Transactional` as the domain write — compliant as inbound-outbox acknowledgement. BRE publish is also inside `@Transactional`, so send failure rolls back the DB — domain coupling honoured. ActionEvent publish is outside `@Transactional` on EP 2 / 8 / 9 — genuine post-commit split-brain when `napUpdateEvent=true`.
+
+**DEC-003 DEVIATES detail:** Both topics use `caseNumber` key. Consistent with platform-wide deviation pattern across all five confirmed business-rules publishers (COMP-12, COMP-15, COMP-23, COMP-24, COMP-25).
+
+**DEC-020 DEVIATES detail:** `idempotency-key` captured by HttpInterceptor and forwarded on Kafka outbound but never validated server-side. No seen-key store, no Redis cache, no DB duplicate check. Duplicate POSTs insert duplicate action rows. Under the current at-most-once platform delivery model (DEC-005) this is not triggered by Kafka redelivery; the risk is limited to concurrent HTTP caller retries.
+
+#### Remaining gaps
+
+- **OQ-COMP-24-1** `${kafka.business-rule-topic}` literal name — env config / team confirmation. Not in repo.
+- **OQ-COMP-24-2** `${kafka.topic}` literal name — env config / team confirmation. Not in repo.
+- **OQ-COMP-24-3** ActionEvent consumer identity — follow-up Claude Code pass on COMP-39 repo (question recorded above).
+- **OQ-COMP-24-4** Effective production IDP token URI — env config. UAT URL in source; no prod override property visible.
+- **OQ-COMP-24-5** Production replica count — XL Deploy placeholder.
+- **OQ-COMP-24-6** DB unique constraint on `(I_CASE, I_ACTION_SEQ)` — DBA confirmation. Schema DDL outside this repo.
+- **OQ-COMP-24-7** Other writers of `nap.DISPUTE_EVENT_CONSUMER_ERROR` — follow-up Claude Code pass on COMP-04 / COMP-05 (question recorded above).
+- **OQ-COMP-24-8** `updatePreviousNapActionEntity` body — follow-up Claude Code pass on this repo (question recorded above).
+- **OQ-COMP-24-9** NAP EP 5 chbkOutbox asymmetry — architect decision (intent or gap?).
+- **OQ-COMP-24-10** Aurora HikariCP pool sizes — env config / team confirmation.
+
+#### Doc status after this change
+- `WDP-COMP-24-CASE-ACTION-SERVICE.md` → `v1.1 DRAFT` — source-verified 2026-04-23 · architect confirmation pending
+---
+### 2026-04-23 — COMP-23 CaseManagementService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `mdws-gcp-case-management-service` — source-verified by Claude Code
+2026-04-23. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source. Multiple material
+corrections to v1.0 DRAFT (Kafka/DB ordering, non-existent table,
+enrichment scope, column names, validation scope), plus five new
+source-level defects and risks surfaced that were not visible in v1.0.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- 🔴 **CORRECTION REQUIRED — remove COMP-23 as a writer of
+  `wdp.dispute_event_change_log`.** Source grep confirms zero references
+  to that table in the `mdws-gcp-case-management-service` repository. The
+  v1.0 DRAFT claim of a cross-datasource audit write from the NAP create
+  path via `wdpTransactionManager` is not supported by source and is
+  withdrawn. If the table is still active in production, its writers live
+  outside this component.
+- Owned-table count for COMP-23 drops from 7 to 6:
+  `nap.case`, `nap.ACTION`, `nap.NOTES`, `WDP.CASE`, `wdp.ACTION`, `wdp.NOTES`.
+- Correct the `nap.case` row: the PAN column COMP-23 writes clear on
+  standard create is `I_ACCT_CDH` (consistent across both schemas). v1.0
+  DRAFT had `I_ACCI_CDH` on the NAP side — typo in source-to-doc carry.
+- Add to `wdp.NOTES` row notes: "COMP-23 US create path contains a
+  duplicate-insert source defect — two identical `USNotesEntity` save
+  blocks execute when `notesRequest != null`, producing two rows per
+  create. New finding 2026-04-23. Defect not fixed in current working tree."
+- Add to `NAP.DISPUTE_EVENT_CONSUMER_ERROR` row notes: "COMP-23 NAP create
+  path calls `.save()` on a freshly-constructed `ConsumerErrorEntity` with
+  three fields populated, without a prior `findById` guard. If the id does
+  not already exist in the table, JPA merge INSERTs a sparse row. Cross-
+  component write into a COMP-05-owned table with no owner check. New
+  finding 2026-04-23."
+- Add to `wdp.chbk_outbox_row` row notes: "COMP-23 update path uses
+  `findById(...).isPresent()` guard (no-op if missing). No terminal-status
+  guard — a PROCESSED row can still be overwritten. Same `@Transactional`
+  as the case save."
+- Shared Table Risk Register: append note to `wdp.NOTES` risk entry —
+  "COMP-23 duplicate-insert defect inflates row count per case create.
+  Investigation needed on whether downstream readers deduplicate."
+- Shared Table Risk Register: append note to `NAP.DISPUTE_EVENT_CONSUMER_
+  ERROR` risk entry — "COMP-23 blind-merge pattern can produce sparse
+  rows in a table it does not own. Ownership / write-contract clarification
+  required between COMP-05 and COMP-23."
+- Add note: "No Flyway / Liquibase / schema.sql / data.sql in the COMP-23
+  repository. DDL is managed elsewhere. Unique-constraint enforcement on
+  COMP-23-owned tables cannot be determined from this repo."
+- Case-number sequence ownership row: add COMP-23 as owner of
+  `nap.case_i_case_sequence` (NAP) and `wdp.pin_case_i_case_sequence`
+  (shared by PIN, CORE, VAP, LATAM). Both called via native `nextval(...)`
+  OUTSIDE any `@Transactional` — sequence values are consumed on rollback
+  (standard Postgres behaviour).
+
+**WDP-KAFKA.md**
+- 🔴 **CORRECTION REQUIRED in Section 2 DEC-001 deviation list.** COMP-23
+  row currently reads "Synchronous publish after DB transaction commits —
+  Kafka failure post-commit is unrecoverable". Replace with: "Synchronous
+  publish INSIDE `@Transactional` before commit — Kafka failure rolls back
+  DB consistently; narrow orphan-Kafka window is Kafka success followed
+  by DB commit failure (constraint at flush, connection drop at commit).
+  `kafka-before-commit` pattern — not an outbox, but not the `kafka-after-
+  commit` pattern either."
+- Section 2 DEC-003 deviation list: COMP-23 entry unchanged
+  (`caseNumber` as partition key — confirmed intentional for case-level
+  ordering).
+- Section 3 Topic Registry row for `${kafka_business_event_topic}`:
+  confirm COMP-23 as sole publisher; confirm COMP-16 as sole consumer;
+  no change required if already present.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: COMP-23 Kafka publish is INSIDE `@Transactional` before commit —
+  NOT after commit. v1.0 DRAFT was incorrect on this point. Kafka failure
+  rolls back DB consistently. Orphan-Kafka window is narrow but non-zero.
+- Add: COMP-23 owns 6 tables (not 7). `wdp.dispute_event_change_log` is
+  NOT written by COMP-23 — zero references in source.
+- Add: COMP-23 enrichment endpoint accepts four card networks
+  (VISA/MC/AMEX/DISCOVER) × four platforms (PIN/CORE/VAP/LATAM), plus a
+  second `noMid=true` sub-path that runs Step E only. v1.0 DRAFT described
+  it as VISA-only.
+- Add: COMP-23 Step C skip constant is `RDR`, not `RDF`. v1.0 DRAFT was
+  wrong on this.
+- Add: COMP-23 Step B method is always invoked on the standard enrichment
+  path; the HTTP call is suppressed for non-CORE platforms and the method
+  returns empty. Flow continues. v1.0 DRAFT treated this as a hard skip.
+- Add: COMP-23 NAP historical blocking is implicit — a US-only whitelist
+  in `createHistoricalCase`; any non-US platform (including NAP) returns
+  400. v1.0 DRAFT implied an explicit NAP check.
+- Add: COMP-23 Merchant Details failure swallow applies ONLY on the
+  non-noMid path. The `noMid=true` path throws `InternalServerError` on
+  Step E failure, rolling back the `@Transactional`.
+- Add: COMP-23 PAN column is `I_ACCT_CDH` on both schemas (was mis-written
+  as `I_ACCI_CDH` on the NAP side in v1.0).
+- Add: COMP-23 liveness probe path is `/livez` (v1.0 had `/lives`).
+- Add: COMP-23 contains a TODO at `GlobalExceptionHandler.java:169` on
+  `METHOD_NOT_ALLOWED` — single TODO in the entire source tree.
+- Add: COMP-23 PIN cardNumber-required rule applies only to PIN, not to
+  CORE/VAP/LATAM. v1.0 DRAFT phrasing implied broader scope.
+- Add: COMP-23 single shared `RestTemplate` bean constructed bare (no
+  `ClientHttpRequestFactory`, no interceptors, no timeouts, no pool, no
+  retries). IDP token is framework-cached via `OAuth2AuthorizedClient-
+  Manager` (not per-call fetch).
+- Add: COMP-23 no `@Scheduled`, no `@EnableScheduling`, no ShedLock, no
+  Spring Batch, no Kafka consumer, no `OncePerRequestFilter`, no
+  `@PreAuthorize` / `@Secured` anywhere. Confirms DEC-023 Not Applicable.
+- Add: COMP-23 case-number generation runs OUTSIDE any `@Transactional`;
+  sequence values are consumed on rollback. Sequence shared across PIN/
+  CORE/VAP/LATAM. NAP has its own sequence.
+- Add: COMP-23 `C_DUPLICATE_IND` — US side has field, `@Column`, and
+  setter ALL commented out (not persisted). UK side is fully wired and
+  setter invoked. v1.0 DRAFT's "silent null persist" claim applies to
+  neither schema.
+- Add: COMP-23 new source-level defects surfaced by audit (all present
+  in current working tree, none fixed): (a) duplicate `wdp.NOTES` insert
+  on US create, (b) `NAP.DISPUTE_EVENT_CONSUMER_ERROR` blind-merge,
+  (c) `RequestCorrelation` ThreadLocal leak, (d) case-number NPE risk at
+  12+ total length, (e) `spring-boot-devtools` shipping in prod image.
+- Resolved open questions:
+    - Kafka vs DB commit ordering — now documented as
+      `kafka-before-commit`.
+    - `wdp.dispute_event_change_log` cross-datasource write — does not
+      exist.
+    - PinActionDao — interface-only, no impl, not injected anywhere.
+    - BusinessRulesConsumerErrorRepository — declared, `.save()` never
+      called, not injected.
+    - IDP token acquisition pattern — framework-cached, not per-call.
+    - Production active profile — `${gcp_env}`; no profile-specific YAML
+      in repo.
+- New open questions:
+    - Known callers of `POST /{platform}/transactions/enrich` — still
+      not determinable from this repo.
+    - Full field inventory of `UpdateCaseRequest` nested objects —
+      `CaseServiceUpdateUtil` 1100+ lines not walked end-to-end.
+    - `${BRANCH_NAME_PLACEHOLDER}` substitution mechanism — no XL Deploy
+      dictionary, Helm values, Kustomize overlay, or Jenkinsfile in repo.
+    - Production replica count, `${kafka_retry_count}`, and all other
+      env-secret values.
+    - Logback layout / structured-log JSON format — no `logback-spring.xml`
+      in repo.
+    - Unique-constraint enforcement at DB schema level — no DDL in repo.
+    - Whether the duplicate-NOTES-insert and blind-save-into-consumer-
+      error defects are known to the team or fresh findings.
+    - Is the dual-schema asymmetry on `C_DUPLICATE_IND` (NAP wired, US
+      disabled) intentional?
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **HIGH candidate: "Kafka-before-commit synchronous publish pattern"** —
+  name the pattern, distinguish from DEC-001 outbox and from the
+  "kafka-after-commit" anti-pattern. Affects COMP-23 confirmed; likely
+  affects COMP-24 CaseActionService, COMP-25 NotesService, COMP-19
+  AcceptService, COMP-20 ContestService (all flagged in Kafka deviation
+  list as "synchronous publish inside/around @Transactional"). Recommend
+  explicit ADR on the intended pattern across case-write services at next
+  DECISIONS rebuild window — currently these services are lumped under
+  DEC-001 non-compliance without distinguishing the two failure modes.
+- **MEDIUM candidate: "Blind JPA merge into cross-component-owned tables"**
+  — COMP-23 writes into `NAP.DISPUTE_EVENT_CONSUMER_ERROR` (COMP-05-owned)
+  without `findById` guard. This is a cross-component write-contract
+  violation that neither DEC-001 nor DEC-020 currently cover. Recommend
+  explicit ADR on cross-component table write contracts.
+- **MEDIUM candidate: "No timeouts on any outbound `RestTemplate` call"**
+  — confirmed on COMP-23; the pattern is already confirmed on multiple
+  components. DEC-014 was voided platform-wide; a positive ADR stating
+  "accepted operating condition: bare RestTemplate, no timeouts, no pool,
+  no retries, no circuit breakers" may be warranted to close the gap
+  between DEC-014 VOID and current platform reality.
+- **LOW candidate: "Feature-flag hardcoded behaviour (productDefender,
+  skipFraudSwitchAPI)"** — enrichment flow hardcodes product-entitlement
+  result to FALSE and skips Fraud Switch HTTP for non-CORE. Both governed
+  by comments, not a feature-flag framework. Consider whether the
+  platform should adopt a feature-flag standard — affects COMP-23 today;
+  pattern likely repeats.
+
+**WDP-ARCHITECTURE.md**
+- No change. Topology and principles unchanged.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- Candidate new RISK (HIGH): "Clear PAN persisted on standard case
+  creation at COMP-23 (DEC-019 accepted risk) — remediation timeline
+  still TBC. PCI-DSS compliance gap." — already implicit via DEC-019 but
+  may warrant an explicit RISK row.
+- Candidate new RISK (MEDIUM): "Orphan Kafka event window at COMP-23
+  (and peer case-write services) — Kafka success + DB commit failure
+  produces an event with no persisted record. Narrow but non-zero. No
+  reconciliation path." — new RISK row recommended; differs from DEC-001
+  generic non-compliance in that it describes the specific failure mode
+  of the `kafka-before-commit` pattern.
+- Candidate new RISK (MEDIUM): "COMP-23 duplicate `wdp.NOTES` insert
+  defect — two rows per case create when `notesRequest` present.
+  Investigation on downstream reader dedup needed."
+- Candidate new RISK (MEDIUM): "COMP-23 `RequestCorrelation` ThreadLocal
+  leak — latent cross-request contamination on pooled Tomcat worker
+  threads. Impact: inaccurate correlation IDs in logs and Kafka headers
+  on unusual code paths."
+- Candidate new RISK (LOW): "COMP-23 case-number NPE risk — `getRandomDigits`
+  returns null once sequence length + prefix + random alpha reaches 12.
+  Deterministic once sequence grows; DBA confirmation on current high-
+  water mark needed."
+- Candidate new RISK (LOW): "`spring-boot-devtools` shipping in COMP-23
+  prod image — dev-time class-path scanning and auto-restart behaviour
+  may execute in production."
+
+**WDP-INTEGRATIONS.md**
+- No change. COMP-23's external dependencies (Settlement Details, Fraud
+  Switch, Product Entitlement, Encryption, Merchant Details, Display
+  Code, IDP) are all internal WDP services or WDP-facing integrations
+  already documented. Kafka is WDP-owned MSK. No external integration
+  contract changes.
+
+#### Deviation flags for COMP-23
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ⛔ NON-COMPLIANT (kafka-before-commit pattern) | 🔴 HIGH |
+| DEC-003 Kafka Partition Key = merchantId | ⛔ DEVIATES (key is caseNumber) | 🟡 MEDIUM |
+| DEC-004 PAN Encryption Before Persistence | ⛔ VIOLATION (standard create path) | 🔴 HIGH |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE (no consumer) | — |
+| DEC-014 Resilience4j Circuit Breakers | ⛔ NON-COMPLIANT (platform VOID) | 🔴 HIGH |
+| DEC-019 No Clear PAN in Persistent Store | ⛔ CONFIRMED VIOLATION (accepted risk) | 🔴 HIGH |
+| DEC-020 Full At-Least-Once Idempotency | ⛔ CONFIRMED GAP (accepted risk) | 🔴 HIGH |
+| DEC-023 Replica = 1 Hard Constraint | ✅ NOT APPLICABLE (stateless REST) | — |
+
+**DEC-001 NON-COMPLIANT detail:** Kafka publish is INSIDE `@Transactional`
+before commit ("kafka-before-commit" pattern). Kafka failure rolls back
+DB consistently. The narrow unrecoverable window is Kafka success
+followed by DB commit failure (constraint at flush, connection drop at
+commit) — produces an orphan Kafka event with no reconciliation path.
+v1.0 DRAFT characterised this as "kafka-after-commit" which would have
+widened the failure window significantly — the correction materially
+changes the risk profile for the better, but DEC-001 non-compliance
+remains.
+
+**DEC-003 DEVIATES detail:** Partition key = `caseNumber`. Intentional
+for per-case ordering across the BRE consumer (COMP-16). Platform
+standard is `merchantId`. Pattern matches COMP-24 / COMP-25 / COMP-19 /
+COMP-20 — all case-level services key by `caseNumber`. May warrant a
+platform-standard amendment rather than treating each as a deviation.
+
+**DEC-004 / DEC-019 VIOLATION detail:** Clear `cardNumber` written to
+`nap.case.I_ACCT_CDH` and `WDP.CASE.I_ACCT_CDH` on standard create via
+`CaseServiceSupport.mapNapCaseDetails` and `.mapPinCaseDetails`. PAN
+encryption via EncryptionService (COMP-35) occurs ONLY on the enrichment
+retry flow's Step D, which writes HPAN back to `WDP.CASE`. Cases created
+but never enriched retain clear PAN indefinitely. PCI-DSS compliance gap.
+
+**DEC-014 NON-COMPLIANT detail:** Single shared bare `RestTemplate` bean
+on all 7 outbound call sites. No `ClientHttpRequestFactory`, no
+interceptors, no connection pool, no timeouts (connection or read), no
+retries, no circuit breakers. No Resilience4j / Spring Retry / Apache
+HttpClient / OkHttp dependency. A slow dependency blocks the Tomcat
+request thread indefinitely; thread-pool exhaustion cascades into
+request-queue buildup.
+
+**DEC-020 CONFIRMED GAP detail:** No SELECT-before-INSERT on any create
+path. No DB unique constraint relied upon. `idempotency-key` header is
+propagated from inbound request → MDC → Kafka message header but NEVER
+consulted for duplicate detection. Two concurrent identical requests
+produce two separate case records with different case numbers. Client-
+side retry storms produce N records per request. Accepted risk per
+WDP-DECISIONS.md DEC-020; no remediation timeline.
+
+#### Doc status after this change
+- `WDP-COMP-23-CASE-MANAGEMENT-SERVICE.md` → `v1.1 DRAFT` — source-
+  verified 2026-04-23 · architect confirmation pending
 
 ### 2026-04-18 · COMP-18 NotificationOrchestrator · v2.0 DRAFT
 
@@ -67,7 +960,7 @@ v1.0 DRAFT confirmed substantively accurate; seven factual corrections,
 one new risk, and one confirmed cross-document error (WDP-DB.md).
 
 #### Platform-level impacts
-
+---
 **WDP-DB.md**
 - 🔴 **CORRECTION REQUIRED — remove COMP-18 as a writer of
   `wdp.outgoing_event_outbox`.** Source grep confirms zero references to

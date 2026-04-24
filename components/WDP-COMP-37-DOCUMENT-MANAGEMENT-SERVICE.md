@@ -1,7 +1,7 @@
 # WDP-COMP-37-DOCUMENT-MANAGEMENT-SERVICE
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: `gcp-document-management-service` (artifact: `document-management-service` v2.2.8) using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 1.1 DRAFT | April 2026*
+*Extracted from: `gcp-document-management-service` (artifact: `document-management-service` v2.2.8) — source-verified by Claude Code audit 2026-04-23 | Architect-confirmed: PENDING*
 
 ---
 
@@ -17,9 +17,9 @@
 | **Type**             | `REST API + Kafka Producer` |
 | **Repository**       | `gcp-document-management-service` |
 | **Git SCM**          | `https://github.worldpay.com/Worldpay/mdvs-gcp-document-management-service` |
-| **Context path**     | `/merchant/gcp/document-management` (set via `SERVER_SERVLET_CONTEXT_PATH` env var) |
+| **Context path**     | `/merchant/gcp/document-management` (from `SERVER_SERVLET_CONTEXT_PATH` env var) |
 | **Status**           | ✅ Production |
-| **Doc status**       | 📝 DRAFT |
+| **Doc status**       | 📝 DRAFT — source-verified, architect confirmation pending |
 | **Sections present** | Core \| Block A — REST \| Block C — Kafka Producer |
 
 ---
@@ -28,159 +28,189 @@
 
 **What it does**
 
-DocumentManagementService is the central document storage and retrieval hub for the Worldpay Dispute Platform. It handles all evidence document lifecycle operations: upload (multipart and base64), list, download, metadata update, and issuer document attachment. Storage is physically split by platform: NAP (UK) writes to AWS `eu-west-2` (S3 bucket `nap-dispute-documents`, DynamoDB table `NAP_DISPUTE_DOCUMENTS`), while all other platforms (CORE, PIN, VAP, LATAM) write to `us-east-2` (S3 bucket `wdp-pin-dispute-documents`, DynamoDB table `WDP_PIN_DISPUTE_DOCUMENTS`). The platform routing decision is driven by a NAP/non-NAP binary check — not by the `{platform}` path variable directly.
+DocumentManagementService is the central document storage and retrieval hub for the Worldpay Dispute Platform. It handles all evidence document lifecycle operations: upload (multipart and base64), list, download, metadata update, and issuer document attachment. Storage is physically split by platform: NAP (UK) writes to AWS `eu-west-2` (S3 bucket `nap-dispute-documents`, DynamoDB table `NAP_DISPUTE_DOCUMENTS`); all other platforms (CORE, PIN, VAP, LATAM) write to `us-east-2` (S3 bucket `wdp-pin-dispute-documents`, DynamoDB table `WDP_PIN_DISPUTE_DOCUMENTS`). Platform routing is a `"NAP".equalsIgnoreCase(platform)` binary — no per-platform divergence inside the non-NAP branch.
 
-The service exposes **thirteen REST endpoints** across two controllers: `DocumentManagementController` (12 endpoints for the primary dispute document flow) and `CoreDocumentManagementController` (1 endpoint for CORE-platform historical document backfill). Document bytes are treated as opaque content — the service does not parse, inspect, or extract data from document content. File conversion (TIFF→PDF, image→PDF) is performed internally using PDFBox and ImageConverter before S3 upload.
+The service exposes **thirteen REST endpoints** across two controllers: `DocumentManagementController` (12 endpoints for the primary dispute document flow) and `CoreDocumentManagementController` (1 endpoint for CORE-platform historical document backfill). Document bytes are treated as opaque — the service does not parse, inspect, or extract data from content. File conversion (TIFF→PDF, image→PDF) is performed internally using PDFBox and ImageConverter before S3 upload. MASTERCARD-specific PDF resolution reduction is applied as an additional branch before upload.
 
-On document upload, when `notifyBRQueue=true` and a `startRuleGroup` is provided, the service publishes synchronously to the `business-rules` Kafka topic on AWS MSK (IAM auth). This is a **direct Kafka publish with no transactional outbox** — the publish occurs after DynamoDB write but outside any spanning transaction. This is a confirmed DEC-001 deviation.
+On upload-class endpoints (1, 9, 10, 11) where `notifyBRQueue=true` and a `startRuleGroup` is non-blank, the service publishes synchronously to the `business-rules` Kafka topic on AWS MSK (IAM auth). On the primary upload path the publish happens **after** the DynamoDB write and **before** the downstream action-indicator update — no transactional outbox and no spanning transaction. On the questionnaire path (Endpoint 11), the publish is wrapped by `@Transactional(rollbackOn=Exception.class)`, so a Kafka failure rolls back the PostgreSQL save. Both paths are DEC-001 deviations.
 
 The service also maintains questionnaire state and case desk-number records in two PostgreSQL databases (WDP/US and NAP/UK) accessed via separate Spring Data JPA datasources.
 
 **What it does NOT do**
 
-- Does not consume from any Kafka topic — it is a producer only.
-- Does not use a transactional outbox for Kafka publishing (DEC-001 deviation).
+- Does not consume from any Kafka topic — no `@KafkaListener` anywhere in source. Producer only.
+- Does not use a transactional outbox for Kafka publishing on the primary upload path (DEC-001 deviation).
 - Does not parse or inspect document content — bytes are treated as opaque.
-- Does not perform PAN encryption or PAN data handling of any kind.
+- Does not perform PAN encryption or PAN data handling of any kind — no PAN field in any write payload.
 - Does not interact with any staging S3 bucket — it receives raw bytes from the HTTP request and writes directly to the target bucket.
 - Does not delete or archive source files after upload — no staging-to-production move exists.
-- Does not implement Resilience4j circuit breakers on any outbound dependency (DEC-014 — consistent with platform-wide pattern).
+- Does not implement Resilience4j circuit breakers on any outbound dependency (DEC-014 — voided platform-wide).
 - Does not implement endpoint-level RBAC — no `@PreAuthorize` or role checks.
 - Does not trust the API Gateway for JWT validation — it acts as an OAuth2 Resource Server and validates JWTs itself.
+- Does not use the `idempotency-key` header for deduplication — header is accepted, MDC-tagged, echoed in response, and propagated as an outbound Kafka message header, but no dedup store or lookup exists.
+- Does not run any scheduled job or batch — no `@Scheduled`, no Spring Batch, no Quartz, no AWS SQS listener.
 
 ---
 
 ## Internal Processing Flow
 
-*Primary path shown: `POST /{platform}/documents/{caseNumber}` — the multipart document upload flow.
-This is the most complex path and exercises all major dependencies. Other endpoint flows are simpler subsets.*
+*Primary path shown: `POST /{platform}/documents/{caseNumber}` — the multipart document upload flow. This is the most complex path and exercises every major dependency. Endpoints 8, 9, 10 all funnel into the same internal `uploadFile()` implementation; Endpoint 11 diverges onto the questionnaire path; Endpoint 13 is isolated on a separate controller + service.*
 
 ```mermaid
 flowchart TD
-    IN["HTTP POST /{platform}/documents/{caseNumber}\nmultipart/form-data + Bearer JWT"]
+    IN["HTTP POST /{platform}/documents/{caseNumber}<br/>multipart/form-data + Bearer JWT"]
 
-    BEANVAL{"Bean validation\nplatform, caseNumber, actionSeq,\ndocumentType, uploadedBy, file"}
-    BEANVAL_FAIL["HTTP 400 BAD_REQUEST"]
+    BEANVAL{"Bean validation<br/>platform, caseNumber, actionSequence,<br/>documentType, uploadedBy, file"}
+    BEANVAL_FAIL["HTTP 400"]
 
-    JWTCHECK{"JWT claims\nnull or blank?"}
-    JWT_FAIL["HTTP 400 / 401 UNAUTHORIZED"]
+    FILEEMPTY{"file.isEmpty()?"}
+    FILEEMPTY_FAIL["HTTP 400"]
 
-    USERID["Extract & mask displayUserId\nif issuer = us_worldpay_fis_int\n→ WORLDPAY or System"]
+    USERID["Mask displayUserId via JWT iss<br/>internal → WORLDPAY / System"]
+    JWT_FAIL["HTTP 400<br/>Token is blank"]
 
-    CASELOOKUP["Case lookup\nGET case-management-service\n(cardNetwork, merchantId,\ncaseStatus, deskNumber, entities)"]
+    REQVALID["Request validation<br/>filename, extension, stageCode"]
+    REQVALID_FAIL["HTTP 400"]
+
+    CASELOOKUP["GET case-management-service<br/>cardNetwork, merchantId, caseStatus,<br/>deskNumber, entity hierarchy"]
     CASELOOKUP_FAIL["HTTP 404 NOT_FOUND"]
 
-    ACTIONLOOKUP["Action lookup\nGET case-actions-service\n(actionStatuses, stageCode)"]
+    ACTIONLOOKUP["GET case-actions-service<br/>actionStatuses, stageCode"]
     ACTIONLOOKUP_FAIL["HTTP 404 NOT_FOUND"]
 
-    DUPCHECK["Duplicate file check\nDynamoDB query by caseNumber PK\nin-memory filename comparison\n(extension-stripped)"]
-    DUP_FOUND["HTTP 400 BAD_REQUEST\nFile already present"]
+    CLOSED_OPEN{"caseStatus=CLOSED<br/>AND actionStatus=OPEN?"}
+    CLOSED_OPEN_FAIL["HTTP 400"]
 
-    ACTIONSTATUS{"Case status CLOSED\n+ action status OPEN?"}
-    ACTIONSTATUS_FAIL["HTTP 400 BAD_REQUEST"]
+    DUPCHECK["DynamoDB duplicate check<br/>query PK=caseNumber<br/>in-memory filename compare (ext-stripped)<br/>NON-ATOMIC"]
+    DUP_FOUND["HTTP 400<br/>Duplicate file"]
 
-    DOCTYPE{"docType = RESPDOC\n+ action CLOSED or blank?"}
-    DOCTYPE_RECLASSIFY["Reclassify docType\nRESPDOC → MISCDOC"]
+    RECLASSIFY{"docType=RESPDOC<br/>AND action blank or CLOSED?"}
+    RECLASSIFY_DO["Mutate docType → MISCDOC"]
 
-    PAGECOUNT["Calculate page count\nPDFBox / ImageIO"]
-    NETLIMIT["Network limit lookup\nYAML config DocumentLimitConfig"]
+    PAGECOUNT["Page count<br/>PDFBox / ImageIO"]
+    NETLIMIT["Load per-network limits<br/>network.max-limits-in-MB"]
 
-    PAGELIMIT{"Page count\nexceeds network limit?"}
-    PAGELIMIT_FAIL["HTTP 400 BAD_REQUEST"]
+    PAGELIMIT{"Skip pagecount for<br/>ISSRDOC/ISSRQDOC/RESPDOC?"}
+    PAGELIMIT_CHECK{"pageCount exceeds<br/>maxPageCount?"}
+    PAGELIMIT_FAIL["HTTP 400"]
 
-    CONVERT{"convertDocument\n= true?"}
-
+    CONVERT{"convertDocument flag"}
     FORMAT{"File extension?"}
-    PDF_PATH["PDF: resolution check\nPDFDocumentUtil"]
-    TIFF_PATH["TIFF/TIF → PDF\nImageConverter.getTiffToPdfConvertedData()"]
-    IMG_PATH["JPG/JPEG/BMP/PNG/GIF → PDF\nImageConverter.getPdfConvertedData()"]
-    FORMAT_FAIL["HTTP 400 BAD_REQUEST\nUnsupported format"]
-    CONV_FALSE["convertDocument=false\nOnly PDF/TIFF/TIF accepted\nImages rejected → 400"]
+    PDF_PATH["PDF pass-through<br/>+ MASTERCARD PDF<br/>resolution reduction"]
+    TIFF_PATH["TIFF/TIF → PDF<br/>+ MASTERCARD resolution reduction"]
+    IMG_PATH["JPG/JPEG/BMP/PNG/GIF → PDF<br/>+ MASTERCARD resolution reduction"]
+    FORMAT_FAIL["HTTP 400<br/>Unsupported format"]
+    CONV_FALSE["convertDocument=false<br/>Only PDF/TIFF/TIF accepted<br/>Images → HTTP 400"]
 
-    SIZECHECK{"File size\nexceeds network limit?"}
-    SIZECHECK_FAIL["HTTP 400 BAD_REQUEST"]
+    SIZECHECK{"Skip sizecheck for<br/>ISSRDOC/ISSRQDOC/RESPDOC?"}
+    SIZE_DO{"fileSize exceeds<br/>maxFileSize?"}
+    SIZECHECK_FAIL["HTTP 400"]
 
-    PLATFORM{"platform\n== NAP?"}
+    ENTITY["Construct DocumentMetaData<br/>via DocumentServiceUtil"]
 
-    S3_NAP["S3 PutObjectRequest\nnap-dispute-documents\neu-west-2\nNAPS3Client"]
-    S3_WDP["S3 PutObjectRequest\nwdp-pin-dispute-documents\nus-east-2\nS3Client"]
-    S3_FAIL["HTTP 500\nDynamoDB NOT yet written\nNo compensating action"]
+    PLATFORM{"platform = NAP?"}
 
-    DDB_NAP["DynamoDB putItem\nNAP_DISPUTE_DOCUMENTS\neu-west-2"]
-    DDB_WDP["DynamoDB putItem\nWDP_PIN_DISPUTE_DOCUMENTS\nus-east-2"]
-    DDB_FAIL["HTTP 500\nS3 object ORPHANED in bucket\nNo compensating action"]
+    S3_NAP["S3 PutObject<br/>nap-dispute-documents<br/>eu-west-2"]
+    S3_WDP["S3 PutObject<br/>wdp-pin-dispute-documents<br/>us-east-2"]
+    S3_FAIL["HTTP 500<br/>no DDB written yet"]
 
-    DESKNUM{"docType = ISSRDOC\n+ deskNumber = WPISDOC\nor WMISDOC?"}
-    DESKNUM_UPDATE["Null desk number in PostgreSQL\nUSCaseRepository or UKCaseRepository\n(JPA)"]
+    DDB_NAP["DynamoDB putItem<br/>NAP_DISPUTE_DOCUMENTS"]
+    DDB_WDP["DynamoDB putItem<br/>WDP_PIN_DISPUTE_DOCUMENTS"]
+    DDB_FAIL["HTTP 500<br/>S3 object ORPHANED<br/>no compensating delete"]
 
-    ACTIONUPDATE["PUT case-actions-service\nUpdate action indicator"]
-    ACTIONUPDATE_FAIL["HTTP 500\nS3 + DynamoDB already committed"]
+    DESKNUM{"docType=ISSRDOC<br/>AND deskNumber in<br/>(WPISDOC, WMISDOC)?"}
+    DESKNUM_NAP["UPDATE uk_case<br/>SET desk=NULL<br/>(UKCaseRepository)"]
+    DESKNUM_WDP["UPDATE us_case<br/>SET desk=NULL<br/>(USCaseRepository)"]
+    DESKNUM_FAIL["HTTP 500<br/>S3 + DDB already committed"]
 
-    BROUTE{"notifyBRQueue = true\n+ startRuleGroup not blank?"}
+    BROUTE{"notifyBRQueue=true<br/>AND startRuleGroup not blank?"}
 
-    KAFKA["Publish to business-rules topic\nKafkaTemplate.send().get()\nSynchronous — blocks\n3 retries × 100ms"]
-    KAFKA_FAIL["HTTP 500\nS3 + DynamoDB already committed\nDocument stored, BR not triggered"]
+    KAFKA["Publish to business-rules<br/>sendBusinessRulesToKafka()<br/>key=caseNumber<br/>sync send().get()<br/>@Retryable 3 × 100ms"]
+    KAFKA_FAIL["HTTP 500 via @Recover<br/>EventServiceException<br/>S3 + DDB + desk committed<br/>BR not triggered"]
 
-    OUT["HTTP 201 CREATED\nDocumentResponse\n{caseNumber, documentName,\ndocumentRef (S3 key),\ndateUploaded, documentType,\ndisputeStage}"]
+    ACTIONUPDATE["PUT case-actions-service<br/>issuerDocIndicator=Y<br/>or merchantDocIndicator=Y"]
+    ACTIONUPDATE_FAIL["HTTP 500<br/>S3 + DDB + desk + Kafka<br/>all already committed"]
+
+    OUT["HTTP 201 CREATED<br/>DocumentResponse"]
 
     IN --> BEANVAL
-    BEANVAL -->|"blank field or empty file"| BEANVAL_FAIL
-    BEANVAL -->|"valid"| JWTCHECK
-    JWTCHECK -->|"null / no claims"| JWT_FAIL
-    JWTCHECK -->|"valid JWT"| USERID
-    USERID --> CASELOOKUP
-    CASELOOKUP -->|"any exception"| CASELOOKUP_FAIL
-    CASELOOKUP -->|"success"| ACTIONLOOKUP
-    ACTIONLOOKUP -->|"any exception"| ACTIONLOOKUP_FAIL
-    ACTIONLOOKUP -->|"success"| DUPCHECK
-    DUPCHECK -->|"duplicate found"| DUP_FOUND
-    DUPCHECK -->|"no duplicate"| ACTIONSTATUS
-    ACTIONSTATUS -->|"yes"| ACTIONSTATUS_FAIL
-    ACTIONSTATUS -->|"no"| DOCTYPE
-    DOCTYPE -->|"yes"| DOCTYPE_RECLASSIFY
-    DOCTYPE -->|"no"| PAGECOUNT
-    DOCTYPE_RECLASSIFY --> PAGECOUNT
+    BEANVAL -->|"invalid"| BEANVAL_FAIL
+    BEANVAL -->|"valid"| FILEEMPTY
+    FILEEMPTY -->|"empty"| FILEEMPTY_FAIL
+    FILEEMPTY -->|"non-empty"| USERID
+    USERID -->|"jwt null"| JWT_FAIL
+    USERID -->|"ok"| REQVALID
+    REQVALID -->|"invalid"| REQVALID_FAIL
+    REQVALID -->|"ok"| CASELOOKUP
+    CASELOOKUP -->|"missing cardNetwork or REST fail"| CASELOOKUP_FAIL
+    CASELOOKUP -->|"ok"| ACTIONLOOKUP
+    ACTIONLOOKUP -->|"empty or REST fail"| ACTIONLOOKUP_FAIL
+    ACTIONLOOKUP -->|"ok"| CLOSED_OPEN
+    CLOSED_OPEN -->|"yes"| CLOSED_OPEN_FAIL
+    CLOSED_OPEN -->|"no"| DUPCHECK
+    DUPCHECK -->|"duplicate"| DUP_FOUND
+    DUPCHECK -->|"none"| RECLASSIFY
+    RECLASSIFY -->|"yes"| RECLASSIFY_DO
+    RECLASSIFY -->|"no"| PAGECOUNT
+    RECLASSIFY_DO --> PAGECOUNT
     PAGECOUNT --> NETLIMIT
     NETLIMIT --> PAGELIMIT
-    PAGELIMIT -->|"exceeds"| PAGELIMIT_FAIL
-    PAGELIMIT -->|"within limit"| CONVERT
+    PAGELIMIT -->|"yes — skip"| CONVERT
+    PAGELIMIT -->|"no — check"| PAGELIMIT_CHECK
+    PAGELIMIT_CHECK -->|"exceeds"| PAGELIMIT_FAIL
+    PAGELIMIT_CHECK -->|"ok"| CONVERT
     CONVERT -->|"true"| FORMAT
     CONVERT -->|"false"| CONV_FALSE
     FORMAT -->|"PDF"| PDF_PATH
-    FORMAT -->|"TIFF / TIF"| TIFF_PATH
-    FORMAT -->|"JPG / JPEG / BMP / PNG / GIF"| IMG_PATH
-    FORMAT -->|"any other extension"| FORMAT_FAIL
+    FORMAT -->|"TIFF/TIF"| TIFF_PATH
+    FORMAT -->|"JPG/JPEG/BMP/PNG/GIF"| IMG_PATH
+    FORMAT -->|"other"| FORMAT_FAIL
     PDF_PATH --> SIZECHECK
     TIFF_PATH --> SIZECHECK
     IMG_PATH --> SIZECHECK
     CONV_FALSE --> SIZECHECK
-    SIZECHECK -->|"exceeds"| SIZECHECK_FAIL
-    SIZECHECK -->|"within limit"| PLATFORM
+    SIZECHECK -->|"yes — skip"| ENTITY
+    SIZECHECK -->|"no — check"| SIZE_DO
+    SIZE_DO -->|"exceeds"| SIZECHECK_FAIL
+    SIZE_DO -->|"ok"| ENTITY
+    ENTITY --> PLATFORM
     PLATFORM -->|"NAP"| S3_NAP
     PLATFORM -->|"non-NAP"| S3_WDP
     S3_NAP -->|"exception"| S3_FAIL
     S3_WDP -->|"exception"| S3_FAIL
-    S3_NAP -->|"success"| DDB_NAP
-    S3_WDP -->|"success"| DDB_WDP
+    S3_NAP -->|"ok"| DDB_NAP
+    S3_WDP -->|"ok"| DDB_WDP
     DDB_NAP -->|"exception"| DDB_FAIL
     DDB_WDP -->|"exception"| DDB_FAIL
-    DDB_NAP -->|"success"| DESKNUM
-    DDB_WDP -->|"success"| DESKNUM
-    DESKNUM -->|"yes"| DESKNUM_UPDATE
-    DESKNUM -->|"no"| ACTIONUPDATE
-    DESKNUM_UPDATE --> ACTIONUPDATE
-    ACTIONUPDATE -->|"exception"| ACTIONUPDATE_FAIL
-    ACTIONUPDATE -->|"success"| BROUTE
-    BROUTE -->|"no"| OUT
+    DDB_NAP -->|"ok"| DESKNUM
+    DDB_WDP -->|"ok"| DESKNUM
+    DESKNUM -->|"yes — NAP"| DESKNUM_NAP
+    DESKNUM -->|"yes — non-NAP"| DESKNUM_WDP
+    DESKNUM -->|"no"| BROUTE
+    DESKNUM_NAP -->|"exception"| DESKNUM_FAIL
+    DESKNUM_WDP -->|"exception"| DESKNUM_FAIL
+    DESKNUM_NAP -->|"ok"| BROUTE
+    DESKNUM_WDP -->|"ok"| BROUTE
+    BROUTE -->|"no"| ACTIONUPDATE
     BROUTE -->|"yes"| KAFKA
-    KAFKA -->|"all retries exhausted"| KAFKA_FAIL
-    KAFKA -->|"broker ACK received"| OUT
+    KAFKA -->|"retries exhausted"| KAFKA_FAIL
+    KAFKA -->|"broker ACK"| ACTIONUPDATE
+    ACTIONUPDATE -->|"exception"| ACTIONUPDATE_FAIL
+    ACTIONUPDATE -->|"ok"| OUT
 ```
 
-**Critical architectural note on failure atomicity:**
-There is no distributed transaction or compensating saga across S3, DynamoDB, PostgreSQL, and Kafka. Each write is independent:
-- S3 succeeds → DynamoDB fails: S3 object is orphaned in bucket with no cleanup.
-- DynamoDB succeeds → Kafka fails (after 3 retries): document is stored but Business Rules processing is never triggered. The dispute case is effectively stuck without a BR event.
+**Critical architectural note — step order is Kafka BEFORE action-update, not after:**
+Source executes `DDB putItem → updateDeskNumber → Kafka publish → updateDocumentIndicator`. There is no distributed transaction across S3, DynamoDB, PostgreSQL (desk blanking), Kafka, and the action-update REST call. Each write is independent:
+
+- S3 succeeds → DynamoDB fails → S3 object orphaned (no compensating delete).
+- DynamoDB succeeds → desk-blank fails → S3 + DDB committed, desk left stale.
+- Desk-blank succeeds → Kafka fails (after 3 × 100ms retries) → S3 + DDB + desk all committed, BR never triggered.
+- Kafka succeeds → action-update REST fails → S3 + DDB + desk + Kafka all committed, action indicator stale.
+
+The DRAFT v1.0 mermaid showed action-update preceding Kafka; source shows the opposite. This changes the unrecoverable partial-state surface — action-indicator staleness is the last failure mode in the chain.
+
+**Note on Endpoint 11 (POST questionnaire path):**
+Diverges at the service boundary into `DocumentQuestionnaireServiceImpl.updateDocumentInformation()`, which is annotated `@Transactional(rollbackOn = Exception.class)`. PostgreSQL save (`QuestionnaireRepository.save`) and Kafka publish both sit inside that transaction. If `@Recover` throws `EventServiceException` after 3 retries, the PostgreSQL save rolls back. A successful broker ACK followed by a later commit-time exception can still leak a published-but-unpersisted event, but S3/DDB are not in play for this endpoint.
 
 ---
 
@@ -195,37 +225,44 @@ There is no distributed transaction or compensating saga across S3, DynamoDB, Po
 | Internal case processing services | REST | `POST /{platform}/documents/{caseNumber}/actions` | Add/update document metadata (transmission date) |
 | WDP Ops Portal | REST | `PUT /{platform}/documents/{caseNumber}` | Update document metadata (updatedBy, timestamp) |
 | Internal services needing doc bytes | REST | `POST /{platform}/documents/base64/{caseNumber}` | Fetch document content as base64 |
-| WDP Ops Portal / Merchant Portal | REST | `GET /{platform}/document/{caseNumber}/download` | Download document via S3 presigned URL (302 redirect) |
-| WDP Ops Portal / Merchant Portal | REST | `GET /{platform}/documents/{caseNumber}/unique-document` | Get unique document list with display codes |
-| NAP EvidenceConsumer / WDP Ops Portal | REST | `POST /nap/response/document` | Upload NAP base64 document (fixed platform=NAP) |
+| WDP Ops Portal / Merchant Portal | REST | `GET /{platform}/document/{caseNumber}/download` | Download via S3 presigned URL (302) — ⚠️ `@PathVariable` missing on `platform` |
+| WDP Ops Portal / Merchant Portal | REST | `GET /{platform}/documents/{caseNumber}/unique-document` | Deduplicated list enriched with display codes |
+| COMP-15 NAP EvidenceConsumer / WDP Ops Portal | REST | `POST /nap/response/document` | Upload NAP base64 document (fixed platform=NAP, `notifyBRQueue` forced to `false`) |
 | Internal dispute workflow / FileProcessor | REST | `POST /{platform}/documents/{caseNumber}/issuerdoc` | Add issuer document (v1, JSON body) |
-| Internal dispute workflow | REST | `POST v2/{platform}/documents/{caseNumber}/issuerdoc` | Add issuer document (v2, multipart) |
-| WDP Ops Portal / Questionnaire service | REST | `PUT /{platform}/document/{caseNumber}/action/{actionSeq}` | Update document info + optional Kafka BR notify |
-| WDP Ops Portal / Questionnaire service | REST | `POST /{platform}/documents/{caseNumber}/validate` | Validate total file size against network limits |
-| WDP Ops Portal / data migration jobs | REST | `POST /{platform}/documents/{caseNumber}/history-doc` | Upload historical document (CORE platform only) |
-| Kubernetes | HTTP | `GET /actuator/health`, `/readyz`, `/liveness` | Liveness / readiness probes |
+| Internal dispute workflow | REST | `POST /v2/{platform}/documents/{caseNumber}/issuerdoc` | Add issuer document (v2, multipart) |
+| WDP Ops Portal / COMP-26 QuestionnaireService | REST | `POST /{platform}/document/{caseNumber}/action/{actionSeq}` | Update document info + optional Kafka BR notify — questionnaire flow |
+| WDP Ops Portal / COMP-26 QuestionnaireService | REST | `POST /{platform}/documents/{caseNumber}/validate` | Validate total file size against per-network limit |
+| WDP Ops Portal / data migration jobs | REST | `POST /{platform}/documents/{caseNumber}/history-doc` | Upload historical document (CORE only) |
+| Kubernetes | HTTP | `GET /actuator/health`, `/readyz`, `/livez` | Readiness / liveness probes |
 
 ### Outbound Interfaces
 
 | Target | Protocol | Endpoint / Resource | Purpose | On failure |
 |--------|----------|---------------------|---------|------------|
-| `mdvs-gcp-case-management-service` | REST (RestTemplate) | `GET {casesearch.url}` | Case lookup — cardNetwork, merchantId, caseStatus, deskNumber, entity hierarchy | Exception → HTTP 404 to caller |
-| `mdvs-gcp-case-actions-service` | REST (RestTemplate) | `GET {actionsearch.url}` | Action lookup — actionStatuses, stageCode | Exception → HTTP 404 to caller |
-| `mdvs-gcp-case-actions-service` | REST (RestTemplate) | `PUT` action update | Update action indicator after document upload | Exception → HTTP 500; S3+DynamoDB already committed |
-| `mdvs-gcp-case-management-service` | REST (RestTemplate) | `PUT` case update | Update case desk number | Exception logged; propagates → 500 |
-| `mdvs-gcp-case-search-service` | REST (RestTemplate) | `GET` case lookup by ARN | Used in NAP base64 upload path only | Exception → HTTP 500 |
-| `mdvs-gcp-rules-service` | REST (RestTemplate) | `GET` issuer doc detail type | Issuer doc endpoint — doc type lookup from rules | Exception → HTTP 500 |
-| `mdvs-gcp-visa-adapter` | REST (RestTemplate) | Visa RTSI proxy | Issuer doc endpoint — Visa RTSI calls | Exception → HTTP 500 |
-| `mdvs-gcp-mastercard-adapter` | REST (RestTemplate) | Mastercard MCOM proxy | Issuer doc endpoint — Mastercard MCOM calls | Exception → HTTP 500 |
-| `mdvs-gcp-display-code-service` | REST (RestTemplate) | Display code lookup | Enrich doc type/stage descriptions (unique-document endpoint) | Exception caught; response field left empty |
-| `gcp-api-log-service` | REST | Error logging | URL configured; no active usage observed in main processing paths | — |
-| AWS S3 (`wdp-pin-dispute-documents`) | AWS SDK v2 (`S3Client`) | `PutObjectRequest` / presigned GET | Store/retrieve WDP/CORE/PIN/VAP/LATAM documents (us-east-2) | Exception → HTTP 500; no retry |
-| AWS S3 (`nap-dispute-documents`) | AWS SDK v2 (`S3Client`) | `PutObjectRequest` / presigned GET | Store/retrieve NAP documents (eu-west-2) | Exception → HTTP 500; no retry |
-| AWS DynamoDB (`WDP_PIN_DISPUTE_DOCUMENTS`) | AWS SDK v2 Enhanced Client | `putItem` / `query` | Document metadata store — WDP/CORE/PIN/VAP/LATAM (us-east-2) | Exception → HTTP 500; S3 object orphaned |
-| AWS DynamoDB (`NAP_DISPUTE_DOCUMENTS`) | AWS SDK v2 Enhanced Client | `putItem` / `query` | Document metadata store — NAP (eu-west-2) | Exception → HTTP 500; S3 object orphaned |
-| AWS MSK Kafka (`business-rules`) | Spring Kafka producer (SASL/SSL IAM) | `business-rules` topic | Notify Business Rules Processor after document upload | 3 retries × 100ms; exhaustion → HTTP 500; document already stored |
-| PostgreSQL WDP/US (`spring.datasource.wdp`) | Spring Data JPA (HikariCP) | `USCaseRepository` / `QuestionnaireRepository` | Questionnaire state + desk number blanking — WDP platform | Exception → HTTP 500 |
-| PostgreSQL NAP/UK (`spring.datasource.nap`) | Spring Data JPA (HikariCP) | `UKCaseRepository` | Desk number blanking — NAP platform | Exception → HTTP 500 |
+| `mdvs-gcp-case-management-service` | REST (RestTemplate, Bearer) | `GET ${app.casesearch.url}` | Case lookup — cardNetwork, merchantId, caseStatus, deskNumber, entities | Exception caught → HTTP 404 |
+| `mdvs-gcp-case-management-service` | REST (RestTemplate, Bearer) | `PUT ${app.caseupdate.url}` | Case update (desk blanking path, Endpoint 11 branch) | Exception caught → HTTP 400 |
+| `mdvs-gcp-case-actions-service` | REST (RestTemplate, Bearer) | `GET ${app.actionsearch.url}` | Action lookup | Exception caught → HTTP 404 |
+| `mdvs-gcp-case-actions-service` | REST (RestTemplate, Bearer) | `PUT ${app.caseactionupdate.url}` | Action indicator update — LAST step in primary flow | Propagates → HTTP 500; S3 + DDB + desk + Kafka already committed |
+| `mdvs-gcp-case-search-service` | REST (RestTemplate, Bearer) | `GET ${app.caselookup.url}` | Case lookup by ARN (NAP base64 path, issuer doc paths) | Exception caught → HTTP 400/404 |
+| `mdvs-gcp-rules-service` | REST (RestTemplate, Bearer) | `GET ${app.docdetailstype.url}` | Issuer-doc type lookup | Exception caught and **swallowed** — returns null |
+| `mdvs-gcp-visa-adapter` | REST (RestTemplate, `vantiveLicense` or Bearer for NAP) | Visa RTSI proxy | Issuer-doc endpoint — Visa RTSI calls | Exception → HTTP 400 or 500 (hyper-search path) |
+| Visa DataPower (direct) | REST (RestTemplate, `vantiveLicense`) | Direct Visa RTSI URL | Non-NAP Visa RTSI path | Same |
+| `mdvs-gcp-mastercard-adapter` | REST (RestTemplate, `vantiveLicense` or Bearer for NAP) | Mastercard MCOM proxy | Issuer-doc endpoint — MCOM calls | Exception → HTTP 400 or 500 |
+| Mastercard DataPower (direct) | REST (RestTemplate, `vantiveLicense`) | Direct Mastercard URL | Non-NAP Mastercard path | Same |
+| `mdvs-gcp-display-code-service` | REST (RestTemplate, Bearer) — ⚠️ via a **second** inline `new RestTemplate()` in `RestInvoker.postData()` | Display code lookup | Unique-document endpoint enrichment | Exception **swallowed** — response field left empty |
+| `gcp-api-log-service` | REST (RestTemplate, Bearer) | `${app.errorlog.url}` | Error logging — reachable only on Visa RTSI hyper-search failure | Exception swallowed; defensive-only path |
+| `wdp-idp-token-service` | REST | `${idp.tokenUrl}` | Per-request IDP token for internal service calls (via `IdpTokenCache`) | Exception → HTTP 500 |
+| AWS S3 (`wdp-pin-dispute-documents`, us-east-2) | AWS SDK v2 (`S3Client`) | `PutObject` / `GetObjectAsBytes` / presigned GET | Document store — non-NAP | Exception → HTTP 500 |
+| AWS S3 (`nap-dispute-documents`, eu-west-2) | AWS SDK v2 (`S3Client`) | Same | Document store — NAP | Same |
+| AWS DynamoDB (`WDP_PIN_DISPUTE_DOCUMENTS`, us-east-2) | AWS SDK v2 Enhanced Client | `putItem` / `query` | Metadata store — non-NAP | Exception → HTTP 500; **S3 object orphaned** |
+| AWS DynamoDB (`NAP_DISPUTE_DOCUMENTS`, eu-west-2) | AWS SDK v2 Enhanced Client | Same | Metadata store — NAP | Same |
+| AWS MSK Kafka (`business-rules`) | Spring Kafka producer (SASL_SSL + AWS_MSK_IAM) | Topic `business-rules` | Notify BusinessRulesProcessor (COMP-16) after upload | `@Retryable` 3 × 100ms; `@Recover` → HTTP 500; document already stored |
+| PostgreSQL WDP/US (`spring.datasource.wdp`) | Spring Data JPA (HikariCP, `wdpTransactionManager` `@Primary`) | `QuestionnaireRepository`, `USCaseRepository` | Questionnaire state (write+read) + desk-number blanking (write) — WDP platform | Exception → HTTP 500; Endpoint 11 rolls back under `@Transactional(rollbackOn=Exception.class)` |
+| PostgreSQL NAP/UK (`spring.datasource.nap`) | Spring Data JPA (HikariCP, `napTransactionManager`) | `UKCaseRepository` | Desk-number blanking — NAP platform | Exception → HTTP 500 |
+| `user-access-management-service` | *(configured URL; no Java references)* | — | None — DEAD CONFIG | — |
+| `core-hierarchy-authorization-service` | *(configured URL; no Java references)* | — | None — DEAD CONFIG | — |
+
+**All outbound REST calls share a single `RestTemplate` bean with no connect/read timeout, no connection pool tuning, no retry, no circuit breaker.** A second inline `new RestTemplate()` exists inside `RestInvoker.postData()` on the display-code-service path — also untimed.
 
 ---
 
@@ -234,54 +271,69 @@ There is no distributed transaction or compensating saga across S3, DynamoDB, Po
 ### Tables Owned (written by this component)
 
 | Store | Table / Resource | Purpose | Key columns | Retention / Notes |
-|-------|-----------------|---------|-------------|-------------------|
-| Amazon DynamoDB (us-east-2) | `WDP_PIN_DISPUTE_DOCUMENTS` | Document metadata for WDP/CORE/PIN/VAP/LATAM platforms | PK: `I_CASE` (caseNumber), SK: `C_ACTION_SEQ_DOC_NAME` (actionSeq + documentName) | ⚠️ S3 lifecycle/expiry policy not configured in application code — requires AWS console verification |
-| Amazon DynamoDB (eu-west-2) | `NAP_DISPUTE_DOCUMENTS` | Document metadata for NAP platform | PK: `I_CASE` (caseNumber), SK: `C_ACTION_SEQ_DOC_NAME` (actionSeq + documentName) | ⚠️ S3 lifecycle/expiry policy not configured in application code — requires AWS console verification |
-| AWS S3 (us-east-2) | `wdp-pin-dispute-documents` | Document file storage — WDP/CORE/PIN/VAP/LATAM | Key pattern: `{yyyy/MM/dd}/{caseNumber}/{documentName}` | S3 lifecycle policy not configured in application code |
-| AWS S3 (eu-west-2) | `nap-dispute-documents` | Document file storage — NAP platform | Key pattern: `{yyyy/MM/dd}/{caseNumber}/{documentName}` | S3 lifecycle policy not configured in application code |
-| PostgreSQL WDP (US) | `QuestionnaireEntity` table | Questionnaire state per case/action | caseNumber, actionSeq | Managed via `QuestionnaireRepository` |
-| PostgreSQL NAP (UK) | `UKCaseEntity` table | NAP case records — used for desk number blanking on issuer doc upload | caseNumber | Managed via `UKCaseRepository` |
+|-------|------------------|---------|-------------|-------------------|
+| DynamoDB (us-east-2) | `WDP_PIN_DISPUTE_DOCUMENTS` | Document metadata for CORE/PIN/VAP/LATAM platforms | PK `I_CASE` (caseNumber), SK `C_ACTION_SEQ_DOC_NAME` (actionSeq + docName) | ⚠️ TTL / lifecycle not in application code — requires AWS console verification |
+| DynamoDB (eu-west-2) | `NAP_DISPUTE_DOCUMENTS` | Document metadata for NAP platform | Same | Same |
+| AWS S3 (us-east-2) | `wdp-pin-dispute-documents` | Document byte store — non-NAP | Key pattern `{yyyy/MM/dd}/{caseNumber}/{documentName}` | SSE and lifecycle external to application code |
+| AWS S3 (eu-west-2) | `nap-dispute-documents` | Document byte store — NAP | Same pattern | Same |
+| PostgreSQL WDP/US | `QuestionnaireEntity` table | Questionnaire state per case/action (Endpoint 11) | caseNumber, actionSeq | Primary key guard only — no unique index beyond PK |
 
-**DynamoDB attribute schema — full attribute set written on upload:**
+**DynamoDB attribute schema — attributes written on primary upload** (corrected against `entity/DocumentMetaData.java`):
 
-| Java Field | DynamoDB Attribute | Type | Description |
-|-----------|-------------------|------|-------------|
-| `caseId` | `I_CASE` | String | Case number (Partition Key) |
-| `actionSeqDocName` | `C_ACTION_SEQ_DOC_NAME` | String | actionSequence + documentName (Sort Key) |
-| `stageCode` | `C_STAGE_CODE` | String | Dispute stage (CHI, PAS, etc.) |
-| `actionSeq` | `I_ACTION_SEQ` | String | Action sequence number |
-| `docType` | `C_DOC_TYPE` | String | Document type code (RESPDOC, MISCDOC, ISSRDOC, etc.) |
-| `docName` | `B_DOC_NAME` | String | Document filename |
-| `docS3Ref` | `C_DOC_S3_REF` | String | Full S3 key path |
-| `insertedBy` | `X_INSERT` | String | userId of uploader |
-| `insertedTimestamp` | `Z_INSERT` | String | Upload timestamp |
-| `insertedDisplayUserId` | `X_INSERT_DISPLAY` | String | Masked display userId |
-| `updatedDisplayUserId` | `X_UPDT_DISPLAY` | String | Same as insertedDisplayUserId on first write |
-| `fileSize` | `I_FILE_SIZE` | String | File size in bytes (stored as String) |
-| `pageCount` | `I_PAGE_COUNT` | String | Page count (stored as String) |
-| `merchantId` | `c_level1_entity` | String | Merchant ID from case search |
-| `level2Entity` | `c_level2_entity` | String | L2 entity from case search |
-| `level3Entity` | `c_level3_entity` | String | L3 entity from case search |
-| `level4Entity` | `c_level4_entity` | String | L4 entity from case search |
-| `level5Entity` | `c_level5_entity` | String | L5 entity from case search |
-| `docPreview` | `b_doc_preview` | String | Base64 PNG thumbnail |
+| Java field | DynamoDB attribute |
+|-----------|-------------------|
+| `caseId` | `I_CASE` (PK) |
+| `actionSeqDocName` | `C_ACTION_SEQ_DOC_NAME` (SK) |
+| `stageCode` | `C_STAGE_CODE` |
+| `actionSeq` | `I_ACTION_SEQ` |
+| `docType` | `C_DOC_TYPE` |
+| `docName` | `N_DOC_NAME` |
+| `docS3Ref` | `C_DOC_S3_REF` |
+| `fileSize` | `I_FILE_SIZE` |
+| `pageCount` | `I_PAGE_COUNT` |
+| `insertedBy` | `X_INSRT` |
+| `insertedTimestamp` | `Z_INSRT` |
+| `insertedDisplayUserId` | `X_INSRT_DISPLAY` |
+| `updatedBy` | `X_UPDT` |
+| `updatedTimestamp` | `Z_UPDT` |
+| `updatedDisplayUserId` | `X_UPDT_DISPLAY` |
+| `transmittedBy` | `X_TRANSMITTED` |
+| `transmittedTimestamp` | `Z_TRANSMITTED` |
+| `merchantID` | `c_level1_entity` |
+| `level2Entity` | `c_level2_entity` |
+| `level4Entity` | `c_level4_entity` |
+| `level5Entity` | `c_level5_entity` |
+| `docPreview` | `b_doc_preview` |
 
-**Attributes written on metadata update (`PUT /{platform}/documents/{caseNumber}`):**
-`updatedBy` (`X_UPDT`), `updatedTimestamp` (`Z_UPDT`), `updatedDisplayUserId` (`X_UPDT_DISPLAY`). All other fields preserved via read-then-update pattern.
+*No `level3Entity` attribute exists on the entity.*
 
-**Attributes written on `POST .../actions` (Add Document Action):**
-Updates existing record: adds `transmittedBy` (`X_TRANSMITTED`), `transmittedTimestamp` (`Z_TRANSMITTED`), `updatedBy`, `updatedTimestamp`, `updatedDisplayUserId`.
+**Attributes written on metadata update (`PUT /{platform}/documents/{caseNumber}`):** `X_UPDT`, `Z_UPDT`, `X_UPDT_DISPLAY`. Read-then-update pattern; all other fields preserved.
 
-**DynamoDB write ordering:** S3 write occurs **before** DynamoDB `putItem()`. They are sequential but independent — no AWS transaction spans both. There is a crash window between S3 success and DynamoDB write.
+**Attributes written on `POST .../actions`:** adds `X_TRANSMITTED`, `Z_TRANSMITTED`, plus the update triplet.
 
-**No DynamoDB conditional expressions:** Duplicate prevention is application-level only (query by PK, iterate, in-memory filename comparison). Not a DynamoDB condition expression. Concurrent uploads of the same filename can both pass the duplicate check before either writes.
+**DynamoDB write ordering:** S3 `PutObject` precedes DynamoDB `putItem` — sequential, no AWS transaction spans them. Crash window exists between S3 success and DDB write — S3 object orphaned on DDB failure with no compensating delete.
+
+**No DynamoDB conditional expressions used anywhere.** Duplicate prevention is application-level only (query by PK, iterate, extension-stripped filename compare). Concurrent uploads with identical `(caseNumber, actionSequence, documentName)` can both pass the check. S3 last-write-wins on key collision; DDB `putItem` overwrites on SK collision (including `X_INSRT` fields); Kafka publishes both events.
+
+**Global Secondary Indexes — five declared, none queried from Java:**
+
+| Attribute | GSI partition key |
+|-----------|-------------------|
+| `C_STAGE_CODE` | Secondary partition key |
+| `I_ACTION_SEQ` | Secondary partition key |
+| `C_DOC_TYPE` | Secondary partition key |
+| `N_DOC_NAME` | Secondary partition key |
+| `Z_UPDT` | Secondary partition key |
+
+No `queryConditional(...).index(...)` call exists in source — every DDB query targets the base table PK. These indexes are either over-provisioned or exist for an external consumer. Projection type is **not determinable from Java source** (configured on AWS side via CreateTable / CloudFormation / Terraform).
 
 ### Tables Read (not owned by this component)
 
 | Store | Table / Resource | Owned by | Why accessed |
-|-------|-----------------|---------|--------------|
-| PostgreSQL WDP (US) | `USCaseEntity` | COMP-22 DisputeService (shared) | Desk number blanking on issuer doc upload |
-| DynamoDB (both tables) | `WDP_PIN_DISPUTE_DOCUMENTS` / `NAP_DISPUTE_DOCUMENTS` | This component | Duplicate check (query by PK), document list retrieval, update operations |
+|-------|------------------|----------|--------------|
+| PostgreSQL WDP/US | `USCaseEntity` table | ⚠️ Likely COMP-22 DisputeService (shared — needs cross-component confirmation) | Desk-number blanking — column-level UPDATE only, no INSERT/DELETE from this service |
+| PostgreSQL NAP/UK | `UKCaseEntity` table | ⚠️ Likely COMP-22 DisputeService (shared — needs cross-component confirmation) | Desk-number blanking — column-level UPDATE only |
+| DynamoDB (both tables) | `WDP_PIN_DISPUTE_DOCUMENTS` / `NAP_DISPUTE_DOCUMENTS` | This component | Duplicate check, list retrieval, read-then-update operations |
 
 ---
 
@@ -290,24 +342,29 @@ Updates existing record: adds `transmittedBy` (`X_TRANSMITTED`), `transmittedTim
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | Replica count | `{{ replicas-gcp-document-management-service }}` | XL Deploy variable — actual value not determinable from source |
-| HPA | None | Not present in `resources.yaml` |
+| HPA | None | No `HorizontalPodAutoscaler` in manifest |
 | Memory request | `1024Mi` | |
 | Memory limit | `4096Mi` | |
-| CPU request | Not set | Absent from `resources.yaml` |
-| CPU limit | Not set | Absent from `resources.yaml` |
-| Deployment type | Kubernetes Deployment | `kind: Deployment` confirmed |
-| Rollout strategy | RollingUpdate — maxSurge:1, maxUnavailable:0 | Zero-downtime; `minReadySeconds: 30` |
-| PodDisruptionBudget | None | Not present in `resources.yaml` |
-| Topology spread | ScheduleAnyway — maxSkew:1 by `kubernetes.io/hostname` | ⚠️ Label uses `${BRANCH_NAME_PLACEHOLDER}` — mismatch risk if branch substitution fails |
+| CPU request | Not set | Burstable QoS |
+| CPU limit | Not set | Burstable QoS |
+| Deployment type | Kubernetes Deployment | |
+| Rollout strategy | RollingUpdate — maxSurge:1, maxUnavailable:0, minReadySeconds:30 | Zero-downtime |
+| PodDisruptionBudget | None | Not present |
+| Topology spread | ScheduleAnyway, maxSkew:1 by `kubernetes.io/hostname` | ⚠️ `matchLabels` uses `${BRANCH_NAME_PLACEHOLDER}` — silent mismatch risk if branch substitution fails at deploy time |
+| Container port | 8082 | |
+| Readiness probe | `GET /merchant/gcp/document-management/readyz`, initialDelay 10s, timeout 5s, period 10s, failureThreshold 3 | |
+| Liveness probe | `GET /merchant/gcp/document-management/livez`, initialDelay 20s, timeout 5s, period 10s, failureThreshold 3 | Path is `/livez` — the DRAFT v1.0 `/liveness` spelling was incorrect |
+| Startup probe | Absent | |
 | Observability | OpenTelemetry Java agent (auto-instrumentation via OTel operator) | Pod annotation: `instrumentation.opentelemetry.io/inject-java` |
-| Actuator | `/actuator/health`, `/merchant/gcp/prometheus`, `/readyz`, `/liveness` | Health show-details: `never` |
-| Logstash | `logstash-logback-encoder` — Logstash host injected via `${logstash_server_host_port}` | Declared **twice** in pom.xml (lines 92-96 and 169-174) — harmless duplicate |
-| Metrics | Prometheus scraping on `/actuator/prometheus` | |
-| Service type | ClusterIP — external access via NGINX Ingress | Ingress: proxy body size `25m`, CORS enabled, multiple host rules |
+| Actuator endpoints | `info`, `health`, `prometheus` — exposed via default base path `/actuator` | Effective Prometheus URL: `/merchant/gcp/document-management/actuator/prometheus` on port 8082 |
+| Actuator health details | `never` | |
+| Logstash | `logstash-logback-encoder` | Declared **twice** in pom.xml — harmless duplicate |
 | Spring Boot version | 3.1 | |
 | Java version | 17 | |
 | AWS SDK version | v2 (DynamoDB Enhanced, S3) | |
-| PostgreSQL datasources | Two: WDP/US (`spring.datasource.wdp`) + NAP/UK (`spring.datasource.nap`) | Separate HikariCP pools — default pool size (10) |
+| PostgreSQL datasources | Two — `spring.datasource.wdp` (`wdpTransactionManager` `@Primary`) + `spring.datasource.nap` (`napTransactionManager` qualified) | Separate HikariCP pools, default sizing (Boot defaults) |
+| Service type | ClusterIP — external via NGINX Ingress | Ingress: proxy/client body size `25m`, CORS enabled, four host rules |
+| Kafka auth | SASL_SSL + `AWS_MSK_IAM` via `IAMLoginModule` | |
 
 ---
 
@@ -315,16 +372,18 @@ Updates existing record: adds `transmittedBy` (`X_TRANSMITTED`), `transmittedTim
 
 | Decision | ADR reference | Notes |
 |----------|---------------|-------|
-| DynamoDB for document metadata — not Aurora | DEC-PLACEHOLDER | Only WDP component with a DynamoDB dependency. Two separate tables split by platform (NAP vs WDP). |
-| S3 for document storage — not DB blob | DEC-PLACEHOLDER | Documents stored as opaque bytes. S3 key pattern: `{yyyy/MM/dd}/{caseNumber}/{documentName}`. |
-| Single service owns all document operations | DEC-PLACEHOLDER | All callers go through this service — no direct S3 access by other components. |
-| Service acts as OAuth2 Resource Server | Local decision | Validates JWT tokens itself via `JwtIssuerAuthenticationManagerResolver`. Does NOT trust API Gateway for JWT bypass. Multi-issuer support configured. |
-| Storage split by platform (NAP eu-west-2, WDP us-east-2) | Local decision | Driven by data residency — NAP (UK) data must remain in eu-west-2. |
-| No transactional outbox for Kafka publish | **DEC-001 — DEVIATION** 🔴 | Direct Kafka publish after DynamoDB write. No outbox table. If service dies between DynamoDB write and Kafka send, BR event is lost. |
-| Kafka partition key inconsistent across code paths | **DEC-003 — DEVIATION** 🔴 | Legacy `sendBusinessRules()` uses `merchantId` as key. Newer `sendBusinessRulesToKafka()` uses `caseNumber` as key. Ordering guarantee differs per code path. Requires remediation. |
-| No Resilience4j circuit breakers | DEC-014 — ABSENT | Consistent with platform-wide pattern. All outbound calls (S3, DynamoDB, REST, Kafka) fail directly to caller. |
-| No timeout on RestTemplate | Local — operational gap 🔴 | Plain `new RestTemplate()` with no timeout, no retry, no connection pool tuning. All REST calls can block indefinitely. |
-| Synchronous Kafka publish blocking caller thread | Local decision | `kafkaTemplate.send().get()` — caller waits for broker ACK. Failure propagates HTTP 500 to upstream. |
+| DynamoDB for document metadata — not Aurora | Local decision | Only WDP component with a DynamoDB dependency. Two tables split by platform. Five GSIs declared but unqueried from Java. |
+| S3 for document storage — not DB blob | Local decision | Opaque byte storage. Key pattern `{yyyy/MM/dd}/{caseNumber}/{documentName}`. Presigned URL validity 15 minutes. |
+| Single service owns all document operations | Local decision | No direct S3 access by other WDP components — every caller routes through this service's REST surface. |
+| Service acts as OAuth2 Resource Server | Local decision | Validates JWTs itself via `JwtIssuerAuthenticationManagerResolver`. Does NOT trust API Gateway for JWT bypass. Multi-issuer support configured. |
+| Storage split by platform (NAP eu-west-2, non-NAP us-east-2) | Local decision | Driven by UK data residency. Binary `"NAP".equalsIgnoreCase(platform)` gate. |
+| No transactional outbox on primary upload path | **DEC-001 — DEVIATION** 🔴 | Direct Kafka publish after DynamoDB write. No outbox table. If service dies between DDB write and Kafka send, BR event is permanently lost. |
+| Kafka partition key = `caseNumber` on every active publish path | **DEC-003 — DEVIATION** 🔴 | Every reachable call site uses `sendBusinessRulesToKafka()` with `caseNumber` key. The legacy `sendBusinessRules()` (merchantId key) still exists but has **zero callers** — dead code. Consistent deviation from DEC-003 `merchantId` standard. |
+| Endpoint 11 questionnaire path — Kafka publish inside `@Transactional(rollbackOn=Exception.class)` | Local decision | Provides stronger atomicity than the primary-upload path: Kafka failure rolls back the PostgreSQL save. Still leaks on post-ACK commit failure. |
+| No Resilience4j circuit breakers | DEC-014 — voided platform-wide | Consistent with platform pattern. All outbound calls fail directly to caller. |
+| No timeout on RestTemplate (plus a second inline `new RestTemplate()` in `RestInvoker.postData()`) | Local — operational gap 🔴 | Plain `new RestTemplate()` with no connect/read timeout, no retry, no connection pool tuning. Every REST call can block the handler thread indefinitely. |
+| Synchronous Kafka publish blocking caller thread | Local decision | `kafkaTemplate.send(message).get()` — caller waits for broker ACK. Failure propagates HTTP 500 to upstream. |
+| `idempotency-key` header accepted but not used for dedup | Local decision | Logged, MDC-tagged, echoed in response, propagated as outbound Kafka message header — but no dedup store or lookup exists. DEC-020 partial deviation. |
 
 ---
 
@@ -332,29 +391,42 @@ Updates existing record: adds `transmittedBy` (`X_TRANSMITTED`), `transmittedTim
 
 | Severity | Risk | Consequence |
 |----------|------|-------------|
-| 🔴 HIGH | **No distributed transaction across S3, DynamoDB, and Kafka.** S3 write precedes DynamoDB write; Kafka follows. Any crash between steps leaves partial state with no compensating action. | S3 object orphaned (DynamoDB fails); or document stored but BR never triggered (Kafka fails). |
-| 🔴 HIGH | **DEC-001 deviation — no transactional outbox.** If service crashes or Kafka is unavailable after DynamoDB write, the BR event is permanently lost. No retry or recovery mechanism exists. | Dispute case stalls at document-attached state; business rules processing never fires; manual intervention required. |
-| 🔴 HIGH | **DEC-003 deviation — inconsistent Kafka partition key.** Legacy path uses `merchantId`; questionnaire path uses `caseNumber`. Messages for the same case may land on different partitions depending on code path taken. | Ordering guarantee broken. Two BR events for the same case may be consumed out of order by BusinessRulesProcessor. |
-| 🔴 HIGH | **RestTemplate with no timeout on all outbound REST calls.** Any hanging downstream service (case-management, case-actions, rules-service, visa-adapter, etc.) blocks the handler thread indefinitely. | Thread exhaustion under load; full service unresponsive. |
-| 🟡 MEDIUM | **No DynamoDB conditional write for duplicate prevention.** Duplicate check is application-level (query + in-memory compare). Two concurrent requests can both pass the check. | Same document uploaded twice to S3 and DynamoDB. |
-| 🟡 MEDIUM | **Topology spread label uses `${BRANCH_NAME_PLACEHOLDER}`.** If branch substitution fails at deploy time, the `matchLabels` in `topologySpreadConstraints` will not match the pod template label. | Topology spread constraint is silently ignored; pods may concentrate on a single node. |
-| 🟡 MEDIUM | **No CPU limit or request defined.** Only memory limits/requests are set in `resources.yaml`. | CPU can be starved by other pods or can consume unbounded CPU, impacting co-located workloads. |
-| 🟡 MEDIUM | **No HPA configured.** Replica count is static (XL Deploy variable). | Service cannot auto-scale under document upload load spikes. |
-| 🟡 MEDIUM | **Kafka publish blocked on slow broker.** Synchronous `.get()` call blocks the HTTP handler thread until broker acknowledgment or retry exhaustion. | Under Kafka latency spikes, upload endpoint response times degrade significantly. |
-| 🟢 LOW | **S3 lifecycle / document retention policy not configured in application code.** Requires direct AWS console verification. | Documents may accumulate indefinitely; retention compliance risk for PCI-DSS 7-year rule. |
-| 🟢 LOW | **`spring-boot-devtools` present in pom.xml as runtime-optional.** If not excluded from production Docker image, it could cause unexpected class reloading behaviour. | Operational instability in rare scenarios. |
+| 🔴 HIGH | **No distributed transaction across S3, DynamoDB, PostgreSQL, Kafka, and the final action-indicator PUT.** Five sequential writes on the primary upload path; any failure after the first leaves partial state with no compensating action. | S3 object orphaned on DDB failure; document stored but BR never triggered on Kafka failure; action indicator stale on action-update failure after Kafka ACK. |
+| 🔴 HIGH | **DEC-001 deviation — no transactional outbox on primary upload path.** If service crashes or Kafka is unavailable after DynamoDB write, the BR event is permanently lost. | Dispute case stalls at document-attached state; business rules processing never fires; manual intervention required. |
+| 🔴 HIGH | **DEC-003 deviation — partition key is `caseNumber` on every reachable publish.** Cross-platform standard is `merchantId`. Consistent deviation rather than inconsistent — every message on this topic from this service is case-scoped. | Case-level ordering only, not merchant-level. Interleaving of events across different cases for the same merchant is unordered from this producer. |
+| 🔴 HIGH | **RestTemplate has no timeout on any outbound REST call.** Any hanging downstream (case-management, case-actions, rules-service, visa-adapter, display-code-service, etc.) blocks the handler thread indefinitely. A second inline `new RestTemplate()` in `RestInvoker.postData()` compounds the surface. | Thread exhaustion under load; full service unresponsive. |
+| 🟡 MEDIUM | **No DynamoDB conditional write for duplicate prevention.** Duplicate check is application-level (query + in-memory compare). Two concurrent requests with identical `(caseNumber, actionSequence, documentName)` can both pass the check. | Later `putItem` silently overwrites earlier row (including `X_INSRT*` fields); S3 key last-write-wins; Kafka publishes two events. |
+| 🟡 MEDIUM | **Endpoint 6 (`GET /download`) is missing `@PathVariable` on the `platform` parameter.** Every sibling endpoint annotates it; this one does not. | Spring MVC parameter binding may fail at runtime; needs git-blame and runtime verification. Suspected OCR-level defect in the source snapshot. |
+| 🟡 MEDIUM | **Endpoint 11 questionnaire path: repeat PUT overwrites state and republishes Kafka.** No idempotency guard beyond PK `(caseNumber, actionSequence)`. | Duplicate BR events on client retry; last-write-wins on questionnaire payload. |
+| 🟡 MEDIUM | **Topology spread `matchLabels` uses `${BRANCH_NAME_PLACEHOLDER}`.** If branch substitution fails at deploy time, the constraint silently matches no pod. | Pods concentrate on a single node; resilience assumption broken without failure signal. |
+| 🟡 MEDIUM | **No CPU limit or request defined.** Only memory is set in `resources.yml`. | CPU starvation under contention; unbounded CPU consumption possible. |
+| 🟡 MEDIUM | **No HPA configured.** Static replica count. | No auto-scaling under document upload load spikes. |
+| 🟡 MEDIUM | **Synchronous Kafka publish blocks the HTTP handler thread.** `.get()` waits for broker ACK or retry exhaustion. | Kafka latency spikes degrade upload endpoint response times. |
+| 🟢 LOW | **S3 bucket lifecycle / retention policy not in application code.** Requires AWS console verification. | Documents may accumulate indefinitely; PCI-DSS 7-year retention compliance risk. |
+| 🟢 LOW | **`spring-boot-devtools` present in pom.xml as `runtime` + `optional`.** Dockerfile is absent from the repo snapshot — cannot confirm exclusion from the production image. Paketo Buildpacks default behaviour honours `optional` scope. | Operational instability in rare scenarios if the image does include it. |
 | 🟢 LOW | **`logstash-logback-encoder` declared twice in pom.xml.** Functionally harmless but indicates stale dependency management. | No runtime impact. |
+| 🟢 LOW | **Five DynamoDB GSIs declared but never queried from Java.** Either over-provisioning or external consumer dependency. | Unnecessary write amplification and cost; projection type and scan pattern should be confirmed on the AWS side. |
+| 🟢 LOW | **Dead config for `user-access-management-service` and `core-hierarchy-authorization-service-url`.** URLs configured in prod/cert YAML but zero Java references. | Misleading ops perception of service reach. |
 
 ---
 
 ## Planned Changes
 
-- ⚠️ OPEN QUESTION: S3 bucket lifecycle / document retention policy — confirm whether expiry rules are configured at the bucket level in AWS console. Required for PCI-DSS 7-year retention compliance confirmation.
+- ⚠️ OPEN QUESTION: S3 bucket lifecycle / retention policy — confirm whether expiry rules are configured at the bucket level in AWS console. Required for PCI-DSS 7-year retention compliance confirmation.
 - ⚠️ OPEN QUESTION: Actual replica count for `replicas-gcp-document-management-service` XL Deploy variable — confirm prod and non-prod values.
-- ⚠️ OPEN QUESTION: Whether `spring-boot-devtools` is excluded from the production Docker build image.
-- TODO (in source): `DocumentManagementServiceImpl.java` line 2189 — eventType currently inferred from documentType as a fallback. Intended future state: eventType passed explicitly from caller. Technical debt in Kafka event type handling.
-- `pdfThumbnailService.generatePNGThumbnail()` on the historical doc endpoint returns a fixed placeholder thumbnail from `Thumbnail.png` resource — may indicate incomplete migration path for historical document display.
-- Commented-out code in `DocumentManagementServiceImpl.entityToResponse()` (lines 1932-1938) — previously set dispute stage and document type directly from DynamoDB enum values. Replaced by display code service lookup. Candidate for removal.
+- ⚠️ OPEN QUESTION: DynamoDB GSI projection type (`KEYS_ONLY` / `INCLUDE` / `ALL`) for the five declared indexes — confirm from CloudFormation / Terraform / AWS console.
+- ⚠️ OPEN QUESTION: Whether `spring-boot-devtools` is excluded from the production image build (Dockerfile not present in the repo snapshot).
+- ⚠️ OPEN QUESTION: Endpoint 6 (`GET /download`) missing `@PathVariable("platform")` — source defect or OCR-drop in the snapshot? Needs git-blame.
+- ⚠️ OPEN QUESTION: `USCaseEntity` / `UKCaseEntity` ownership — confirm whether COMP-22 DisputeService is the sole INSERT/DELETE owner while this service is a column-level UPDATE co-writer only.
+- ⚠️ OPEN QUESTION: DEC-001 remediation plan — accept risk or implement outbox pattern for this service? (Architect decision)
+- ⚠️ OPEN QUESTION: DEC-003 remediation plan — standardise `caseNumber` across the platform, or switch this service's publish to `merchantId`? (Architect decision)
+- TODO (source): `DocumentManagementServiceImpl` line ~2187 — `eventType` currently inferred from documentType as a fallback (`ISSRDOC/ISSRQDOC → DOCUMENT_UPLOADED`; otherwise `DOC_ATTACHED`). Intended future state: callers pass `eventType` explicitly.
+- **Dead code candidate for removal:** `sendBusinessRules(merchantId-key)` method — zero callers. Safe to delete alongside DEC-003 remediation.
+- **Dead code candidate for removal:** commented block in `DocumentManagementServiceImpl.entityToResponse()` at lines 1923–1930 (previously set dispute stage and document type directly from DynamoDB enum values; replaced by display-code-service lookup).
+- **Dead config candidate for removal:** `user.access-management-api-url`, `user.core-hierarchy-authorization-service-url`, `app.authorization-client-registration-id`, `app.authorization-client-principal`, `kafka.retry-count`, `kafka.retry-delay` — no Java reader. The Kafka retry values are cosmetic; actual retry is hardcoded in the `@Retryable` annotation.
+- **Historical-doc thumbnail placeholder:** `PdfThumbnailServiceImpl.generatePNGThumbnail()` unconditionally returns a fixed `Thumbnail.png` resource. Confirm whether real thumbnail generation was intended for this path.
+- **DTO fields that never reach the payload:** `BusinessRulesData` declares `merchantId` and several other fields that neither active publish method populates — emitted as null. Clean up the DTO or populate these fields explicitly.
+- **Primary-upload RESPDOC source code divergence:** primary upload uses `BRRSUP`; questionnaire path uses `BRMRUP`. Confirm which is correct for the downstream BusinessRulesProcessor.
 
 ---
 
@@ -369,9 +441,9 @@ Updates existing record: adds `transmittedBy` (`X_TRANSMITTED`), `transmittedTim
 **Authentication model:**
 The service acts as a **Spring OAuth2 Resource Server**. It validates JWT Bearer tokens itself against a configurable list of trusted issuers (`jwt.trustedIssuers`). Spring Security's `JwtIssuerAuthenticationManagerResolver` handles multi-issuer support. There is no API Gateway JWT bypass — JWTs are validated at this service boundary.
 
-All endpoints except `/actuator/health`, `/readyz`, and `/liveness` require a valid Bearer JWT. In non-prod environments, Swagger UI paths (`/v3/api-docs/**`) are also whitelisted.
+All endpoints except `/actuator/health`, `/readyz`, and `/livez` require a valid Bearer JWT. In non-prod environments, Swagger UI paths (`/v3/api-docs/**`) are also whitelisted.
 
-Internal vs external caller detection: if the JWT `iss` claim contains `us_worldpay_fis_int`, the userId is masked to `WORLDPAY` or `System` for audit purposes. No endpoint-level RBAC is implemented (`@PreAuthorize` not present).
+Internal vs external caller detection: if the JWT `iss` claim contains `us_worldpay_fis_int`, the userId is masked to `WORLDPAY` (userId prefix `e` or `lc`) or `System` (otherwise) for audit purposes. No endpoint-level RBAC is implemented (`@PreAuthorize` not present).
 
 **Base URL pattern:** `https://<host>/merchant/gcp/document-management/{platform}/...`
 
@@ -380,16 +452,16 @@ Internal vs external caller detection: if the JWT `iss` claim contains `us_world
 | Header | Required | Description |
 |--------|----------|-------------|
 | `Authorization: Bearer <JWT>` | Yes | OAuth2 JWT token |
-| `v-correlation-id` | No | Correlation ID for distributed tracing |
-| `idempotency-key` | No | Accepted and logged but **not used for deduplication** in application code |
+| `v-correlation-id` | No | Correlation ID for tracing. If absent, a UUID is generated. MDC-tagged, echoed in response headers, propagated to RTSI-flagged outbound calls only (Visa/Mastercard adapters), and included in outbound Kafka messages as the `correlationId` **payload field** (not as a Kafka record header) |
+| `idempotency-key` | No | Accepted, MDC-tagged, echoed in response, and propagated as an outbound Kafka message **header** via `RequestCorrelation` — but **not used for deduplication** anywhere in application code |
 
 ---
 
 ### Endpoint 1: `POST /{platform}/documents/{caseNumber}` — Upload File (Multipart)
 
-**Purpose:** Primary document upload endpoint. Accepts multipart file. Performs duplicate check, image conversion, S3 upload, DynamoDB metadata write, desk-number update, and optional Kafka BR notification.
-**Caller(s):** WDP Ops Portal, internal dispute workflow services, COMP-15 EvidenceConsumer
-**Auth required:** Bearer JWT
+**Purpose:** Primary document upload endpoint. Accepts multipart file. Performs duplicate check, image conversion, S3 upload, DynamoDB metadata write, desk-number update, optional Kafka BR notification, and action-indicator update.
+**Caller(s):** WDP Ops Portal, internal dispute workflow services, COMP-15 EvidenceConsumer.
+**Auth required:** Bearer JWT.
 
 **Request**
 
@@ -399,33 +471,35 @@ Internal vs external caller detection: if the JWT `iss` claim contains `us_world
 | `caseNumber` | String | Path | Yes | Case identifier |
 | `actionSequence` | String | Query | Yes | Action sequence number |
 | `uploadedBy` | String | Query | Yes | User identifier |
-| `convertDocument` | Boolean | Query | No | Default `true`. If false, only PDF/TIFF/TIF accepted. |
-| `notifyBRQueue` | Boolean | Query | No | Default `false`. If `true` and `startRuleGroup` not blank, publishes to Kafka. |
-| `file` | MultipartFile | Body (form-data) | Yes | Document file |
+| `convertDocument` | Boolean | Query | No | Default `true`. If `false`, only PDF/TIFF/TIF accepted |
+| `notifyBRQueue` | Boolean | Query | No | Default `false`. If `true` and `startRuleGroup` non-blank, publishes to Kafka |
 | `documentType` | String | Query | Yes | RESPDOC / MISCDOC / ISSRDOC / DRFTDOC etc. |
+| `file` | MultipartFile | Body (form-data) | Yes | Document file |
+
+**Controller-injected payload:** `startRuleGroup = DOCUMENT_ATTACHED_TO_OPEN_CASE` (hardcoded); `eventType = null` (inferred downstream from documentType).
 
 **Response — Success**
 
 | HTTP Status | Condition | Body |
 |-------------|-----------|------|
-| 201 CREATED | Document stored successfully in S3 + DynamoDB | `DocumentResponse` {caseNumber, documentName, documentRef (S3 key), dateUploaded, documentType, disputeStage} |
+| 201 CREATED | S3 + DynamoDB write successful; downstream steps succeed or are skipped | `DocumentResponse` { caseNumber, documentName, documentRef (S3 key), dateUploaded, documentType, disputeStage } |
 
 **Response — Error**
 
 | HTTP Status | Condition |
 |-------------|-----------|
-| 400 | File empty; blank required params; duplicate filename; unsupported format; case CLOSED + action OPEN; page count exceeds limit; file size exceeds limit |
+| 400 | Bean validation; empty file; duplicate filename; unsupported format; case CLOSED + action OPEN; page count exceeds limit; file size exceeds limit; JWT blank |
 | 401 | Missing or invalid JWT |
 | 404 | Case not found; action sequence not found |
-| 500 | S3 failure; DynamoDB failure; Kafka failure (after 3 retries); downstream REST exception |
+| 500 | S3 failure; DynamoDB failure; desk-blank failure; Kafka failure after retries; action-update failure |
 
 ---
 
 ### Endpoint 2: `GET /{platform}/documents/{caseNumber}` — List Documents
 
-**Purpose:** Returns list of all documents stored for a case, with optional filters.
-**Caller(s):** WDP Ops Portal, internal dispute services
-**Auth required:** Bearer JWT
+**Purpose:** Returns list of documents stored for a case, with optional filters.
+**Caller(s):** WDP Ops Portal, internal dispute services.
+**Auth required:** Bearer JWT.
 
 **Request**
 
@@ -433,136 +507,121 @@ Internal vs external caller detection: if the JWT `iss` claim contains `us_world
 |-----------|------|----------|----------|-------------|
 | `platform` | String | Path | Yes | |
 | `caseNumber` | String | Path | Yes | |
-| `actionSequence` | String | Query | No | Filter by action sequence |
-| `documentType` | String | Query | No | Filter by document type |
-| `disputeStage` | String | Query | No | Filter by dispute stage |
+| `actionSequence` | String | Query | No | Filter |
+| `documentType` | String | Query | No | Filter |
+| `disputeStage` | String | Query | No | Filter |
 
-**Response — Success**
-
-| HTTP Status | Body |
-|-------------|------|
-| 200 | `List<DocumentGetResponse>` — each item: {caseNumber, documentName, documentRef, dateUploaded, uploadedBy, actionSequence, dateTransmitted, transmittedBy, disputeStage, insertedDisplayUserId, updatedDisplayUserId, docPreview} |
-
-**Response — Error:** 401, 404 (no documents found), 500
+**Response — Success:** HTTP 200, `List<DocumentGetResponse>` — each: { caseNumber, documentName, documentRef, dateUploaded, uploadedBy, actionSequence, dateTransmitted, transmittedBy, disputeStage, insertedDisplayUserId, updatedDisplayUserId, docPreview }.
+**Response — Error:** 401, 404, 500.
 
 ---
 
 ### Endpoint 3: `POST /{platform}/documents/{caseNumber}/actions` — Add Document Action
 
 **Purpose:** Adds or updates document metadata — specifically network transmission date and related fields.
-**Caller(s):** Internal case processing services
-**Auth required:** Bearer JWT
+**Caller(s):** Internal case processing services.
+**Auth required:** Bearer JWT.
 
-**Request body:** `List<AddDocumentActionRequest>` — each item: {documentName, actionSequence, documentType, stageCode, transmittedBy, transmittedDate}
+**Request body:** `List<AddDocumentActionRequest>` — each: { documentName, actionSequence, documentType, stageCode, transmittedBy, transmittedDate }.
 
-**Response — Success:** HTTP 200 (empty body)
-
-**Response — Error:** 400 (doc not found, transmitted date missing), 401, 500
+**Response — Success:** HTTP 200 (empty body).
+**Response — Error:** 400 (doc not found, transmitted date missing), 401, 500.
 
 ---
 
 ### Endpoint 4: `PUT /{platform}/documents/{caseNumber}` — Update Document Metadata
 
-**Purpose:** Updates document metadata fields (updatedBy, timestamp). Read-then-update pattern on DynamoDB.
-**Caller(s):** WDP Ops Portal
-**Auth required:** Bearer JWT
+**Purpose:** Updates document metadata fields (updatedBy, timestamp). Read-then-update pattern.
+**Caller(s):** WDP Ops Portal.
+**Auth required:** Bearer JWT.
 
-**Request body:** `UpdateDocumentRequest` {actionSequence, documentName, updatedBy}
+**Request body:** `UpdateDocumentRequest` { actionSequence, documentName, updatedBy }.
 
-**Response — Success:** HTTP 200 (empty body)
-
-**Response — Error:** 400, 401, 404, 500
+**Response — Success:** HTTP 200 (empty body).
+**Response — Error:** 400, 401, 404, 500.
 
 ---
 
 ### Endpoint 5: `POST /{platform}/documents/base64/{caseNumber}` — Fetch Base64 Documents
 
 **Purpose:** Returns document content as base64-encoded strings. Fetches from S3.
-**Caller(s):** Internal services needing document bytes
-**Auth required:** Bearer JWT
+**Caller(s):** Internal services needing document bytes.
+**Auth required:** Bearer JWT.
 
-**Request body:** `Base64DocumentRequest` {documentRefIds: List\<String\>, documentNames: List\<String\>} — one of the two required.
+**Request body:** `Base64DocumentRequest` { documentRefIds: List\<String\>, documentNames: List\<String\> } — one of the two required.
 
-**Response — Success**
-
-| HTTP Status | Body |
-|-------------|------|
-| 200 | `List<Base64DocumentResponse>` — each item: {documentRefId, documentName, base64Data, status: DOCUMENT_FOUND \| DOCUMENT_NOT_FOUND \| INVALID_REFERENCE \| INTERNAL_SERVER_ERROR} |
-
-**Response — Error:** 400, 401, 500
+**Response — Success:** HTTP 200, `List<Base64DocumentResponse>` — each: { documentRefId, documentName, base64Data, status: `DOCUMENT_FOUND` \| `DOCUMENT_NOT_FOUND` \| `INVALID_REFERENCE` \| `INTERNAL_SERVER_ERROR` }.
+**Response — Error:** 400, 401, 500.
 
 ---
 
 ### Endpoint 6: `GET /{platform}/document/{caseNumber}/download` — Download Document (Presigned URL)
 
 **Purpose:** Generates and returns a presigned S3 URL (15-minute validity) via HTTP 302 redirect.
-**Caller(s):** WDP Ops Portal, Merchant Portal
-**Auth required:** Bearer JWT
+**Caller(s):** WDP Ops Portal, Merchant Portal.
+**Auth required:** Bearer JWT.
 
 **Request**
 
 | Parameter | Type | Location | Required | Description |
 |-----------|------|----------|----------|-------------|
-| `documentRefId` | String | Query | Conditionally | One of documentRefId or documentName required |
-| `documentName` | String | Query | Conditionally | One of documentRefId or documentName required |
+| `platform` | String | Path | Yes | ⚠️ **Source defect**: missing `@PathVariable("platform")` annotation on the handler parameter. Every sibling endpoint in this controller annotates `platform` as `@PathVariable`; this one does not. Spring MVC parameter binding may fail at runtime |
+| `caseNumber` | String | Path | Yes | |
+| `documentRefId` | String | Query | Conditionally | One of `documentRefId` or `documentName` required |
+| `documentName` | String | Query | Conditionally | One of `documentRefId` or `documentName` required |
 
-**Response — Success:** HTTP 302 FOUND with `Location` header = presigned S3 URL (15-minute validity). Region for presigner: NAP → eu-west-2; all others → us-east-2.
-
-**Response — Error:** 400, 401, 404 (doc not found in DynamoDB), 500
+**Response — Success:** HTTP 302 FOUND with `Location` header = presigned S3 URL (15-minute validity). Region for presigner: NAP → eu-west-2; non-NAP → us-east-2.
+**Response — Error:** 400, 401, 404, 500.
 
 ---
 
 ### Endpoint 7: `GET /{platform}/documents/{caseNumber}/unique-document` — Unique Document List
 
-**Purpose:** Returns deduplicated document list enriched with display code descriptions via call to `mdvs-gcp-display-code-service`.
-**Caller(s):** WDP Ops Portal, Merchant Portal
-**Auth required:** Bearer JWT
+**Purpose:** Returns deduplicated document list enriched with display-code descriptions via call to `mdvs-gcp-display-code-service`.
+**Caller(s):** WDP Ops Portal, Merchant Portal.
+**Auth required:** Bearer JWT.
 
-**Response — Success:** HTTP 200, `List<DocumentActionResponse>` enriched with display code descriptions.
-
-**Response — Error:** 401, 404, 500
+**Response — Success:** HTTP 200, `List<DocumentActionResponse>`.
+**Response — Error:** 401, 404, 500. Display-code-service failure is **caught and swallowed** — display-code fields left empty; overall response still 200.
 
 ---
 
 ### Endpoint 8: `POST /nap/response/document` — NAP Base64 Upload
 
-**Purpose:** Upload NAP document as base64 string. Platform is fixed to NAP. `notifyBRQueue` is forced to `false` in controller — no BR event published from this path.
-**Caller(s):** NAP EvidenceConsumer (COMP-15), WDP Ops Portal
-**Auth required:** Bearer JWT
+**Purpose:** Upload NAP document as base64 string. Platform fixed to NAP. `notifyBRQueue` **forced to `false` at the controller** — no BR event published from this path under any condition.
+**Caller(s):** COMP-15 NAP EvidenceConsumer, WDP Ops Portal.
+**Auth required:** Bearer JWT.
 
-**Request body:** `UploadDocumentRequest` {userId, fileName, file (base64 string), arn, acquirerCaseNumber, uniqueId, notifyBRQueue (forced false by controller)}
+**Request body:** `UploadDocumentRequest` { userId, fileName, file (base64), arn, acquirerCaseNumber, uniqueId, notifyBRQueue (controller override to false) }.
 
-**Behaviour:** Looks up case by ARN/acquirer case number, selects max action sequence, determines docType (RESPDOC for open actions, MISCDOC for closed), calls internal `uploadFile()`, then updates questionnaire, then attempts action owner update to WPAYOPS.
+**Behaviour:** Looks up case by ARN + acquirerCaseNumber, selects max action sequence, determines docType (RESPDOC for open actions, MISCDOC for closed), delegates to internal `uploadFile()`, then calls `DocumentQuestionnaireServiceImpl.updateDocumentInformation`, then attempts action-owner update to `WPAYOPS`.
 
-**Response — Success:** HTTP 201 (empty body)
-
-**Response — Error:** 400, 401, 404, 500
+**Response — Success:** HTTP 201 (empty body).
+**Response — Error:** 400, 401, 404, 500.
 
 ---
 
 ### Endpoint 9: `POST /{platform}/documents/{caseNumber}/issuerdoc` — Add Issuer Doc (v1, JSON)
 
-**Purpose:** Attach issuer document to a case. v1 JSON body variant. Calls rules-service for doc type, Visa adapter or Mastercard adapter depending on card network.
-**Caller(s):** Internal dispute workflow, FileProcessor
-**Auth required:** Bearer JWT
+**Purpose:** Attach issuer document to a case. v1 JSON body variant. Calls rules-service for doc type, then Visa adapter or Mastercard adapter depending on card network.
+**Caller(s):** Internal dispute workflow, FileProcessor.
+**Auth required:** Bearer JWT.
 
-**Request body:** `IssuerDocRequest` {userId, addDocToCase (bool), skipDocStatus (bool), notifyToBr (bool, defaults to `true`)}
+**Request body:** `IssuerDocRequest` { userId, addDocToCase (bool), skipDocStatus (bool), notifyToBr (bool, defaults `true`) }.
+**Request query:** `actionSequence` (optional).
 
-**Request query:** `actionSequence` (optional)
+**Response — Success:** HTTP 201, `IssuerDocResponse` { issuerDocAddedToCase: bool, base64EncodedFiles: List, networkDocStatus: string }.
+**Response — Error:** 400, 401, 404, 500.
 
-**Response — Success:** HTTP 201, `IssuerDocResponse` {issuerDocAddedToCase: bool, base64EncodedFiles: List, networkDocStatus: string}
-
-**Response — Error:** 400, 401, 404, 500
-
-**Note:** `notifyToBr=true` (default) triggers Kafka publish to `business-rules` after successful issuer doc upload.
+**Note:** `notifyToBr=true` (default) triggers Kafka publish via `sendBusinessRulesToKafka()` with partition key `caseNumber` after successful issuer-doc upload.
 
 ---
 
-### Endpoint 10: `POST v2/{platform}/documents/{caseNumber}/issuerdoc` — Add Issuer Doc (v2, Multipart)
+### Endpoint 10: `POST /v2/{platform}/documents/{caseNumber}/issuerdoc` — Add Issuer Doc (v2, Multipart)
 
 **Purpose:** Attach issuer document as multipart file upload. v2 variant of Endpoint 9.
-**Caller(s):** Internal dispute workflow
-**Auth required:** Bearer JWT
+**Caller(s):** Internal dispute workflow.
+**Auth required:** Bearer JWT.
 
 **Request**
 
@@ -570,62 +629,65 @@ Internal vs external caller detection: if the JWT `iss` claim contains `us_world
 |-----------|------|----------|----------|-------------|
 | `actionSequence` | String | Query | No | |
 | `uploadedBy` | String | Query | Yes | |
-| `skipDocStatus` | Boolean | Query | No | Default false |
-| `addDocToCase` | Boolean | Query | No | Default false |
-| `notifyToBr` | Boolean | Query | No | Default true |
+| `skipDocStatus` | Boolean | Query | No | Default `false` |
+| `addDocToCase` | Boolean | Query | No | Default `false` |
+| `notifyToBr` | Boolean | Query | No | Default `true` |
 | `file` | MultipartFile | Part | No | Optional multipart file |
 
-**Response — Success:** HTTP 201, `IssuerDocResponse`
-
-**Response — Error:** 400, 401, 404, 500
+**Response — Success:** HTTP 201, `IssuerDocResponse`.
+**Response — Error:** 400, 401, 404, 500.
 
 ---
 
-### Endpoint 11: `PUT /{platform}/document/{caseNumber}/action/{actionSeq}` — Update Document Info / Questionnaire
+### Endpoint 11: `POST /{platform}/document/{caseNumber}/action/{actionSeq}` — Update Document Info / Questionnaire
 
-**Purpose:** Updates questionnaire state in PostgreSQL. If `notifyBRQueue=true`, publishes to Kafka after PostgreSQL write. This is the endpoint used by the questionnaire flow; uses `caseNumber` as the Kafka partition key (newer `sendBusinessRulesToKafka()` code path).
-**Caller(s):** WDP Ops Portal, Questionnaire service (COMP-26)
-**Auth required:** Bearer JWT
+**Purpose:** Updates questionnaire state in PostgreSQL. If `notifyBRQueue=true`, publishes to Kafka inside the same transaction. This is the questionnaire path — diverges from all other endpoints at the service layer.
+**Caller(s):** WDP Ops Portal, COMP-26 QuestionnaireService.
+**Auth required:** Bearer JWT.
 
-**Request body:** `UpdateQuestionnaireDocumentRequest` {documents: List\<String\>, userId, notifyBRQueue (bool, defaults to false)}
+**⚠️ HTTP verb is POST, not PUT** (corrected from DRAFT v1.0).
 
-**Validation:** If `notifyBRQueue=false` and documents list is null/empty → HTTP 400
+**Request body:** `UpdateQuestionnaireDocumentRequest` { documents: List\<String\>, userId, notifyBRQueue (bool, defaults `false`) }.
 
-**Side effects:** Writes/updates `QuestionnaireEntity` in PostgreSQL. PostgreSQL write is `@Transactional` but the transaction does **not** span the Kafka publish that follows. If `notifyBRQueue=true`, publishes to Kafka outside the transaction.
+**Validation:** If `notifyBRQueue=false` AND `documents` list is null/empty → HTTP 400.
 
-**Response — Success:** HTTP 200 (empty body)
+**Side effects:**
+- `QuestionnaireRepository` upsert on `QuestionnaireEntity` (find → save).
+- If `notifyBRQueue=true` AND `documents` non-empty: Kafka publish with document-derived `startRuleGroup`.
+- If `notifyBRQueue=true` AND `documents` empty: Kafka publish with `startRuleGroup=QUEUE`.
 
-**Response — Error:** 400, 401, 500
+**Transaction semantics:** the service method is `@Transactional(rollbackOn = Exception.class)`. Kafka publish executes inside the transaction. On Kafka exhaustion (`@Recover` throws `EventServiceException`), the PostgreSQL save is rolled back. A successful broker ACK followed by any later exception in the method can still leak a published-but-unpersisted event.
+
+**Response — Success:** HTTP 200 (empty body).
+**Response — Error:** 400, 401, 500.
 
 ---
 
 ### Endpoint 12: `POST /{platform}/documents/{caseNumber}/validate` — Validate Max File Size
 
-**Purpose:** Validates total file size of a list of named documents against per-network limits. Returns 400 if total exceeds limit.
-**Caller(s):** WDP Ops Portal, Questionnaire service
-**Auth required:** Bearer JWT
+**Purpose:** Validates total file size of a list of named documents against per-network aggregate limit (`maxAllFilesSize`).
+**Caller(s):** WDP Ops Portal, COMP-26 QuestionnaireService.
+**Auth required:** Bearer JWT.
 
-**Request body:** `List<String>` (document names)
+**Request body:** `List<String>` (document names).
 
-**Response — Success:** HTTP 200 (empty body if within limits)
-
-**Response — Error:** 400 (total exceeds network limit), 401, 500
+**Response — Success:** HTTP 200 (empty body).
+**Response — Error:** 400 (aggregate exceeds network limit), 401, 500.
 
 ---
 
 ### Endpoint 13: `POST /{platform}/documents/{caseNumber}/history-doc` — Upload Historical Document (CORE only)
 
-**Purpose:** Backfill endpoint for historical CORE platform documents. Accepts base64 document content. Only routes to WDP S3/DynamoDB bucket (NAP bucket not used). Returns a fixed placeholder thumbnail.
-**Caller(s):** WDP Ops Portal pre-submission check, data migration jobs
-**Auth required:** Bearer JWT
+**Purpose:** Backfill endpoint for historical CORE platform documents. Accepts base64 document content. Routes only to non-NAP S3/DynamoDB target. Served by `CoreDocumentManagementController` (separate controller, separate service impl).
+**Caller(s):** WDP Ops Portal pre-submission check, data migration jobs.
+**Auth required:** Bearer JWT.
 
-**Request body:** `UploadHistoricalDocRequest` {docName, imageData (base64), actionSeq, docType, updatedBy, insertedTimestamp, stageCode}
+**Request body:** `UploadHistoricalDocRequest` { docName, imageData (base64), actionSeq, docType, updatedBy, insertedTimestamp, stageCode }.
 
-**Note:** Served by `CoreDocumentManagementController` — this is the single endpoint on that controller. The `insertedTimestamp` from the request is used as the S3 key date prefix (not the current date). `pdfThumbnailService.generatePNGThumbnail()` returns a fixed `Thumbnail.png` resource — likely a placeholder.
+**Note:** `insertedTimestamp` from the request is used as the S3 key date prefix (not the current date). `PdfThumbnailServiceImpl.generatePNGThumbnail()` returns a fixed `Thumbnail.png` classpath resource — placeholder, not a real preview.
 
-**Response — Success:** HTTP 200, `CoreDocumentResponse` {caseNumber, documentName, documentRef (S3 key), dateUploaded, disputeStage}
-
-**Response — Error:** 400, 401, 500
+**Response — Success:** HTTP 200, `CoreDocumentResponse` { caseNumber, documentName, documentRef, dateUploaded, disputeStage }.
+**Response — Error:** 400, 401, 500.
 
 ---
 
@@ -637,11 +699,14 @@ Internal vs external caller detection: if the JWT `iss` claim contains `us_world
 
 ## Kafka Producer Contracts
 
-**Producer framework:** Spring Kafka `KafkaTemplate`
-**Idempotent producer:** Yes — `ENABLE_IDEMPOTENCE_CONFIG = true`, `MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION = 1`
-**Publish mode:** **Synchronous** — `kafkaTemplate.send(message).get()` blocks until broker acknowledgment
-**Auth:** SASL_SSL with AWS MSK IAM (`AWS_MSK_IAM` mechanism, `IAMLoginModule`)
-**Retry on publish failure:** Yes — Spring Retry `@Retryable`, 3 attempts, 100ms fixed delay. After exhaustion, `@Recover` throws `EventServiceException` → HTTP 500 to caller.
+**Producer framework:** Spring Kafka `KafkaTemplate` (single producer factory).
+**Idempotent producer:** Yes — `ENABLE_IDEMPOTENCE_CONFIG=true`, `MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION=1`.
+**Serializers:** `StringSerializer` (key) + `JsonSerializer` (value).
+**Publish mode:** **Synchronous** — `kafkaTemplate.send(message).get()` blocks until broker acknowledgment.
+**Auth:** SASL_SSL with AWS MSK IAM (`AWS_MSK_IAM` mechanism, `IAMLoginModule`).
+**Retry on publish failure:** Yes — Spring Retry `@Retryable(retryFor={Exception.class}, maxAttemptsExpression="3", backoff=@Backoff(delayExpression="100"))`. After exhaustion, `@Recover` throws `EventServiceException(HTTP 500, SYSTEM_ERROR)`.
+
+**Important:** the yml keys `kafka.retry-count` and `kafka.retry-delay` are **cosmetic** — the retry count and delay are hardcoded in the `@Retryable` annotation. Changing the yml values has no runtime effect.
 
 ---
 
@@ -649,72 +714,75 @@ Internal vs external caller detection: if the JWT `iss` claim contains `us_world
 
 | Parameter | Value |
 |-----------|-------|
-| **Topic name** | `business-rules` (prod) / `business-rules-dev` (dev) |
+| **Topic name** | `business-rules` (prod) / `business-rules-cert` (cert) / `business-rules-dev` (dev) |
 | **Config key** | `kafka.businessrule-topic` |
-| **Message key** | ⚠️ **INCONSISTENT** — see note below |
-| **Ordering guarantee** | Per-partition — but inconsistent key means same case may land on different partitions per code path |
+| **Message key** | `caseNumber` on every reachable publish path — ⚠️ DEC-003 deviation, not `merchantId` |
+| **Ordering guarantee** | Per-partition (case-scoped). No merchant-scoped ordering. |
+| **Published on** | Successful primary upload (Endpoint 1) / issuer-doc upload (Endpoints 9, 10) / questionnaire update (Endpoint 11) — subject to the `notifyBRQueue` + `startRuleGroup` gate. Endpoint 8 (NAP base64) never publishes (controller forces `notifyBRQueue=false`). |
 | **Consumed by** | COMP-16 BusinessRulesProcessor |
 
-**⚠️ Kafka partition key inconsistency (DEC-003 deviation):**
+**Active vs dead publish methods:**
 
-There are two publish methods in the codebase with different partition keys:
+| Method | Key | Callers | Status |
+|--------|-----|---------|--------|
+| `sendBusinessRulesToKafka(...)` | `caseNumber` | 7 call sites inside `DocumentManagementServiceImpl` + 2 in `DocumentQuestionnaireServiceImpl` | ✅ Active — every reachable publish goes through this |
+| `sendBusinessRules(...)` | `merchantId` | 0 callers | ⚠️ DEAD CODE — method body and interface declaration remain but nothing invokes them. Safe to delete |
 
-| Method | Key Used | Code Paths |
-|--------|----------|-----------|
-| `sendBusinessRules()` (legacy, still present) | `merchantId` | Legacy upload paths |
-| `sendBusinessRulesToKafka()` (newer) | `caseNumber` | Questionnaire flow (Endpoint 11); newer upload paths |
-
-This inconsistency means that messages for the same case can land on different partitions depending on which code path was taken. Ordering guarantees across these paths are broken.
+The DRAFT v1.0 described the Kafka key as "inconsistent per code path." Source shows the inconsistency does not manifest at runtime — all messages use `caseNumber`. Severity remains 🔴 because the deviation from DEC-003 is uniform across the service.
 
 **Triggering endpoints and conditions:**
 
-| Endpoint | Trigger Condition | Kafka Key Used | After Which Step |
-|---------|------------------|----------------|-----------------|
-| `POST /{platform}/documents/{caseNumber}` | `notifyBRQueue=true` AND `startRuleGroup` not blank | `merchantId` (legacy path) | After DynamoDB write |
-| `POST /nap/response/document` | `notifyBRQueue` forced to `false` in controller | N/A — no publish | Never |
-| `POST /{platform}/documents/{caseNumber}/issuerdoc` (v1) | `notifyToBr=true` (default) AND doc successfully uploaded to case | `merchantId` (legacy path) | After upload |
-| `POST v2/{platform}/documents/{caseNumber}/issuerdoc` (v2) | `notifyToBr=true` (default) AND doc successfully uploaded to case | `merchantId` (legacy path) | After upload |
-| `PUT /{platform}/document/{caseNumber}/action/{actionSeq}` | `notifyBRQueue=true` in request body | `caseNumber` (newer path) | After PostgreSQL write |
+| Endpoint | Trigger condition | startRuleGroup value | After which step |
+|---------|------------------|----------------------|------------------|
+| `POST /{platform}/documents/{caseNumber}` (Endpoint 1) | `notifyBRQueue=true` AND `startRuleGroup` not blank | `DOCUMENT_ATTACHED_TO_OPEN_CASE` (hardcoded at controller) | After desk-number update, BEFORE action-indicator update |
+| `POST /nap/response/document` (Endpoint 8) | Never — controller overrides `notifyBRQueue=false` | N/A | Never |
+| `POST /{platform}/documents/{caseNumber}/issuerdoc` (Endpoint 9) | `notifyToBr=true` (default) AND doc upload succeeded | Derived from caller context | After upload |
+| `POST /v2/{platform}/documents/{caseNumber}/issuerdoc` (Endpoint 10) | `notifyToBr=true` (default) AND doc upload succeeded | Derived from caller context | After upload |
+| `POST /{platform}/document/{caseNumber}/action/{actionSeq}` (Endpoint 11) | `notifyBRQueue=true`. If `documents` non-empty → document-derived startRuleGroup; if empty → hardcoded `QUEUE` | Document-derived or `QUEUE` | Inside `@Transactional` scope; PostgreSQL save and publish share one transaction |
 
-**Source code mapping (documentType → source field):**
+**`documentType` → `source` field mapping:**
 
-| docType | source value |
-|---------|-------------|
-| ISSRDOC | `BRISUP` |
-| RESPDOC | `BRMRUP` |
-| MISCDOC | `BRMCUP` |
-| DRFTDOC | `BRMRUP` |
+| docType | Primary upload path (`source`) | Questionnaire path (`source`) |
+|---------|--------------------------------|-------------------------------|
+| ISSRDOC | `BRISUP` | `BRISUP` |
+| RESPDOC | `BRRSUP` | `BRMRUP` |
+| MISCDOC | `BRMCUP` | `BRMCUP` |
+| DRFTDOC | `BRMRUP` | `BRMRUP` |
+
+⚠️ **Path divergence**: RESPDOC maps to `BRRSUP` on the primary upload path but to `BRMRUP` on the questionnaire path. Source confirms this is intentional divergence, not a bug — but BusinessRulesProcessor (COMP-16) must be verified to handle both values for RESPDOC.
 
 **Message payload structure (`BusinessRulesData`):**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `platform` | String | e.g. `NAP` |
-| `caseNumber` | String | Case identifier |
-| `actionSequence` | String | Action sequence number |
-| `stage` | String | Dispute stage e.g. `CHI` |
-| `documentType` | String | e.g. `RESPDOC` |
-| `startRuleGroup` | String | `DOCUMENT_ATTACHED_TO_OPEN_CASE` (upload) or `QUEUE` (questionnaire empty-doc path) |
-| `topicCreatedTimestamp` | String | ISO-8601 timestamp of event creation |
-| `caseCreatedDate` | String | May be null |
-| `merchantId` | String | Merchant ID from case search |
-| `documentNameList` | List\<String\> | Document names associated with this event |
-| `source` | String | Source code derived from docType (BRISUP, BRMRUP, BRMCUP) |
-| `eventType` | String | `DOC_ATTACHED` — inferred from documentType as fallback if not passed from caller |
-| `previousActionSequence` | String | May be null |
-| `correlationId` | String | Correlation identifier |
-| `disputeStage` | String | Dispute stage |
-| `type` | String | Document type |
+| Field | Type | Populated by | Notes |
+|-------|------|--------------|-------|
+| `platform` | String | Always | e.g. `NAP`, `CORE`, `PIN` |
+| `caseNumber` | String | Always | Also used as the partition key |
+| `actionSequence` | String | Always | |
+| `stage` | String | Always | Dispute stage e.g. `CHI` |
+| `documentType` | String | Always | e.g. `RESPDOC` |
+| `startRuleGroup` | String | Always | `DOCUMENT_ATTACHED_TO_OPEN_CASE` (upload) or `QUEUE` (questionnaire empty-docs path) or caller-supplied (issuer paths) |
+| `topicCreatedTimestamp` | String | Always | ISO-8601 |
+| `merchantId` | String | ⚠️ **Field exists in DTO but never populated by either publish method** — emitted as `null` on the wire. The `merchantId` parameter passed to `sendBusinessRules(...)` is used only as the (dead) partition key; it is not copied into the payload |
+| `documentNameList` | List\<String\> | Conditional | Populated on questionnaire path; may be empty on upload path |
+| `source` | String | Always | Derived from `documentType` per the table above |
+| `eventType` | String | Fallback | If not passed from caller, inferred: `ISSRDOC/ISSRQDOC → DOCUMENT_UPLOADED`; otherwise `DOC_ATTACHED`. TODO marked for explicit caller passing |
+| `previousActionSequence` | String | Optional | May be null |
+| `correlationId` | String | Always | Carries the inbound `v-correlation-id` header value (or generated UUID) |
+| `disputeStage` | String | Always | |
+| `type` | String | Always | Document type |
 
-**Payload notes:**
-- `eventType` is currently inferred from documentType as a fallback when not explicitly provided by the caller. A TODO comment in source marks this as technical debt — future intent is for callers to pass eventType explicitly.
-- `startRuleGroup` is hardcoded to `DOCUMENT_ATTACHED_TO_OPEN_CASE` from the upload controller for the primary upload path.
-- For the questionnaire endpoint (`PUT .../action/{actionSeq}`): if `notifyBRQueue=true` and the documents list is **non-empty**, publishes with document-derived `startRuleGroup`. If documents list is **empty**, publishes with `startRuleGroup=QUEUE`.
+*Note:* DRAFT v1.0 listed a `caseCreatedDate` field. Source `BusinessRulesData` has no such field — removed from v1.1.
 
-**Transaction boundary:**
-The Kafka publish is **outside** any transaction that covers S3 or DynamoDB writes. S3 and DynamoDB writes complete first. Kafka publish follows. If Kafka fails after 3 retries: S3 and DynamoDB are already committed, document is stored, but BR processing is never triggered. No compensating action exists.
+**Kafka record headers:**
+- `idempotency-key` — carries the inbound header value (or generated UUID) via `RequestCorrelation.getIdempotencyId()`. Not used for dedup downstream.
+- `v-correlation-id` is **not** set as a record header — it travels only in the payload `correlationId` field.
 
-For the questionnaire endpoint: PostgreSQL write is `@Transactional` but the transaction does **not** span the Kafka publish. Same atomicity risk applies.
+**Transaction boundary per path:**
+
+| Path | Transaction semantics |
+|------|-----------------------|
+| Endpoints 1, 9, 10 (primary / issuer upload) | Kafka publish is **outside** any transaction. S3 + DDB + desk-update are already committed. Kafka failure after exhaustion → HTTP 500; document stored but BR not triggered. DEC-001 deviation. |
+| Endpoint 11 (questionnaire) | `@Transactional(rollbackOn = Exception.class)` spans both the PostgreSQL save and the Kafka publish. Kafka failure (`EventServiceException` from `@Recover`) rolls back the save. Successful broker ACK followed by a commit-time exception still leaks a published event — leak surface is smaller than the primary path but non-zero. |
 
 ---
 
@@ -724,11 +792,13 @@ For the questionnaire endpoint: PostgreSQL write is `@Transactional` but the tra
 
 | Standard | Status | Detail | Severity |
 |----------|--------|--------|----------|
-| DEC-001 — Transactional Outbox | ⛔ DEVIATION | Direct Kafka publish inside `sendBusinessRulesToKafka()` after DynamoDB write. No outbox table. No spanning transaction. If service dies between DynamoDB write and Kafka send, BR event is permanently lost. | 🔴 HIGH |
-| DEC-003 — Partition Key = merchantId | ⚠️ PARTIAL / INCONSISTENT | Legacy `sendBusinessRules()` uses `merchantId`. Newer `sendBusinessRulesToKafka()` uses `caseNumber`. Both are active in production. Partition routing is inconsistent per code path. | 🔴 HIGH |
-| DEC-004 — PAN Encryption | ✅ COMPLIANT | Documents treated as opaque byte arrays. No PAN parsing, inspection, or logging. S3 SSE is bucket-policy responsibility. | — |
-| DEC-005 — Kafka Offset Commit Timing | ✅ NOT APPLICABLE | This service has no Kafka consumer side. Producer only. | — |
-| DEC-014 — Resilience4j Circuit Breakers | ℹ️ ABSENT | No Resilience4j imports in pom.xml. No `@CircuitBreaker` annotations. No circuit breaker config. Consistent with platform-wide pattern. | — |
+| DEC-001 — Transactional Outbox | ⛔ DEVIATION | Primary upload path: direct Kafka publish after DynamoDB write; no outbox. Questionnaire path: better — Kafka inside `@Transactional(rollbackOn=Exception.class)`, so Kafka failure rolls back PostgreSQL, but still no outbox and post-ACK commit-time failures leak events. | 🔴 HIGH |
+| DEC-003 — Partition Key = merchantId | ⛔ DEVIATION (uniform) | Every reachable publish uses `caseNumber`. The legacy `sendBusinessRules()` method with `merchantId` key is dead code (0 callers). Consistent deviation — not inconsistent as DRAFT v1.0 claimed. | 🔴 HIGH |
+| DEC-004 — PAN Encryption | ✅ COMPLIANT | No PAN handling of any kind. Documents treated as opaque bytes. S3 SSE is bucket-policy responsibility. | — |
+| DEC-005 — Kafka Offset Commit Timing | ✅ NOT APPLICABLE | No Kafka consumer side. Producer only. | — |
+| DEC-014 — Resilience4j Circuit Breakers | ℹ️ ABSENT | No Resilience4j dependency. Consistent with voided platform-wide pattern. | — |
+| DEC-019 — Clear PAN Persisted | ✅ COMPLIANT | No PAN attribute in any DynamoDB, S3, or PostgreSQL write. Confirmed from `DocumentMetaData` entity. | — |
+| DEC-020 — Full At-Least-Once Idempotency | ⛔ PARTIAL DEVIATION | Upload duplicate check is non-atomic (application-level query + in-memory compare; no DynamoDB condition expression). `idempotency-key` header accepted but not used for dedup — only logged, MDC'd, and propagated as an outbound Kafka record header. Endpoint 11 repeat PUTs overwrite state and republish Kafka — no idempotency guard beyond PK. | 🔴 HIGH |
 
 ---
 
@@ -736,16 +806,20 @@ For the questionnaire endpoint: PostgreSQL write is `@Transactional` but the tra
 
 | Gap | Action needed |
 |-----|---------------|
-| S3 bucket lifecycle / document retention policy | Confirm with AWS console/CLI — not visible in application code |
+| S3 bucket lifecycle / document retention policy | AWS console / Terraform / CloudFormation review |
 | Actual production replica count | Confirm XL Deploy variable `replicas-gcp-document-management-service` value |
-| JWT trusted issuer URLs in prod | Injected via `${jwt.trusted_issuer_urls}` — confirm prod values |
-| `spring-boot-devtools` exclusion from Docker image | Confirm with team or Dockerfile review |
-| DEC-003 remediation plan — Kafka key inconsistency | Architect decision required: standardise on `caseNumber` or `merchantId` and migrate legacy method |
-| DEC-001 remediation plan — no outbox | Architect decision required: whether to accept risk or implement outbox pattern for this service |
-| `user-access-management-service` URL configured but not called in observed paths | Confirm with team — dead config or used in path not analysed? |
+| DynamoDB GSI projection type for the 5 declared indexes | CloudFormation / Terraform / AWS console review |
+| JWT trusted issuer URLs in prod | Injected via `${jwt.trusted_issuer_urls}` — confirm prod values with team |
+| `spring-boot-devtools` exclusion from the production Docker image | Dockerfile not present in repo snapshot — team confirmation or Paketo Buildpacks image inspection |
+| Endpoint 6 (`GET /download`) missing `@PathVariable("platform")` | Git-blame + runtime verification — suspected source defect or OCR-drop |
+| `USCaseEntity` / `UKCaseEntity` ownership boundary with COMP-22 DisputeService | Cross-component review |
+| DEC-001 remediation plan | Architect decision — accept risk or adopt outbox pattern |
+| DEC-003 remediation plan — Kafka key standardisation | Architect decision — standardise on `caseNumber` platform-wide or switch this service to `merchantId` |
+| RESPDOC source-code divergence (BRRSUP primary vs BRMRUP questionnaire) | Architect / COMP-16 verification — confirm intended mapping |
+| Live BusinessRulesProcessor handling of `merchantId=null` in payload | Cross-component check against COMP-16 |
 
 ---
 
 *End of WDP-COMP-37-DOCUMENT-MANAGEMENT-SERVICE.md*
-*Status: 📝 DRAFT — awaiting architect confirmation*
-*After confirmation: update WDP-COMP-INDEX.md, WDP-KAFKA.md, WDP-DB.md, WDP-HANDOVER.md*
+*Status: 📝 DRAFT v1.1 — source-verified by Claude Code audit 2026-04-23 · architect confirmation pending*
+*After confirmation: update WDP-COMP-INDEX.md, WDP-KAFKA.md, WDP-DB.md, WDP-HANDOVER.md, WDP-DECISIONS.md (deviation maps)*
