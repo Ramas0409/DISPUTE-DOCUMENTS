@@ -59,6 +59,925 @@ against which set of Pending Entries.*
 *New entries are appended here by per-component chats. Reconciliation sessions
 consume entries from this section and move them to **Reconciled** below.*
 
+### 2026-04-25 — COMP-17 CaseExpiryUpdateConsumer · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `gcp-case-expiry-consumer` v1.1.1 — source-verified by Claude Code
+2026-04-25. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source. No functional change in
+production. Verified all v1.0 DRAFT facts against repository; corrected six
+factual errors, surfaced one new risk (cross-action predecessor interference)
+and one new gap (`v-correlation-id` not propagated to IDP token call).
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- **Section 2 · `wdp.case_expiry` row:**
+  - Correct column name `z_insr` → **`z_insrt`** in the Key columns list.
+  - Append to Notes: "UPSERT is application-level (SELECT-then-INSERT-or-UPDATE
+    in Java); no DB-level INSERT … ON CONFLICT or MERGE. UPDATE branch
+    overwrites only `d_response_due`, `d_expiry_due`, `z_updt`. `case_expiry`
+    writes are `@Transactional REQUIRED`, independent of outbox writes."
+  - Open question on downstream readers narrowed: "No reader inside
+    `gcp-case-expiry-consumer` itself; cross-component sweep on remaining
+    WDP repos still pending."
+
+- **Section 2 · `wdp.outgoing_event_outbox` row:**
+  - Append to Notes: "No service-level `@Transactional` on
+    `OutgoingEventOutboxServiceImpl` — every save runs in the implicit
+    per-call JPA transaction. No DB-level UNIQUE constraint visible in
+    COMP-17 repo (no DDL/Flyway/Liquibase/schema.sql); confirm with DBA team.
+    Predecessor candidate filter excludes `SUCCESS` and `SKIPPED`. Predecessor
+    scope is `caseNumber + channelType=EXPIRY_EVENTS + id < currentId` only
+    — **not scoped on `i_action_seq`**, causing cross-action interference."
+  - Add to status lifecycle: clarify that any non-ERROR predecessor (FAILED,
+    PENDING, PENDING_DEFERRED, BLOCKED, PUBLISHED) maps to PENDING_DEFERRED —
+    not just FAILED.
+
+- **Section 4 · Shared Table Risk Register · `wdp.outgoing_event_outbox` row:**
+  - Append clarifying note: "COMP-17 source verification 2026-04-25 confirms
+    no DB unique constraint visible in repo. Whether
+    `(idempotency_id, channel_type, event_timestamp)` is enforced at DB level
+    must be confirmed with the DBA team. Cross-action interference confirmed:
+    a stuck `ERROR`/`FAILED` row for action A on case X blocks all subsequent
+    EXPIRY_EVENTS for the same case regardless of action_seq."
+
+**WDP-KAFKA.md**
+
+- **Section 3 · Topic Registry · `case-action-events (expiry)` row:**
+  - Add cert environment topic name `case-action-events-cert`.
+  - No publisher change (COMP-18 Filter 1 EXPIRY_EVENT routing — already
+    accurate).
+
+- **Section 4 · Consumer Group Registry · `case-action-events-group` row:**
+  - **Correct `Max poll: 280` to `Max poll: 500`.**
+  - **Correct `max.poll.interval.ms` value to `600000`** (10 min — minute
+    count in description is correct; ms value was wrong).
+  - Add cert group name `case-action-events-group-cert`.
+  - Add SASL/SSL: `AWS_MSK_IAM` over `SASL_SSL`.
+  - No DEC-005 status change — still flagged with inconsistent-ACK detail.
+
+- **Section 2 · DEC-005 Deviations table · COMP-17 row:**
+  - Reword detail to: "Inconsistent — Path A: ACK as first listener action
+    (pre-processing); Path B: ACK mid-flow after outbox INSERT but before
+    case_expiry write; header-blank path: ACK after error-row INSERT (and
+    skipped if INSERT throws)."
+
+- **Section 2 · DEC-001 Deviations table · COMP-17 row:**
+  - Reword to clarify dual deviation: (a) outbox repurposed as consumer-side
+    audit/idempotency store (no Kafka publish); (b) outbox INSERT and
+    case_expiry write run in **separate** transactional boundaries — outbox
+    saves have no service `@Transactional`; case_expiry saves are
+    `@Transactional REQUIRED`. Both share `wdpTransactionManager` but no
+    method brackets both writes.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+Add or correct:
+- COMP-17 Kafka headers are kebab-case on the wire: `idempotency-key`,
+  `event-timestamp` — not the Java field names `idempotencyId`, `eventTimestamp`.
+- COMP-17 `max.poll.records=500` and `max.poll.interval.ms=600000`
+  (10 minutes). Prior documentation of `280` / `300000` was wrong.
+- COMP-17 poison-message handling: a payload that fails JSON deserialisation
+  causes an NPE at the path-selection branch **before any ACK in either path**.
+  The same poison message redelivers indefinitely until `max.poll.interval.ms`
+  trips a rebalance. Prior documentation that Path A loses such messages
+  immediately was wrong.
+- COMP-17 predecessor query is **not scoped on `i_action_seq`** — a stuck
+  row for action A blocks events for action B on the same case. Documented
+  as a confirmed deviation, not a bug claim — pending architect decision.
+- COMP-17 predecessor blocking: any non-ERROR prior row (FAILED, PENDING,
+  PENDING_DEFERRED, BLOCKED, PUBLISHED) maps to PENDING_DEFERRED, not just
+  FAILED. Predecessor candidate filter excludes SUCCESS and SKIPPED.
+- COMP-17 outbox writes have **no service-level `@Transactional`**;
+  `case_expiry` writes are `@Transactional REQUIRED`. Both share
+  `wdpTransactionManager` but no method brackets both — non-atomic split
+  confirmed and unrecoverable in either path (offset ACKed before the gap).
+- COMP-17 `v-correlation-id` is **not propagated** on the IDP token call —
+  only on the case-search call. Correlation chain breaks at IDP boundary.
+- COMP-17 has no liveness, readiness, or startup probes wired.
+- COMP-17 Actuator exposure defaults to `health, info` only — no
+  `management.endpoints.web.exposure.include` configured.
+- COMP-17 has 6 fully unused + 1 partially-wired pom dependencies.
+  `spring-boot-starter-cache` is enabled by `@EnableCaching` but has no
+  `@Cacheable`/`@CachePut`/`@CacheEvict` consumers anywhere — partially
+  wired only.
+- COMP-17 has no `MDC` context, no custom Micrometer metrics. Correlation
+  flows only through method parameters. Default JVM and Kafka-client meters
+  only.
+- COMP-17 cert environment uses distinct topic `case-action-events-cert`
+  and group `case-action-events-group-cert`.
+- COMP-17 Kafka SASL: `AWS_MSK_IAM` over `SASL_SSL`; credentials from
+  K8s secret `gcp-case-expiry-consumer-secrets` + shared `wdp-common-secrets`.
+- COMP-17 has no `@SchedulerLock`, advisory lock, or singleton guard.
+  Replica > 1 relies entirely on Kafka consumer-group rebalance.
+
+Resolved open questions (remove from HANDOVER):
+- COMP-17 state-machine skip behaviour when apiName=Validate_Previous_Record
+  → resolved: each step has its own `if apiName == X` gate; entering with
+  Validate_Previous_Record causes Validate_Notification step to be skipped.
+- COMP-17 publisher of `case-action-events` → confirmed COMP-18
+  NotificationOrchestrator (Filter 1 EXPIRY_EVENT routing).
+- COMP-17 dedup detection key fields → confirmed
+  `(idempotencyId, channelType, eventTimestamp)`.
+
+New open questions (add to HANDOVER):
+- COMP-17 cross-action predecessor scope — intentional (case-level ordering)
+  or bug (should be action-level)? Architect decision required.
+- COMP-17 non-atomic outbox + `case_expiry` split — accept as risk or
+  remediate via single transaction bracketing? Architect decision required.
+- COMP-17 `v-correlation-id` not propagated to IDP token call — bug or
+  intentional? Architect decision required.
+- COMP-17 DB-level UNIQUE constraint on `wdp.outgoing_event_outbox
+  (idempotency_id, channel_type, event_timestamp)` — DBA team confirmation
+  needed (no DDL in repo).
+- COMP-17 downstream readers of `wdp.case_expiry` — cross-component sweep
+  on remaining WDP repos still required (confirmed not in COMP-17 itself).
+- COMP-17 production replica count — XLD-templated value; if > 1, multiple
+  replicas join the consumer group with no application-level singleton
+  guard.
+- COMP-17 inbound `RECEIVED_KEY` discipline at COMP-18 publisher — confirm
+  caseNumber-scoped to preserve same-case ordering.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+
+- **HIGH candidate:** "Non-atomic outbox + business-write split in
+  consumer-side outbox usage" — confirmed in COMP-17; same anti-pattern
+  worth checking in COMP-18 NotificationOrchestrator and COMP-43
+  CoreNotificationConsumer (the other writers of `wdp.outgoing_event_outbox`).
+  Recommend raising at next DECISIONS rebuild window. Distinct from the
+  existing DEC-001 deviation map because this is the *transactional* gap,
+  not the producer/consumer-role gap.
+- **MEDIUM candidate:** "Poison-message redelivery loop on no-op
+  `CommonErrorHandler`" — confirmed in COMP-17; pattern likely repeats
+  across other consumers. Architectural choice between application-level
+  null-guard or a real `DefaultErrorHandler` with seek-past behaviour.
+- **MEDIUM candidate:** "Cross-action predecessor scope in
+  `wdp.outgoing_event_outbox`" — case-level scope (current) creates
+  cross-action interference. Architectural intent unclear.
+- **LOW candidate:** "`v-correlation-id` propagation gaps in outbound
+  REST" — confirmed missing on COMP-17 IDP token call; sweep recommended
+  across consumers. Could be a platform-wide low-priority remediation.
+
+**WDP-ARCHITECTURE.md**
+
+- No change. Topology, principles, and Section 7 Event Consumers narrative
+  on COMP-17 remain accurate at platform-summary level.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+
+- No new RISK rows required at platform level. The existing platform risks
+  on at-most-once delivery, no-DLQ posture, and shared-table coordination
+  cover the COMP-17 risks generically.
+- Minor clarification opportunity: existing risk on at-most-once delivery
+  could note that COMP-17 Path A is the cleanest example of pre-processing
+  ACK, while Path B is the cleanest example of mid-flow ACK — useful
+  reference points for future consumer audits.
+
+**WDP-INTEGRATIONS.md**
+
+- No change. COMP-17 has no external integrations — both REST dependencies
+  (`wdp-idp-token-service`, `mdvs-gcp-case-search-service`) are internal
+  WDP services on the in-cluster `wdp-micro` namespace.
+
+#### Deviation flags for COMP-17
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ⚠️ PARTIAL | 🟡 MEDIUM |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES | — |
+| DEC-005 Manual Kafka Offset Commit AFTER Processing | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⚠️ PARTIAL | 🔴 HIGH |
+| DEC-014 Resilience4j Circuit Breakers | ✅ ABSENT (factual record only — DEC-014 is platform-VOID) | — |
+
+**DEC-001 PARTIAL detail:** Outbox repurposed as consumer-side audit /
+idempotency store; no Kafka publish (acceptable per DEC-001 deviation map).
+Additionally, outbox INSERT and `case_expiry` write run in **separate**
+transactional boundaries (outbox: no service `@Transactional`; case_expiry:
+`@Transactional REQUIRED`). Both share `wdpTransactionManager` but no method
+brackets both inside one transaction — non-atomic split confirmed and
+unrecoverable in either ACK path.
+
+**DEC-005 DEVIATES detail:** ACK timing is inconsistent and never matches
+"after all processing": Path A pre-ACKs as the first listener action;
+Path B ACKs mid-flow after the outbox INSERT but before the `case_expiry`
+write; header-blank path ACKs after the ERROR row INSERT. None of these
+match the platform standard. Severity is HIGH because Path A is fully
+at-most-once and Path B has a 1-write crash window.
+
+**DEC-020 PARTIAL detail:** Path B has application-level dedup on
+`(idempotency_id, channel_type, event_timestamp)`. Path A bypasses dedup
+entirely (the pre-set `eventId` short-circuits past the dedup query into
+the post-ACK pipeline). The non-atomic split between `case_expiry` write
+and outbox `SUCCESS` UPDATE is unrecoverable in either path — Scheduler3
+in COMP-12 reads only FAILED and PENDING_DEFERRED rows, so a row stuck at
+PUBLISHED is invisible to platform retry. No DB-level UNIQUE constraint
+visible in repo; DBA team confirmation pending. Severity is HIGH because
+the unrecoverable crash window affects every successful execution path.
+
+#### Doc status after this change
+
+- `WDP-COMP-17-CASE-EXPIRY-CONSUMER.md` → `v1.1 DRAFT` — source-verified
+  2026-04-25 · architect confirmation pending
+---
+
+### 2026-04-25 — COMP-43 CoreNotificationConsumer · v1.0 DRAFT → v2.0 DRAFT
+
+**Source:** `gcp-case-action-core-consumer` — source-verified by Claude Code
+2026-04-25. Architect confirmation still pending.
+
+**Nature of change:** Correction pass against source. No functional change in
+production; 4 corrections, 14 confirmations, and 9 net-new findings against
+the v1.0 DRAFT extracted by the prior Copilot CLI pass. Three findings rise
+to HIGH severity (R4, R6, R10).
+
+#### Corrections to v1.0 DRAFT
+
+1. **DB2 PAN column name `I_ACCT_CDR` → `I_ACCT_CDH`.** Source `CaseEntity`
+   maps `cardNumber` to `@Column(name="I_ACCT_CDH")` and PAN-last-4 to
+   `I_ACCT_CDH_LST`. There is no `I_ACCT_CDR` column anywhere in source.
+   Corrected throughout v2.0 — Boundaries, Database Ownership, DEC-004,
+   DEC-019, R6, mermaid diagram, transformation table.
+2. **Step 6 4xx classification.** v1.0 said "4xx/404 → ERROR". Source
+   actually checks **only HTTP 400 OR 404 → ERROR**; **all other status
+   codes (other 4xx, 5xx) → FAILED**. Corrected in failure tables and
+   mermaid.
+3. **STOP_DUP path ACK behaviour.** v1.0 mermaid showed STOP_DUP
+   terminating without ACK. Source confirms `processNewCaseActionEvent`
+   returns with `apiName=BLANK`, control returns to the listener, ACK
+   fires at `KafkaConsumer:61`, and `processCaseActionEvent` then
+   short-circuits because no `apiName` branch matches BLANK. STOP_DUP
+   is silent skip + ACK + no outbox write. Mermaid corrected.
+4. **`eventId` field type.** v1.0 said "String / null". Source declares
+   `private Long eventId;` — boxed Long, nullable. Corrected in
+   payload table.
+
+#### Net-new findings (all confirmed at file:line)
+
+- **No K8s liveness / readiness / startup probes.** `resources.yml` has
+  no probe block. Pod readiness governed only by `minReadySeconds: 30`.
+  Hung pods are not evicted by kubelet. Combined with R1 (no REST
+  timeouts), a stalled pod holds the consumer-group slot indefinitely.
+  Promoted to R10 🔴 HIGH.
+- **No `management:` block in any YAML profile.** Spring Boot defaults
+  apply: management endpoints share port 8082 with the main server;
+  default exposure is `health` and `info` only. Prometheus / metrics /
+  loggers are not exposed.
+- **Predecessor query filtering happens in Java, not SQL.** The
+  derived `findByCaseNumber` JPA method translates to
+  `SELECT ... WHERE i_case = :caseNumber` only. The
+  channel-type / id / status filtering happens in a Java stream inside
+  `OutgoingEventOutboxServiceImpl.checkPreviousOutBoxInfo`. Volume
+  scaling implication for cases with long history.
+- **`processNewCaseActionEvent` is NOT `@Transactional`.** SELECT
+  (idempotency check) and INSERT (Step 3) run in separate JPA short
+  transactions. R2 race window is wider than v1.0 implied.
+- **UPDATE path runs `coreCaseRepository.save` outside any explicit
+  `@Transactional`.** Spring Data wraps it in a per-call short coreTx,
+  but the surrounding catch in `processEvent` writes outbox FAILED on a
+  separate `wdpTransactionManager`. Same DEC-001 split as CREATE, but
+  the CREATE-path's `@Transactional(coreTransactionManager)` symmetry
+  is missing on UPDATE. Promoted to R7 🟡 MEDIUM.
+- **Bad `event-timestamp` header → `IllegalArgumentException` →
+  outer try/catch.** Same indefinite-redelivery profile as bad-payload
+  NPE. No ERROR row, no audit. Promoted to R8 🟡 MEDIUM.
+- **No MDC enrichment, no custom Micrometer metrics.** Zero
+  `MDC.put` calls in source. Zero `@Timed` / Counter / Gauge /
+  MeterRegistry references. Per-event business keys appear only in
+  formatted log lines via SLF4J placeholders. Promoted to R13 🟡 MEDIUM.
+- **`idempotency-key` Kafka header NOT propagated to outbound REST.**
+  Only `v-correlation-id` is propagated (and even that is omitted on
+  the IDP token call). Cross-service idempotency on enrichment chain
+  cannot be derived from a single key.
+- **No Kafka coordinates on outbox row.** `OutgoingEventOutboxEntity`
+  has no `kafka_topic` / `kafka_partition` / `kafka_offset` columns.
+  Incident correlation between Kafka logs (which DO print partition +
+  offset) and outbox rows requires log-side join on `idempotencyId`.
+  Promoted to R12 🟢 LOW.
+- **`actionSequence = "01"` is string equality via
+  `equalsIgnoreCase`.** No leading-zero normalisation. If upstream
+  publishes `"1"` instead of `"01"`, BOTH the PAN gate and the
+  CREATE-first gate fail — PAN decryption is skipped AND the case is
+  treated as a subsequent occurrence (entering `findByWdpCaseNumber`,
+  which will not find an existing row → likely error path). Promoted
+  to R14 🟡 MEDIUM.
+- **DataSource bean qualifiers `coredataSource` / `wdpdataSource`
+  (lowercase, single-word) plus `@Primary` on the WDP datasource.**
+  Any non-qualified `@Autowired DataSource` injection in this
+  codebase would silently get the WDP datasource. Currently no such
+  injection exists — flagged as R11 🟢 LOW (foot-gun).
+- **`nextRetryAt` set on EVERY non-SUCCESS update**, not only on
+  FAILED writes. Minor clarification to v1.0.
+- **`retry_count` increment fires only when incoming `status==FAILED`.**
+  Escalation to ERROR happens on the **third** FAILED write for a row.
+  Minor clarification to v1.0.
+
+#### WDP-KAFKA.md update
+
+Section 3 Topic Registry — `core-request-events` row:
+
+| Topic | Publisher | Consumer | Partition key | DEC-003 status | Notes |
+|-------|-----------|----------|---------------|----------------|-------|
+| `core-request-events` | COMP-18 NotificationOrchestrator | COMP-43 CoreNotificationConsumer | `caseNumber` (consumer-side variable name) | ⛔ DEVIATION | Producer-side key assignment confirmation owed by COMP-18. AWS_MSK_IAM / SASL_SSL. |
+
+Section 4 Consumer Group Registry — `core-request-events-group` row:
+
+| Group | Topic | Component | AckMode | Offset commit timing | DEC-005 status |
+|-------|-------|-----------|---------|----------------------|----------------|
+| `core-request-events-group` | `core-request-events` | COMP-43 | `MANUAL_IMMEDIATE` + `syncCommits=true` | Path A: post outbox-ERROR write, pre-DB2. Path B: pre `processCaseActionEvent`. Path C: post outbox-PUBLISHED INSERT, pre-DB2. | ⛔ DEVIATION (pre-ACK on all paths) |
+
+Add to platform-wide DEC-005 deviations list (already present from v1.0 —
+confirm row). No new Kafka topic introduced. No producer side.
+
+#### WDP-DB.md update
+
+Section 2 Schema Ownership Map — `wdp.outgoing_event_outbox` row, COMP-43
+notes column: tighten the existing entry to record:
+- `created_by` / `updated_by` hardcoded to `"PCSECRTC"` on COMP-43 writes
+- `next_retry_at` set on every non-SUCCESS update (not only FAILED)
+- `retry_count` incremented only on incoming `status==FAILED`; ERROR
+  escalation fires on the third such write
+- `original_event` column carries the full `OutgoingEvent` JSON,
+  including fields not used by COMP-43 (`actionStatus`, `expirationDate`,
+  `responseDueDate`, `dateReceivedByAcquirer`, `level1Entity`–`level5Entity`,
+  `disputeStage`, `channelType`)
+- **No Kafka coordinates** on the entity — flag the observability gap
+
+Section 3 External Database Dependencies — IBM DB2 BC schema:
+
+1. **Correct `BC.TBC_DM_CASE` clear-PAN column from `I_ACCT_CDR` to
+   `I_ACCT_CDH`** in the WDP-DB.md row for COMP-43. Add `I_ACCT_CDH_LST`
+   as the PAN-last-4 column.
+2. **Correct the COMP-43 read-list.** v2.0 DB.md currently states COMP-43
+   reads `BC.TBC_DM_CASE`, `BC.TBC_DM_OCCUR`, and `BC.TBC_DM_NOTES` for
+   enrichment. Source contradicts — enrichment is fully REST-driven; DB2
+   reads are limited to `BC.TBC_DM_CASE` only via `findByCaseId` and
+   `findByWdpCaseNumber` in Step 7 (UPDATE and CREATE-subsequent).
+   Remove `BC.TBC_DM_OCCUR` and `BC.TBC_DM_NOTES` from the COMP-43
+   read-list. Both reads use `WITH UR` isolation.
+3. Confirm the two-phase save mechanism for `BC.TBC_DM_CASE` (first save
+   generates `I_CASE_ID` via IDENTITY; second save patches
+   `I_CASE = leftPad(I_CASE_ID, 10, "9")`). Pattern applies only to
+   `saveCoreCase` (CREATE + actionSeq=01). `addOccurrence` is single
+   save. UPDATE path is single save outside any enclosing
+   `@Transactional`.
+
+Section 4 Shared Table Risk Register — `wdp.outgoing_event_outbox`:
+existing row already records the multi-writer pattern (COMP-17, COMP-18,
+COMP-43). Add a note: COMP-43 writes carry the `created_by="PCSECRTC"`
+constant — useful for log-side filtering during incidents.
+
+#### WDP-DECISIONS.md · Candidate updates
+
+- **No new ADRs.**
+- DEC-004 deviation map already records COMP-43 — confirm the column
+  name correction (`I_ACCT_CDH`, not `I_ACCT_CDR`) propagates to the
+  DEC-004 entry text.
+- DEC-019 deviation map — same correction.
+- DEC-001 deviation map — confirm COMP-43 entry. v2.0 audit reinforces
+  the detail: outbox INSERT is on `wdpTransactionManager` and DB2 write
+  is on `coreTransactionManager`; Step 3 INSERT commits before
+  `coreDao.saveCoreCase` is even invoked. Crash window is wide open —
+  consider enriching at next DEC reconciliation.
+- DEC-005 deviation map — confirm COMP-43 entry. v2.0 audit reinforces
+  three distinct ACK call sites (Path A/B/C) all firing before the DB2
+  write.
+- DEC-014 deviation map — already records "VOID platform-wide". COMP-43
+  fits the pattern; no new entry needed.
+- DEC-020 deviation map — already records COMP-43. v2.0 audit reinforces
+  R2 (wider race window than implied) and R4 (silent-loss between ACK
+  and FAILED-write). Consider enriching at next DEC reconciliation.
+
+#### WDP-ARCHITECTURE.md
+
+- No change to platform topology. COMP-43 remains the sole DB2 writer in
+  WDP and the sole consumer of `core-request-events`.
+
+#### WDP-NFRS.md · Section 6 Risk Register
+
+- **Confirm RISK row already covering "no Resilience4j platform-wide"** —
+  COMP-43 fits the pattern, no new row needed for R1.
+- **Add candidate RISK row 🔴 HIGH:** "COMP-43 has no K8s liveness /
+  readiness / startup probes; pod readiness governed only by
+  `minReadySeconds: 30`; hung pods are not evicted by kubelet.
+  Compounds R1 (no REST timeouts) — a stalled pod holds the
+  consumer-group slot indefinitely." (R10 in this doc)
+- **Add candidate RISK row 🔴 HIGH:** "COMP-43 silent-loss window —
+  if the component crashes after ACK (Path B or C) but before the
+  FAILED/ERROR outbox row is written, the message is permanently lost.
+  PostgreSQL unavailability also defeats the FAILED-write fallback."
+  (R4 in this doc)
+- **Add candidate RISK row 🔴 HIGH:** "COMP-43 — REST PUT to WDP Case
+  Actions Service is made INSIDE the DB2 `@Transactional` block on
+  CREATE paths. REST latency holds DB2 locks; REST failure rolls back
+  DB2; no REST timeout compounds the risk." (R3)
+- **Add candidate RISK row 🔴 HIGH:** "COMP-43 — clear PAN persisted
+  to `BC.TBC_DM_CASE.I_ACCT_CDH` after Encryption Service decrypt on
+  CREATE + actionSeq=01 path. Confirmation owed by CORE platform team
+  whether this is intentional and approved." (R6 — DEC-004 / DEC-019)
+- **Add candidate RISK row 🟡 MEDIUM:** "COMP-43 — empty
+  `CommonErrorHandler` anonymous class. Bad-payload and
+  bad-`event-timestamp` exceptions are swallowed by listener-level
+  outer try/catch; no ACK fires; message redelivers up to
+  `max.poll.interval.ms`; consumer is then expelled from the group.
+  Persistent bad payloads can produce a rebalance loop." (R5, R8)
+- **Add candidate RISK row 🟡 MEDIUM:** "COMP-43 UPDATE path runs
+  `coreCaseRepository.save` outside any explicit `@Transactional` —
+  Spring Data wraps in a per-call short coreTx, but CREATE-path
+  symmetry is missing." (R7)
+- **Add candidate RISK row 🟡 MEDIUM:** "COMP-43 idempotency check
+  SELECT and INSERT run in separate JPA short transactions
+  (`processNewCaseActionEvent` not `@Transactional`). No DB-level
+  UNIQUE constraint visible in source. Race window wider than DRAFT
+  v1.0 implied." (R2)
+- **Add candidate RISK row 🟡 MEDIUM:** "COMP-43 has no MDC
+  enrichment and no custom Micrometer metrics. Per-event business
+  keys appear only in formatted log lines via SLF4J placeholders.
+  No counters for SKIPPED / ERROR / FAILED / SUCCESS outcomes." (R13)
+- **Add candidate RISK row 🟡 MEDIUM:** "COMP-43 — `actionSequence`
+  comparison is string equality `equalsIgnoreCase("01")`. No
+  leading-zero normalisation. Upstream publishing `"1"` would skip
+  PAN decryption AND treat the case as a subsequent occurrence.
+  Contract-edge brittleness." (R14)
+
+#### WDP-INTEGRATIONS.md
+
+- No change. COMP-43's only "external" target is IBM DB2 (BC schema)
+  on the CORE platform, which is already documented as a WDP-owned
+  platform with direct JDBC/JPA connection. All other dependencies
+  are internal WDP services.
+
+#### Deviation flags for COMP-43
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ⛔ DEVIATES (separate transaction managers — outbox INSERT commits before DB2 write) | 🔴 HIGH |
+| DEC-003 Kafka Partition Key = merchantId | ⛔ DEVIATES (consumer-side variable named `caseNumber`) | 🟡 MEDIUM |
+| DEC-004 PAN Encryption Before Persistence | ⛔ DEVIATES (clear PAN written to `BC.TBC_DM_CASE.I_ACCT_CDH`) | 🔴 HIGH |
+| DEC-005 Manual Kafka Offset Commit | ⛔ DEVIATES (pre-ACK on all paths before DB2 write) | 🔴 HIGH |
+| DEC-014 Resilience4j Circuit Breakers | ⛔ DEVIATES (platform VOID) | 🔴 HIGH |
+| DEC-019 No Clear PAN in Persistent Store | ⛔ DEVIATES (linked to DEC-004) | 🔴 HIGH |
+| DEC-020 Full At-Least-Once Idempotency | ⚠️ PARTIAL — four gaps | 🔴 HIGH |
+| DEC-023 Replica = 1 Hard Constraint | ✅ NOT APPLICABLE (this is a scaled consumer, not a polling singleton) | — |
+
+**DEC-001 DEVIATES detail:** Outbox writes use `wdpTransactionManager`;
+DB2 writes use `coreTransactionManager`. No XA. Step 3 INSERT
+(`createNewNotificationEvent`) commits before `coreDao.saveCoreCase` is
+even invoked. Crash between outbox INSERT (PUBLISHED) and DB2 write
+leaves a PUBLISHED outbox row with no corresponding DB2 row.
+
+**DEC-003 DEVIATES detail:** `@Header(KafkaHeaders.RECEIVED_KEY) String caseNumber`
+in `KafkaConsumer.onMessage`. Variable name is `caseNumber`, not
+`merchantId`. Producer-side key assignment by COMP-18 owes confirmation.
+
+**DEC-004 / DEC-019 DEVIATES detail:** EncryptionService decrypt at
+Step 6 PAN gate; clear PAN overwrites `caseResponse.cardNumber` and is
+written to `BC.TBC_DM_CASE.I_ACCT_CDH` via `mapDb2CaseEntity`. Column
+mapping is `@Column(name="I_ACCT_CDH")` on `CaseEntity.cardNumber`.
+Needs CORE platform team confirmation as intentional and approved.
+
+**DEC-005 DEVIATES detail:** Three ACK call sites in `KafkaConsumer.java`:
+Path A (line 52, after outbox-ERROR write, pre-DB2); Path B (line 56,
+before `processCaseActionEvent`); Path C (line 61, after outbox-PUBLISHED
+INSERT in `processNewCaseActionEvent`, before `processCaseActionEvent`).
+All three pre-date the DB2 write.
+
+**DEC-020 PARTIAL detail (severity 🔴 HIGH):** Four concurrent gaps.
+(a) SELECT-then-INSERT race window —`processNewCaseActionEvent` not
+`@Transactional`, no DB UNIQUE constraint visible. (b) Pre-ACK
+silent-loss window — Path B / C ACK precedes DB2 write; crash between
+ACK and FAILED-write loses the message. (c) Path A header-error path's
+own outbox ERROR write is unguarded — if PostgreSQL is down, the write
+fails into the outer try/catch and the message redelivers (the **one**
+branch where redelivery is the recovery mechanism). (d) Bad-payload and
+bad-`event-timestamp` paths produce no audit record anywhere.
+
+#### Remaining gaps
+
+- **OQ-COMP-43-1 Producer-side partition key.** Confirm at COMP-18 source
+  that the publisher to `core-request-events` keys messages by
+  `caseNumber` (consistent with consumer variable name). Follow-up
+  Claude Code question for COMP-18 source: *"For the publisher to
+  `core-request-events`, what is the message key set on
+  `kafkaTemplate.send(...)`? Cite file:line."*
+- **OQ-COMP-43-2 External retry scheduler owner.** Which component
+  polls `wdp.outgoing_event_outbox` rows where
+  `channel_type='CORE_EVENTS' AND status='FAILED' AND next_retry_at<now()`?
+  Not in this repo. Architect / team confirmation needed. Without this
+  component, all FAILED rows are permanently stuck.
+- **OQ-COMP-43-3 DB-level UNIQUE constraint on
+  `wdp.outgoing_event_outbox`.** Is there a UNIQUE index on
+  `(idempotency_id, channel_type, event_timestamp)` in the actual
+  PostgreSQL cluster? Not declared on the entity, no DDL in this repo.
+  DBA confirmation needed. Severity of R2 depends on this.
+- **OQ-COMP-43-4 Production replica count.** Helm placeholder
+  `{{ replicas-gcp-case-action-core-consumer }}` has no default in this
+  repo. Confirm via XL Deploy / environment config. Any value > 1
+  compounds R2.
+- **OQ-COMP-43-5 DB2 connection pool sizing.** No custom Hikari
+  properties. Spring Boot defaults apply (max pool size 10,
+  connectionTimeout 30s). For the sole DB2 writer in WDP, confirm
+  whether this is sufficient under expected load. Architect / capacity
+  team confirmation.
+- **OQ-COMP-43-6 DEC-004 / DEC-019 clear-PAN-to-DB2 — intentional?**
+  Architect decision required. Document approved exception in
+  WDP-DECISIONS.md, or remediate.
+- **OQ-COMP-43-7 management endpoint exposure.** No `management:` block
+  in any YAML profile — Spring Boot defaults expose only `health` and
+  `info`. Is Prometheus / metrics exposure intended for COMP-43 (most
+  other WDP components do expose `prometheus`)? Architect / ops
+  decision.
+
+#### Doc status after this change
+- `WDP-COMP-43-CORE-NOTIFICATION-CONSUMER.md` → `v2.0 DRAFT` —
+  source-verified 2026-04-25 · architect confirmation pending.
+  Supersedes v1.0 DRAFT.
+---
+
+
+### 2026-04-25 — COMP-21 ChargebackService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `Worldpay/mdvs-gcp-chargeback-service` — source-verified by Claude Code 2026-04-25 against repo + production K8s Secrets and ConfigMaps (`gcp-chargeback-service-secrets.yml`, `wdp-common-secrets.yml`, `resources.yml`). Architect confirmation pending.
+
+**Nature of change:** Correction pass driven by performance-optimisation question on downstream API mapping. Component remains REST API only; no scope or category change. Existing 23-call inventory expanded to 38 distinct call sites with resolved hosts; multiple corrections (rollout strategy, prometheus auth, Jasypt password value, property names, Mermaid label, JustAI status). Several material new findings on async executor sizing, IDP token caching, and shared-RestTemplate mutation.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- No change. ChargebackService owns no database state and reads no database tables. Confirmed by exhaustive grep — no JPA, no JdbcTemplate, no DataSource references; classpath has neither `spring-boot-starter-data-jpa` nor `spring-boot-starter-jdbc`.
+
+**WDP-KAFKA.md**
+- No change. ChargebackService has no Kafka producer or consumer. Confirmed by full-tree grep — zero `@KafkaListener`, `KafkaTemplate`, `@EnableKafka`, `kafka.bootstrap` occurrences.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: COMP-21 makes 38 distinct downstream call sites across 12 target applications. 4 of those are dead code (3 unreachable call sites #5/#25/#38 and 1 dead `@Value` field #37).
+- Add: COMP-21 has **no IDP token cache** — `CachedTokenServiceImpl` delegates straight through to a fresh GET on every call. WDP-path `contest` performs 5 business calls each preceded by a token GET, producing ~10 sequential round-trips on a `RestTemplate` with no connection pool.
+- Add: COMP-21 `asyncExecutor` is core=1, max=1, queue=5. The `CompletableFuture.allOf` parallel ACL+lookup pattern provides no real parallelism. Seventh concurrent action request hits `RejectedExecutionException`.
+- Add: COMP-21 `IdpRestInvoker` mutates the shared `RestTemplate` `setErrorHandler` per token call — concurrency hazard on a global bean.
+- Add: COMP-21 logstash appender effectively broken — `logstash_server_host_port` is empty in both production secrets; only stdout logs reach aggregation today.
+- Add: COMP-21 surfaces `cardNumber` (full) in two model classes and `cardNumberLast4` in eight, populated from downstream case-search-service responses, with no masking transformation in this service before serialisation.
+- Add: COMP-21 has dead config — `wdp.caseUpdateUrl` injected as field but never read.
+- Correct: JustAI handling **is active** in COMP-21 (constant `JUSTTAI` with double-T). This contradicts the platform-wide statement in the existing handover that "JustAI is planned only — no JustAI reference exists anywhere in the COMP-41 codebase". The platform-wide statement is correct *for COMP-41* but not platform-wide. Update the handover wording to scope it to COMP-41 specifically.
+- Correct: COMP-21 rollout strategy is `maxSurge=4`, not `maxSurge=1` as previously documented.
+- Correct: COMP-21 `/actuator/prometheus` requires JWT — it is **not** in the security whitelist.
+- Resolved open questions: none.
+- New open questions:
+  - Is the missing IDP token cache intentional, or a defect in `CachedTokenServiceImpl`?
+  - Is the `asyncExecutor` core=1 / max=1 / queue=5 sizing intentional, or leftover defaults?
+  - Is the empty `logstash_server_host_port` and resulting stdout-only logging intentional?
+  - Should JustAI handling be considered active platform-wide, or active only in COMP-21? Reconcile against COMP-41.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **Candidate ADR — IDP token caching** 🟡 MEDIUM: Wrapper class `CachedTokenServiceImpl` does not cache. Token is fetched per-call. Architectural decision needed: introduce TTL-based cache, or formally accept the per-call cost. Affects every WDP-bound call across COMP-21.
+- **Candidate ADR — Async executor sizing for orchestrator services** 🟡 MEDIUM: Single-thread async executor with queue=5 contradicts the visible parallel-block design. Other orchestrator components may have similar tuning. Worth an ADR establishing minimum sizing for the parallel-block pattern.
+- **Candidate ADR — Shared `RestTemplate` mutation** 🟡 MEDIUM: `setErrorHandler` mutated per token call on the global bean. Establish a platform rule that shared HTTP clients are immutable post-construction.
+- **No new ADR for** existing DEC-014 deviation (already VOID) or DEC-020 deviation (already recorded).
+
+**WDP-ARCHITECTURE.md**
+- No topology change. Note: the documented "concurrent ACL+case-lookup" pattern in COMP-21 should be flagged in any architecture diagram footnote as effectively serial under current production sizing.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- Add RISK-COMP-21-A 🔴 HIGH: "ChargebackService no IDP token cache despite class name. WDP-path `contest` produces 10 sequential round-trips (5 business calls each preceded by token GET) on a no-pool `RestTemplate`. Latency floor for the platform's externally-visible API is set by this."
+- Add RISK-COMP-21-B 🔴 HIGH: "ChargebackService `asyncExecutor` core=1, max=1, queue=5. Seventh concurrent action request hits `RejectedExecutionException`. Throughput ceiling is far below replica-count expectations."
+- Add RISK-COMP-21-C 🔴 HIGH: "ChargebackService LATAM silent fall-through. `SourceSystem.LATAM` matches no controller branch; action requests return HTTP 200 empty body with no log, no metric, no error."
+- Add RISK-COMP-21-D 🟡 MEDIUM: "ChargebackService `IdpRestInvoker.setErrorHandler` mutates global `RestTemplate` per token call. Non-deterministic error-handling under concurrent load."
+- Add RISK-COMP-21-E 🟡 MEDIUM: "ChargebackService logstash appender effectively broken — production secret `logstash_server_host_port` is empty. Only stdout logs reach aggregation today."
+- Add RISK-COMP-21-F 🟡 MEDIUM: "ChargebackService surfaces full `cardNumber` in `SearchCaseList` and `Transaction` model classes with no masking before response serialisation. Risk is downstream-dependent (case-search-service) but unguarded here."
+- Add RISK-COMP-21-G 🟡 MEDIUM: "ChargebackService `/cases/{id}/changeowner` VAP path can fire two PUT calls; second is wrapped in try/catch that swallows. Silent partial failure on the second note with no signal to the caller."
+- Add RISK-COMP-21-H 🟡 MEDIUM: "ChargebackService `GET /cases/{id}` uses a different source-system helper than action endpoints. Same caseId may resolve to different source systems on read vs action."
+- Update existing platform-wide DEC-014 risk to cite COMP-21's 38 unprotected call sites as additional evidence.
+
+**WDP-INTEGRATIONS.md**
+- Update Section 5.x JustAI entry: JustAI is **active in ChargebackService** (consumer name `JUSTTAI` triggers partner branch in `isPartner`). It remains absent from COMP-41. Scope the "planned only" wording to outbound third-party notification (COMP-41), not to inbound partner identification (COMP-21).
+- Add to ChargebackService outbound integration list: enterprise Cert eAPI Entitlement Lookup (`https://cert-eapi.../entitlement-lookup-api/v1/api-key-entitlements`) — Bearer (forwarded inbound JWT). Currently inactive in production (`entitlementFlag=false`) but wired and ready.
+
+#### Deviation flags for COMP-21
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 | ✅ NOT APPLICABLE | — |
+| DEC-003 | ✅ NOT APPLICABLE | — |
+| DEC-004 | ✅ NOT APPLICABLE (no persistence) — but in-flight PAN surface concern | 🟡 |
+| DEC-005 | ✅ NOT APPLICABLE | — |
+| DEC-014 | ⛔ DEVIATES (already formally VOID platform-wide) | 🔴 |
+| DEC-019 | ✅ NOT APPLICABLE | — |
+| DEC-020 | ⛔ DEVIATES — no idempotency on action endpoints | 🟡 |
+
+DEC-004 in-flight surface concern: response models `SearchCaseList` and `Transaction` carry full `cardNumber` field; eight other models carry `cardNumberLast4`. Populated from downstream `case-search-service` responses; no masking transformation in this service. Whether clear PAN actually flows is downstream-dependent.
+
+DEC-014 deviation: 38 distinct call sites across 12 target applications, all on a single shared `RestTemplate` with no pool, no connect timeout, no read timeout, no retry, no circuit breaker. WDP-path `contest` produces ~10 sequential round-trips. This component is one of the strongest pieces of evidence for the platform-wide DEC-014 void.
+
+DEC-020 deviation: no idempotency on any action endpoint. Duplicate `POST /cases/{id}/contest` produces full duplicate fan-out — for WDP-NAP migrated path this is two complete 5-call chains, plus duplicate ACL+lookup, plus duplicate token GETs.
+
+#### Doc status after this change
+- `WDP-COMP-21-CHARGEBACK-SERVICE.md` → `v1.1 DRAFT` — source-verified 2026-04-25 · architect confirmation pending
+---
+
+### 2026-04-24 — COMP-27 CaseSearchService · v1.0 DRAFT → v2.0 DRAFT
+
+**Source:** `mdvs-gcp-case-search-service` (v3.2.1) — source-verified by
+Claude Code 2026-04-24. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source plus headline new
+content — full Search SQL Catalogue added as Section 10 (13 sub-sections
+covering every search, detail, lookup, summary, queue, and lock query in
+the service, captured for platform-wide query optimisation). Seven factual
+corrections to v1.0 DRAFT. Five new HIGH-severity findings promoted to
+Risks and Constraints.
+
+#### Corrections to v1.0 DRAFT
+
+1. **Endpoint count 14 → 15.** `POST /{platform}/v2/case/lock/{caseNumber}`
+   was undocumented. It is the second write operation in the service and
+   shares pre-read/UPDATE SQL with the V1 PATCH lock. Routes via strategy
+   pattern to `NapCaseLockServiceImpl` or `WdpCaseLockServiceImpl`.
+2. **Ingress host count 6 → 4.** `resources.yml` exposes `hostName`,
+   `internalhostName`, `wdpInternalHostName`, `wdpreverseproxyHostName`
+   only. No `externalHostName` or `wdpExternalHostName`.
+3. **Rollout `maxSurge` 1 → 4.**
+4. **`migrationStatus` suppression claim withdrawn.** v1.0 DRAFT asserted
+   the mapping line was commented out in `searchPinCase`. Source shows the
+   mapping is live (`util/CaseSearchSupport.java:329, 448, 867`). v2.0
+   removes this risk and replaces it with a different, real finding: the
+   SELECT list has **two `as migrationStatus` aliases** on different
+   source columns (`A.c_migration_sta` and `A.o_migration_sta`) — the
+   second overrides the first in most JDBC drivers.
+5. **V1 default `pageSize` 200 → 25.** V1 controller has no default;
+   `CaseSearchSupport.formatSearchRequest` defaults blank to "25". V2
+   controller default remains 200.
+6. **V2 `startRecordNumber` / `pageSize` type String (not Integer).**
+   `DisputeCaseSearchRequest` declares both as String and the controller
+   uses `StringUtils.isNotBlank`.
+7. **JWT claim `igorgid` → `iqorgid`.** US external orgId claim name is
+   `iqorgid` in source.
+
+#### New HIGH-severity findings (promoted to Risks and Constraints)
+
+- **`/lft` trusts request-body `isInternal`.** `LftSearchParams.isInternal`
+  from the request body drives the authorization path. JWT is not
+  consulted for internal-vs-external on this endpoint. A user-controlled
+  request field determines the authorization level.
+- **Case-lock race has no guard.** No `@Transactional`, no
+  `SELECT FOR UPDATE`, no conditional UPDATE, no `@Version`. Two
+  concurrent lockers from different users can both pass the pre-read and
+  both UPDATE; second silently overwrites first. Confirmed from source on
+  both V1 PATCH and V2 POST paths. Severity elevated from MEDIUM (v1.0).
+- **Queue-criterion value SQL injection surface.** `QueueSupport.
+  buildQueueCriterion` concatenates `nap.queue_criterion.value` into SQL
+  fragments wrapped in single quotes but with no quote-escaping. Column
+  and operator are enum-whitelisted; value is not. If values can contain
+  `'`, the concatenation breaks the SQL or opens an injection vector on
+  the NAP internal regular-user search path.
+- **404+known-message predicate has a precedence bug.** `RestInvoker.
+  checkNotFoundResponse` uses `status == 404 && msg == CASE_NOT_FOUND ||
+  msg == ACTION_NOT_FOUND || msg == NOTE_NOT_FOUND || msg ==
+  DOCUMENT_NOT_FOUND`. Java precedence binds the first `&&` tightly — the
+  three trailing messages match on any HTTP status. A non-404 response
+  carrying one of those messages is silently treated as "not found" and
+  produces a null sub-response in the detail fan-out.
+- **External VAP/LATAM entity-scope authorization is absent.**
+  `AuthorizationServiceImpl.authorizeEntity` explicitly routes only NAP
+  (→ UAMS) and PIN/CORE (→ CHAS). VAP and LATAM fall through with no
+  entity-scope call. Source-level finding — confirm intent.
+
+#### Other material findings
+
+- **`/progress` orphans 2 of 4 futures.** `caseDetails` and
+  `documentResponse` are created as `CompletableFuture` but not included
+  in `allOf()`. They execute in-flight — DB and downstream calls are
+  consumed — but their completion is never awaited and the response body
+  is built only from the joined 2. MEDIUM.
+- **NAP vs WDP lock-timestamp column drift.** NAP uses `x_locked_at`;
+  WDP uses `z_locked_at`. Same service, same write path, different
+  column names per schema. MEDIUM.
+- **UK V1 LIMIT/OFFSET vs US V1 ROW_NUMBER+BETWEEN** — pagination drift
+  within the same service.
+- **`QueueCriterionColumn.RECEIVED_DOCUMENT → "Document Type"`** — TODO
+  returns a literal SQL identifier with a space character. Queue search
+  with this criterion emits invalid SQL at execution time. MEDIUM.
+- **`DisputeSummary` CTE terminator looks malformed.** `WITH ... AS (...),
+  Core_Dispute AS (...), SELECT ...` — comma followed directly by SELECT
+  without closing the WITH chain conventionally. May fail on target
+  PostgreSQL. MEDIUM.
+- **N+1 on external logical queue counts.** `QueueCountServiceImpl.
+  getExternalLogicalQueueCount` fans out one SQL statement per queue via
+  `CompletableFuture`. MEDIUM.
+- **Dead POM dependencies.** `modelmapper` (3.0.4) and `jasypt` property
+  declared but not imported or used in main source.
+- **Dead config keys.** `gcp.displayCodeEnvUrl` and `gcp.displayCodeTypes`
+  in `application-prod.yml` — never read at runtime; the active keys are
+  `${displaycode.search}` and `displaycode.values`.
+- **Internal PIN regular-user role (`WDP_PIN_REGULAR`) exists in source**
+  (`AuthorizationServiceImpl.isPINInternalRegularUser`) — not documented
+  in v1.0 DRAFT.
+- **IDP token cache is per-pod in-process**
+  (`InMemoryOAuth2AuthorizedClientService` by Spring default).
+
+#### Section 10 — SQL Catalogue (new)
+
+Thirteen sub-sections cover: V1 PIN search, V1 NAP search, V2 search
+(UK/US), queue search, queue case detail, queue counts, dispute summary,
+case lookup, action-details helper, merchant-ID helpers, case-lock
+pre-read, case-lock UPDATE, and cross-cutting findings. SQL text quoted
+faithfully from source where inspected in full; sub-sections 10.4, 10.8,
+and 10.10 flagged as needing follow-up deep-read if optimiser decisions
+are required.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- `nap.case` row — confirm COMP-27 as lock-column writer (columns
+  `c_case_lock`, `c_locked_by`, `x_locked_at`, `x_updt`, `z_updt`). Shared
+  with COMP-23 (primary) and COMP-24 (case lifecycle). No change to
+  primary ownership.
+- `wdp.case` row — confirm COMP-27 as lock-column writer (columns
+  `c_case_lock`, `c_locked_by`, `z_locked_at`, `x_updt`, `z_updt`). Note
+  **lock-timestamp column name drift**: NAP uses `x_locked_at`, WDP uses
+  `z_locked_at`. Worth a schema-owner flag for future convergence.
+- `nap.queues` and `nap.queue_criterion` rows — owner remains TBC. No DDL,
+  no entity mapping, no migration file in this repository. COMP-27 is
+  read-only via `JdbcClient` native SQL. Quote the SELECT patterns from
+  Section 10 catalogue as evidence of the read-only relationship.
+- `nap.users` and `nap.user_queue` rows — confirm COMP-27 as read-only
+  consumer for NAP internal regular-user queue filtering. Primary owner
+  COMP-02 UAMS unchanged.
+- `nap.action` and `wdp.action` rows — confirm COMP-27 as read-only
+  consumer for search, detail, summary, and queue filters. Primary writer
+  CaseActionService (COMP-24) unchanged.
+- No new shared-table risk. Existing `wdp.case` / `nap.case` shared-table
+  risk (COMP-23 primary writer) is already documented and is reaffirmed
+  here.
+
+**WDP-KAFKA.md**
+- **No change.** COMP-27 has no Kafka involvement — no `@KafkaListener`,
+  no `KafkaTemplate`, no `spring-kafka` dependency in `pom.xml`. The
+  audit confirmed absence across all sections 3 and 4 of WDP-KAFKA.md.
+  No topic rows, no consumer group rows, no producer rows to add or
+  update.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: CaseSearchService has **15 REST endpoints** across six
+  controllers (not 14 as previously referenced).
+- Add: CaseSearchService has **two write operations** — V1 PATCH and V2
+  POST case-lock endpoints. Both target lock columns only on `nap.case`
+  / `wdp.case` with no `@Transactional`, no `SELECT FOR UPDATE`, no
+  optimistic version — concurrent-locker race is unguarded.
+- Add: CaseSearchService is a platform-wide instance of the DEC-014
+  VOID pattern — no Resilience4j, no circuit breaker, no timeout, no
+  retry on any outbound REST call.
+- Add: `POST /lft` derives internal-vs-external authorization from a
+  request-body field (`LftSearchParams.isInternal`), not from the JWT.
+  Flagged for architect review.
+- Add: VAP and LATAM external callers are not routed through any
+  entity-scope authorization service. Only NAP (→ UAMS) and PIN/CORE
+  (→ CHAS) are. Confirm intent.
+- Add: Internal PIN regular-user role exists (`WDP_PIN_REGULAR` in
+  `AuthorizationList`) alongside the already-known `WDP_NAP_REGULAR`.
+- Resolved open questions: the `migrationStatus` suppression claim from
+  v1.0 DRAFT is retracted — mapping is live; the real finding is the
+  duplicate `as migrationStatus` alias pair.
+- New open questions:
+  - Who owns `nap.queues` / `nap.queue_criterion`? (unchanged from v1.0)
+  - Is VAP/LATAM external auth fall-through intentional (internal-only
+    platforms) or a gap?
+  - Are the two `as migrationStatus` aliases a deliberate overlay or a
+    copy-paste defect?
+  - Does `DisputeSummary` CTE syntax execute on production PostgreSQL?
+  - Is the 404+known-message OR-chain precedence behaviour intentional?
+  - Production values for `total_count` and `lft_total_count` env
+    variables — no `@Value` defaults; service fails to start if unset.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **Candidate ADR — Case-lock concurrency control.** The lock-write
+  pattern is unique to COMP-27 (direct DB lock flag with no coordination
+  layer). Platform has no decision recorded for how case locks behave
+  under concurrent contention. Given the confirmed race window, a
+  decision is warranted — accept risk, add conditional-UPDATE guard, or
+  introduce a distributed lock. Proposed severity: 🔴 HIGH.
+- **Candidate ADR — Request-body-driven authorization is prohibited.**
+  The `/lft` endpoint's `LftSearchParams.isInternal` pattern is a
+  platform-level policy question. Worth an explicit decision that
+  authorization must derive from authenticated identity (JWT), never
+  from caller-supplied request fields. Proposed severity: 🔴 HIGH.
+- **Candidate ADR — Platform-wide pagination standard.** COMP-27
+  contains three distinct pagination mechanisms (UK V1 LIMIT/OFFSET,
+  US V1 ROW_NUMBER+BETWEEN, V2 LIMIT/OFFSET). Useful candidate for a
+  platform-level convergence decision. Proposed severity: 🟡 MEDIUM.
+
+**WDP-ARCHITECTURE.md**
+- No change. Topology and principles unchanged. COMP-27 already
+  documented as the platform-wide read layer in Section 4.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- Candidate RISK row — Case-lock concurrency race on COMP-27. Two
+  concurrent lockers from different users can both UPDATE; second
+  silently overwrites first. No distributed lock, no conditional guard.
+  Severity 🔴 HIGH.
+- Candidate RISK row — `/lft` authorization derives from request body.
+  Severity 🔴 HIGH.
+- Candidate RISK row — Queue-criterion value SQL concatenation. Severity
+  🔴 HIGH — gated on whether value content can contain single quotes in
+  production data.
+- Candidate RISK row — External VAP/LATAM entity-scope authorization
+  absent. Severity 🟡 MEDIUM pending intent confirmation.
+- Candidate RISK row — 404+known-message OR-chain precedence bug in
+  `RestInvoker.checkNotFoundResponse`. Severity 🟡 MEDIUM.
+- RISK row already covering "no timeout / no circuit breaker platform-
+  wide" applies to COMP-27 as an instance — no new row needed.
+
+**WDP-INTEGRATIONS.md**
+- No change. COMP-27's external integrations (FIS IDP only) are
+  already documented. In-cluster REST targets (COMP-02, 03, 23, 24, 25,
+  28, 31, 35, 37) are internal and out of scope for WDP-INTEGRATIONS.
+
+#### Deviation flags for COMP-27
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ✅ NOT APPLICABLE | — |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE | — |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⚠️ PARTIAL DEVIATION (lock path) | 🔴 HIGH |
+
+**DEC-001 NOT APPLICABLE detail:** Only write is the case-lock UPDATE.
+Whether lock state changes should themselves be domain events is a
+product decision; no downstream consumer of lock events is visible in
+source. Flag as NOT APPLICABLE unless product team intends to broadcast
+lock events.
+
+**DEC-003 / DEC-005 NOT APPLICABLE detail:** No Kafka producer, no Kafka
+consumer, no `spring-kafka` dependency. Confirmed from `pom.xml` and
+source grep.
+
+**DEC-004 / DEC-019 COMPLIES detail:** No clear PAN is written to any
+persistent store. Only PAN handling is in-flight encryption via
+EncryptionService before DB filter (v2 search). Response masking applied
+for PIN/CORE/VAP/LATAM when role-gated.
+
+**DEC-020 PARTIAL DEVIATION detail:** Lock SET has a pre-read
+idempotency fence (`CASE_ALREADY_LOCKED` branch) but no distributed lock
+— two concurrent PATCHes from different users can race past pre-read and
+both UPDATE. Lock CLEAR is naturally idempotent. Read endpoints do not
+require idempotency. Severity elevated to HIGH because the race is on a
+data-integrity-critical operation (user-locked case concurrency).
+
+#### Remaining gaps
+
+- **OQ-1 Owner of `nap.queues` / `nap.queue_criterion`** — team
+  confirmation. No DDL, entity, or migration in this repo.
+- **OQ-2 Production replica count** — environment config
+  (`{{ replicas-mdvs-gcp-case-search-service }}` XL Deploy placeholder).
+- **OQ-3 `/lft` caller identity** — internal WDP service or external
+  tooling? Service uses FIS IDP token, consistent with service-to-service
+  but not proven. Team confirmation.
+- **OQ-4 Production values for `total_count` / `lft_total_count`** —
+  environment config. No `@Value` default in source.
+- **OQ-5 VAP/LATAM external auth fall-through — bug or intent?** —
+  architect decision. If intentional, document as "VAP/LATAM
+  internal-only today" in WDP-DECISIONS.
+- **OQ-6 Two `as migrationStatus` aliases in `searchPinCase`** — follow-up
+  Claude Code question: *"In `mdvs-gcp-case-search-service`, inside
+  `USCaseSearchDaoImpl.constructBusinessEventNativeSQL` SELECT list,
+  quote the two lines that alias different source columns to
+  `migrationStatus`. Walk git blame for both lines to identify the
+  commit that introduced each. Is there any evidence (commit message,
+  adjacent comment, conditional) that the overlay is deliberate?"*
+- **OQ-7 `DisputeSummary` CTE terminator execution** — environment
+  validation. Requires running the query shape against target
+  PostgreSQL version. DBA confirmation.
+- **OQ-8 EncryptionService call-site depth of inspection** — follow-up
+  Claude Code question: *"In `mdvs-gcp-case-search-service`, trace the
+  V2 search path from `DisputeCaseSearchController` through
+  `DisputeCaseSearchServiceImpl.searchDisputeCase` to the call site of
+  `EncryptionService.encrypt`. Quote the exact gate condition on
+  `cardNumber` (length check, mask-character check) at file:line.
+  Report what is passed to the DB query after encryption — raw HPAN,
+  prefixed HPAN, or full EPAN."*
+- **OQ-9 Queue case search and lookup SQL deep-read** — follow-up
+  Claude Code question (low priority, only if optimiser work is
+  planned): *"In `mdvs-gcp-case-search-service`, fully reconstruct the
+  data query emitted by `UKQueueCaseSearchDAOImpl.
+  buildDynamicExternalSearchQuery` in the simplest and most complex
+  realised forms. Same for `USQueueCaseSearchDAOImpl`. Same for
+  `napCaseLookup` and `pinCaseLookup`. Same for
+  `getMerchantIDAndChainId`. Format each as a fenced SQL block with
+  dynamic-branch comments."*
+- **OQ-10 Caller inventory proof** — team confirmation. No
+  `@KnownCallers`, no Swagger `@Tag` caller identification. All caller
+  rows in the DRAFT are inferred from cross-component evidence. Ask the
+  WDP team to confirm the Merchant Portal, Ops Portal, and LFT runner
+  caller mapping per endpoint.
+
+#### Doc status after this change
+- `WDP-COMP-27-CASE-SEARCH-SERVICE.md` → `v2.0 DRAFT` — source-verified
+  2026-04-24 · architect confirmation pending. Supersedes v1.0 DRAFT.
+---
+
 ### 2026-04-23 — COMP-20 ContestService · v1.0 DRAFT → v2.0 DRAFT
 
 **Source:** `gcp-disputes-contest-service` (dispute-contest-service v1.6.6) —

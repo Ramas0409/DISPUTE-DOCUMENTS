@@ -6,7 +6,7 @@ WDP-HANDOVER.md, WDP-COMP-INDEX.md,
 WDP-COMP-TEMPLATE.md, WDP-ARCHITECTURE.md,
 WDP-DECISIONS.md, WDP-KAFKA.md, WDP-DB.md
 
-Today's component: 20 — ContestService
+Today's component: 41 — ThirdPartyNotificationConsumer
 
 ━━━ PHASE 1 — Generate Claude Code prompt ━━━
 
