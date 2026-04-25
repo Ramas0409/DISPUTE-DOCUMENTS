@@ -59,6 +59,260 @@ against which set of Pending Entries.*
 *New entries are appended here by per-component chats. Reconciliation sessions
 consume entries from this section and move them to **Reconciled** below.*
 
+### 2026-04-25 — COMP-41 ThirdPartyNotificationConsumer · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `wdp-gp-notification-event-consumer` — source-verified by Claude Code
+2026-04-25. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source. No functional change in
+production. Two factual corrections (channel_type value, local RestTemplate
+location), one behavioural correction (@Cacheable is silent no-op), three
+distinct PUBLISHED-orphan paths now characterised explicitly, plus full
+absence-audit confirmations (JustAI, Resilience4j, Spring Retry, @EnableCaching,
+@Transactional, K8s probes).
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- **Section 2 · `wdp.outgoing_event_outbox` row:**
+  - Correct COMP-41 `channel_type` from `GF_EVENTS` to **`GP_EVENTS`** in the
+    Writers list.
+  - Append note: "COMP-41 writes via independent auto-commit JPA saves —
+    zero `@Transactional` annotations across `src/`. SELECT-before-INSERT
+    duplicate check is therefore not atomic. No DB UNIQUE constraint visible
+    in COMP-41 repo (DDL owned outside)."
+  - Append note: "COMP-41 `idempotency_id` typed as `String` on its entity —
+    same as COMP-17, COMP-18, COMP-43; cross-table inconsistency with
+    `chbk_outbox_row` (UUID) confirmed for COMP-41 too."
+- **Section 4 · Shared Table Risk Register · `wdp.outgoing_event_outbox` row:**
+  - Update writers list to confirm COMP-41 contributes `channel_type=GP_EVENTS`
+    rows (correction from `GF_EVENTS`).
+  - Severity remains 🟢 LOW pending COMP-12 Scheduler3 channel_type-filter
+    confirmation. If Scheduler3 does not filter consistently, severity
+    escalates to 🟡 MEDIUM platform-wide.
+
+**WDP-KAFKA.md**
+
+- **Section 4 · Consumer Groups · COMP-41 row:**
+  - Group ID still env-injected — runtime value not in source. No change.
+  - Update strategy column to: "Pre-Signifyd ACK — `MANUAL_IMMEDIATE` +
+    `syncCommits=true`. Committed after PUBLISHED outbox INSERT, before
+    `processEvent()` and any Signifyd REST call (DEC-005 deviation).
+    Concurrency: 1. `auto.offset.reset = latest` — cold-start backlog
+    skipped."
+  - Add note: "Bad payload behaviour: empty `CommonErrorHandler` silently
+    drops bad-deserialise records. No DLT, no halt, no audit row."
+- **Section 5 · Outbox tables that feed Kafka:** No change. COMP-41 is a
+  pure consumer — does not feed Kafka. (`wdp.outgoing_event_outbox` is fed
+  by other consumers.) Confirm: COMP-41 has zero Kafka producer side
+  (no `KafkaTemplate`, no `@SendTo`, no `ProducerFactory`).
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+- Add / correct:
+  - COMP-41 writes `channel_type=GP_EVENTS` to `wdp.outgoing_event_outbox`
+    (NOT `GF_EVENTS` as previously documented). All v1.0 references corrected
+    in v1.1 DRAFT.
+  - COMP-41 has **three distinct PUBLISHED-orphan paths** — all unrecoverable
+    in-component, all invisible to COMP-12 Scheduler3 if Scheduler3 reads
+    only FAILED / PENDING_DEFERRED:
+    (a) post-ACK crash before Signifyd response;
+    (b) Signifyd empty body ("NO_DATA_FROM_SIGNIFYD") — no status transition;
+    (c) final outbox UPDATE failure after ACK.
+  - COMP-41 `@Cacheable("displaycodedetails")` and `@Cacheable("notificationRule")`
+    annotations are **silent no-ops** — `@EnableCaching` is absent, no
+    `CacheManager` bean, no cache starter dependency. Every event hits the
+    upstream Display Code POST and Notification Rule GET. Capacity planning
+    that assumed caching is incorrect.
+  - COMP-41 has zero `@Transactional` annotations. Every save is an
+    independent auto-commit. SELECT-before-INSERT duplicate check is not
+    atomic. No DB UNIQUE constraint visible in this repo.
+  - COMP-41 has **no Kubernetes liveness, readiness, or startup probes**
+    in `resources.yml`, despite Actuator exposing `/livez` and `/readyz`
+    paths on port 8082. Hung pods are not evicted by kubelet.
+  - COMP-41 Spring Retry imports (`@Retryable`, `@Backoff` in
+    `SignifydService`, `TokenServiceRetry`) are **dead** — never applied.
+    The class names containing "Retry" describe custom try/catch behaviour,
+    not the Spring Retry framework.
+  - COMP-41 `auto.offset.reset = latest` — cold start with no committed
+    offset skips backlog.
+  - COMP-41 predecessor lookup (`findByCaseNumber`) loads ALL outbox rows
+    for the case, then filters in Java memory (channel_type, id-less-than,
+    sort id DESC). Unbounded memory and latency growth for long-lived cases.
+  - COMP-41 has **two RestTemplate construction patterns** — one shared
+    `@Bean` in `CommonConfig`, plus two `RestInvoker` methods that bypass
+    the bean and call `new RestTemplate()` locally. Same JDK defaults; no
+    functional difference, but inconsistency in bean management.
+  - COMP-41 has **zero references to JustAI** anywhere — confirmed by
+    absence audit across `src/`, all YAML, POM, properties, tests.
+- Resolved open questions:
+  - "channel_type value used by COMP-41" → **`GP_EVENTS`** (was previously
+    documented as `GF_EVENTS`).
+  - "Are Signifyd response failures fully covered by FAILED/ERROR statuses?"
+    → **No.** Empty-body branch produces no transition — row stuck at
+    PUBLISHED.
+  - "Does Spring Retry govern any outbound REST call?" → **No.** Imports
+    are dead; behaviour is custom try/catch.
+  - "Are the two `@Cacheable` calls actually caching?" → **No.** Annotations
+    are silent no-op.
+- New open questions:
+  - **OQ-COMP41-1:** Does COMP-12 Scheduler3 read `wdp.outgoing_event_outbox`
+    rows with `channel_type=GP_EVENTS`? Does it filter PUBLISHED-status
+    orphans, or only FAILED / PENDING_DEFERRED? Without this, all three
+    orphan paths are platform-unrecoverable. Follow-up Claude Code question
+    against `wdp-chargeback-evidence-event-scheduler`: *"In COMP-12 Scheduler3,
+    report the WHERE clause used to read `wdp.outgoing_event_outbox`. Confirm
+    whether `channel_type` is filtered, which values are processed, and which
+    `status` values are eligible for re-drive."*
+  - **OQ-COMP41-2:** What is the external retry scheduler for FAILED /
+    PENDING_DEFERRED rows in `channel_type=GP_EVENTS`? Identify owner.
+  - **OQ-COMP41-3:** DB-level UNIQUE constraint on
+    `(idempotency_id, channel_type, event_timestamp)` — DBA confirmation
+    required (schema not in this repo).
+  - **OQ-COMP41-4:** Empty-body Signifyd path producing stuck-PUBLISHED — is
+    this accepted, or should the no-data branch promote the row to FAILED?
+    Architect decision.
+  - **OQ-COMP41-5:** `@Cacheable` silent no-op — is this accepted (every
+    event hits Display Code + Notification Rule), or remediate by adding
+    `@EnableCaching` + `CacheManager`? Architect decision; capacity-planning
+    impact.
+  - **OQ-COMP41-6:** No K8s probes despite Actuator endpoints exposed — is
+    this intentional or a deployment template gap? Operational confirmation.
+  - **OQ-COMP41-7:** Production runtime values for `kafka_topic`,
+    `kafka_group_id`, `max_poll_records`, `max_poll_interval`, replica count
+    — environment config / XL Deploy.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+
+- No new ADRs. Existing deviation maps cover COMP-41:
+  - **DEC-005 deviation map:** add COMP-41 — pre-Signifyd ACK after PUBLISHED
+    INSERT. Severity 🔴 HIGH.
+  - **DEC-014 deviation map:** add COMP-41 — 10 unprotected outbound calls
+    (1 IDP + 4 WDP internal + 1 fraudswitch cache + 1 OAuth fallback +
+    3 Signifyd). All bare `RestTemplate` with JDK `HttpURLConnection`
+    defaults — no pool, no connect timeout, no read timeout. Platform-VOID
+    factual record.
+  - **DEC-001 deviation map:** add COMP-41 — outbox repurposed as
+    consumer-side audit/idempotency/retry ledger; not a producer-side
+    transactional outbox. Severity 🟡 MEDIUM.
+  - **DEC-020 deviation map:** add COMP-41 — three distinct PUBLISHED-orphan
+    paths (post-ACK crash, Signifyd empty-body no-transition, final UPDATE
+    failure), plus skip-filter silent-drop, plus bad-payload silent-drop,
+    plus non-atomic SELECT-before-INSERT, plus no DB UNIQUE constraint
+    visible. Severity 🔴 HIGH.
+
+**WDP-ARCHITECTURE.md**
+
+- No change. Topology and principles unchanged.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+
+- Candidate new RISK rows (pending architect decision):
+  - "COMP-41 Signifyd empty-body response produces no outbox status
+    transition — row stuck at PUBLISHED indefinitely. Independent of the
+    post-ACK crash window. Same recovery gap." 🔴 HIGH.
+  - "COMP-41 final outbox UPDATE failure after Kafka ACK produces a
+    permanent PUBLISHED orphan — listener catch swallows the exception,
+    no audit, no retry. Third source of stuck-PUBLISHED rows." 🔴 HIGH.
+  - "COMP-41 `@Cacheable` annotations are silent no-op — `@EnableCaching`
+    absent. Every event hits Display Code POST and Notification Rule GET.
+    Latency and load on those services are higher than v1.0 documentation
+    implies." 🟡 MEDIUM (capacity).
+  - "COMP-41 has no Kubernetes liveness/readiness/startup probes despite
+    Actuator `/livez` and `/readyz` exposed — hung pods are not evicted
+    by kubelet." 🔴 HIGH (operational).
+  - "COMP-41 predecessor lookup loads entire case history into memory —
+    unbounded growth for long-lived cases." 🟡 MEDIUM.
+  - "COMP-41 `auto.offset.reset = latest` — cold-start backlog silently
+    skipped during incident recovery scenarios." 🟡 MEDIUM.
+- Existing RISK-013 (replica constraint not automatically enforced) — does
+  not apply to COMP-41. COMP-41 has no replica=1 hard constraint; it is
+  a standard scaled consumer (concurrency=1, multiple replicas safe at
+  steady state via partition assignment, race window only during rebalance).
+
+**WDP-INTEGRATIONS.md**
+
+- **Section 5.1 Signifyd:** No change. Direction, protocol, three API targets
+  unchanged. Add note to Idempotency-and-retry sub-paragraph: "An empty
+  response body from any Signifyd endpoint is mapped to a `ChargebackResponse`
+  with `errorMessage='NO_DATA_FROM_SIGNIFYD'`. The caller's null-`signifydId`
+  check prevents a SUCCESS write but no exception is thrown — the outbox row
+  is left at PUBLISHED. This is a second silent-orphan source distinct from
+  the post-ACK crash window."
+- **Section 5.2 JustAI (Planned):** No change. Absence in COMP-41 codebase
+  formally confirmed by audit. Status remains 🔴 Planned.
+
+#### Deviation flags for COMP-41
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ⚠️ PARTIAL — consumer-side ledger, not producer outbox | 🟡 MEDIUM |
+| DEC-003 Kafka Partition Key = merchantId | ⚠️ NOT VERIFIABLE from consumer side | 🟡 MEDIUM |
+| DEC-004 PAN Encryption Before Persistence | ✅ NOT APPLICABLE / COMPLIES | — |
+| DEC-005 Manual Kafka Offset Commit AFTER Processing | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-014 Resilience4j Circuit Breakers | ⛔ ABSENT (platform-VOID) | 🟡 MEDIUM |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⚠️ PARTIAL | 🔴 HIGH |
+
+**DEC-005 DEVIATES detail:** ACK fires after PUBLISHED INSERT, before any
+Signifyd REST call. At-most-once relative to Signifyd. Three distinct
+unrecoverable PUBLISHED-orphan paths confirmed.
+
+**DEC-014 ABSENT detail:** No Resilience4j artifact in POM. No `@CircuitBreaker`
+/ `@Bulkhead` / `@RateLimiter` / `@TimeLimiter` anywhere in `src/`. 10
+outbound calls all on bare `RestTemplate` with JDK defaults — no pool, no
+connect timeout, no read timeout, no retry. Spring Retry imports
+(`@Retryable`, `@Backoff` in two interfaces) are never applied — dead.
+
+**DEC-020 PARTIAL detail (🔴 HIGH):**
+- Composite-key duplicate-check protects only the INSERT-before-ACK crash.
+- Three orphan paths bypass the retry mechanism entirely:
+  (a) post-ACK crash before Signifyd response,
+  (b) Signifyd empty-body no-transition,
+  (c) final outbox UPDATE failure after ACK.
+- Skip-filter silently drops events with no audit row.
+- Bad-payload deserialisation silently drops with empty `CommonErrorHandler`
+  — no DLT, no log, no audit.
+- SELECT-before-INSERT not atomic — zero `@Transactional`, no row lock.
+- No DB UNIQUE constraint visible in this repo.
+- All three orphan classes are invisible to COMP-12 Scheduler3 if Scheduler3
+  reads only FAILED / PENDING_DEFERRED — confirmation outstanding.
+
+#### Remaining gaps
+
+- **OQ-COMP41-1** — COMP-12 Scheduler3 channel_type filter and PUBLISHED-row
+  re-drive policy. **Follow-up Claude Code question against
+  `wdp-chargeback-evidence-event-scheduler`:** *"In COMP-12 Scheduler3 (the
+  scheduler that reads `wdp.outgoing_event_outbox`), report the exact WHERE
+  clause or JPA specification used. Confirm whether `channel_type` is filtered
+  and which values are eligible. Confirm which `status` values are read for
+  re-drive — does it ever read `PUBLISHED`, or only `FAILED` and
+  `PENDING_DEFERRED`? Cite file:line."*
+- **OQ-COMP41-2** — Identity of the external retry scheduler for
+  `channel_type=GP_EVENTS`. Architect / operations confirmation.
+- **OQ-COMP41-3** — DB-level UNIQUE constraint on `wdp.outgoing_event_outbox
+  (idempotency_id, channel_type, event_timestamp)`. DBA team confirmation
+  via actual DDL on the production cluster.
+- **OQ-COMP41-4** — Empty-body Signifyd response producing stuck-PUBLISHED
+  rows. **Architect decision** — accept the silent-loss, or require the
+  empty-body branch to promote the row to FAILED.
+- **OQ-COMP41-5** — `@Cacheable` silent no-op. **Architect decision** —
+  accept the upstream load (every event hits Display Code POST + Notification
+  Rule GET), or remediate by adding `@EnableCaching` + `CacheManager`.
+  Capacity-planning impact.
+- **OQ-COMP41-6** — No K8s probes despite Actuator endpoints exposed.
+  **Operational confirmation** — intentional or template gap.
+- **OQ-COMP41-7** — Runtime values for `kafka_topic`, `kafka_group_id`,
+  `max_poll_records`, `max_poll_interval`, replica count. Environment config
+  / XL Deploy / Helm.
+
+#### Doc status after this change
+
+- `WDP-COMP-41-THIRD-PARTY-NOTIFICATION-CONSUMER.md` → `v1.1 DRAFT` —
+  source-verified 2026-04-25 · architect confirmation pending
+---
+
 ### 2026-04-25 — COMP-17 CaseExpiryUpdateConsumer · v1.0 DRAFT → v1.1 DRAFT
 
 **Source:** `gcp-case-expiry-consumer` v1.1.1 — source-verified by Claude Code
