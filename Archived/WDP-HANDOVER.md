@@ -1,8 +1,7 @@
 # WDP-HANDOVER.md
 **Worldpay Dispute Platform — Architecture Session Handover**
-*Version: 2.0 | April 2026*
-*Update this file whenever the knowledge base structure or current
-work position changes significantly.*
+*Version: 3.0 | April 2026*
+*Component migration complete — all 40 available component files uploaded.*
 
 ---
 
@@ -79,81 +78,73 @@ WDP-ARCHITECTURE.md first, then WDP-DECISIONS.md.
 | Document | Status | Notes |
 |----------|--------|-------|
 | WDP-ARCHITECTURE.md | ✅ Current — v2.0 | Fully rebuilt April 2026. 15 Mermaid diagrams confirmed. |
-| WDP-DECISIONS.md | ⚠️ Needs rebuild | Current version has outdated decisions. Rebuild after component files complete. |
-| WDP-INTEGRATIONS.md | ⚠️ Needs rebuild | Rebuild after component files complete. |
-| WDP-NFRS.md | ⚠️ Needs rebuild | Contains outdated NFRs. Never apply NFRs without confirming with Ram first. |
-| WDP-HANDOVER.md | ✅ Current — v2.0 | This file. Updated April 2026. |
-| WDP-ARCHITECTURE-v1-ARCHIVED.md | 📦 Archived | Old architecture. Useful reference for BRE steps, ACK pattern, Kafka config. |
+| WDP-DECISIONS.md | ✅ Current — v2.0 | Rebuilt April 2026. DEC-011 and DEC-014 voided. DEC-019/020 recorded. Deviation maps added. |
+| WDP-INTEGRATIONS.md | ✅ Current — v2.0 | Rebuilt April 2026. BEN Kafka correction applied. JustAI planned status confirmed. |
+| WDP-NFRS.md | ✅ Current — v2.0 | Rebuilt April 2026. DEC-014/011 void references removed. Risk Register added (23 risks). |
+| WDP-HANDOVER.md | ✅ Current — v3.0 | This file. Updated April 2026. |
+| WDP-ARCHITECTURE-v1-ARCHIVED.md | 🗑️ Removed | Removed April 2026. Content superseded by individual component files and current Tier 1 documents. BRE checkpointing section was aspirational design only (DEC-011 VOID). |
 
 ### Tier 2 — Reference Indexes
 
 | Document | Status | Notes |
 |----------|--------|-------|
-| WDP-COMP-INDEX.md | ✅ Created — v1.0 | 50 components registered. Upload to project folder. |
-| WDP-KAFKA.md | ✅ Created — v1.0 Skeleton | Pre-populated from COMPONENTS.md Part 3. Enrichment ongoing. |
-| WDP-DB.md | ✅ Created — v1.0 Skeleton | Pre-populated from COMPLETE component sections. Enrichment ongoing. |
+| WDP-COMP-INDEX.md | ✅ Current — v2.0 | All 50 components registered and statuses updated April 2026. |
+| WDP-KAFKA.md | ✅ Current — v2.0 | Fully populated from all component files April 2026. |
+| WDP-DB.md | ✅ Current — v2.0 | Fully populated from all component files April 2026. |
 | WDP-FLOW-INDEX.md | ✅ Created — v1.0 Skeleton | 11 core flows identified. None documented yet. |
-| WDP-COMP-TEMPLATE.md | ✅ Created — v1.1 | Master template with 4 type blocks. Upload to project folder. |
+| WDP-COMP-TEMPLATE.md | ✅ Created — v1.1 | Master template with 4 type blocks. |
 
 ### Tier 3 — Individual Component Files
 
 | Status | Count | Details |
 |--------|-------|---------|
 | ✅ COMPLETE (individual file created and confirmed) | 1 | COMP-13 FileAcknowledgementProcessor |
-| 📝 DRAFT (individual file created, architect confirmation pending) | 16 | COMP-01 API Gateway, COMP-02 UAMS, COMP-03 CHAS, COMP-04 NAPDisputeEventService ⚠️ decommission-scoped, COMP-05 NAPDisputeEventProcessor ⚠️ decommission-scoped, COMP-06 NAPDisputeDeclineBatch ⚠️ decommission-scoped, COMP-07 VisaDisputeBatch, COMP-08 FirstChargebackBatch, COMP-09 CaseFillingBatch, COMP-11 FileProcessor, COMP-12 InboundDisputeEventScheduler, COMP-14 CaseCreationConsumer, COMP-15 EvidenceConsumer, COMP-16 BusinessRulesProcessor, COMP-17 CaseExpiryUpdateConsumer, COMP-18 NotificationOrchestrator |
-| 📋 PENDING | 20 | COMP-19 through COMP-50 (excluding above) |
-| ⬜ NOT STARTED | 2 | COMP-44 (EDIAConsumer), COMP-48 (NYCEFileGenerationProcessor) |
+| 📝 DRAFT (individual file created, architect confirmation pending) | 40 | COMP-01 through COMP-43 (excluding COMP-10, COMP-13, COMP-33, COMP-44) |
+| 📋 PENDING (enterprise-owned, lower priority) | 1 | COMP-10 DM Mainframe |
+| ⬜ NOT STARTED | 6 | COMP-33 (OrgManagementService — no repo found), COMP-44 (EDIAConsumer — planned), COMP-45, COMP-46, COMP-47 (File Generation — planned next sprint), COMP-48 (NYCEFileGenerationProcessor — planned) |
+| 🔲 UI — separate action item | 2 | COMP-49 WDP Merchant Portal, COMP-50 WDP Ops Portal |
 
-Phase 1 migration complete — all 13 COMPLETE components from WDP-COMPONENTS.md now have individual files.
-Phase 2 begins with COMP-14 CaseCreationConsumer.
+**Component migration complete.** All 40 available component DRAFT files have been uploaded and verified.
+**Next phase:** WDP-DECISIONS.md ✅, WDP-INTEGRATIONS.md ✅, WDP-NFRS.md ✅ all complete. Next: WDP-FLOW documents or Archive WDP-COMPONENTS.md.
 
 ### Tier 4 — Workflow Documents
 
 No workflow files exist yet. 11 flows identified in WDP-FLOW-INDEX.md.
-Workflow documentation to be done in parallel with component migration.
+Workflow documentation to be done as a parallel work stream.
 
 ---
 
 ## Current Work Position
 
-**Phase:** Knowledge base restructure — foundation complete,
-component migration starting.
+**Phase:** Component migration COMPLETE. Ready for knowledge base rebuild phase.
 
-**Completed this session:**
-- Designed the four-tier knowledge architecture
-- Defined the component template (WDP-COMP-TEMPLATE.md v1.1)
-  with shared skeleton + four optional type blocks
-- Created WDP-COMP-INDEX.md with all 50 components registered,
-  numbered, and described
-- Created WDP-KAFKA.md skeleton with topic registry and MSK config
-- Created WDP-DB.md skeleton with schema ownership map
-- Created WDP-FLOW-INDEX.md with 11 core flows identified
-- Rewrote WDP-HANDOVER.md to v2.0
+**Completed:**
+- All 40 available component files uploaded and verified (April 2026)
+- WDP-COMP-INDEX.md v2.0 — all statuses and descriptions updated
+- WDP-KAFKA.md v2.0 — fully populated with all confirmed topic, consumer group, and deviation data
+- WDP-DB.md v2.0 — fully populated with all confirmed table ownership across wdp, nap, and external schemas
 
-**Next work: Component Migration — Phase 1 (COMPLETE components)**
+**Next work — Rebuild phase (in priority order):**
 
-Migrate the 13 COMPLETE components from WDP-COMPONENTS.md to
-individual files using WDP-COMP-TEMPLATE.md. These already have
-confirmed content — migration is mostly moving and enriching with
-REST contracts, Kafka contracts, and flow diagrams via Copilot CLI.
+1. ~~**WDP-DECISIONS.md**~~ ✅ COMPLETE — rebuilt April 2026. DEC-011 and DEC-014
+   formally voided. DEC-019 (clear PAN) and DEC-020 (no idempotency) recorded.
+   Deviation maps added to DEC-001, DEC-003, DEC-005. WDP-DECISIONS-ARCHIVE.md
+   removed from project.
 
-Migration order (priority):
-```
-COMP-01  WDP-COMP-01-API-GATEWAY.md
-COMP-02  WDP-COMP-02-UAMS.md
-COMP-03  WDP-COMP-03-CHAS.md
-COMP-04  WDP-COMP-04-NAP-DISPUTE-EVENT-SERVICE.md
-COMP-05  WDP-COMP-05-NAP-DISPUTE-EVENT-PROCESSOR.md
-COMP-06  WDP-COMP-06-NAP-DISPUTE-DECLINE-BATCH.md
-COMP-07  WDP-COMP-07-VISA-DISPUTE-BATCH.md
-COMP-08  WDP-COMP-08-FIRST-CHARGEBACK-BATCH.md
-COMP-09  WDP-COMP-09-CASE-FILLING-BATCH.md
-COMP-11  WDP-COMP-11-FILE-PROCESSOR.md
-COMP-12  WDP-COMP-12-INBOUND-EVENT-SCHEDULER.md
-COMP-13  WDP-COMP-13-FILE-ACK-PROCESSOR.md
-```
+2. ~~**WDP-INTEGRATIONS.md**~~ ✅ COMPLETE — rebuilt April 2026. BEN delivery
+   corrected to Kafka (BEN-owned MSK cluster, not webhook). JustAI confirmed
+   planned only — not in codebase. WDP-INTEGRATIONS-ARCHIVE.md removed.
 
-*(COMP-10 DM Mainframe is enterprise-owned infrastructure — lower priority)*
+3. ~~**WDP-NFRS.md**~~ ✅ COMPLETE — rebuilt April 2026. Circuit breaker and
+   BRE checkpointing references removed (both void). Kafka delivery corrected
+   to at-most-once. Section 6 Platform Risk Register added — 23 confirmed
+   risks, all cross-referenced to WDP-DECISIONS.md v2.0.
+
+4. **WDP-FLOW-[NAME].md files** — document the 11 core flows identified
+   in WDP-FLOW-INDEX.md. Can start in parallel with decisions rebuild.
+
+5. **Archive WDP-COMPONENTS.md** — once DECISIONS/INTEGRATIONS/NFRS
+   are rebuilt, archive alongside WDP-ARCHITECTURE-v1-ARCHIVED.md.
 
 ---
 
@@ -175,13 +166,13 @@ When adding a new component each quarter:
 
 ## How to Start a New Session
 
-**Option A — Starting a component migration session:**
+**Option A — Starting a decisions rebuild session:**
 ```
 "You are my senior architecture partner for WDP.
 Read WDP-HANDOVER.md first, then WDP-COMP-INDEX.md.
-Today I want to migrate [COMP-NN ComponentName] from
-WDP-COMPONENTS.md to its individual component file.
-I will use Copilot CLI to extract the missing sections."
+Today I want to rebuild WDP-DECISIONS.md from the
+confirmed component files. Start with the decisions
+that have the most cross-component impact."
 ```
 
 **Option B — Starting a workflow documentation session:**
@@ -199,147 +190,186 @@ Read WDP-HANDOVER.md first.
 I have a new architecture decision to discuss: [topic]."
 ```
 
+**Option D — Answering a component question:**
+```
+"You are my senior architecture partner for WDP.
+Read WDP-HANDOVER.md first, then WDP-COMP-INDEX.md.
+Question: [specific component or cross-component question]"
+```
+
 **For all sessions:** Claude always searches project knowledge
 before answering. The tier order above is the search priority.
 
 ---
 
-## Copilot CLI Workflow for Component Migration
-
-For each component migration, Ram will:
-
-1. Open the component repository in IntelliJ with Copilot CLI
-2. Identify the component type (REST / Kafka Consumer / Producer / Batch)
-3. Ask type-appropriate questions from WDP-COMP-TEMPLATE.md
-4. Paste Copilot responses into the chat
-5. Claude extracts architecture signal, discards implementation detail,
-   and completes the component file sections
-6. For each completed component, Claude also provides:
-   - Rows to add to WDP-KAFKA.md (if Kafka involved)
-   - Rows to add to WDP-DB.md (table ownership)
-   - Flags for any deviations from platform standards
-7. Ram confirms or corrects
-8. Component file marked ✅ COMPLETE
-
----
-
 ## Confirmed Architectural Facts
 
-- Case-level authorization is FAIL-CLOSED for NAP and PIN.
-  Any exception including timeouts returns 403. The fail-open
-  branch in WDP-COMPONENTS.md is incorrect — Copilot CLI
-  confirmed this from source. Update WDP-COMPONENTS.md when
-  API Gateway section is retired.
-- No CORE platform value exists in gateway source code. How
-  CORE, VAP, and LATAM requests receive case-level authorization
-  is an open question — to be confirmed during platform
-  integration analysis.
-- removeItemFromQueueDisabled flag is a second active operational
-  safety switch present in both COMP-07 VisaDisputeBatch and
-  COMP-08 FirstChargebackBatch. When true, suppresses ALL MarkAsRead /
-  ACK PUT calls globally — items are processed and written to the
-  outbox but remain in the MCM/Visa queue. Confirmed active production
-  configuration. Operations teams must be aware both flags exist.
-
 Do not contradict these without explicit confirmation from Ram.
-- wdp.file_notifications does not exist. The actual table written by COMP-18 NotificationOrchestrator is wdp.file_generation_event. All prior references to file_notifications have been corrected in WDP-ARCHITECTURE.md, WDP-COMP-INDEX.md, and WDP-DB.md.
-- wdp.bre_orchestration_outbox is a shared table with a component discriminator column. COMP-18 writes component=NOTIFICATION_ORCHESTRATOR rows. COMP-12 Scheduler4 writes component=BUSINESS_RULES rows and reads FAILED/PENDING_DEFERRED rows of both types for retry.
-- case-action-events publisher confirmed as COMP-18 NotificationOrchestrator (Filter 1 EXPIRY_EVENT routing). Resolved open question from COMP-17.
+
+**Access and authorization:**
+- Case-level authorization is FAIL-CLOSED for NAP and PIN. Any exception
+  including timeouts returns 403. The fail-open branch in WDP-COMPONENTS.md
+  is incorrect — confirmed from COMP-01 source.
+- No CORE platform value exists in API Gateway source code. How CORE, VAP,
+  and LATAM requests receive case-level authorization is an open question.
+- validateOrgId() is commented out on GET /orgentity in CHAS (COMP-03). Any
+  authenticated PIN-platform caller can query any org hierarchy without scope
+  validation. Confirmed security gap — flag for formal ADR when
+  WDP-DECISIONS.md is rebuilt.
+- COMP-24 CaseActionService has no RBAC enforcement — RestInvoker.authorizeUser()
+  exists but is never called from any controller. Any authenticated WDP service
+  can modify any case action. Security gap flagged for ADR.
+
+**Kafka — platform-wide patterns:**
+- Every confirmed Kafka consumer in WDP uses pre-ACK or mid-flow ACK. This is
+  a platform-wide pattern, not an isolated exception. DEC-005 (commit after
+  full processing) is aspirational — it is not the current implementation.
+- No Kafka DLQ topics exist in WDP. Error handling is via database error tables
+  per consumer (e.g. NAP.DISPUTE_EVENT_CONSUMER_ERROR for COMP-05).
+- No circuit breakers (Resilience4j) anywhere in WDP. Confirmed absent across
+  all 40 component files.
+- business-rules topic has five confirmed publishers: COMP-12 Scheduler4,
+  COMP-15 EvidenceConsumer, COMP-23 CaseManagementService, COMP-24
+  CaseActionService, COMP-25 NotesService. All use caseNumber as partition
+  key — DEC-003 deviation platform-wide. COMP-14 CaseCreationConsumer
+  candidacy still unverified.
+- wdp.bre_orchestration_outbox is shared between COMP-18
+  (component=NOTIFICATION_ORCHESTRATOR rows) and COMP-12 Scheduler4
+  (component=BUSINESS_RULES rows). The component discriminator column
+  determines routing. PUBLISHED-status orphan rows have no automatic
+  re-drive — manual intervention required.
+- case-action-events publisher confirmed as COMP-18 NotificationOrchestrator
+  (Filter 1 EXPIRY_EVENT routing).
+- wdp.file_notifications does not exist. The actual table is
+  wdp.file_generation_event. Corrected in all documents.
+- COMP-43 CoreNotificationConsumer is the sole WDP component that writes to
+  IBM DB2 Core Platform (BC.TBC_DM_CASE, BC.TBC_DM_OCCUR, BC.TBC_DM_NOTES).
+  All other DB2 access across the platform is read-only.
+
+**Confirmed DEC violations and voids — all now formally recorded in WDP-DECISIONS.md v2.0:**
+- DEC-011 ⛔ VOID — BRE step checkpointing confirmed never implemented in COMP-16.
+  Formally voided in WDP-DECISIONS.md v2.0. Do not reference as active anywhere.
+- DEC-014 ⛔ VOID — Resilience4j confirmed absent across all 40 component files.
+  Formally voided in WDP-DECISIONS.md v2.0. Do not reference as active anywhere.
+- DEC-004 violation in COMP-23 — clear PAN written to persistent storage on standard
+  case creation. Formally recorded as DEC-019 (Accepted Risk) in WDP-DECISIONS.md v2.0.
+- DEC-001 (transactional outbox) — violated by COMP-04, COMP-15, COMP-16,
+  COMP-19, COMP-20, COMP-23, COMP-24, COMP-25. Deviation map recorded in
+  WDP-DECISIONS.md v2.0.
+- No idempotency on case creation (COMP-23) — formally recorded as DEC-020
+  (Accepted Risk) in WDP-DECISIONS.md v2.0.
+
+**Key confirmed platform facts:**
+- BusinessRulesProcessor (COMP-16) makes direct DB calls to nap.rules /
+  wdp.rules — does NOT call BusinessRulesService (COMP-31).
+- NotificationOrchestrator (COMP-18) does NOT publish to
+  internal-integration-events — that topic is published by AcceptService
+  (COMP-19) and ContestService (COMP-20) only.
+- COMP-22 DisputeService is read-only — it owns no database state, performs
+  no writes. Kafka producer to business-rules is wired but commented out.
+- COMP-28 DisplayCodeService does NOT determine TIER1 eligibility — it
+  returns raw code lists. Eligibility logic belongs to calling services.
+- COMP-38 APILogService has no AOP inside it. Callers hold catch-blocks and
+  invoke this service directly via REST.
+- TokenService (COMP-36) is JWT management only — no relation to PAN
+  tokenisation. Redis hash wdpinternalidptoken:token must be written by an
+  external component not yet identified.
+- COMP-33 OrgManagementService — GitHub repository not found.
+  Documentation deferred.
+- removeItemFromQueueDisabled flag is a second active operational safety
+  switch present in both COMP-07 VisaDisputeBatch and COMP-08
+  FirstChargebackBatch. When true, suppresses ALL MarkAsRead/ACK PUT calls
+  globally. Confirmed active production configuration.
+- saveChildWithMerchant in UAMS (COMP-02) uses @Primary wdpTransactionManager
+  instead of napTransactionManager. All three NAP tables it writes are in the
+  NAP schema. Rollback on failure is not guaranteed. Confirmed bug — assess
+  production impact.
+- BEN notification is delivered via Kafka publish to a BEN-owned MSK cluster
+  using separate SASL/JAAS credentials — NOT via REST or webhook. Confirmed
+  from COMP-42 source and WDP-INTEGRATIONS.md v2.0. WDP-COMP-INDEX.md
+  description corrected.
+- JustAI integration is planned only — no JustAI reference exists anywhere in
+  the COMP-41 codebase. Signifyd is the sole live third-party vendor.
+  WDP-COMP-INDEX.md description corrected. WDP-INTEGRATIONS.md v2.0 records
+  JustAI as planned under Section 5.2.
 
 **Enterprise shared services (not WDP owned):**
-- Akamai — CDN and edge security
+- Akamai — CDN and edge security (Merchant Portal only)
 - APIGEE — B2B API gateway for external merchants
 - IDP — enterprise OAuth 2.0 identity provider (SunGard for NAP)
 - Sterling Mailbox — universal file aggregation hub
 - ControlM — on-premise file transfer agent (bridges Sterling and S3)
 - EDIA platform — enterprise Kafka streaming (not owned by WDP)
+- MS SQL Server (legacy fax system) — shared with legacy systems outside WDP
 
 **WDP owned on-premise:**
 - DM Mainframe — mainframe-to-mainframe file transfers
 - File Transfer Batch — DiscoverHybrid special pull via SFTP
 
-**Key confirmed platform decisions:**
-- No circuit breakers in WDP currently — Resilience4j referenced but
-  not active across all components. COMP-05 and COMP-04 confirmed
-  no circuit breaker.
-- No Kafka DLQ topics — error handling via database error tables
-  per consumer (COMP-05 uses NAP.DISPUTE_EVENT_CONSUMER_ERROR)
-- BusinessRulesProcessor (COMP-16) makes direct DB calls — does NOT
-  call BusinessRulesService (COMP-31)
-- NotificationOrchestrator (COMP-18) does NOT publish to
-  internal-integration-events — that topic is published by AcceptService
-  (COMP-19) and ContestService (COMP-20) only
-- TokenService (COMP-36) is JWT management only — nothing to do with
-  PAN tokenisation
-- NAP dispute data has no full PAN — no EncryptionService call needed
-  for NAP inbound path
-- Ops Portal connects directly to API Gateway — no Akamai
-- Merchant Portal routes through Akamai
-- ChargebackService (COMP-21) is the only WDP service exposed
-  externally via APIGEE
-- WPG 119-response documents go directly to DocumentManagementService
-  via NAPDisputeEventService — bypass Kafka entirely
-- All components run on the same AWS EKS cluster
-- InboundDisputeEventScheduler (COMP-12) polls every 2 minutes
-
 **Planned work (not yet built):**
+- COMP-33 OrgManagementService documentation (no repo found)
 - COMP-44 EDIA Consumer (strategic outbound route)
+- COMP-45, 46, 47 File Generation components (next sprint)
 - COMP-48 NYCE File Generation Processor
+- COMP-49, 50 UI Portal documentation (separate action item)
 - Dashboard Section in both portals
 - NAP inbound migration to common chbk_outbox_row path
 - NAP outbound migration from direct NAP-DPS API to EDIA route
 - LATAM full integration
 - VAP full integration
-
-**Open questions requiring architect confirmation:**
-- business-rules topic publishers — COMP-15 EvidenceConsumer (WDP path, isMultiDocPending=false) and COMP-12 InboundDisputeEventScheduler (Scheduler4, bre_orchestration_outbox rows) both confirmed. COMP-14 CaseCreationConsumer candidacy still unverified — Copilot follow-up required on COMP-14 repo.
-- Publisher of wdp.outgoing_event_outbox — COMP-17 confirmed for EXPIRY_EVENTS channel; other channel writers still TBC
-- wdp.bre_orchestration_outbox publisher — RESOLVED: COMP-18 NotificationOrchestrator writes component=NOTIFICATION_ORCHESTRATOR rows; COMP-12 Scheduler4 writes component=BUSINESS_RULES rows and reads both for retry
-- PROCESSING-only query in Schedulers 3 and 4 (COMP-12) — intentional
-  or processing gap?
-- Scheduler 3 topic routing via channelTypeTopicMap — confirm topics
-- Discover vs DiscoverHybrid inbound/outbound differences
-- Amex vs AmexHybrid differences
-- ACK file rules per source (which sources require ACK, which do not)
-- Queue and skill-based routing logic owner — suspected COMP-30
-  UserQueueSkillService (flagged in COMP-02 UAMS analysis)
-- business-rules topic publishers — COMP-15 EvidenceConsumer (WDP path,  
-  isMultiDocPending=false) and COMP-12 InboundDisputeEventScheduler (Scheduler4, 
-  bre_orchestration_outbox rows) both confirmed. COMP-14 CaseCreationConsumer candidacy still 
-  unverified — Copilot follow-up required on COMP-14 repo.
-- DEC-011 BRE step checkpointing — confirmed NOT IMPLEMENTED in COMP-16. The named steps (VALIDATE, ENRICH, ATTACH_ISSUER_DOC) and checkpoint mechanism described in WDP-ARCHITECTURE-v1-ARCHIVED.md and WDP-DECISIONS.md are aspirational design, not current code. Must be corrected when WDP-DECISIONS.md is rebuilt. Do not reference DEC-011 as active.
-- saveChildWithMerchant in UAMS (COMP-02) uses @Primary
-  wdpTransactionManager instead of napTransactionManager.
-  All three tables it writes (nap_child_entity, nap_merchant,
-  nap_entity_rel) are in the NAP schema. Rollback on failure
-  is not guaranteed. Confirm whether this has caused data
-  integrity issues in production and whether a fix is planned.
-  - validateOrgId() is commented out on GET /orgentity in CHAS
-  (COMP-03). Any authenticated PIN-platform caller can query
-  any org hierarchy without scope validation. Confirmed security
-  gap — flag to team and consider formal ADR when
-  WDP-DECISIONS.md is rebuilt.
+- EDIA route migration for NAP Outcome Processor (COMP-39)
+- JustAI third-party notification integration (COMP-41 planned extension)
 
 ---
 
-## After Component Migration is Complete
+## Open Questions Requiring Architect Confirmation
 
-Rebuild in this order once all 50 component files are confirmed:
+| Question | Source | Action needed |
+|----------|--------|---------------|
+| COMP-14 CaseCreationConsumer — does it publish to business-rules topic after case creation? | COMP-14 open question | Copilot follow-up on COMP-14 repo: "Does CaseCreationConsumer publish to the business-rules Kafka topic after case creation?" |
+| COMP-24 CaseActionService ActionEvent topic — what is the actual topic name (${kafka.topic}) and which component consumes it? | COMP-24 Kafka gap | Confirm from deployment config; likely COMP-39 NAPOutcomeProcessor |
+| wdp.case_expiry downstream consumers — which components read this table? | COMP-17 open question | Copilot follow-up on COMP-17 repo: "Which components read from wdp.case_expiry?" |
+| COMP-36 TokenService — which external component writes the Redis hash wdpinternalidptoken:token? | COMP-36 open question | Team confirmation — the TokenService repo does not contain the Redis writer |
+| PROCESSING-only query in Schedulers 3 and 4 (COMP-12) — intentional or gap? | COMP-12 risk | Architect decision required — Scheduler3/4 query FAILED/PENDING_DEFERRED only, not PROCESSING or PENDING rows |
+| Scheduler 3 topic routing via channelTypeTopicMap — confirm all topic mappings | COMP-12 gap | Confirm EXPIRY_EVENTS→case-action-events; confirm other channel types |
+| Discover vs DiscoverHybrid inbound/outbound differences | COMP-11/file gen | Architect confirmation needed |
+| Amex vs AmexHybrid differences | COMP-11/file gen | Architect confirmation needed |
+| COMP-23 non-atomic cross-datasource write (wdp.dispute_event_change_log within NAP create path) — accepted risk or gap? | COMP-23 risk | Architect decision required — WDP-DECISIONS.md rebuilt but this item not yet formally recorded |
+| COMP-23 no idempotency on case creation — accepted risk? | COMP-23 risk | Architect decision required — concurrent identical requests produce duplicate case records |
+| COMP-26 POST idempotency gap — duplicate POSTs insert new rows | COMP-26 risk | Architect decision — DB unique constraint on (I_CASE, I_ACTION_SEQ) needed? |
+| COMP-24 RBAC gap — RestInvoker.authorizeUser() never called | COMP-24 security | Recorded as DEC-018 (Accepted Risk) in WDP-DECISIONS.md v2.0. Remediation timeline TBC with team. |
+| COMP-03 validateOrgId() commented out on GET /orgentity | COMP-03 security | Raise formal ADR — not yet recorded in WDP-DECISIONS.md v2.0. |
+| nap.rule_group, nap.rule_criteria, nap.rule_action_field write ownership | COMP-31 gap | Confirm whether COMP-32 RulesService or DBA scripts own these |
+| PIN platform enrichment path in COMP-14 — same as CORE (MerchantTransactionService) or distinct? | COMP-14 open question | Architect decision + Copilot follow-up |
+| COMP-29 FaxQueueService eViewer License proxy — is it documented and is there a production runbook? | COMP-29 gap | Team confirmation |
+| wdp.api_route table — which component owns writes? | COMP-01 gap | Confirm from team or infrastructure config |
+| File job terminal status PROCESSING vs COMPLETED — COMP-11 never writes COMPLETED, COMP-13 polls for COMPLETED | COMP-11/13 gap | Architect decision — is ACK generation for successful file jobs broken? |
 
-1. **WDP-DECISIONS.md** — rebuild from component-level decision entries.
-   ~34 decisions identified in COMPLETE components. Many DEC-PLACEHOLDER
-   entries in DRAFT components will surface more.
+---
 
-2. **WDP-INTEGRATIONS.md** — rebuild external system contracts from
-   confirmed component boundary sections.
+## After Knowledge Base is Complete
 
-3. **WDP-NFRS.md** — rebuild from confirmed risk registers across all
-   component files. Platform-wide patterns will be visible once all 50
-   are complete.
+Rebuild in this order:
+
+1. ~~**WDP-DECISIONS.md**~~ ✅ COMPLETE — rebuilt April 2026. 29 decisions
+   registered. DEC-011 and DEC-014 voided. DEC-016 through DEC-023 added.
+
+2. ~~**WDP-INTEGRATIONS.md**~~ ✅ COMPLETE — rebuilt April 2026. All external
+   integration contracts confirmed from component files.
+
+3. ~~**WDP-NFRS.md**~~ ✅ COMPLETE — rebuilt April 2026. 23 platform risks
+   documented in new Section 6 Risk Register.
 
 4. **WDP-FLOW-[NAME].md files** — document the 11 core flows identified
-   in WDP-FLOW-INDEX.md. Can start in parallel with migration.
+   in WDP-FLOW-INDEX.md. Can start in parallel.
 
-5. **Archive WDP-COMPONENTS.md** — once all content is migrated and
-   confirmed in individual files, archive alongside
-   WDP-ARCHITECTURE-v1-ARCHIVED.md.
+5. **Archive WDP-COMPONENTS.md** — once DECISIONS/INTEGRATIONS/NFRS
+   are rebuilt, archive alongside WDP-ARCHITECTURE-v1-ARCHIVED.md.
+
+6. **COMP-33 OrgManagementService** — document when GitHub repo is found.
+
+7. **COMP-45, 46, 47 File Generation** — document when sprint work is
+   complete and repos are available.
+
+8. **UI Portal documentation** — COMP-49 and COMP-50 as a separate
+   action item.
