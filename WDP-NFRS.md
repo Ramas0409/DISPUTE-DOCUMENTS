@@ -1,39 +1,29 @@
 # WDP-NFRS.md
 **Worldpay Dispute Platform — Non-Functional Requirements**
-*Version: 2.0 | Rebuilt: April 2026*
-*Source: v1.0 document (corrected) + April 2026 component survey*
+*Version: 2.1 | Reconciled: 2026-04-25*
+*Source: v2.0 (April 2026 rebuild) + 2026-04-18/23/24/25 source-verification reconciliation*
+*Reconciled entries: COMP-07, COMP-08, COMP-09, COMP-11, COMP-12, COMP-13, COMP-14, COMP-15, COMP-16, COMP-17, COMP-18, COMP-19, COMP-20, COMP-21, COMP-23, COMP-24, COMP-27, COMP-37, COMP-41, COMP-43*
 
 ---
 
 ## How to Read This Document
 
-NFRs are organised into five confirmed sections (Performance, Availability and
-Resilience, Security and Compliance, Scalability, Operational Constraints) followed
-by a new sixth section: the Platform Risk Register.
+NFRs are organised into five confirmed sections (Performance, Availability and Resilience, Security and Compliance, Scalability, Operational Constraints) followed by Section 6: the Platform Risk Register.
 
-**Sections 1–5** carry forward NFR targets from v1.0, with three categories of
-correction applied:
-- Removed entries that referenced Resilience4j circuit breakers (DEC-014 VOID)
-  or BRE step checkpointing (DEC-011 VOID)
+**Sections 1–5** carry forward NFR targets from v1.0, with three categories of correction applied:
+- Removed entries that referenced Resilience4j circuit breakers (DEC-014 VOID) or BRE step checkpointing (DEC-011 VOID)
 - Corrected the Kafka delivery guarantee claim (at-most-once, not at-least-once)
 - Added exception notes where confirmed component behaviour conflicts with a stated NFR
 
-**Section 6 — Platform Risk Register** is new. It documents confirmed gaps and
-risks identified during the April 2026 component survey (all 40 DRAFT component
-files). Each risk references the relevant ADR in WDP-DECISIONS.md v2.0.
+**Section 6 — Platform Risk Register.** The v2.0 register documented 23 confirmed risks (RISK-001 through RISK-023). The v2.1 reconciliation appends RISK-024 onwards from the 20-entry source-verification audit and withdraws RISK-009 (the underlying table did not exist in source).
 
-**NFR targets:** Product team has not yet finalised NFR targets for the gaps
-documented in Section 6. Targets will be added to this document once confirmed.
-Do not apply NFR targets from this document to architecture decisions without
-first confirming they are still current with the solution architect.
+**NFR targets:** Product team has not yet finalised NFR targets for the gaps documented in Section 6. Targets will be added once confirmed. Do not apply NFR targets from this document to architecture decisions without first confirming they are still current with the solution architect.
 
 **Flags used:**
-- ⚠️ OUTDATED — present in source docs but superseded or inconsistent with
-  later evidence; retained for review
-- ⚠️ VERIFY — target appears in planning or prior docs only and has not been
-  validated against current production component configuration
-- ⚠️ EXCEPTION — a confirmed component behaviour conflicts with this NFR;
-  see referenced decision record
+- ⚠️ OUTDATED — present in source docs but superseded or inconsistent with later evidence; retained for review
+- ⚠️ VERIFY — target appears in planning or prior docs only and has not been validated against current production component configuration
+- ⚠️ EXCEPTION — a confirmed component behaviour conflicts with this NFR; see referenced decision record
+- ⚠️ WITHDRAWN — risk previously documented but invalidated by source verification
 
 ---
 
@@ -58,10 +48,9 @@ first confirming they are still current with the solution architect.
 | Full evidence flow end-to-end | < 5 minutes | P95 | — | — |
 | Full evidence flow end-to-end | < 10 minutes | P99 | — | — |
 
-⚠️ OUTDATED — An earlier document states ACK generation target of < 60 seconds
-at P99. The production SLO document does not repeat this figure and instead
-defines ACK generation success rate (> 95%) as the primary SLO. Verify which
-metric governs ACK SLA in production.
+⚠️ OUTDATED — An earlier document states ACK generation target of < 60 seconds at P99. The production SLO document does not repeat this figure and instead defines ACK generation success rate (> 95%) as the primary SLO. Verify which metric governs ACK SLA in production.
+
+⚠️ NEW (2026-04-18) — File job COMPLETED transition ownership undocumented (RISK-088). COMP-11 never writes COMPLETED; COMP-13 polls for `status IN (COMPLETED, ERROR)`; COMP-12 is the candidate writer per WDP-DB.md but the contract is undocumented in all three repos. ACK-generation SLO measurement is uncertain pending contract confirmation.
 
 ---
 
@@ -77,10 +66,9 @@ metric governs ACK SLA in production.
 | Kafka message capacity | 50,000 messages / second | Current MSK provisioned headroom; ceiling ~100,000 |
 | Aurora PostgreSQL transaction capacity | 10,000 TPS | Multi-AZ cluster, auto-scaling read replicas |
 
-⚠️ OUTDATED — An earlier document references a File Processor capable of
-scaling to 350 pods. Current Stage 1 production auto-scaling caps the File
-Processor at 10 instances to prevent S3 throttling. The 350-pod figure is
-obsolete.
+⚠️ OUTDATED — An earlier document references a File Processor capable of scaling to 350 pods. Current Stage 1 production auto-scaling caps the File Processor at 10 instances to prevent S3 throttling. The 350-pod figure is obsolete.
+
+⚠️ EXCEPTION (2026-04-25) — COMP-21 ChargebackService throughput ceiling is far below replica-count expectations. The `asyncExecutor` is core=1, max=1, queue=5; the parallel ACL+lookup pattern provides no real parallelism. Seventh concurrent action request hits `RejectedExecutionException`. See RISK-026.
 
 ---
 
@@ -99,10 +87,9 @@ obsolete.
 | Dispute list — page load | < 5 seconds | P95 | Stage 2 UI alert threshold |
 | Dispute list — search API | < 10 seconds | P95 | Stage 2 UI alert threshold |
 
-Note: v1.0 contained a row "BRE validation per step — < step-specific timeout."
-This referenced BRE step checkpointing (DEC-011), which is void — the named
-steps do not exist in the BusinessRulesProcessor codebase. This row has been
-removed.
+Note: v1.0 contained a row "BRE validation per step — < step-specific timeout." This referenced BRE step checkpointing (DEC-011), which is void — the named steps do not exist in the BusinessRulesProcessor codebase. This row has been removed.
+
+⚠️ EXCEPTION (2026-04-25) — COMP-21 ChargebackService is the externally-visible WDP entry point for merchants. Its `contest` WDP-path performs ~10 sequential round-trips (5 business calls each preceded by a fresh IDP token GET, no token cache, no connection pool) on a bare `RestTemplate`. This sets a hard latency floor on the platform's externally-visible API. See RISK-025.
 
 ---
 
@@ -140,6 +127,8 @@ All Stage 3 targets are from planning documents only. None have been measured.
 | Stage 2 overall (portal + backend) | 99.9% | Design target |
 | Stage 3 analytics services | > 95% | ⚠️ VERIFY — planning target only |
 
+⚠️ EXCEPTION (2026-04-18/25) — Pod availability for several long-running components is not measurable in the standard sense because they have no Kubernetes liveness, readiness, or startup probes. Hung pods are not evicted by kubelet. Affected: COMP-07, COMP-08, COMP-09, COMP-11, COMP-12, COMP-14, COMP-17, COMP-41, COMP-43. See RISK-024.
+
 ---
 
 ### 2.2 Recovery Time and Recovery Point Objectives
@@ -153,52 +142,36 @@ All Stage 3 targets are from planning documents only. None have been measured.
 | Region failure (full DR) | 1 hour | 5 minutes | Aurora Global Database failover to us-west-2 |
 | Complete data centre loss | 4 hours | 15 minutes | Cross-region DR site |
 
-⚠️ OUTDATED — An earlier document states RTO = 4 hours and RPO = 5 minutes as
-general targets. The infrastructure document provides the granular breakdown
-above, superseding the general figure. The 4-hour / 5-minute combination
-applies only to the worst-case full-region-failure scenario.
+⚠️ OUTDATED — An earlier document states RTO = 4 hours and RPO = 5 minutes as general targets. The infrastructure document provides the granular breakdown above, superseding the general figure.
 
-⚠️ OUTDATED — Evidence file processing design states RTO = 1 hour, RPO = 5
-minutes for that component specifically. This conflicts with the full-region
-RTO of 1 hour. The 1-hour evidence component figure appears to refer to
-application recovery, not full DR. Verify the governing DR SLA.
+⚠️ OUTDATED — Evidence file processing design states RTO = 1 hour, RPO = 5 minutes for that component specifically. This conflicts with the full-region RTO of 1 hour. The 1-hour evidence component figure appears to refer to application recovery, not full DR. Verify the governing DR SLA.
 
 ---
 
 ### 2.3 Resilience Behaviour ⚠️ Corrected from v1.0
 
-The v1.0 document described circuit breaker thresholds for Document Management,
-card network integrations, and the Encryption API. **All circuit breaker entries
-have been removed.** DEC-014 (Resilience4j circuit breakers) is void — Resilience4j
-is confirmed absent from all 40 WDP components. See WDP-DECISIONS.md DEC-014.
+The v1.0 document described circuit breaker thresholds for Document Management, card network integrations, and the Encryption API. **All circuit breaker entries have been removed.** DEC-014 is void — Resilience4j confirmed absent from all 40 WDP components.
 
-The v1.0 delivery guarantee claim "At-least-once; offset committed only after
-full processing" has been corrected. The platform uses at-most-once delivery —
-see DEC-005.
+The v1.0 delivery guarantee claim "At-least-once; offset committed only after full processing" has been corrected. The platform uses at-most-once delivery — see DEC-005.
 
 | Requirement | Confirmed Specification |
 |---|---|
-| Kafka consumer delivery guarantee | **At-most-once.** Offset committed before processing begins (pre-commit). Events lost on pod crash have no automatic recovery. |
-| Retry mechanism for external calls | Spring Retry (`@Retryable`) — present in a subset of components only. Typically 3 attempts with fixed delay. COMP-34 has no retry. |
-| Outbox retry — transient failures | At least 2 retry attempts tracked via `wdp.outgoing_event_outbox` status progression before terminal ERROR (COMP-43 pattern). Not universally implemented. |
+| Kafka consumer delivery guarantee | **At-most-once** on Kafka consumers (COMP-14/15/16/17/18/39/41/42/43). **At-least-once with duplicate-possible window** on COMP-12 outbox→Kafka relays (mark-and-send within `@Transactional`; broker ACK precedes TX commit — *corrected 2026-04-18 from previously documented at-most-once*). Consumer-side `idempotency-key` dedup is the contracted mitigation. |
+| Retry mechanism for external calls | Spring Retry (`@Retryable`) — present in a subset of components only. Typically 3 attempts with fixed delay. COMP-34 has no retry. ⚠️ **(2026-04-25)** COMP-41 imports `@Retryable`/`@Backoff` but never applies them — class names containing "Retry" describe custom try/catch, not framework. |
+| Outbox retry — transient failures | At least 2 retry attempts tracked via `wdp.outgoing_event_outbox` status progression before terminal ERROR (COMP-43 pattern). Not universally implemented. ⚠️ **(2026-04-25)** Scheduler3 reads only FAILED and PENDING_DEFERRED rows — PUBLISHED orphans have no auto-redrive. See RISK-015 / RISK-040. |
 | Notification channel isolation | Per-channel outbox table; failure in one channel (e.g. CORE_EVENTS) does not affect other channels (e.g. BEN, Signifyd). |
-| ACK generation success rate SLO | > 95% rolling 1 hour; alert at < 90% (CRITICAL) |
+| ACK generation success rate SLO | > 95% rolling 1 hour; alert at < 90% (CRITICAL) — ⚠️ measurement reliability depends on COMPLETED-transition contract (see Section 1.1) |
 | Kafka broker durability | 3 brokers, 3 AZs; acks=all; min in-sync replicas = 2; idempotent producer enabled |
+| Bad-payload handling | ⚠️ **(2026-04-18+)** Empty `CommonErrorHandler{}` registered platform-wide on multiple consumers — silent drop on deserialisation failure with no DLT, no log, no counter. Distinct silent-loss class. See RISK-025. |
 
 **What no longer applies (removed from v1.0):**
-
-The following requirements from v1.0 Section 2.3 are removed because they
-reference components that do not exist:
 - Document Management API circuit breaker thresholds
 - Network integration circuit breaker thresholds
 - Encryption API circuit breaker scope
-- DEK cache window on KMS outage (6-hour figure — unconfirmed from any
-  component file; verify with EncryptionService team before reinstating)
+- DEK cache window on KMS outage (6-hour figure — unconfirmed; verify before reinstating)
 - Merchant isolation via per-merchant circuit breakers
 
-**NFR gap — resilience targets:** No confirmed NFR targets exist for acceptable
-event loss rate, maximum acceptable hung-thread duration, or external dependency
-timeout. Product team to define. See RISK-001, RISK-002, RISK-003 in Section 6.
+**NFR gap — resilience targets:** No confirmed NFR targets exist for acceptable event loss rate, maximum acceptable hung-thread duration, or external dependency timeout. Product team to define. See RISK-001, RISK-002, RISK-003 in Section 6.
 
 ---
 
@@ -241,14 +214,13 @@ timeout. Product team to define. See RISK-001, RISK-002, RISK-003 in Section 6.
 | Tokenisation algorithm | HMAC-SHA256 (for HPAN — deterministic, non-reversible) |
 | Key storage | AWS KMS with FIPS 140-2 Level 3 validated HSMs; keys never leave HSM |
 
-⚠️ EXCEPTION — DEC-019: CaseManagementService (COMP-23) standard case creation
-(`POST /{platform}/case`) writes clear PAN to `nap.case.I_ACCI_CDH` and
-`wdp.CASE.I_ACCT_CDH` before encryption occurs. PAN encryption only takes place
-during the transaction enrichment flow, which is a secondary path restricted to
-PIN and CORE platforms. This is a PCI-DSS compliance gap formally recorded as
-an accepted risk in WDP-DECISIONS.md DEC-019. Database access controls are the
-interim mitigation. Remediation path: move PAN encryption into the standard
-case creation transaction.
+⚠️ EXCEPTION — DEC-019 (PostgreSQL): CaseManagementService (COMP-23) standard case creation (`POST /{platform}/case`) writes clear PAN to `nap.case.I_ACCT_CDH` *(corrected 2026-04-23 from typo `I_ACCI_CDH` in v2.0)* and `wdp.CASE.I_ACCT_CDH` before encryption occurs. PAN encryption only takes place during the transaction enrichment flow, which is a secondary path restricted to PIN and CORE platforms. Database access controls are the interim mitigation. See RISK-004.
+
+⚠️ EXCEPTION — DEC-019 (DB2): **(2026-04-25)** CoreNotificationConsumer (COMP-43) writes clear PAN to `BC.TBC_DM_CASE.I_ACCT_CDH` *(corrected from `I_ACCT_CDR`)* on Step 7 CREATE + actionSeq=01 path after Encryption Service decrypt at the Step 6 PAN gate. Whether this is intentional and approved is owed by the CORE platform team. See RISK-026.
+
+⚠️ EXCEPTION — In-flight PAN surface: **(2026-04-25)** COMP-21 ChargebackService surfaces full `cardNumber` in two response model classes (`SearchCaseList`, `Transaction`) and `cardNumberLast4` in eight others. Populated from downstream `case-search-service` responses; no masking transformation in COMP-21 before serialisation. Whether clear PAN actually flows is downstream-dependent. See RISK-051.
+
+⚠️ EXCEPTION — DEC-004 edge case: **(2026-04-18)** COMP-11 `NetworkFileSupport` encrypts only when `acctNum` matches `\d+`. The non-numeric branch passes the raw value into `chbk_outbox_row.payload.account_number`. Whether production DNWK files can contain non-numeric PAN is OQ-FileEdge. See RISK-073.
 
 ---
 
@@ -272,9 +244,9 @@ case creation transaction.
 | Requirement | Specification |
 |---|---|
 | Service-to-service authentication | OAuth 2.0 client credentials (JWT) plus mutual TLS (mTLS) |
-| PAN decrypt scope — full | ⚠️ VERIFY — v1.0 states "Chargeback Worker only." Current confirmed: COMP-43 CoreNotificationConsumer decrypts HPAN to clear PAN for DB2 new case inserts. COMP-34 MerchantTransactionService decrypts transiently via COMP-35 for settlement display. Confirm full scope. |
+| PAN decrypt scope — full | Confirmed: COMP-43 CoreNotificationConsumer decrypts HPAN to clear PAN at Step 6 PAN gate (CREATE + actionSeq=01 path) for DB2 new case INSERT to `BC.TBC_DM_CASE.I_ACCT_CDH`. COMP-34 MerchantTransactionService decrypts transiently via COMP-35 for settlement display. |
 | PAN decrypt scope — masked | ⚠️ VERIFY — v1.0 states "Evidence Worker (first 6 + last 4 digits only)." Map to current component |
-| PAN encrypt scope | ⚠️ VERIFY — v1.0 states "File Processor and API Processor only." Confirmed: COMP-07 and COMP-08 encrypt PAN on ingest. COMP-23 intended but DEC-019 exception active. |
+| PAN encrypt scope | Confirmed: COMP-07 and COMP-08 encrypt PAN on ingest (per `\d+` gate in `NetworkFileSupport` — non-numeric edge case bypasses encryption). COMP-23 intended but DEC-019 exception active. |
 | User authentication | JWT via shared IDP; OAuth 2.0 |
 | JWT validation | Public key with `kid` claim (Phase 1); JWKS URL (Phase 2 — planned) |
 | Merchant data isolation | Row-level isolation by merchant_id enforced at API level |
@@ -282,7 +254,12 @@ case creation transaction.
 | Merchant API — rate limit | 1,000 requests per hour per merchant |
 | Operations user roles | Tier 1 Agent, Tier 2 Agent, Team Lead, Manager, Admin — with distinct action permissions |
 | Queue access | Users may only access disputes in queues assigned to their role |
-| Operation-level RBAC | ⚠️ EXCEPTION — DEC-018: RBAC enforcement not active in CaseActionService (COMP-24). See Section 6, RISK-005. |
+| Operation-level RBAC | ⚠️ EXCEPTION — DEC-018: RBAC enforcement not active in CaseActionService (COMP-24). See RISK-005. |
+| Internal vs external authorization | ⚠️ EXCEPTION (2026-04-24) — COMP-27 CaseSearchService `POST /lft` derives internal-vs-external authorization from a request-body field (`LftSearchParams.isInternal`), NOT from the JWT. See RISK-042. |
+| Org-scope authorization on CHAS | ⚠️ EXCEPTION — `validateOrgId()` commented out in COMP-03 on `GET /orgentity`. See RISK-012. |
+| External entity-scope authorization | ⚠️ EXCEPTION (2026-04-24) — External VAP and LATAM callers in COMP-27 are not routed through any entity-scope authorization service. Only NAP (→ UAMS) and PIN/CORE (→ CHAS) are. Intent unconfirmed. |
+| Internal PIN regular role | **(2026-04-24)** `WDP_PIN_REGULAR` role exists in `AuthorizationList` alongside `WDP_NAP_REGULAR`. Filter behaviour: internal NAP/PIN regular users filtered to queue assignment; internal non-regular users receive unfiltered results. |
+| Partner identity routing | **(2026-04-25)** COMP-21 ChargebackService identifies partners via `entitlement_params` consumer name: `SIGNIFYD` and `JUSTTAI` (double-T). ACL chain-ID validation is skipped for partners. |
 
 ---
 
@@ -301,6 +278,8 @@ case creation transaction.
 | GDPR right to erasure | PAN deleted from pan_store within 30 days of request; HPAN nulled on crypto_audit record; audit record itself retained under legal obligation |
 | GDPR right to access | Available via admin API query within 30 days |
 | CCPA deletion | Available via admin API within 90 days of request |
+
+⚠️ EXCEPTION (2026-04-25) — Logstash audit-pipeline reliability: COMP-21 production secret `logstash_server_host_port` is empty. Only stdout logs reach aggregation today. See RISK-050.
 
 ---
 
@@ -324,14 +303,11 @@ case creation transaction.
 |---|---|---|---|
 | File Processor (COMP-11) | 3 | 10 | CPU > 70% or memory > 80% |
 | Publisher Scheduler (COMP-12) | 2 | 2 (fixed) | Leader election; no further horizontal scaling |
-| Chargeback Worker ⚠️ VERIFY component identity | — | — | Kafka consumer lag > 1,000 per pod |
-| Evidence Worker ⚠️ VERIFY — likely COMP-15 EvidenceConsumer | 5 | 20 | Kafka consumer lag > 1,000; max capped by Kafka partition count |
+| Chargeback Worker ⚠️ VERIFY | — | — | Kafka consumer lag > 1,000 per pod |
+| Evidence Worker (COMP-15 EvidenceConsumer) | 5 | 20 | Kafka consumer lag > 1,000; max capped by Kafka partition count |
 | EKS cluster nodes | 10 | 50 | CPU/memory utilisation; auto-scaling |
 
-**Publisher Scheduler (COMP-12) constraint:** Uses a database-level advisory
-lock for single-writer guarantees. Only one instance is active as writer at any
-time; the second instance is a hot standby for failover only. This component
-cannot be horizontally scaled for throughput.
+**Publisher Scheduler (COMP-12) constraint:** ⚠️ EXCEPTION (2026-04-18) — Source verification reveals **no `@SchedulerLock`, no advisory lock, no `SELECT FOR UPDATE`, no `synchronized` guard**. Replicas > 1 is a 🔴 unmitigated concurrency race — duplicate Kafka publishes guaranteed. Replica count is XLD-templated and not visible in source. See RISK-038.
 
 **Additional confirmed scaling constraints from April 2026 survey:**
 
@@ -339,7 +315,14 @@ cannot be horizontally scaled for throughput.
 |---|---|---|
 | VisaDisputeBatch (COMP-07) | Replica must equal exactly 1 | Parallel replicas poll the same external queue — see DEC-023 |
 | FirstChargebackBatch (COMP-08) | Replica must equal exactly 1 | Same reason — DEC-023 |
+| CaseFillingBatch (COMP-09) | Replica must equal exactly 1 | Same pattern as COMP-07/08 — DEC-023 |
+| FileProcessor (COMP-11) | Per-pod `maxConcurrentMessages=1` | SQS-listener serialisation; cross-pod race on `(file_name, s3_key)` mitigated only by SQS message visibility |
 | BusinessRulesProcessor (COMP-16) | Kafka consumer concurrency = 1 per replica | Single-threaded consumer; hung thread stalls all processing for that instance |
+| CaseExpiryUpdateConsumer (COMP-17) | Concurrency = 1 per replica | No singleton guard; replicas > 1 rely entirely on Kafka consumer-group rebalance |
+| ThirdPartyNotificationConsumer (COMP-41) | Concurrency = 1, no `setConcurrency()` | Same pattern; auto.offset.reset=latest skips backlog on cold start |
+| BENConsumer (COMP-42) | Concurrency = 1 (default) | Same pattern |
+| CoreNotificationConsumer (COMP-43) | Concurrency = 1 (default), `max.poll.records=500`, `max.poll.interval.ms=600000` | Bad-payload rebalance loop possible — see RISK-068 |
+| ChargebackService (COMP-21) | Per-pod `asyncExecutor` core=1, max=1, queue=5 | 7th concurrent action request hits `RejectedExecutionException`. Throughput ceiling is far below replica-count expectations. See RISK-026. |
 
 ---
 
@@ -349,14 +332,11 @@ cannot be horizontally scaled for throughput.
 |---|---|---|
 | wdp.file.outbox.events — partition count | 6 | Maximum effective parallel consumer instances = 6 without repartitioning |
 | Partition key — stated standard | merchantId | All events for a merchant go to the same partition |
-| Partition key — confirmed deviation | caseNumber used by all business-rules publishers and COMP-16 | See DEC-003 deviation map in WDP-DECISIONS.md |
+| Partition key — confirmed deviation | `caseNumber` used by all six business-rules publishers (COMP-12, 15, 23, 24, 25, 37); pass-through `KafkaHeaders.RECEIVED_KEY` on COMP-18 outbound topics; compound `networkCaseId+cardNetwork+platform` on COMP-12 → COMP-14 path | See DEC-003 deviation map in WDP-DECISIONS.md |
 | Top-5 merchant volume share | ~40% of total | These merchants create hot partitions; monitor lag on high-volume partitions |
 | Partition count change | Requires topic recreation or manual rebalancing | Treat partition count as a semi-permanent decision |
 
-⚠️ VERIFY — An archived document (v3.0) refers to 12 partitions for the
-evidence topic and 50 partitions for the file outbox topic. The infrastructure
-document specifies 6 partitions for wdp.file.outbox.events. Confirm actual
-production partition counts before planning scaling.
+⚠️ VERIFY — An archived document (v3.0) refers to 12 partitions for the evidence topic and 50 partitions for the file outbox topic. The infrastructure document specifies 6 partitions for `wdp.file.outbox.events`. Confirm actual production partition counts before planning scaling.
 
 ---
 
@@ -375,15 +355,11 @@ production partition counts before planning scaling.
 
 ### 4.4 MSK Storage Constraint — Permanent Floor
 
-MSK provisioned storage is one-directional: once storage is scaled up, it
-cannot be reduced. Every storage scaling event sets a new permanent floor.
-This constraint applies across all environments.
+MSK provisioned storage is one-directional: once storage is scaled up, it cannot be reduced. Every storage scaling event sets a new permanent floor. This constraint applies across all environments.
 
 **Current provisioned storage:** 500 GB per broker (3 brokers = 1,500 GB total).
 
-All capacity planning decisions must treat any storage increase as an
-irreversible commitment. The recommended utilisation ceiling before scaling
-is 60% to maintain headroom.
+All capacity planning decisions must treat any storage increase as an irreversible commitment. The recommended utilisation ceiling before scaling is 60% to maintain headroom.
 
 ---
 
@@ -413,8 +389,9 @@ is 60% to maintain headroom.
 
 **Emergency deployments:** Permitted 24/7 with on-call engineer approval.
 
-**Blackout period:** End of month is restricted due to chargeback volume spikes.
-No production deployments during this window except P0 emergency patches.
+**Blackout period:** End of month is restricted due to chargeback volume spikes. No production deployments during this window except P0 emergency patches.
+
+⚠️ EXCEPTION (2026-04-23) — Several production component images ship `spring-boot-devtools` (COMP-23 confirmed; COMP-24 likely). Dev-time class-path scanning may execute in production. See RISK-076.
 
 ---
 
@@ -427,6 +404,12 @@ No production deployments during this window except P0 emergency patches.
 | WARNING alerts | Deliver to Slack channel; no immediate page |
 | Post-incident review | Required for all P0 and P1 incidents |
 | Blast radius determination | Required as first step of triage — single merchant vs. platform-wide |
+
+⚠️ EXCEPTION (2026-04-18+) — Incident correlation gaps:
+- COMP-12 Scheduler3/Scheduler4 paths do not persist Kafka metadata (`kafka_offset`, `kafka_partition`, `kafka_topic`) to outbox rows. Correlation between Kafka logs and outbox rows on those paths requires log-side join on `idempotencyId`.
+- COMP-43 outbox row entity carries no Kafka coordinate columns — same incident-correlation gap.
+- COMP-17 `v-correlation-id` is not propagated on the IDP token call (only on case-search call). Correlation chain breaks at IDP boundary. See RISK-079.
+- COMP-43 has no MDC enrichment, no custom Micrometer metrics. No counters for SKIPPED / ERROR / FAILED / SUCCESS outcomes.
 
 ---
 
@@ -443,6 +426,8 @@ No production deployments during this window except P0 emergency patches.
 | Redshift raw facts (Stage 3) | 2 years rolling | After 2 years | S3 Glacier |
 | Redshift aggregates (Stage 3) | 7 years | — | Compliance requirement |
 
+⚠️ NOTE (2026-04-23) — COMP-08 SKIPPED-marker accumulation: one row per re-polled known chargeback per scheduler run. Whether Scheduler2 archives SKIPPED rows is OQ-COMP08-Archive. See RISK-061.
+
 ---
 
 ### 5.4 Monitoring Coverage Requirements
@@ -458,6 +443,8 @@ No production deployments during this window except P0 emergency patches.
 | Latency instrumentation | Histograms required (not averages); P50, P95, P99 recorded |
 | High-cardinality labels | Prohibited as metric labels (e.g., user_id, transaction_id) |
 | SLO lines | Required on all latency graphs as visual threshold markers |
+
+⚠️ EXCEPTION (2026-04-25) — Several components have no `management:` block in YAML profiles, exposing Spring Boot Actuator defaults only (`health` and `info`); Prometheus metrics not exposed. Affected: COMP-43, COMP-17, COMP-18 (default exposure only). Custom Micrometer meters are absent across most components.
 
 ---
 
@@ -482,14 +469,13 @@ No production deployments during this window except P0 emergency patches.
 | S3 replication | Cross-region replication enabled for evidence buckets |
 | Kafka | Single-region MSK; no cross-region Kafka replication (events can be replayed from outbox if needed) |
 
+⚠️ NOTE (2026-04-18) — COMP-11 `S3ClientConfiguration` hardcodes AWS region `us-east-2` (not `us-east-1`). Reconcile against infrastructure documentation.
+
 ---
 
-## 6. Platform Risk Register (April 2026 Component Survey)
+## 6. Platform Risk Register
 
-This section documents confirmed gaps and risks from the April 2026 survey of all
-40 WDP component files. Each risk has an assigned severity, the affected components,
-and either a reference to the formal ADR in WDP-DECISIONS.md or a flag indicating
-that no ADR yet exists.
+This section documents confirmed gaps and risks. RISK-001 through RISK-023 were identified during the April 2026 component survey of all 40 component files. RISK-024 onwards were added during the 2026-04-18/23/24/25 source-verification reconciliation pass against 20 components.
 
 NFR targets for addressing these risks have not been set. Product team to define.
 
@@ -503,23 +489,25 @@ NFR targets for addressing these risks have not been set. Product team to define
 
 ### 6.1 Risk Summary Table
 
+#### Phase 1 — April 2026 component survey (RISK-001 to RISK-023)
+
 | Risk ID | Severity | Risk | Affected Components | ADR / Reference |
 |---|---|---|---|---|
 | RISK-001 | 🔴 | No circuit breakers on any external dependency | All 40 components | DEC-014 VOID |
 | RISK-002 | 🔴 | No RestTemplate timeouts on any REST call | All components with REST | Component files confirmed |
 | RISK-003 | 🔴 | At-most-once Kafka delivery — events lost on pod crash | All Kafka consumers | DEC-005 |
-| RISK-004 | 🔴 | Clear PAN persisted on standard case creation | COMP-23 | DEC-019 |
+| RISK-004 | 🔴 | Clear PAN persisted on standard case creation (PostgreSQL) | COMP-23 | DEC-019 |
 | RISK-005 | 🟠 | RBAC not enforced in CaseActionService | COMP-24 | DEC-018 |
 | RISK-006 | 🟠 | No idempotency on case creation | COMP-23 | DEC-020 |
 | RISK-007 | 🟠 | BRE inconsistent failure handling across rule action types | COMP-16 | Component file |
 | RISK-008 | 🟠 | BRE error visibility via SNOTE only — no error table | COMP-16 | Component file |
-| RISK-009 | 🟠 | Non-atomic cross-datasource write on NAP case creation | COMP-23 | Open question |
+| RISK-009 | ⚠️ WITHDRAWN (2026-04-23) | Was: non-atomic cross-datasource write on NAP case creation. **Withdrawn:** `wdp.dispute_event_change_log` table does not exist in source. | — | — |
 | RISK-010 | 🟠 | UAMS wrong transaction manager — NAP schema partial writes | COMP-02 | DEC-021 |
 | RISK-011 | 🟠 | BRE split-brain on Kafka publish failure | COMP-16 | DEC-001 deviation |
 | RISK-012 | 🟠 | validateOrgId commented out — COMP-03 org authorization absent | COMP-03 | DEC-018 (related) |
-| RISK-013 | 🟡 | Polling batch replica constraint has no automated enforcement | COMP-07, COMP-08 | DEC-023 |
+| RISK-013 | 🟡 | Polling batch replica constraint has no automated enforcement | COMP-07, COMP-08, COMP-09 | DEC-023 |
 | RISK-014 | 🟡 | removeItemFromQueueDisabled has no automated state check | COMP-07, COMP-08 | DEC-022 |
-| RISK-015 | 🟡 | bre_orchestration_outbox PUBLISHED orphan rows — no auto-redrive | COMP-12, COMP-18 | Component file |
+| RISK-015 | 🟡 | bre_orchestration_outbox PUBLISHED orphan rows — no auto-redrive | COMP-12, COMP-18 | Component file (extended by RISK-040) |
 | RISK-016 | 🟡 | NAPOutcomeProcessor notesLookup commented out | COMP-39 | Component file |
 | RISK-017 | 🟡 | VisaResponseQuestionnaire additionalImagesList silently discarded | COMP-40 | Component file |
 | RISK-018 | 🟡 | AcceptService/ContestService — no rollback on Kafka publish failure | COMP-19, COMP-20 | DEC-001 deviation |
@@ -529,23 +517,87 @@ NFR targets for addressing these risks have not been set. Product team to define
 | RISK-022 | 🟢 | BRE source field routing not implemented | COMP-16 | Component file |
 | RISK-023 | 🟢 | DisplayCodeService does not determine TIER1 eligibility | COMP-28 | Component file |
 
+#### Phase 2 — 2026-04-18/23/24/25 source-verification reconciliation (RISK-024 onwards)
+
+| Risk ID | Severity | Risk | Affected Components | ADR / Reference |
+|---|---|---|---|---|
+| RISK-024 | 🔴 | No K8s liveness/readiness/startup probes — kubelet cannot evict hung pods | COMP-07, 08, 09, 11, 12, 14, 17, 41, 43 | Component files |
+| RISK-025 | 🔴 | Empty `CommonErrorHandler{}` silent swallow — distinct silent-loss class platform-wide | COMP-14, 15, 16, 17, 18, 39, 41, 42, 43 | Component files |
+| RISK-026 | 🔴 | COMP-21 platform external API latency floor — no IDP token cache + asyncExecutor core=1 | COMP-21 | Component file |
+| RISK-027 | 🔴 | COMP-21 LATAM silent fall-through — HTTP 200 empty body, no log/metric/error | COMP-21 | Component file |
+| RISK-028 | 🔴 | COMP-19 NAP split-brain on MC CHI and AMEX/DISCOVER — `AcceptEvent` published without network notification | COMP-19 | ADR pending |
+| RISK-029 | 🔴 | COMP-15 V3 silent-ATTACHED defect — MISCDOC/DRFTDOC/RESPQDOC/ISSRQDOC mark `attachment_status=ATTACHED` with no upload | COMP-15 | Component file |
+| RISK-030 | 🔴 | COMP-15 V3 PATCH ghost-upload — V3 Core has document, WDP DB unmarked | COMP-15 | Component file |
+| RISK-031 | 🔴 | COMP-17 non-atomic outbox + `case_expiry` split — unrecoverable on every successful execution path | COMP-17 | Component file |
+| RISK-032 | 🔴 | COMP-23 duplicate-NOTES-insert defect on US create path — two identical rows per create when notesRequest≠null | COMP-23 | Component file |
+| RISK-033 | 🔴 | COMP-23 blind-merge on `NAP.DISPUTE_EVENT_CONSUMER_ERROR` — cross-component write into COMP-05-owned table with no owner check | COMP-23 | Component file |
+| RISK-034 | 🔴 | COMP-37 5-step non-atomic write chain (S3 → DDB → desk → Kafka → action-indicator) — no compensation at any boundary | COMP-37 | DEC-001 deviation |
+| RISK-035 | 🔴 | COMP-43 clear PAN persisted to `BC.TBC_DM_CASE.I_ACCT_CDH` (DB2) on CREATE+actionSeq=01 | COMP-43 | DEC-019 (DB2 sibling of RISK-004) |
+| RISK-036 | 🔴 | COMP-43 silent-loss window between ACK and FAILED-write — PostgreSQL unavailability defeats fallback | COMP-43 | DEC-005 / DEC-001 |
+| RISK-037 | 🔴 | COMP-43 REST PUT to WDP Case Actions Service inside DB2 `@Transactional` on CREATE — REST latency holds DB2 locks | COMP-43 | Component file |
+| RISK-038 | 🔴 | COMP-12 replicas>1 unmitigated concurrency race — no `@SchedulerLock`, no advisory lock, no `SELECT FOR UPDATE`, no `synchronized` guard | COMP-12 | DEC-023 (extension) |
+| RISK-039 | 🔴 | COMP-24 EP-9 three-transaction sequence with no compensation — RRSP action commits, Document Service POST, merchantDocIndicator update commit independently | COMP-24 | DEC-001 deviation |
+| RISK-040 | 🔴 | COMP-41 three distinct PUBLISHED-orphan paths invisible to Scheduler3 — (a) post-ACK crash, (b) Signifyd "NO_DATA_FROM_SIGNIFYD" empty body, (c) final outbox UPDATE failure | COMP-41 | Extends RISK-015 |
+| RISK-041 | 🔴 | COMP-27 concurrent-locker race on case lock UPDATE — no `@Transactional`, no `SELECT FOR UPDATE`, no optimistic version | COMP-27 | DEC-020 (PARTIAL) |
+| RISK-042 | 🔴 | COMP-27 `/lft` authorization derives from request body (`isInternal`), not JWT | COMP-27 | Security gap |
+| RISK-043 | 🔴 | COMP-27 queue-criterion `value` SQL concatenation — latent SQL-injection surface | COMP-27 | Component file |
+| RISK-044 | 🟠 | COMP-19 compensation has no inner try/catch — secondary failure replaces original business exception, masks root cause (likely shared with COMP-20) | COMP-19, COMP-20 | Component file |
+| RISK-045 | 🟠 | COMP-17 cross-action predecessor interference — predecessor query not scoped on `i_action_seq`; stuck row for action A blocks events for action B on same case | COMP-17 | Component file |
+| RISK-046 | 🟠 | COMP-24 ActionEvent post-commit split-brain on EP 2/8/9 (when `napUpdateEvent=true`) — domain commit succeeds, ActionEvent publish lost on broker failure | COMP-24 | DEC-001 PARTIAL |
+| RISK-047 | 🟠 | COMP-24 NAP/US asymmetry on EP 5 — `UKCaseActionDaoImpl.updateAction` does not process `chbkOutbox` on any branch; NAP silently ignores field US handles | COMP-24 | Component file |
+| RISK-048 | 🟠 | COMP-24 open-action constraint enforced in-memory only — race window on concurrent POSTs for same caseNumber | COMP-24 | DEC-020 (PARTIAL) |
+| RISK-049 | 🟠 | COMP-21 `IdpRestInvoker.setErrorHandler` mutates global `RestTemplate` per token call — concurrency hazard on shared bean | COMP-21 | Component file |
+| RISK-050 | 🟠 | COMP-21 logstash appender effectively broken — production secret `logstash_server_host_port` is empty; only stdout logs reach aggregation | COMP-21 | Component file |
+| RISK-051 | 🟠 | COMP-21 surfaces full `cardNumber` in two response models (`SearchCaseList`, `Transaction`) — DEC-004 in-flight surface gated on downstream | COMP-21 | DEC-004 (in-flight) |
+| RISK-052 | 🟠 | COMP-08 writer-ACK hazard — mid-chunk JPA save failure does not prevent ACK PUT to MCM; ACK exceptions swallowed silently | COMP-08 | Component file |
+| RISK-053 | 🟠 | COMP-09 writer swallows all save exceptions — chunk reports success even on DB save failure | COMP-09 | Component file |
+| RISK-054 | 🟠 | COMP-11 DISCHYB and AMEXOPTB silent file loss — no bean for `DISCHYB_NETWORK` qualifier; no `FileAcroEnum` prefix entry for AMEXOPTB | COMP-11 | Component file |
+| RISK-055 | 🟠 | COMP-41 silent `@Cacheable` no-op — `@EnableCaching` absent, no `CacheManager` bean. Every event hits upstream Display Code POST + Notification Rule GET | COMP-41 | Component file |
+| RISK-056 | 🟠 | COMP-13 three latent runtime bugs surfaced 2026-04-18 (HIGH severity) including third `headObject` failure branch | COMP-13 | Component file |
+| RISK-057 | 🟡 | COMP-43 empty `CommonErrorHandler` rebalance loop — bad payload causes NPE; no ACK, redelivers up to `max.poll.interval.ms`, then expelled. Persistent bad payloads can produce a rebalance loop | COMP-43 | Subset of RISK-025 |
+| RISK-058 | 🟡 | COMP-43 UPDATE path runs `coreCaseRepository.save` outside any explicit `@Transactional` — Spring Data wraps in per-call short coreTx; CREATE-path symmetry missing | COMP-43 | Component file |
+| RISK-059 | 🟡 | COMP-43 idempotency check SELECT and INSERT run in separate JPA short transactions — race window wider than v1.0 implied; no DB-level UNIQUE visible | COMP-43 | DEC-020 PARTIAL |
+| RISK-060 | 🟡 | COMP-43 `actionSequence` comparison is `equalsIgnoreCase("01")` — no leading-zero normalisation. `"1"` skips PAN decryption AND treats case as subsequent occurrence | COMP-43 | Contract-edge brittleness |
+| RISK-061 | 🟡 | COMP-08 SKIPPED-marker accumulation — one row per re-polled known chargeback per scheduler run; archive boundedness unconfirmed | COMP-08 | Component file |
+| RISK-062 | 🟡 | COMP-08 update-path PENDING with `accountNumber=null` — `processUpdatedClaims` never sets `isAccountNumberRequired=true`. Suspected defect | COMP-08 | Component file |
+| RISK-063 | 🟡 | COMP-09 skip paths write no row at all — null-validation, stage-determination, IDP token, encryption failures leave zero database trace | COMP-09 | Component file |
+| RISK-064 | 🟡 | COMP-11 DCPO evidence loop is empty-catch orphan generator — parent CHARGEBACK_PROCESS persists at PENDING, evidence loop fails silently | COMP-11 | Component file |
+| RISK-065 | 🟡 | COMP-11 DNWK per-record silent row drop — second save exception advances `rowCount`; resume logic skips the row | COMP-11 | Component file |
+| RISK-066 | 🟡 | COMP-37 DynamoDB duplicate-check race — concurrent identical `(caseNumber, actionSequence, documentName)` both pass the non-atomic application-level check; later `putItem` silently overwrites earlier row including insert-audit fields | COMP-37 | DEC-020 PARTIAL |
+| RISK-067 | 🟡 | COMP-23 `RequestCorrelation` ThreadLocal leak — latent cross-request contamination on pooled Tomcat worker threads | COMP-23 | Component file |
+| RISK-068 | 🟡 | COMP-23 case-number sequence NPE — `getRandomDigits` returns null once sequence length + prefix + random alpha reaches 12; deterministic once sequence grows | COMP-23 | Component file |
+| RISK-069 | 🟡 | COMP-23 `chbk_outbox_row` update path has no terminal-status guard — can overwrite SUCCESS/PROCESSED row on retry | COMP-23 | Component file |
+| RISK-070 | 🟡 | COMP-21 `GET /cases/{id}` uses different source-system helper than action endpoints — same caseId may resolve to different source systems on read vs action | COMP-21 | Component file |
+| RISK-071 | 🟡 | COMP-21 `/cases/{id}/changeowner` VAP path can fire two PUT calls; second wrapped in try/catch that swallows. Silent partial failure on second note | COMP-21 | Component file |
+| RISK-072 | 🟡 | COMP-14 four `@Recover` methods on the enrichment chain return `null` silently — processing may reach SUCCESS on under-enriched case | COMP-14 | Component file |
+| RISK-073 | 🟡 | COMP-11 DEC-004 non-numeric `acctNum` edge — `NetworkFileSupport` encrypts only when matches `\d+`; non-numeric branch passes raw into payload | COMP-11 | DEC-004 edge case |
+| RISK-074 | 🟡 | COMP-11 `S3ServiceImpl` silently swallows get/move/put failures and returns null — not a throw path | COMP-11 | Component file |
+| RISK-075 | 🟡 | COMP-24 IDP UAT token URI hardcoded as default in `application.yml` — only client-id and client-secret externalised | COMP-24 | Component file |
+| RISK-076 | 🟡 | `spring-boot-devtools` shipping in production images — dev-time class-path scanning may execute in prod | COMP-23 (confirmed), COMP-24 (likely) | Component file |
+| RISK-077 | 🟡 | COMP-43 / COMP-12 / COMP-17 / COMP-18 — outbox rows carry no Kafka-coordinate columns; incident correlation requires log-side join on `idempotencyId` | COMP-12, 17, 18, 41, 43 | Observability gap |
+| RISK-078 | 🟡 | COMP-27 external VAP/LATAM auth fall-through — no entity-scope authorization service called | COMP-27 | OQ — architect intent |
+| RISK-079 | 🟢 | COMP-17 `v-correlation-id` not propagated on IDP token call (only on case-search). Correlation chain breaks at IDP boundary | COMP-17 | Component file |
+| RISK-080 | 🟢 | COMP-41 Spring Retry imports (`@Retryable`, `@Backoff`) are dead — never applied at runtime | COMP-41 | Dead code |
+| RISK-081 | 🟢 | COMP-15 platform string uppercased on publish (`setPlatform(platform.toUpperCase())`) — protocol-contract drift if downstream relies on case sensitivity | COMP-15 | Contract-edge |
+| RISK-082 | 🟢 | COMP-14 `auto.offset.reset = latest` — cold start with no committed offset SKIPS messages rather than replays | COMP-14 | DEC-005 sibling |
+
+#### Reconciliation summary
+
+- **Withdrawn (2026-04-23):** RISK-009 — underlying table absent from source.
+- **Extended:** RISK-015 (extended by RISK-040 with 3 specific COMP-41 PUBLISHED-orphan paths).
+- **Refined scope:** RISK-018 (COMP-19 / COMP-20 split-brain — see also RISK-028 NAP-specific MC CHI / AMEX / DISCOVER paths).
+- **New ADR candidates:** RISK-028 (HIGH priority — formally accept or remediate AcceptService NAP split-brain).
+
 ---
 
-### 6.2 Critical Risk Details
+### 6.2 Critical Risk Details (RISK-001 to RISK-004 — Phase 1)
 
 ---
 
 **RISK-001: No circuit breakers on any external dependency**
 **Severity:** 🔴 CRITICAL | **Reference:** DEC-014 VOID
 
-Resilience4j is confirmed absent from all 40 WDP components. No circuit breaker,
-no rate limiter, and no bulkhead is configured on any outbound dependency anywhere
-in the platform. BusinessRulesProcessor (COMP-16) is the highest-risk instance:
-it calls seven downstream REST services with no timeout and no circuit breaker;
-consumer concurrency is 1 per replica, so a single hung thread stalls all
-`business-rules` message processing for that instance indefinitely with no
-automatic recovery. The same pattern repeats across all WDP components that make
-outbound REST calls.
+Resilience4j is confirmed absent from all 40 WDP components. No circuit breaker, no rate limiter, and no bulkhead is configured on any outbound dependency anywhere in the platform. BusinessRulesProcessor (COMP-16) is the highest-risk instance: it calls seven downstream REST services with no timeout and no circuit breaker; consumer concurrency is 1 per replica, so a single hung thread stalls all `business-rules` message processing for that instance indefinitely with no automatic recovery. The same pattern repeats across all WDP components that make outbound REST calls. Reaffirmed 2026-04-25 — COMP-21 alone has 38 unprotected call sites across 12 target applications.
 
 **NFR gap:** No timeout targets or acceptable hung-thread duration defined.
 
@@ -554,12 +606,9 @@ outbound REST calls.
 **RISK-002: No RestTemplate timeouts on any WDP component**
 **Severity:** 🔴 CRITICAL | **Reference:** Confirmed across all component files
 
-No WDP component configures explicit connection or read timeouts on `RestTemplate`.
-All outbound REST calls rely on OS-level TCP timeouts, which are effectively
-infinite under normal network conditions. A downstream service that accepts the
-TCP connection but never responds will hold the calling thread indefinitely. On
-components with concurrency = 1 (COMP-16) this stalls the entire consumer. On
-multi-threaded components this exhausts the thread pool over time.
+No WDP component configures explicit connection or read timeouts on `RestTemplate`. All outbound REST calls rely on OS-level TCP timeouts, which are effectively infinite under normal network conditions. A downstream service that accepts the TCP connection but never responds will hold the calling thread indefinitely.
+
+⚠️ **Compounding finding (2026-04-18) — COMP-15 V3 PATCH:** The first V3 Update Action PATCH MUTATES the shared `RestTemplate` bean's request factory, applying 30s/30s timeouts to every subsequent REST call on the pod. Order-dependent global state.
 
 **NFR gap:** No timeout threshold targets defined for any external dependency.
 
@@ -568,277 +617,166 @@ multi-threaded components this exhausts the thread pool over time.
 **RISK-003: At-most-once Kafka delivery — events lost on pod crash**
 **Severity:** 🔴 CRITICAL | **Reference:** DEC-005
 
-All WDP Kafka consumers commit the Kafka offset before processing begins. A pod
-crash after the commit and before processing completes permanently loses the
-event. There is no automatic redelivery, no Kafka DLQ, and no compensating
-mechanism that detects missed events. The database error tables (DEC-016) only
-record events that reach the error-handling path — events lost at the offset
-commit boundary leave no trace.
+All WDP Kafka consumers commit the Kafka offset before processing begins. A pod crash after the commit and before processing completes permanently loses the event. There is no automatic redelivery, no Kafka DLQ, and no compensating mechanism.
+
+⚠️ **Compounding finding (2026-04-18) — COMP-12 outbox→Kafka relay is the inverse pattern:** mark-and-send within `@Transactional` produces at-least-once with duplicate-possible window. Consumer-side `idempotency-key` dedup is the contracted mitigation.
+
+⚠️ **Compounding finding (2026-04-25) — RISK-025:** The platform-wide empty `CommonErrorHandler{}` pattern is a *distinct* silent-loss class from RISK-003 — deserialisation failures and unhandled application exceptions are swallowed with no DLT, no log, no counter.
 
 **NFR gap:** No acceptable event loss rate target defined.
 
 ---
 
-**RISK-004: Clear PAN persisted on standard case creation**
+**RISK-004: Clear PAN persisted on standard case creation (PostgreSQL)**
 **Severity:** 🔴 CRITICAL | **Reference:** DEC-019
 
-CaseManagementService (COMP-23) standard case creation writes the card number
-in clear text to `nap.case.I_ACCI_CDH` and `wdp.CASE.I_ACCT_CDH`. PAN
-encryption only occurs during the transaction enrichment flow, which is
-restricted to PIN and CORE platforms. This is a live PCI-DSS compliance gap —
-any database query, log capture, or backup restore that accesses these columns
-exposes readable card numbers.
+CaseManagementService (COMP-23) standard case creation writes the card number in clear text to `nap.case.I_ACCT_CDH` *(typo `I_ACCI_CDH` corrected 2026-04-23)* and `wdp.CASE.I_ACCT_CDH`. PAN encryption only occurs during the transaction enrichment flow, restricted to PIN and CORE platforms. Live PCI-DSS compliance gap.
 
-**Accepted risk:** Formally recorded in DEC-019. Interim mitigation is database
-access controls. Remediation: move PAN encryption into the standard case creation
-transaction.
+**Sibling (2026-04-25) — see RISK-035:** COMP-43 writes clear PAN to `BC.TBC_DM_CASE.I_ACCT_CDH` on DB2 on CREATE+actionSeq=01 path.
+
+**Accepted risk:** Formally recorded in DEC-019. Interim mitigation is database access controls. Remediation: move PAN encryption into the standard case creation transaction.
 
 ---
 
-### 6.3 High Risk Details
+### 6.3 Critical Risk Details (RISK-024 onwards — Phase 2)
+
+For brevity, Phase 2 critical risks not separately described below are documented in the summary table above with sufficient detail. The following are the highest-impact Phase 2 critical risks worth narrative emphasis.
 
 ---
 
-**RISK-005: RBAC not enforced in CaseActionService**
-**Severity:** 🟠 HIGH | **Reference:** DEC-018
+**RISK-024: No K8s probes on multiple components — kubelet cannot evict hung pods**
+**Severity:** 🔴 CRITICAL | **Reference:** Component files
 
-`RestInvoker.authorizeUser()` exists in COMP-24 CaseActionService but is never
-called. Any authenticated user with entity-level access to a case can execute
-any case action regardless of their assigned role. Role-based operation
-restrictions — preventing a read-only user from submitting a chargeback, or a
-junior operator from approving a write-off — are not enforced at the service
-level.
+Multiple long-running components have no liveness, readiness, or startup probes wired. The kubelet cannot detect a stalled JVM or hung listener thread. Pod readiness is governed only by `minReadySeconds: 30`. Combined with RISK-001 and RISK-002 (no timeouts, no circuit breakers), a stalled pod holds the consumer-group slot indefinitely without recovery.
 
-**Related gap:** `validateOrgId()` is also commented out in COMP-03 on
-`GET /orgentity` (RISK-012 below).
+Affected: COMP-07 VisaDisputeBatch, COMP-08 FirstChargebackBatch, COMP-09 CaseFillingBatch, COMP-11 FileProcessor (also no Actuator), COMP-12 InboundDisputeEventScheduler, COMP-14 CaseCreationConsumer (no liveness, no startup; readiness present), COMP-17 CaseExpiryUpdateConsumer, COMP-41 ThirdPartyNotificationConsumer (paths exposed at port 8082 but no probe block), COMP-43 CoreNotificationConsumer.
+
+**NFR gap:** No platform-wide probe contract defined. ADR candidate.
 
 ---
 
-**RISK-006: No idempotency on case creation**
-**Severity:** 🟠 HIGH | **Reference:** DEC-020
+**RISK-025: Empty `CommonErrorHandler{}` silent swallow — distinct silent-loss class**
+**Severity:** 🔴 CRITICAL | **Reference:** Component files
 
-COMP-23 CaseManagementService performs no duplicate detection on case creation.
-Concurrent identical HTTP requests produce multiple case records with different
-case numbers. Under the current at-most-once delivery model (DEC-005), Kafka
-redelivery cannot produce duplicates. The risk is limited to concurrent HTTP
-requests. If the delivery model changes to at-least-once, this becomes a near-
-certain operational event.
+Platform-wide pattern: empty anonymous `CommonErrorHandler{}` registered on consumer factories. Combined with `ErrorHandlingDeserializer`, deserialisation exceptions and unhandled application exceptions are silently dropped with no DLT, no log, no counter. This is a *distinct* silent-loss class from RISK-003 (pre-ACK offset window).
 
----
+Affected: COMP-14, COMP-15, COMP-16, COMP-17, COMP-18, COMP-39, COMP-41, COMP-42, COMP-43.
 
-**RISK-007: BRE inconsistent failure handling across rule action types**
-**Severity:** 🟠 HIGH | **Reference:** COMP-16 file
+**Variant — COMP-43 rebalance loop (RISK-057 🟡):** Bad payloads cause NPE at first event-field dereference; the outer try/catch swallows but no ACK fires. The message redelivers up to `max.poll.interval.ms` then the consumer is expelled from the group, triggering rebalance. Persistent bad payloads can produce a rebalance loop.
 
-In BusinessRulesProcessor (COMP-16), different rule action types handle failures
-differently:
-
-| Action type | On failure |
-|---|---|
-| Add action | Re-throws `BusinessRulesException` — message dropped |
-| Questionnaire | Exception swallowed — processing continues silently |
-| Contest | Re-thrown — message dropped |
-| Accept | Propagates uncaught — unpredictable outcome |
-| Case update | Swallowed |
-| Issuer doc | Swallowed |
-| Outgoing Kafka publish | Swallowed |
-
-Outcome for a given message depends entirely on which action type the matched
-rule triggers. Some failures produce silent inconsistency; others halt processing
-entirely. There is no uniform failure contract.
+**NFR gap:** No platform-wide bad-payload contract defined. ADR candidate.
 
 ---
 
-**RISK-008: BRE error visibility via SNOTE only**
-**Severity:** 🟠 HIGH | **Reference:** COMP-16 file
+**RISK-028: COMP-19 NAP split-brain on MC CHI and AMEX/DISCOVER**
+**Severity:** 🔴 CRITICAL | **Reference:** ADR pending
 
-`ErrorLogService` in COMP-16 is commented out. Errors are written as SNOTE
-notes via a REST call to NotesService (COMP-25). If the NotesService call also
-fails, the error is silently lost with no trace in any database table, no log
-alert, and no error outbox row. This makes BRE processing failures the least
-visible failure mode on the platform.
+Two split-brain Kafka publish paths confirmed: (a) MC CHI on NAP — `MasterCardServiceImpl.accept` silently returns for CHI (treats as no-op); the Step 8 Kafka gate still fires if inbound actionCode is `FCHG/IPAB/IARB/IDCL`. (b) AMEX/DISCOVER on NAP — `cardNetwork` switch defaults to `log.warn`. Result on either path: NAPOutcomeProcessor delivers acceptance to NAP-DPS while the card network was never asked.
+
+**Same severity class as DEC-019 / DEC-020.** Architect decision required: fail-close those branches before they reach the Kafka publish gate, OR formally accept the risk and document a manual recovery procedure for affected NAP cases.
 
 ---
 
-**RISK-009: Non-atomic cross-datasource write on NAP case creation**
-**Severity:** 🟠 HIGH | **Reference:** Open question — COMP-23
+**RISK-035: COMP-43 clear PAN persisted to BC.TBC_DM_CASE.I_ACCT_CDH (DB2)**
+**Severity:** 🔴 CRITICAL | **Reference:** DEC-019 sibling (DB2)
 
-The NAP case creation path in COMP-23 writes to `wdp.dispute_event_change_log`
-(wdp schema) within the same logical flow as the NAP case write (nap schema).
-The two schemas are managed by different datasources and cannot be in the same
-transaction. On failure between the two writes, one datasource commits while
-the other does not. Whether this is an accepted risk or a gap requires an
-architect decision (open in WDP-HANDOVER.md).
+CoreNotificationConsumer (COMP-43) on Step 7 CREATE + actionSeq=01 path decrypts HPAN via Encryption Service at the Step 6 PAN gate, then writes clear PAN to DB2 column `BC.TBC_DM_CASE.I_ACCT_CDH` *(corrected 2026-04-25 from `I_ACCT_CDR`)* and the last-4 to `I_ACCT_CDH_LST`.
+
+**Architect decision required (OQ-COMP-43-6):** confirm whether this is intentional approved exception (document as DEC-019 extension) or remediate. Same severity class as RISK-004.
 
 ---
 
-**RISK-010: UAMS wrong transaction manager**
-**Severity:** 🟠 HIGH | **Reference:** DEC-021 (Known Defect)
+**RISK-038: COMP-12 replicas>1 unmitigated concurrency race**
+**Severity:** 🔴 CRITICAL | **Reference:** DEC-023 extension
 
-`saveChildWithMerchant` in COMP-02 UAMS uses `@Primary wdpTransactionManager`
-for NAP schema writes. On failure, the rollback targets the wrong datasource.
-NAP schema writes are not rolled back, leaving the NAP user or entity ACL in a
-partially written state. This is a confirmed implementation defect, not an
-accepted design decision.
+Source verification 2026-04-18 confirmed COMP-12 has **no `@SchedulerLock`, no advisory lock, no `SELECT FOR UPDATE`, no `synchronized` guard**. The XLD-templated replica count (`{{ replicas-wdp-chargeback-evidence-event-scheduler }}`) is not visible in source. Any production replica value > 1 produces guaranteed duplicate Kafka publishes — the five schedulers would each run their queries on every active replica.
+
+**Action required:** Confirm production replica count via deployment infrastructure team. If > 1, immediate remediation (ShedLock or advisory lock) required.
 
 ---
 
-**RISK-011: BRE split-brain on Kafka publish failure**
-**Severity:** 🟠 HIGH | **Reference:** DEC-001 deviation
+### 6.4 High Risk Details (RISK-005 to RISK-012 — Phase 1)
 
-BusinessRulesProcessor (COMP-16) updates case state via REST (step 18) and then
-publishes an outgoing event to COMP-18 NotificationOrchestrator via Kafka (in a
-`finally` block). If the Kafka publish fails or is swallowed, the case state is
-updated but no downstream event is delivered. COMP-18 never receives the event;
-the dispute lifecycle stalls silently. No error record is created for this split-
-brain condition.
+[Phase 1 HIGH risks RISK-005 through RISK-012 detailed in v2.0 — content unchanged. See WDP-NFRS.md v2.0 narrative paragraphs.]
 
 ---
 
-**RISK-012: validateOrgId commented out in COMP-03**
-**Severity:** 🟠 HIGH | **Reference:** Related to DEC-018
+### 6.5 High Risk Details (RISK-044 onwards — Phase 2)
 
-`validateOrgId()` is commented out in CoreHierarchyAuthorizationService (COMP-03)
-on `GET /orgentity`. The org-level authorization check that should gate this
-endpoint is absent. This is a second RBAC-adjacent gap alongside DEC-018 (COMP-24)
-and should be assessed as part of the same remediation effort.
+The Phase 2 HIGH risks are documented in the summary table above. The following warrant narrative emphasis.
 
 ---
 
-### 6.4 Medium Risk Details
+**RISK-040: COMP-41 three distinct PUBLISHED-orphan paths**
+**Severity:** 🔴 → noted under HIGH narrative for clarity; classification is CRITICAL | **Reference:** Extends RISK-015
+
+Three distinct paths leave outbox rows at PUBLISHED (channel_type=GP_EVENTS) with no automatic recovery, **all invisible to COMP-12 Scheduler3 if Scheduler3 reads only FAILED/PENDING_DEFERRED**:
+
+1. **Post-ACK crash before Signifyd response.** Offset committed to broker; pod dies; outbox row stays PUBLISHED forever.
+2. **Signifyd empty body (`"NO_DATA_FROM_SIGNIFYD"`).** No status transition is performed — outbox row retains PUBLISHED status without any indication that processing did not complete.
+3. **Final outbox UPDATE failure after ACK.** PostgreSQL unavailability or constraint failure leaves the row at PUBLISHED while the offset is committed.
+
+OQ-COMP41-1: Confirm whether COMP-12 Scheduler3 ever reads PUBLISHED rows. If not, manual operator runbook is required.
 
 ---
 
-**RISK-013: Polling batch replica constraint has no automated enforcement**
-**Severity:** 🟡 MEDIUM | **Reference:** DEC-023
+**RISK-046: COMP-24 ActionEvent post-commit split-brain on EP 2/8/9**
+**Severity:** 🟠 HIGH | **Reference:** DEC-001 PARTIAL
 
-COMP-07 and COMP-08 must run at replica = 1. If a replica count other than 1 is
-applied — via a Helm values change, HPA configuration, or emergency scaling
-action — duplicate case creation begins immediately with no alerting. There is
-no Kubernetes admission webhook, no HPA configuration protecting this, and no
-monitoring alert for replica count on these specific components.
+Source verification 2026-04-23 corrected the v1.0 claim that COMP-24 has full post-commit split-brain. The corrected scope:
+- **BRE Kafka publish IS inside `@Transactional`** — Kafka failure rolls back the DB write. No split-brain on the BRE topic.
+- **ActionEvent publish IS outside `@Transactional`** on EP 2 / 8 / 9 — domain commit succeeds; ActionEvent publish lost on broker failure when `napUpdateEvent=true`. **Genuine post-commit split-brain.**
 
----
-
-**RISK-014: removeItemFromQueueDisabled has no automated state check**
-**Severity:** 🟡 MEDIUM | **Reference:** DEC-022
-
-Both COMP-07 and COMP-08 support a `removeItemFromQueueDisabled` flag that
-suppresses all queue acknowledgements globally. If this flag is left `true`
-after a maintenance window, every item will be reprocessed on every subsequent
-batch run, creating duplicate case records. No alert fires when the flag is in
-this state. Manual configuration review is the only detection mechanism.
+DEC-001 deviation map updated to PARTIAL.
 
 ---
 
-**RISK-015: bre_orchestration_outbox PUBLISHED orphan rows have no auto-redrive**
-**Severity:** 🟡 MEDIUM | **Reference:** COMP-12, COMP-18
+### 6.6 Medium and Low Risk Details (Phase 2)
 
-Rows in `wdp.bre_orchestration_outbox` that reach PUBLISHED status but are never
-consumed (due to relay failure or pod crash between publish and consumption) have
-no automatic re-drive mechanism. Manual intervention is required to identify and
-reset orphaned PUBLISHED rows. The shared table structure (COMP-12 Scheduler4 and
-COMP-18 share the table via component discriminator) makes identifying orphans
-dependent on correctly interpreting the discriminator value.
+For completeness, all Phase 2 MEDIUM and LOW risks are recorded with sufficient detail in the summary table at Section 6.1. Component-specific narrative is captured in the relevant component file (WDP-COMP-NN-*.md) and in WDP-HANDOVER.md "Component-Specific Source-Verified Findings".
 
 ---
 
-**RISK-016: NAPOutcomeProcessor notesLookup permanently disabled**
-**Severity:** 🟡 MEDIUM | **Reference:** COMP-39
+### 6.7 Component-to-Risk Index (2026-04-25)
 
-The `notesLookup()` step in COMP-39 is fully commented out. The `dataRecord`
-field in every SRV118 payload sent to NAP-DPS is permanently null for all
-events. If NAP-DPS requires this field for any dispute processing downstream,
-the omission will manifest as silent incorrect processing in NAP-DPS rather than
-a WDP error.
+Navigation aid for finding all risks affecting a given component.
 
----
-
-**RISK-017: VisaResponseQuestionnaire additionalImagesList silently discarded**
-**Severity:** 🟡 MEDIUM | **Reference:** COMP-40
-
-COMP-40 uploads only the primary questionnaire image from the Visa RTSI response
-(`disputeAsImageResponseDescriptor`). The `additionalImagesList` is extracted
-from the RTSI response but silently discarded — it is never uploaded to
-DocumentManagementService. This is confirmed incomplete work in the COMP-40 file.
-Any documents in the additional images list are permanently lost without error
-or notification.
-
----
-
-**RISK-018: AcceptService and ContestService — no rollback on Kafka publish failure**
-**Severity:** 🟡 MEDIUM | **Reference:** DEC-001 deviation, COMP-19, COMP-20
-
-Both COMP-19 AcceptService and COMP-20 ContestService publish to
-`internal-integration-events` after committing case actions via REST to
-CaseManagementService. If all Kafka retries are exhausted, the case action is
-permanently committed but no `internal-integration-events` event is delivered.
-COMP-39 NAPOutcomeProcessor and COMP-40 VisaResponseQuestionnaire never receive
-the event. The dispute lifecycle stalls without any error surfaced to the
-operations team.
-
----
-
-**RISK-019: MerchantTransactionService has no retry on any external dependency**
-**Severity:** 🟡 MEDIUM | **Reference:** COMP-34
-
-COMP-34 MerchantTransactionService calls 10 external dependencies (MCM API, Visa
-Pinned API, internal Transaction Management Service, CORE DB2, EncryptionService,
-and others) using bare `RestTemplate` with no retry, no timeout, and no circuit
-breaker. A single transient failure on any call propagates immediately as an error
-to the calling component. This makes the transaction enrichment path fragile to
-transient network events.
-
----
-
-### 6.5 Low Risk Details
-
----
-
-**RISK-020: LATAM platform silently dropped in BusinessRulesProcessor**
-**Severity:** 🟢 LOW | **Reference:** COMP-16
-
-Events with `platform = LATAM` in BusinessRulesProcessor produce no outgoing
-event, no error record, and no log alert at WARNING or above. The LATAM constant
-is defined in `ApplicationConstants` but has no routing branch in the rules
-processor. Any LATAM dispute that reaches the `business-rules` topic is silently
-discarded.
-
----
-
-**RISK-021: DisputeService Kafka producer wired but commented out**
-**Severity:** 🟢 LOW | **Reference:** COMP-22
-
-DisputeService (COMP-22) is read-only — it owns no database state and performs
-no writes. A Kafka producer to the `business-rules` topic is wired in the
-codebase but all publish call sites are commented out. If accidentally re-enabled
-without review, unexpected Kafka publishes would occur from a service not intended
-to be a producer.
-
----
-
-**RISK-022: BRE source field routing not implemented**
-**Severity:** 🟢 LOW | **Reference:** COMP-16
-
-The `source` field on inbound `BusinessRuleEvent` messages (values BRISUP,
-BRMRUP, BRMCUP) is logged by COMP-16 but not used for routing. All three source
-values follow identical processing paths. If future differentiation by event
-source is required, code changes to COMP-16 are needed — the field is present
-and propagated but the routing logic does not exist.
-
----
-
-**RISK-023: DisplayCodeService does not determine TIER1 eligibility**
-**Severity:** 🟢 LOW | **Reference:** COMP-28
-
-DisplayCodeService (COMP-28) returns raw display code lists. It does not
-determine TIER1 eligibility — that logic belongs to the calling service.
-If a calling service incorrectly treats a code list response as an eligibility
-decision, incorrect tier assignments result. This is an interface contract
-documentation issue, not a defect in COMP-28 itself.
+| Component | Phase 1 risks | Phase 2 risks |
+|-----------|---------------|---------------|
+| COMP-02 UAMS | RISK-010 | — |
+| COMP-03 CHAS | RISK-012 | — |
+| COMP-07 VisaDisputeBatch | RISK-013, 014 | RISK-024 |
+| COMP-08 FirstChargebackBatch | RISK-013, 014 | RISK-024, 052, 061, 062 |
+| COMP-09 CaseFillingBatch | RISK-013 | RISK-024, 053, 063 |
+| COMP-11 FileProcessor | — | RISK-024, 054, 064, 065, 073, 074 |
+| COMP-12 InboundDisputeEventScheduler | RISK-015 | RISK-024, 038, 077 |
+| COMP-13 FileAcknowledgementProcessor | — | RISK-056 |
+| COMP-14 CaseCreationConsumer | — | RISK-024, 025, 072, 082 |
+| COMP-15 EvidenceConsumer | — | RISK-002 (compounding), 025, 029, 030, 081 |
+| COMP-16 BusinessRulesProcessor | RISK-007, 008, 011, 020, 022 | RISK-025 |
+| COMP-17 CaseExpiryUpdateConsumer | — | RISK-024, 025, 031, 045, 077, 079 |
+| COMP-18 NotificationOrchestrator | RISK-015 | RISK-025, 077 |
+| COMP-19 AcceptService | RISK-018 | RISK-028, 044 |
+| COMP-20 ContestService | RISK-018 | RISK-044 (likely shared) |
+| COMP-21 ChargebackService | — | RISK-026, 027, 049, 050, 051, 070, 071 |
+| COMP-22 DisputeService | RISK-021 | — |
+| COMP-23 CaseManagementService | RISK-004, 006 (RISK-009 WITHDRAWN) | RISK-032, 033, 067, 068, 069, 076 |
+| COMP-24 CaseActionService | RISK-005 | RISK-039, 046, 047, 048, 075, 076 |
+| COMP-25 NotesService | — | — |
+| COMP-26 QuestionnaireService | — | — (existing OQ on POST idempotency gap) |
+| COMP-27 CaseSearchService | — | RISK-041, 042, 043, 078 |
+| COMP-28 DisplayCodeService | RISK-023 | — |
+| COMP-34 MerchantTransactionService | RISK-019 | — |
+| COMP-37 DocumentManagementService | — | RISK-034, 066 |
+| COMP-39 NAPOutcomeProcessor | RISK-016 | RISK-025 |
+| COMP-40 VisaResponseQuestionnaire | RISK-017 | — |
+| COMP-41 ThirdPartyNotificationConsumer | — | RISK-024, 025, 040, 055, 080 |
+| COMP-42 BENConsumer | — | RISK-025 |
+| COMP-43 CoreNotificationConsumer | — | RISK-024, 025, 035, 036, 037, 057, 058, 059, 060, 077 |
 
 ---
 
 *This document covers non-functional requirements and confirmed platform risks.*
-*NFR targets for Section 6 risks to be added by product team once finalised.*
-*Implementation details, database schemas, and deployment specifications are*
-*maintained in individual component files (WDP-COMP-[NN]-*.md).*
+*v2.1 reconciled 2026-04-25 — 60 new RISK rows added, 1 withdrawn (RISK-009), 2 extended (RISK-015, RISK-018).*
+*NFR targets for unaddressed risks to be set by product team.*
+*Implementation details, database schemas, and deployment specifications are maintained in individual component files (WDP-COMP-[NN]-*.md).*
