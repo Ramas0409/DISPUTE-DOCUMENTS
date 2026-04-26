@@ -1,7 +1,7 @@
 # WDP-COMP-INDEX.md
 **Worldpay Dispute Platform — Master Component Registry**
-*Version: 1.0 | April 2026*
-*Source: WDP-COMPONENTS.md v1.0 DRAFT + architect review*
+*Version: 2.0 | April 2026*
+*Updated: All component files uploaded and verified April 2026*
 
 ---
 
@@ -74,12 +74,10 @@ is a cross-reference, not a separate service.
 
 **Documentation status:**
 - ✅ COMPLETE — individual component file exists, architect-confirmed
-- 📝 MIGRATING — content migrated from WDP-COMPONENTS.md to
-  individual file, enrichment (REST contracts, Kafka contracts,
-  flow diagrams) in progress
-- 📋 PENDING — not yet migrated to individual file;
-  content still only in WDP-COMPONENTS.md
-- ⬜ NOT STARTED — no content exists yet
+- 📝 DRAFT — individual component file created from Copilot CLI analysis, architect confirmation pending
+- 📋 PENDING — not yet migrated to individual file
+- ⬜ NOT STARTED — no content exists yet (no repo or planned feature)
+- 🔲 UI — tracked as separate action item
 
 ---
 
@@ -89,9 +87,9 @@ is a cross-reference, not a separate service.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 01 | API Gateway | REST API | ✅ Production | 📝 MIGRATING | WDP-COMP-01-API-GATEWAY.md |
-| 02 | UserAccessManagementService | REST API | ✅ Production | 📝 MIGRATING | WDP-COMP-02-UAMS.md |
-| 03 | CoreHierarchyAuthorizationService | REST API | ✅ Production | 📝 MIGRATING | WDP-COMP-03-CHAS.md |
+| 01 | API Gateway | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-01-API-GATEWAY.md |
+| 02 | UserAccessManagementService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-02-UAMS.md |
+| 03 | CoreHierarchyAuthorizationService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-03-CHAS.md |
 
 **01 — API Gateway**
 Single entry point for all WDP traffic. Runs a 4-layer JWT authentication,
@@ -117,9 +115,9 @@ non-NAP platform case-level authorization. Owns no data and performs no writes.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 04 | NAPDisputeEventService ⚠️ Decommission-scoped | REST API + Kafka Producer | ✅ Production | 📝 MIGRATING | WDP-COMP-04-NAP-DISPUTE-EVENT-SERVICE.md |
-| 05 | NAPDisputeEventProcessor ⚠️ Decommission-scoped | Kafka Consumer | ✅ Production | 📝 MIGRATING | WDP-COMP-05-NAP-DISPUTE-EVENT-PROCESSOR.md |
-| 06 | NAPDisputeDeclineBatch ⚠️ Decommission-scoped | Batch/Scheduler | ✅ Production | 📝 MIGRATING | WDP-COMP-06-NAP-DISPUTE-DECLINE-BATCH.md |
+| 04 | NAPDisputeEventService ⚠️ Decommission-scoped | REST API + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-04-NAP-DISPUTE-EVENT-SERVICE.md |
+| 05 | NAPDisputeEventProcessor ⚠️ Decommission-scoped | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-05-NAP-DISPUTE-EVENT-PROCESSOR.md |
+| 06 | NAPDisputeDeclineBatch ⚠️ Decommission-scoped | Batch/Scheduler | ✅ Production | 📝 DRAFT | WDP-COMP-06-NAP-DISPUTE-DECLINE-BATCH.md |
 
 **04 — NAPDisputeEventService**
 REST-to-Kafka bridge for inbound NAP dispute events. Receives SRV-116 events
@@ -132,8 +130,8 @@ without Kafka involvement. Stateless — no database.
 Kafka consumer on nap-dispute-events topic. Translates NAP dispute notifications
 into case management actions via REST calls to downstream services. Classifies
 events as SRV116, WIN/LOSS, or SRV118 by field inspection. Uses at-most-once
-offset commit (deliberate deviation from DEC-005). Database-backed DLQ — no
-Kafka dead-letter topic. Currently in hybrid CB911 migration state.
+offset commit (DEC-005 deviation). Database-backed DLQ — no Kafka dead-letter
+topic. Currently in hybrid CB911 migration state.
 
 **06 — NAPDisputeDeclineBatch**
 Spring Batch job that polls nap.action table for open PAB actions, queries
@@ -222,7 +220,7 @@ and uploads to S3. Documented in WDP-COMPONENTS.md sections 2.3.4 and 5.3.2
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
 | 14 | CaseCreationConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-14-CASE-CREATION-CONSUMER.md |
-| 15 | EvidenceConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-15-EVIDENCE-CONSUMER.md |
+| 15 | EvidenceConsumer | Kafka Consumer + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-15-EVIDENCE-CONSUMER.md |
 | 16 | BusinessRulesProcessor | Kafka Consumer + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-16-BUSINESS-RULES-PROCESSOR.md |
 | 17 | CaseExpiryUpdateConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-17-CASE-EXPIRY-CONSUMER.md |
 | 18 | NotificationOrchestrator | Kafka Consumer + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-18-NOTIFICATION-ORCHESTRATOR.md |
@@ -231,37 +229,42 @@ and uploads to S3. Documented in WDP-COMPONENTS.md sections 2.3.4 and 5.3.2
 Primary case creation component for all non-NAP dispute events. Consumes
 from new-case-events topic. Enriches events with merchant and transaction
 data from the relevant acquiring platform API (CORE via MerchantTransactionService,
-LATAM and VAP via direct API calls). Creates dispute cases in WDP Core via
-CaseManagementService. Handles transient PAN decryption for enrichment calls —
-clear PAN never persisted.
+LATAM and VAP via direct API calls, PIN path TBC). Creates dispute cases in
+WDP Core via CaseManagementService. Handles transient PAN decryption for
+enrichment calls — clear PAN never persisted. Pre-ACK (DEC-005 deviation).
 
 **15 — EvidenceConsumer**
 Consumes from case-evidence-events topic and attaches evidence documents to
-existing dispute cases. Retrieves documents from S3 /staging using path
-reference in the event, then calls DocumentManagementService to store the
-document in S3 with metadata in DynamoDB.
+existing dispute cases. Two paths: WDP path (PIN always; CORE when
+coreMigrationFlag=true) uploads via DocumentManagementService and publishes
+to business-rules; V3 legacy path (CORE when flag=false) queries IBM DB2 and
+uploads to V3 Core endpoint. Pre-ACK (DEC-005 deviation). ⚠️ MISCDOC/DRFTDOC
+document types silently unprocessed — known gap.
 
 **16 — BusinessRulesProcessor**
 Kafka consumer that executes configured business rules against dispute events.
 The execution engine — distinct from BusinessRulesService which manages rule
 definitions. Reads rules directly from Aurora PostgreSQL (no API call to
-BusinessRulesService). Publishes processed events to outgoing-events topic
-for downstream routing. BRE crash recovery via step checkpointing (DEC-011).
+BusinessRulesService). Publishes processed events to outgoing-events and
+conditionally to internal-integration-events (UK/NAP path). Pre-ACK
+(DEC-005 deviation). ⚠️ DEC-011 BRE step checkpointing NOT implemented —
+aspirational design only.
 
 **17 — CaseExpiryUpdateConsumer**
-Consumes from case-action-events (expiry) topic and updates case expiry status
-in WDP Core database. Terminal consumer — no further downstream processing
-triggered from this component.
+Consumes from case-action-events (expiry) topic and maintains wdp.case_expiry
+table — the active expiry schedule per case and action. State-machine driven
+via internal apiName token. Uses wdp.outgoing_event_outbox for idempotency and
+predecessor control. Terminal consumer — no Kafka publish. ⚠️ ACK timing
+inconsistent between Path A (pre-ACK) and Path B (mid-flow ACK).
 
-**18 — NotificationOrchestrator**
+**18 — NotificationOrchestrator** *(repository: wp-mfd/wdp-outgoing-consumer)*
 Central outbound routing component. Consumes from outgoing-events topic and
-routes each event to the appropriate outbound Kafka topic based on code-defined
-routing logic (no config table). Publishes to external-request-events,
-core-request-events, and case-action-events (expiry). Also writes to
-wdp.file_generation_event table (⚠️ previously documented as wdp.file_generation_event
-— that table does not exist) to stage requests for file-based output components.
-Does NOT publish to internal-integration-events (that is AcceptService and
-ContestService).
+fans out to up to four simultaneous outputs via four independent filter methods.
+Publishes to case-action-events, core-request-events, and external-request-events.
+Also writes to wdp.file_generation_event to stage requests for file-based output
+components. Uses wdp.bre_orchestration_outbox for idempotency and retry (component=
+NOTIFICATION_ORCHESTRATOR rows). ACK committed after outbox INSERT but before
+Kafka publishes (DEC-005 deviation). Does NOT publish to internal-integration-events.
 
 ---
 
@@ -269,58 +272,75 @@ ContestService).
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 19 | AcceptService | REST API + Kafka Producer | ✅ Production | 📋 PENDING | WDP-COMP-19-ACCEPT-SERVICE.md |
-| 20 | ContestService | REST API + Kafka Producer | ✅ Production | 📋 PENDING | WDP-COMP-20-CONTEST-SERVICE.md |
-| 21 | ChargebackService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-21-CHARGEBACK-SERVICE.md |
-| 22 | DisputeService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-22-DISPUTE-SERVICE.md |
-| 23 | CaseManagementService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-23-CASE-MANAGEMENT-SERVICE.md |
-| 24 | CaseActionService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-24-CASE-ACTION-SERVICE.md |
-| 25 | NotesService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-25-NOTES-SERVICE.md |
-| 26 | QuestionnaireService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-26-QUESTIONNAIRE-SERVICE.md |
+| 19 | AcceptService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-19-ACCEPT-SERVICE.md |
+| 20 | ContestService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-20-CONTEST-SERVICE.md |
+| 21 | ChargebackService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-21-CHARGEBACK-SERVICE.md |
+| 22 | DisputeService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-22-DISPUTE-SERVICE.md |
+| 23 | CaseManagementService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-23-CASE-MANAGEMENT-SERVICE.md |
+| 24 | CaseActionService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-24-CASE-ACTION-SERVICE.md |
+| 25 | NotesService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-25-NOTES-SERVICE.md |
+| 26 | QuestionnaireService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-26-QUESTIONNAIRE-SERVICE.md |
 
 **19 — AcceptService**
 Processes merchant decisions to accept a dispute. Calls Visa and MasterCard
-APIs directly and synchronously to notify the network of acceptance. For NAP
-disputes across all networks, publishes to internal-integration-events for
-NAP Outcome Processor to notify NAP-DPS.
+APIs directly and synchronously. Publishes AcceptEvent to internal-integration-events
+(caseNumber key — DEC-003 deviation). For NAP disputes, NAPOutcomeProcessor
+delivers the outcome to NAP-DPS. No Kafka DLQ or outbox — DEC-001 deviation.
 
 **20 — ContestService**
 Processes merchant decisions to contest a dispute. Calls Visa and MasterCard
-APIs directly and synchronously. Publishes two event categories to
-internal-integration-events: NAP contest events (all networks) for NAP-DPS
-notification, and Visa contest events (all acquiring platforms) to trigger
-Visa questionnaire retrieval by VisaResponseQuestionnaire.
+APIs directly and synchronously. Publishes ContestEvent to internal-integration-events
+(merchantId key — DEC-003 compliant). Up to 3 publishes per request when CRMR
+action code present. No Kafka DLQ or outbox — DEC-001 deviation.
 
 **21 — ChargebackService**
-The only WDP Core service accessible externally to merchants via APIGEE and
-Akamai. Supports both dispute read and action operations. Also serves as the
-callback endpoint for third-party systems (SignifyD, JustAI) and BEN merchant
-notification platform after they receive dispute notifications.
+Sole externally-exposed WDP REST API accessible to merchants via APIGEE and
+Akamai. Handles both dispute read operations (case search, detail, documents)
+and action operations (contest, accept, add note, change owner, document upload).
+Platform routing derived entirely from inbound caseId format. Two runtime
+authorization modes toggled by entitlement_flag. Third-party systems
+(SignifyD, JustAI, BEN) call back via this service after receiving notifications.
 
 **22 — DisputeService**
-Manages the core dispute lifecycle — state transitions, dispute data retrieval,
-and dispute-level operations. Authoritative service for dispute state.
+Read-and-orchestration layer only — owns no database state, performs no writes.
+Two independent endpoints: POST /summary (dispute summary aggregation from WDP
+Aurora or IBM DB2 depending on core_migration_status flag) and POST
+/{platform}/cases/{caseNumber}/documents (internal-firm document upload
+orchestration). Kafka producer to business-rules is wired but call site is
+commented out in production.
 
 **23 — CaseManagementService**
-Owns the dispute case record. Responsible for case creation, case updates, and
-maintaining the integrity of the case state machine. Authoritative source for
-all case data in WDP. Called by CaseCreationConsumer and NAPDisputeEventProcessor
-as the primary case write target.
+Authoritative owner of the dispute case record across all five platforms (NAP,
+PIN, CORE, VAP, LATAM). Single write target for case creation and updates.
+Owns separate nap and wdp PostgreSQL schemas — never cross-schema in one
+transaction. Publishes BusinessRuleEvent to business-rules Kafka topic
+(caseNumber key — DEC-003 deviation) after every material write.
+⚠️ DEC-004 violation: clear PAN written to persistent storage on standard
+case creation — encryption only occurs during transaction enrichment flow.
 
 **24 — CaseActionService**
-Handles specific case-level actions taken by operations teams — routing a case
-to a queue, writing off a case, splitting a case, or advancing a case through
-the dispute lifecycle. Called by NAPDisputeDeclineBatch to create IDCL draft
-actions.
+Handles all case action lifecycle operations across NAP and US platforms —
+creating, updating, and closing actions; ownership transfers; case open/close
+transitions. Writes wdp.case, wdp.action, nap.case, nap.action, and
+conditionally wdp.chbk_outbox_row and wdp.notes in the same transaction.
+Publishes to business-rules topic and a second ActionEvent topic (${kafka.topic}
+— consumer TBC). ⚠️ No RBAC enforcement — any authenticated caller can modify
+any case action.
 
 **25 — NotesService**
-Allows operations teams and merchants to add notes to a dispute case. Notes
-are retained as part of the immutable case audit trail.
+Platform-aware notes persistence service for all WDP acquiring platforms. Dual
+schema (nap/wdp) — separate JPA entity managers, transaction managers, and
+datasources, never mixed. Publishes AddNotesBREvent to business-rules Kafka
+topic for all non-SNOTE note types. ⚠️ DEC-001 deviation — DB write and Kafka
+publish share @Transactional boundary but are not atomically coupled.
 
 **26 — QuestionnaireService**
-Manages the response questionnaire merchants complete before submitting a
-contest. Captures structured evidence and reasoning submitted to the card
-network as part of the contest response.
+Persistence and retrieval store for all dispute-response questionnaires. Two
+controller families: VisaQuestionnaireController (Representment, Pre-Compliance,
+Pre-Arbitration, Allocation stages) and DisputeQuestionnaireController (non-Visa
++ document-status lookup). Serialises full questionnaire payload as JSON blob
+into wdp.disputes_questionnaire. No Kafka.
+⚠️ POST idempotency gap — duplicate POSTs insert new rows.
 
 ---
 
@@ -328,20 +348,24 @@ network as part of the contest response.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 27 | CaseSearchService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-27-CASE-SEARCH-SERVICE.md |
-| 28 | DisplayCodeService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-28-DISPLAY-CODE-SERVICE.md |
+| 27 | CaseSearchService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-27-CASE-SEARCH-SERVICE.md |
+| 28 | DisplayCodeService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-28-DISPLAY-CODE-SERVICE.md |
 
 **27 — CaseSearchService**
-Provides dispute search capability across the platform. Supports extensive
-filter criteria. Serves both portal UIs and programmatic search requests.
-Also called by VisaDisputeBatch and NAPDisputeDeclineBatch for case lookup
-during ingestion and batch processing.
+Platform-wide read layer for dispute case data across all five acquiring
+platforms. 14 active REST endpoints across six controllers. Platform routing
+via {platform}/{region} path variable selecting between nap.* and wdp.* schemas.
+Case detail endpoints use parallel async fan-out (Spring @Async, 10-thread pool)
+calling up to five downstream services concurrently. Display code lookups
+in-memory cached for JVM lifetime.
 
 **28 — DisplayCodeService**
-Manages mapping between internal WDP codes and human-readable display values
-shown in UI — reason codes, network codes, status codes, action codes. Called
-by NAPDisputeEventService during enrichment to determine TIER1 sub-product
-eligibility from fraud and INR reason code lists.
+Reference-data lookup hub. Returns structured code/description lists for ~40
+code domain types given requested domain names and optional platform filter.
+Secondary function resolves UI tab permissions from wdp.dispute_static_tabs_rules.
+All results cached in-memory (no TTL, no eviction — pod restart only).
+⚠️ Correction: does NOT determine TIER1 eligibility — it returns raw code lists;
+eligibility logic belongs to the calling service.
 
 ---
 
@@ -349,19 +373,22 @@ eligibility from fraud and INR reason code lists.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 29 | FaxQueueService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-29-FAX-QUEUE-SERVICE.md |
-| 30 | UserQueueSkillService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-30-USER-QUEUE-SKILL-SERVICE.md |
+| 29 | FaxQueueService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-29-FAX-QUEUE-SERVICE.md |
+| 30 | UserQueueSkillService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-30-USER-QUEUE-SKILL-SERVICE.md |
 
 **29 — FaxQueueService**
-Handles fax communications sent by merchants to WDP. Operations teams act on
-merchant faxes through this service. Available to Ops Portal users only.
+Manages full lifecycle of inbound fax documents received from merchants. Backend
+for the Fax Queue section of the WDP Ops Portal. Writes to legacy MS SQL Server
+(dbo.IncomingFaxes) and audit records to WDP PostgreSQL (WDP.FAX_ACTION). Also
+bundles an eViewer License Management proxy as a secondary controller group.
+Provides three reporting endpoints including CSV email delivery.
 
 **30 — UserQueueSkillService**
-Manages the relationship between users, queues, and skills. Determines which
-queues a user can access and which cases within those queues are eligible
-based on assigned skills. Likely owns the queue and skill-based routing logic
-referenced in the platform architecture (follow-up required — see UAMS note
-in WDP-COMP-02).
+Manages users, queues, and skills for the WDP platform. Owns upsert of user
+records from JWT claims on portal session start. Manages queue creation and
+assignment, skill creation and assignment, and queue criterion rules.
+Auto-enrols internal users with NAP queue roles into SKILLS_INTERNAL queues
+on first insert.
 
 ---
 
@@ -369,20 +396,23 @@ in WDP-COMP-02).
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 31 | BusinessRulesService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-31-BUSINESS-RULES-SERVICE.md |
-| 32 | RulesService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-32-RULES-SERVICE.md |
+| 31 | BusinessRulesService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-31-BUSINESS-RULES-SERVICE.md |
+| 32 | RulesService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-32-RULES-SERVICE.md |
 
 **31 — BusinessRulesService**
-Provides CRUD management of business rules used in dispute processing. Called
-by portal UIs via API Gateway to add, modify, retrieve, and delete rules.
-Manages rule definitions only — does NOT execute rules. Execution is handled
-by BusinessRulesProcessor (16). Called by VisaDisputeBatch for queue status
-rule lookups.
+CRUD management service for business rules — owns nap.rules, nap.rule_criterion,
+nap.rule_action and wdp equivalents. Portal UIs call this to create, update,
+enable/disable, and delete rules. Read-only for br_case_audit_log
+(GET /audit-log). No Kafka. Rule execution is performed by BusinessRulesProcessor
+(COMP-16) reading directly from these tables — BusinessRulesService is never
+called at execution time.
 
 **32 — RulesService**
-Manages additional configuration rules for dispute routing, queue assignment,
-and case handling behaviour. Works alongside BusinessRulesService to provide
-full rules configuration capability.
+Read-only configuration service. Serves workflow rule configuration, action
+configuration, and stage-locking rules used by the dispute portals. Owns no
+writes — all tables are populated via database migrations or admin tooling.
+Used by portal UIs to determine available actions and locked-out case stages
+for non-migrated merchants.
 
 ---
 
@@ -390,19 +420,23 @@ full rules configuration capability.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 33 | OrgManagementService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-33-ORG-MANAGEMENT-SERVICE.md |
-| 34 | MerchantTransactionService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-34-MERCHANT-TRANSACTION-SERVICE.md |
+| 33 | OrgManagementService | REST API | ✅ Production | ⬜ NOT STARTED | WDP-COMP-33-ORG-MANAGEMENT-SERVICE.md |
+| 34 | MerchantTransactionService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-34-MERCHANT-TRANSACTION-SERVICE.md |
 
 **33 — OrgManagementService**
 Manages organisational hierarchies within WDP. Handles merchant account
 configuration, org-level settings, and routing rule configuration at the
-organisation level.
+organisation level. ⚠️ GitHub repository not found — documentation deferred.
 
 **34 — MerchantTransactionService**
 Provides merchant and transaction data enrichment for CORE acquiring platform
-disputes. Called by CaseCreationConsumer during dispute case creation to fetch
-merchant and transaction details from the CORE platform. LATAM and VAP
-enrichment is handled by CaseCreationConsumer calling those platform APIs directly.
+disputes. Supports six endpoint families: external transaction lookup
+(Visa/CapOne/international), card activity summary, authorisation details,
+chargeback details, settlement details, and case search. Read-only across all
+datasources — owns no database state. Calls EncryptionService (COMP-35) to
+decrypt HPAN before enrichment API calls.
+⚠️ DEC-014 deviation: no timeouts, no circuit breakers on any of 10 outbound
+dependencies.
 
 ---
 
@@ -410,24 +444,25 @@ enrichment is handled by CaseCreationConsumer calling those platform APIs direct
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 35 | EncryptionService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-35-ENCRYPTION-SERVICE.md |
-| 36 | TokenService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-36-TOKEN-SERVICE.md |
-| 37 | DocumentManagementService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-37-DOCUMENT-MANAGEMENT-SERVICE.md |
-| 38 | APILogService | REST API | ✅ Production | 📋 PENDING | WDP-COMP-38-API-LOG-SERVICE.md |
+| 35 | EncryptionService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-35-ENCRYPTION-SERVICE.md |
+| 36 | TokenService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-36-TOKEN-SERVICE.md |
+| 37 | DocumentManagementService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-37-DOCUMENT-MANAGEMENT-SERVICE.md |
+| 38 | APILogService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-38-API-LOG-SERVICE.md |
 
 **35 — EncryptionService**
-Sole component authorised to handle plaintext PAN data in WDP. Encrypts PANs
-at point of ingestion. Provides transient decryption to authorised callers
-(CaseCreationConsumer only). Implements two-token PAN strategy (DEC-007) —
-HPAN for deterministic lookups, EPAN for reversible storage. Uses AWS KMS
-with 6-hour DEK cache (DEC-008). Global dependency — all inbound processing
-halts if this service is unavailable.
+Sole component authorised to handle plaintext PAN data in WDP. Implements
+two-token PAN strategy (DEC-007) — HPAN for deterministic lookups, EPAN for
+reversible storage. Uses AWS KMS with 6-hour DEK cache (DEC-008). Global
+dependency — all inbound processing paths that touch PAN halt if this service
+is unavailable.
 
 **36 — TokenService**
-Centralised JWT token management for all WDP consumers and batch jobs.
-Caches JWT tokens in AWS ElastiCache and refreshes from IDP only on expiry.
-Eliminates per-component IDP integration. Note: has no relation to PAN
-tokenisation — JWT management only.
+Centralised JWT token management for all WDP consumers and batch jobs. Two-layer
+cache: AWS ElastiCache Redis (primary) and Spring in-memory OAuth2 store
+(secondary). Falls through to IDP client_credentials grant only on full cache
+miss. ⚠️ Redis hash must be written by an external component not in this
+repository — identity of that writer is an open question. Note: no relation to
+PAN tokenisation — JWT management only.
 
 **37 — DocumentManagementService**
 Handles evidence document storage and retrieval. Documents stored in S3 with
@@ -437,9 +472,13 @@ VisaResponseQuestionnaire (Visa contest questionnaires), NAPDisputeEventService
 with a DynamoDB dependency.
 
 **38 — APILogService**
-Provides API-level audit logging across the platform. Captures inbound API
-calls for audit, compliance, and operational troubleshooting. Called via AOP
-by components that throw LoggingException (e.g. VisaDisputeBatch).
+Centralised error-log sink. Callers POST structured error records to the single
+endpoint POST /log on error conditions. No AOP inside this service — callers
+hold the catch-block logic and invoke this service directly via REST. Four
+confirmed callers: AcceptService (COMP-19), ContestService (COMP-20),
+CaseActionService (COMP-24), DocumentManagementService (COMP-37).
+⚠️ Correction: prior description of AOP and LoggingException trigger is
+incorrect — confirmed from source.
 
 ---
 
@@ -447,20 +486,23 @@ by components that throw LoggingException (e.g. VisaDisputeBatch).
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 39 | NAPOutcomeProcessor | Kafka Consumer | ✅ Production | 📋 PENDING | WDP-COMP-39-NAP-OUTCOME-PROCESSOR.md |
-| 40 | VisaResponseQuestionnaire | Kafka Consumer | ✅ Production | 📋 PENDING | WDP-COMP-40-VISA-RESPONSE-QUESTIONNAIRE.md |
+| 39 | NAPOutcomeProcessor | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-39-NAP-OUTCOME-PROCESSOR.md |
+| 40 | VisaResponseQuestionnaire | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-40-VISA-RESPONSE-QUESTIONNAIRE.md |
 
 **39 — NAPOutcomeProcessor**
-Consumes from internal-integration-events and delivers dispute outcomes to
-NAP-DPS for NAP acquiring platform money movement. Processes NAP accept events
-(from AcceptService) and NAP contest events (from ContestService) for all
-networks. Direct API call to NAP-DPS — planned migration to EDIA route.
+Consumes internal-integration-events and delivers dispute outcomes to NAP-DPS
+for NAP platform money movement. Filters to platform=NAP only — all other
+platform events silently discarded. Processes both SRV116 (accept/contest)
+and SRV117/SRV118 events. Built-in prior-error reprocessing on each message
+cycle. ⚠️ Pre-ACK (DEC-005 deviation). ⚠️ notesLookup and checkCRMRAction
+both commented out in production. Planned migration to EDIA route.
 
 **40 — VisaResponseQuestionnaire**
-Consumes from internal-integration-events and retrieves the Visa questionnaire
-submitted as part of a merchant contest. Triggered for all acquiring platforms
-whenever a merchant contests a Visa dispute. Calls Visa API, then stores the
-questionnaire via DocumentManagementService (S3 + DynamoDB).
+Consumes internal-integration-events and retrieves the Visa questionnaire
+submitted as part of a merchant contest. Filters to non-null visaResponseIds
+only — AcceptService events silently discarded. Calls Visa RTSI API to retrieve
+questionnaire, then stores via DocumentManagementService (S3 + DynamoDB).
+⚠️ Pre-ACK (DEC-005 deviation).
 
 ---
 
@@ -468,27 +510,34 @@ questionnaire via DocumentManagementService (S3 + DynamoDB).
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 41 | ThirdPartyNotificationConsumer | Kafka Consumer | ✅ Production | 📋 PENDING | WDP-COMP-41-THIRD-PARTY-NOTIFICATION-CONSUMER.md |
-| 42 | BENConsumer | Kafka Consumer | ✅ Production | 📋 PENDING | WDP-COMP-42-BEN-CONSUMER.md |
-| 43 | CoreNotificationConsumer | Kafka Consumer | ✅ Production | 📋 PENDING | WDP-COMP-43-CORE-NOTIFICATION-CONSUMER.md |
+| 41 | ThirdPartyNotificationConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-41-THIRD-PARTY-NOTIFICATION-CONSUMER.md |
+| 42 | BENConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-42-BEN-CONSUMER.md |
+| 43 | CoreNotificationConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-43-CORE-NOTIFICATION-CONSUMER.md |
 | 44 | EDIAConsumer | Kafka Consumer + Kafka Producer | 🔴 Planned | ⬜ NOT STARTED | WDP-COMP-44-EDIA-CONSUMER.md |
 
 **41 — ThirdPartyNotificationConsumer**
-Consumes from external-request-events and delivers dispute event notifications
-to SignifyD and JustAI via REST API. After receiving notification, those systems
-call back ChargebackService to get dispute details and act on disputes.
+Consumes external-request-events and delivers dispute event notifications to
+Signifyd via REST API. Applies own filtering to determine which events require
+third-party notification. After receiving notification Signifyd calls back
+ChargebackService for dispute details. ⚠️ JustAI is planned — no JustAI
+reference exists anywhere in the current codebase. Signifyd is the sole live
+vendor. Confirmed from WDP-INTEGRATIONS.md v2.0.
 
 **42 — BENConsumer**
-Consumes from external-request-events and delivers dispute lifecycle
-notifications to BEN merchant notification platform via webhook. Merchants
-receive notifications via BEN and call back ChargebackService for dispute
-details and actions.
+Consumes external-request-events and delivers dispute lifecycle notifications
+to BEN merchant notification platform via Kafka publish to a BEN-owned MSK
+cluster (separate SASL/JAAS config from WDP MSK). ⚠️ There is no REST or
+webhook call to BEN — delivery is Kafka-only. Merchants receive notifications
+via BEN and call back ChargebackService for dispute details and actions.
+Confirmed from WDP-INTEGRATIONS.md v2.0.
 
 **43 — CoreNotificationConsumer**
-Consumes from core-request-events and delivers dispute outcome notifications
-to the CORE acquiring platform via IBM DB2 direct connection. CORE is WDP-owned
-so has a direct DB2 connection, bypassing the EDIA route used by external
-platforms. Potential future migration to EDIA as EDIA adoption matures.
+Consumes core-request-events and writes dispute case and occurrence records
+to the CORE platform IBM DB2 database (BC.TBC_DM_CASE, BC.TBC_DM_OCCUR,
+BC.TBC_DM_NOTES). Full enrichment via REST calls to CaseManagementService,
+CaseActionsService, NotesService, and EncryptionService before DB2 write.
+Uses wdp.outgoing_event_outbox (channel_type=CORE_EVENTS) for idempotency
+and retry. Sole WDP component that writes to IBM DB2 Core platform.
 
 **44 — EDIAConsumer** *(Planned)*
 WDP-owned anti-corruption layer between WDP internal event format and the
@@ -503,26 +552,29 @@ and VAP acquiring platforms.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 45 | CapitalOneResponseFileProcessor | Batch/Scheduler | ✅ Production | 📋 PENDING | WDP-COMP-45-CAPONE-RESPONSE-FILE-PROCESSOR.md |
-| 46 | NetworkResponseFileProcessor | Batch/Scheduler | ✅ Production | 📋 PENDING | WDP-COMP-46-NETWORK-RESPONSE-FILE-PROCESSOR.md |
-| 47 | DialoguIssuerDocumentProcessor | Batch/Scheduler | ✅ Production | 📋 PENDING | WDP-COMP-47-DIALOGU-ISSUER-DOC-PROCESSOR.md |
+| 45 | CapitalOneResponseFileProcessor | Batch/Scheduler | ✅ Production | ⬜ NOT STARTED | WDP-COMP-45-CAPONE-RESPONSE-FILE-PROCESSOR.md |
+| 46 | NetworkResponseFileProcessor | Batch/Scheduler | ✅ Production | ⬜ NOT STARTED | WDP-COMP-46-NETWORK-RESPONSE-FILE-PROCESSOR.md |
+| 47 | DialoguIssuerDocumentProcessor | Batch/Scheduler | ✅ Production | ⬜ NOT STARTED | WDP-COMP-47-DIALOGU-ISSUER-DOC-PROCESSOR.md |
 | 48 | NYCEFileGenerationProcessor | Batch/Scheduler | 🔴 Planned | ⬜ NOT STARTED | WDP-COMP-48-NYCE-FILE-GENERATION-PROCESSOR.md |
 
 **45 — CapitalOneResponseFileProcessor**
-Reads from wdp.file_generation_event DB table and generates CapitalOne response files.
-Places files in S3 /outbound/capitalOne/ for ControlM to transfer to Sterling
-Mailbox for delivery to CapitalOne via DM Mainframe.
+Reads from wdp.file_generation_event DB table and generates CapitalOne response
+files. Places files in S3 /outbound/capitalOne/ for ControlM to transfer to
+Sterling Mailbox for delivery to CapitalOne via DM Mainframe.
+⬜ Not yet documented — planned next sprint.
 
 **46 — NetworkResponseFileProcessor**
 Reads from wdp.file_generation_event DB table and generates four network response
-files: Amex, AmexHybrid, Discover, and DiscoverHybrid. Each placed in its
-own dedicated S3 /outbound folder. DiscoverHybrid uses a special on-premise
-File Transfer Batch pull via SFTP rather than the standard ControlM push flow.
+files: Amex, AmexHybrid, Discover, and DiscoverHybrid. Each placed in its own
+dedicated S3 /outbound folder. DiscoverHybrid uses a special on-premise File
+Transfer Batch pull via SFTP rather than the standard ControlM push flow.
+⬜ Not yet documented — planned next sprint.
 
 **47 — DialoguIssuerDocumentProcessor**
 Reads from wdp.file_generation_event DB table and generates a ZIP file containing
-all issuer documents received by WDP. Places ZIP in S3 /outbound/dialogu/
-for delivery to merchants via Sterling SFTP to Dialogue.
+all issuer documents received by WDP. Places ZIP in S3 /outbound/dialogu/ for
+delivery to merchants via Sterling SFTP to Dialogue.
+⬜ Not yet documented — planned next sprint.
 
 **48 — NYCEFileGenerationProcessor** *(Planned)*
 Will generate outbound files for PIN Networks (NYCE) and place them in
@@ -535,35 +587,35 @@ S3 /outbound/pinNetworks/ for ControlM to transfer to Sterling → DM Mainframe
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 49 | WDP Merchant Portal | UI Application | ✅ Production | 📋 PENDING | WDP-COMP-49-MERCHANT-PORTAL.md |
-| 50 | WDP Ops Portal | UI Application | ✅ Production | 📋 PENDING | WDP-COMP-50-OPS-PORTAL.md |
+| 49 | WDP Merchant Portal | UI Application | ✅ Production | 🔲 UI — separate action | WDP-COMP-49-MERCHANT-PORTAL.md |
+| 50 | WDP Ops Portal | UI Application | ✅ Production | 🔲 UI — separate action | WDP-COMP-50-OPS-PORTAL.md |
 
 **49 — WDP Merchant Portal**
 Merchant-facing UI. Allows merchants to view disputes, take actions, submit
 evidence, and manage their organisation and users. Routes through Akamai for
 CDN and edge security. Includes Disputes, User Management, and Org Management
-sections. Dashboard section planned. UI sections 7.3–7.6 from WDP-COMPONENTS.md
-are documented within this file.
+sections. Dashboard section planned.
 
 **50 — WDP Ops Portal**
 Internal operations-facing UI. Allows WDP operations teams to manage disputes,
 configure queues, manage users and organisations. Connects directly to API
 Gateway — does not route through Akamai. Includes Disputes, Queues, User
-Management, and Org Management sections. Dashboard section planned. Queue
-and Fax Queue functionality documented within this file.
+Management, and Org Management sections. Dashboard section planned.
 
 ---
+
 ## Migration Progress Summary
 
 | Status | Count | Components |
 |--------|-------|------------|
 | ✅ COMPLETE (individual file created and confirmed) | 1 | COMP-13 FileAcknowledgementProcessor |
-| 📝 DRAFT (individual file created, architect confirmation pending) | 12 | COMP-01 through COMP-14 (excluding COMP-10) |
-| 📋 PENDING (not yet migrated to individual file) | 25 | COMP-15 through COMP-50 (excluding above) |
-| ⬜ NOT STARTED (no content yet) | 2 | COMP-44 (EDIAConsumer), COMP-48 (NYCEFileGenerationProcessor) |
+| 📝 DRAFT (individual file created, architect confirmation pending) | 40 | COMP-01 through COMP-43 (excluding COMP-10, COMP-13, COMP-33, COMP-44) |
+| 📋 PENDING (enterprise-owned, lower priority) | 1 | COMP-10 DM Mainframe |
+| ⬜ NOT STARTED | 6 | COMP-33 (OrgManagementService — no repo found), COMP-44 (EDIAConsumer — planned), COMP-45, COMP-46, COMP-47 (File Generation — planned next sprint), COMP-48 (NYCEFileGenerationProcessor — planned) |
+| 🔲 UI — separate action item | 2 | COMP-49 WDP Merchant Portal, COMP-50 WDP Ops Portal |
 
-**Phase 1 migration complete.** All 13 COMPLETE components from WDP-COMPONENTS.md now have individual files.
-**Next: Phase 2 — DRAFT components.** Start with COMP-14 CaseCreationConsumer.
+**Phase 1 and Phase 2 migration complete.** All 40 available component files created.
+**Remaining:** COMP-33 (no repo), COMP-44/45/46/47/48 (planned features), COMP-49/50 (UI — separate action).
 
 ---
 
@@ -571,7 +623,7 @@ and Fax Queue functionality documented within this file.
 
 | Section in WDP-COMPONENTS.md | Documented in |
 |------------------------------|---------------|
-| Part 3 — Kafka Event Bus (3.1, 3.2) | WDP-KAFKA.md (to be created) |
+| Part 3 — Kafka Event Bus (3.1, 3.2) | WDP-KAFKA.md |
 | Part 6 — Acquiring Platform Integrations (6.1–6.5) | WDP-INTEGRATIONS.md |
 | Part 7.3 — Disputes Section (UI) | WDP-COMP-49 and WDP-COMP-50 |
 | Part 7.4 — Queues Section (UI) | WDP-COMP-50 (Ops Portal only) |
