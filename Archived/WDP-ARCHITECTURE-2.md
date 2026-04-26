@@ -16,42 +16,8 @@
 8. [Outbound Processing](#8-outbound-processing)
 9. [Acquiring Platform Integration](#9-acquiring-platform-integration)
 10. [Cross-Cutting Concerns](#10-cross-cutting-concerns)
-11. [Deployment Context](#11-deployment-context)
-12. [Component Status Registry](#12-component-status-registry)
-
----
-
-## Knowledge Base Navigation
-
-This document covers platform-level topology, principles, and deployment
-context. It is the starting point — not the complete picture.
-
-For deeper detail, use the documents below. Claude searches all project
-files simultaneously, so these cross-references help orient every response
-toward the right source of truth.
-
-| Question type | Go to |
-|---------------|-------|
-| What does component X do? | WDP-COMP-INDEX.md → WDP-COMP-[NN]-*.md |
-| What are the REST endpoints for component X? | WDP-COMP-[NN]-*.md Block A |
-| Which Kafka topics does component X produce or consume? | WDP-COMP-[NN]-*.md Block B/C + WDP-KAFKA.md |
-| Which database tables does component X own? | WDP-COMP-[NN]-*.md + WDP-DB.md |
-| How does a dispute flow end to end? | WDP-FLOW-INDEX.md → WDP-FLOW-*.md |
-| What are the architecture decisions and tradeoffs? | WDP-DECISIONS.md |
-| What does WDP integrate with externally? | WDP-INTEGRATIONS.md |
-| What are the performance and resilience constraints? | WDP-NFRS.md ⚠️ confirm with Ram — may be outdated |
-| What is the current work position and session context? | WDP-HANDOVER.md |
-
-**Document status as of April 2026:**
-- WDP-ARCHITECTURE.md — ✅ Current (this document)
-- WDP-COMP-INDEX.md — ✅ Current (50 components registered)
-- WDP-KAFKA.md — ✅ Skeleton (topic registry, enrichment in progress)
-- WDP-DB.md — ✅ Skeleton (schema map, enrichment in progress)
-- WDP-FLOW-INDEX.md — ✅ Skeleton (11 flows identified, none documented yet)
-- WDP-COMP-[NN]-*.md — 📋 Migration in progress (13 complete, 37 pending)
-- WDP-DECISIONS.md — ✅ Current v2.0 (rebuilt April 2026 — DEC-011 and DEC-014 voided)
-- WDP-INTEGRATIONS.md — ✅ Current v2.0 (rebuilt April 2026)
-- WDP-NFRS.md — ✅ Current v2.0 (rebuilt April 2026 — Risk Register added)
+11. [Deployment Context](#11-deployment-context---to-be-completed)
+12. [Component Status Registry](#12-component-status-registry---to-be-completed)
 
 ---
 
@@ -101,147 +67,7 @@ WDP interacts with four categories of external actors:
 
 **On-Premise File Infrastructure** forms the file exchange boundary between WDP and external systems. This includes the DM Mainframe for mainframe-to-mainframe file transfers, Sterling Mailbox as the universal file aggregation and distribution hub, and ControlM as the on-premise agent that bridges Sterling and AWS S3.
 
-### 2.2 High Level Architecture Overview
-
-```mermaid
-graph LR
-    subgraph EXTERNAL_IN["External Inbound"]
-        NAP_SRC[NAP\nWPG & DPS]
-        VISA_N[Visa]
-        MC_N[MasterCard]
-        FILE_SRC[File Sources\nAmex, Discover\nWalmart, CapitalOne\nMeijer, Dialogu\nLATAM, PIN Networks\nMI Image, Issuer Docs\nMC Retrieval]
-    end
-
-    subgraph FILE_INFRA["On-Premise File Infrastructure"]
-        DM[DM Mainframe\nWDP Owned]
-        STERLING[Sterling Mailbox\nEnterprise Shared]
-        CONTROLM[ControlM\nEnterprise Shared]
-    end
-
-    subgraph AWS_INBOUND["AWS Inbound"]
-        S3_IN[(S3 /inbound)]
-        SQS[SQS Queue]
-    end
-
-    subgraph INBOUND["Inbound Processing"]
-        NADES[NAPDisputeEvent\nService]
-        VISA_B[VisaDisputeBatch]
-        MC_B[FirstChargeback\nCaseFillingBatch]
-        FP[FileProcessor]
-        SCHED[InboundDispute\nEventScheduler]
-        OUTBOX[(chbk_outbox_row\nfile_job\nfile_evidence)]
-    end
-
-    subgraph KAFKA["Kafka Event Bus - AWS MSK"]
-        K_NAP[nap-dispute-events]
-        K_CASE[new-case-events]
-        K_EVID[case-evidence-events]
-        K_BIZ[business-rules]
-        K_OUT[outgoing-events]
-        K_INT[internal-integration-events]
-        K_EXT[external-request-events]
-        K_CORE_T[core-request-events]
-        K_EXPIRY[case-action-events expiry]
-    end
-
-    subgraph CONSUMERS["Event Consumers"]
-        CCC[CaseCreation\nConsumer]
-        EVID[Evidence\nConsumer]
-        BRP[BusinessRules\nProcessor]
-        NO[Notification\nOrchestrator]
-        NOP[NAP Outcome\nProcessor]
-        VRQ[VisaResponse\nQuestionnaire]
-        CEUC[CaseExpiry\nConsumer]
-        TP3[ThirdParty\nNotification\nConsumer]
-        BEN_C[BEN Consumer]
-        EDIA_C[EDIA Consumer\n🔴 Planned]
-        CORE_C[CoreNotification\nConsumer]
-    end
-
-    subgraph UI_ACCESS["UI & Access Layer"]
-        MP[Merchant Portal]
-        OP[Ops Portal]
-        AK[Akamai]
-        APIGEE[APIGEE]
-        AGW[API Gateway]
-        IDP[IDP]
-        UAMS[UserAccess\nMgmtService]
-    end
-
-    subgraph CORE["WDP Core Services - AWS EKS"]
-        SVCS[Microservices\nAcceptService ContestService\nChargebackService DisputeService\nCaseManagementService etc]
-        DB[(Aurora PostgreSQL\nDynamoDB\nS3 Documents)]
-    end
-
-    subgraph OUTBOUND_NET["Card Network Outbound"]
-        VISA_OUT[Visa API]
-        MC_OUT[MasterCard API]
-        NAPDPS[NAP-DPS]
-    end
-
-    subgraph NOTIF_OUT["Notification Targets"]
-        SIGNIFY[SignifyD]
-        JUSTAI[JustAI]
-        BEN[BEN]
-        CORE_P[CORE]
-        EDIA_P[EDIA Platform\n🔴 Planned]
-    end
-
-    subgraph FILE_OUT["Outbound File Processing"]
-        FILE_GEN[File Generation\nComponents]
-        S3_OUT[(S3 /outbound)]
-        CONTROLM_OUT[ControlM\nEnterprise Shared]
-        STERLING_OUT[Sterling Mailbox\nEnterprise Shared]
-        DM_OUT[DM Mainframe\nWDP Owned]
-    end
-
-    %% Inbound flows
-    NAP_SRC --> NADES --> K_NAP
-    VISA_N --> VISA_B --> OUTBOX
-    MC_N --> MC_B --> OUTBOX
-    FILE_SRC -->|mainframe-to-mainframe| DM --> STERLING
-    FILE_SRC -->|SFTP| STERLING
-    STERLING --> CONTROLM --> S3_IN -->|S3 event| SQS --> FP --> OUTBOX
-    OUTBOX --> SCHED --> K_CASE & K_EVID
-
-    %% UI & Access
-    MP --> AK --> AGW
-    OP -->|direct| AGW
-    AGW -->|auth| IDP
-    AGW -->|authorize| UAMS
-    AGW --> SVCS
-
-    %% Kafka consumers
-    K_NAP --> CCC
-    K_CASE --> CCC --> CORE
-    K_EVID --> EVID --> CORE
-    K_BIZ --> BRP --> CORE
-    K_EXPIRY --> CEUC --> CORE
-    K_OUT --> NO
-    K_INT --> NOP & VRQ
-    K_EXT --> TP3 & BEN_C & EDIA_C
-    K_CORE_T --> CORE_C
-
-    %% Core to Kafka
-    CORE --> K_BIZ & K_OUT & K_INT & K_EXT & K_CORE_T & K_EXPIRY
-
-    %% Outbound network
-    NOP --> NAPDPS
-    VRQ --> VISA_OUT
-    CORE --> VISA_OUT & MC_OUT
-
-    %% Notifications
-    TP3 --> SIGNIFY & JUSTAI
-    BEN_C --> BEN
-    CORE_C --> CORE_P
-    EDIA_C --> EDIA_P
-
-    %% File outbound
-    NO --> FILE_GEN --> S3_OUT --> CONTROLM_OUT --> STERLING_OUT
-    STERLING_OUT --> DM_OUT
-```
-
-### 2.3 Inbound Dispute Reception Models
+### 2.2 Inbound Dispute Reception Models
 
 WDP supports three models for receiving inbound disputes:
 
@@ -251,7 +77,7 @@ WDP supports three models for receiving inbound disputes:
 | Pull | WDP polls card network APIs on a schedule to fetch dispute events | Visa, MasterCard |
 | File | Dispute events and evidence arrive as files through on-premise file infrastructure | All file-based sources |
 
-### 2.4 Card Network Integration Patterns
+### 2.3 Card Network Integration Patterns
 
 WDP receives disputes from two categories of card networks:
 
@@ -314,38 +140,16 @@ The WDP API Gateway is the single internal entry point for all requests from all
 - **Authorization** — calls UserAccessManagementService to verify the caller has permission to perform the requested action
 - **Routing** — routes authenticated and authorized requests to the appropriate WDP Core microservice
 
-```mermaid
-graph LR
-    subgraph MERCHANT_PORTAL["Merchant Portal Path"]
-        MP[WDP Merchant Portal]
-        AK1[Akamai\nCDN & Edge Security]
-    end
+```
+Portal & Access Layer:
 
-    subgraph OPS_PORTAL["Ops Portal Path"]
-        OP[WDP Ops Portal]
-    end
+WDP Merchant Portal → Akamai (CDN & Edge) → API Gateway
+WDP Ops Portal → API Gateway (direct)
+External Merchant Systems → Akamai (CDN & Edge) → APIGEE → API Gateway
 
-    subgraph B2B_PATH["B2B / System-to-System Path"]
-        MA[External Merchant\nSystems]
-        AK2[Akamai\nCDN & Edge Security]
-        APIGEE[APIGEE]
-    end
-
-    subgraph INTERNAL["WDP Internal"]
-        AGW[API Gateway\nAll traffic enters here]
-        IDP[IDP\nauthenticate]
-        UAMS[UserAccess\nManagementService\nauthorize]
-        CHBK[ChargebackService]
-        SVCS[Other WDP Core\nServices]
-    end
-
-    MP --> AK1 --> AGW
-    OP -->|direct| AGW
-    MA --> AK2 --> APIGEE --> AGW
-    AGW -->|authenticate| IDP
-    AGW -->|authorize| UAMS
-    AGW --> CHBK
-    AGW --> SVCS
+API Gateway → IDP (authenticate)
+API Gateway → UserAccessManagementService (authorize)
+API Gateway → WDP Core Services
 ```
 
 ### 3.4 Authentication & Authorization
@@ -434,7 +238,7 @@ For other acquiring platforms, enrichment works differently:
 
 ### 4.8 Core Data Stores
 
-**Aurora PostgreSQL** is the primary operational database for WDP. It holds the canonical case record, outbox tables, rules, notes, questionnaires, org and user data, wdp.file_generation_event table, and all operational state. It runs in a multi-AZ configuration with read replicas for query offload.
+**Aurora PostgreSQL** is the primary operational database for WDP. It holds the canonical case record, outbox tables, rules, notes, questionnaires, org and user data, file_notifications table, and all operational state. It runs in a multi-AZ configuration with read replicas for query offload.
 
 **DynamoDB** is used exclusively by DocumentManagementService for evidence document metadata storage. It provides fast, scalable access to document metadata without impacting the primary Aurora PostgreSQL instance.
 
@@ -446,86 +250,9 @@ For other acquiring platforms, enrichment works differently:
 
 WDP receives dispute events through three distinct inbound paths. Each path reflects a different integration pattern with external systems. Regardless of path, all dispute events converge at `chbk_outbox_row` and follow the common event-driven processing path from there.
 
-```mermaid
-graph LR
-    subgraph NAP_PATH["Path 1 — API Push"]
-        WPG[WPG]
-        DPS[DPS]
-        NADES[NAPDisputeEvent\nService]
-        K_NAP[nap-dispute-events]
-        NADEP[NAPDisputeEvent\nProcessor]
-    end
-
-    subgraph BATCH_PATH["Path 2 — Pull / Batch"]
-        VISA[Visa]
-        MC[MasterCard]
-        VISA_B[VisaDisputeBatch]
-        MC_B[FirstChargeback\nCaseFillingBatch]
-    end
-
-    subgraph FILE_PATH["Path 3 — File-Based"]
-        FILE_SRC[File Sources\nAmex, Discover, Walmart\nCapitalOne, Meijer etc]
-        DM[DM Mainframe]
-        STERLING[Sterling Mailbox]
-        CONTROLM[ControlM]
-        S3_IN[(S3 /inbound)]
-        SQS[SQS Queue]
-        FP[FileProcessor]
-    end
-
-    subgraph COMMON["Common Processing Path"]
-        OUTBOX[(chbk_outbox_row)]
-        SCHED[InboundDispute\nEventScheduler]
-        K_CASE[new-case-events]
-        K_EVID[case-evidence-events]
-        CCC[CaseCreation\nConsumer]
-        EVID[Evidence\nConsumer]
-    end
-
-    WPG & DPS --> NADES --> K_NAP --> NADEP -->|current direct path| COMMON
-    VISA --> VISA_B --> OUTBOX
-    MC --> MC_B --> OUTBOX
-    FILE_SRC --> DM --> STERLING
-    FILE_SRC -->|SFTP| STERLING
-    STERLING --> CONTROLM --> S3_IN -->|S3 event| SQS --> FP --> OUTBOX
-    OUTBOX --> SCHED --> K_CASE --> CCC
-    SCHED --> K_EVID --> EVID
-```
-
 ### 5.1 NAP/WPG Path (Current)
 
 The NAP inbound path handles real-time dispute events from the NAP acquiring platform. It is a direct event-driven integration that currently operates independently of the common file-based inbound path.
-
-```mermaid
-graph LR
-    subgraph NAP_SOURCES["NAP Sources"]
-        WPG[WPG]
-        DPS[DPS]
-    end
-
-    subgraph NAP_PROC["NAP Inbound Processing"]
-        NADES[NAPDisputeEvent\nService]
-        K_NAP[nap-dispute-events\nKafka topic]
-        NADEP[NAPDisputeEvent\nProcessor]
-        NADDB[NAPDisputeDeclineBatch]
-    end
-
-    subgraph CORE["WDP Core"]
-        CASE[Dispute Case]
-    end
-
-    subgraph DMS["DocumentManagementService"]
-        DOC[Document Storage\nS3 + DynamoDB]
-    end
-
-    WPG -->|119-response docs| NADES
-    DPS -->|srv116 srv117 vin-loss| NADES
-    NADES -->|publishes| K_NAP
-    K_NAP -->|consumes| NADEP
-    NADEP -->|creates dispute case| CORE
-    NADES -->|attaches 119 docs directly| DMS
-    NADDB -->|polls Visa API\nissuer-declined NAP events| CORE
-```
 
 **NAPDisputeEventService** receives events from two NAP sources and handles them differently:
 
@@ -551,34 +278,6 @@ From **WPG:**
 
 WDP polls Visa and MasterCard APIs directly using scheduled batch jobs to retrieve dispute events. This is the primary inbound integration with these two card networks for API-capable network connectivity.
 
-```mermaid
-graph LR
-    subgraph NETWORKS["Card Networks"]
-        VISA[Visa\nMultiple Queues\nAll dispute lifecycle stages]
-        MC[MasterCard API]
-    end
-
-    subgraph BATCHES["Batch Jobs - AWS EKS"]
-        VDB[VisaDisputeBatch\nevery 2 minutes]
-        FCB[FirstChargebackBatch\nfirst chargeback events]
-        CFB[CaseFillingBatch\nsubsequent events]
-    end
-
-    subgraph ENC["PAN Security"]
-        ENCSVC[EncryptionService\nencrypt PAN]
-    end
-
-    subgraph OUTBOX["Outbox"]
-        COR[(chbk_outbox_row)]
-    end
-
-    VISA -->|dispute events| VDB
-    MC -->|first chargeback| FCB
-    MC -->|subsequent events| CFB
-    VDB & FCB & CFB -->|encrypt PAN| ENCSVC
-    ENCSVC --> COR
-```
-
 **VisaDisputeBatch** runs every 2 minutes and polls multiple Visa queues to fetch dispute events across all stages of the Visa dispute lifecycle. Each Visa queue corresponds to a different stage of the dispute cycle. Fetched events are written to `chbk_outbox_row` for downstream processing.
 
 ⚠️ Visa queue details and dispute stage mapping are deferred to component-level documentation.
@@ -599,37 +298,15 @@ The file-based inbound path handles dispute events, evidence documents, and issu
 
 All file-based inbound traffic flows through a shared on-premise file infrastructure before reaching AWS. Sterling Mailbox is the universal aggregation point — all inbound files arrive at Sterling regardless of transport mechanism.
 
-```mermaid
-graph LR
-    subgraph DM_SOURCES["Via DM Mainframe"]
-        MF_SRC[Mainframe-connected\nSources\nDiscover, Amex, PIN\nCapitalOne, Walmart\nMI Image, Issuer Docs\nMC Retrieval]
-    end
+```
+File-only networks (Amex, Discover, PIN Networks etc.):
+External Source → DM Mainframe (mainframe-to-mainframe) → Sterling Mailbox
 
-    subgraph SFTP_SOURCES["Via SFTP"]
-        SFTP_SRC[SFTP-connected\nSources\nMeijer, Dialogu, LATAM]
-    end
+SFTP-capable sources (Meijer, Dialogu, LATAM):
+External Source → SFTP → Sterling Mailbox
 
-    subgraph ON_PREMISE["On-Premise File Infrastructure"]
-        DM[DM Mainframe\nWDP Owned\nmainframe-to-mainframe]
-        STERLING[Sterling Mailbox\nEnterprise Shared\nuniversal file hub]
-        CONTROLM[ControlM\nEnterprise Shared\nfile transfer agent]
-    end
-
-    subgraph AWS["AWS"]
-        S3_IN[(S3 /inbound\nsource-specific folders)]
-        S3_STAGE[(S3 /staging\nevidence documents)]
-        SQS[SQS Queue\nS3 event trigger]
-        FP[FileProcessor]
-    end
-
-    MF_SRC -->|mainframe-to-mainframe| DM
-    DM --> STERLING
-    SFTP_SRC -->|SFTP| STERLING
-    STERLING --> CONTROLM
-    CONTROLM --> S3_IN
-    S3_IN -->|S3 event notification| SQS
-    SQS -->|triggers| FP
-    FP -->|extracts documents| S3_STAGE
+Common path from Sterling:
+Sterling Mailbox → ControlM → S3 /inbound (source-specific folder) → SQS Queue → FileProcessor
 ```
 
 **DM Mainframe** is the on-premise mainframe system that provides direct mainframe-to-mainframe connectivity with external systems. It acts as the file exchange gateway for all mainframe-connected sources, both receiving files inbound and sending files outbound. It exchanges files with Sterling Mailbox in both directions.
@@ -677,35 +354,6 @@ The following sources transmit files to WDP via SFTP directly to Sterling Mailbo
 
 FileProcessor is the core inbound file processing component. It listens to the SQS Queue and processes each file that lands in the S3 `/inbound` bucket.
 
-```mermaid
-graph LR
-    subgraph TRIGGER["Trigger"]
-        SQS[SQS Queue]
-    end
-
-    subgraph FP_PROC["FileProcessor"]
-        FP[FileProcessor]
-        ENC[EncryptionService\nencrypt PAN]
-    end
-
-    subgraph STORAGE["Storage"]
-        S3_STAGE[(S3 /staging\nevidence documents)]
-    end
-
-    subgraph OUTBOX["Outbox Tables - Aurora PostgreSQL"]
-        FJ[(file_job\nfile processing status)]
-        FE[(file_evidence\nevidence metadata +\nS3 staging path)]
-        COR[(chbk_outbox_row\ndispute events +\nincoming documents)]
-    end
-
-    SQS -->|triggers| FP
-    FP -->|tracks status| FJ
-    FP -->|extracts & stores documents| S3_STAGE
-    FP -->|writes S3 path & metadata| FE
-    FP -->|encrypt PAN| ENC
-    ENC -->|stages events| COR
-```
-
 FileProcessor performs the following on each inbound file:
 - Creates a `file_job` record to track the overall file processing status
 - Parses the file to identify its content type — dispute events, evidence documents, issuer documents, or a combination
@@ -729,20 +377,6 @@ Three database tables in Aurora PostgreSQL form the file processing state machin
 #### 5.3.6 InboundDisputeEventScheduler
 
 InboundDisputeEventScheduler polls `chbk_outbox_row` every 2 minutes and publishes eligible rows to the appropriate Kafka topics for downstream processing.
-
-```mermaid
-graph LR
-    OUTBOX[(chbk_outbox_row\npolled every 2 minutes)]
-    SCHED[InboundDispute\nEventScheduler]
-    K_CASE[new-case-events]
-    K_EVID[case-evidence-events]
-    CCC[CaseCreation\nConsumer]
-    EVID[Evidence\nConsumer]
-
-    OUTBOX --> SCHED
-    SCHED -->|dispute events| K_CASE --> CCC
-    SCHED -->|evidence documents| K_EVID --> EVID
-```
 
 It publishes to two topics:
 - **`new-case-events`** — for dispute events that require case creation
@@ -795,60 +429,6 @@ WDP uses Apache Kafka, managed via AWS MSK, as the backbone for all asynchronous
 ⚠️ Per-consumer outbox table details deferred to component-level documentation.
 
 ### 6.2 Topic Registry
-
-The following diagram shows all topics, their publishers, and their consumers:
-
-```mermaid
-graph LR
-    subgraph PUBLISHERS["Publishers"]
-        NADES[NAPDisputeEventService]
-        SCHED[InboundDisputeEventScheduler]
-        BRP[BusinessRulesProcessor]
-        NO[NotificationOrchestrator]
-        ACC[AcceptService]
-        CONT[ContestService]
-        EDIA_C[EDIA Consumer\n🔴 Planned]
-    end
-
-    subgraph TOPICS["Kafka Topics - AWS MSK"]
-        T1[nap-dispute-events]
-        T2[new-case-events]
-        T3[case-evidence-events]
-        T4[business-rules]
-        T5[case-action-events\nexpiry]
-        T6[outgoing-events]
-        T7[internal-integration-events]
-        T8[external-request-events]
-        T9[core-request-events DB2]
-        T10[EDIA events\n🔴 Planned]
-    end
-
-    subgraph CONSUMERS_T["Consumers"]
-        NADEP[NAPDisputeEventProcessor]
-        CCC[CaseCreationConsumer]
-        EVID[EvidenceConsumer]
-        BRP2[BusinessRulesProcessor]
-        NO2[NotificationOrchestrator]
-        CEUC[CaseExpiryUpdateConsumer]
-        NOP[NAP Outcome Processor]
-        VRQ[VisaResponseQuestionnaire]
-        TP3[ThirdPartyNotificationConsumer]
-        BEN_C[BEN Consumer]
-        EDIA_C2[EDIA Consumer 🔴]
-        CORE_C[CoreNotificationConsumer]
-    end
-
-    NADES --> T1 --> NADEP
-    SCHED --> T2 --> CCC
-    SCHED --> T3 --> EVID
-    BRP --> T4 --> BRP2
-    NO --> T5 --> CEUC
-    BRP --> T6 --> NO2
-    ACC & CONT --> T7 --> NOP & VRQ
-    NO --> T8 --> TP3 & BEN_C & EDIA_C2
-    NO --> T9 --> CORE_C
-    EDIA_C --> T10
-```
 
 #### Inbound Topics
 
@@ -1000,8 +580,7 @@ CaseCreationConsumer is the primary case creation component for all non-NAP disp
 | CORE | Calls MerchantTransactionService |
 | LATAM | Calls LATAM platform API directly |
 | VAP | Calls VAP platform API directly |
-| PIN | ⚠️ Confirmed present in codebase (sourceSystem = PIN accepted) but enrichment path not fully documented. Architect decision required — does PIN follow MerchantTransactionService path (same as CORE) or a distinct path? See WDP-COMP-14 open questions. |
-| NAP | Not processed by CaseCreationConsumer by design — handled by NAPDisputeEventProcessor (current path). ⚠️ No code guard prevents NAP events from arriving and being processed — confirmed gap. |
+| NAP | Not processed by CaseCreationConsumer — handled by NAPDisputeEventProcessor (current) |
 
 **PAN handling during case creation:**
 - Calls EncryptionService to decrypt EPAN transiently for acquiring platform API enrichment calls
@@ -1058,7 +637,7 @@ NotificationOrchestrator publishes to:
 - **`external-request-events`** — for third-party notifications, BEN, and EDIA acquiring platform events
 - **`core-request-events`** — for CORE acquiring platform money movement notifications
 - **`case-action-events (expiry)`** — for case expiry lifecycle events
-- **`wdp.file_generation_event` DB table** — for file-based outbound notifications
+- **`file_notifications` DB table** — for file-based outbound notifications
 
 NotificationOrchestrator does **not** publish to `internal-integration-events` — that topic is published exclusively by AcceptService and ContestService.
 
@@ -1126,42 +705,6 @@ WDP delivers dispute outcomes and events to external systems through three disti
 
 AcceptService and ContestService make direct synchronous API calls to Visa and MasterCard when a merchant accepts or contests a dispute.
 
-```mermaid
-graph LR
-    subgraph CORE["WDP Core Services"]
-        ACC[AcceptService]
-        CONT[ContestService]
-    end
-
-    subgraph NETWORKS["Card Networks - Direct Synchronous"]
-        VISA[Visa API]
-        MC[MasterCard API]
-    end
-
-    subgraph KAFKA["Kafka"]
-        INT_EVT[internal-integration-events]
-    end
-
-    subgraph CONSUMERS["Consumers"]
-        NOP[NAP Outcome Processor]
-        VRQ[VisaResponseQuestionnaire]
-    end
-
-    subgraph EXTERNAL["External"]
-        NAPDPS[NAP-DPS]
-    end
-
-    ACC -->|sync API call all networks| VISA
-    ACC -->|sync API call all networks| MC
-    CONT -->|sync API call all networks| VISA
-    CONT -->|sync API call all networks| MC
-    ACC -->|NAP disputes all networks| INT_EVT
-    CONT -->|NAP disputes all networks| INT_EVT
-    CONT -->|Visa disputes all acquiring platforms| INT_EVT
-    INT_EVT --> NOP --> NAPDPS
-    INT_EVT --> VRQ --> VISA
-```
-
 **AcceptService publishes to `internal-integration-events`:**
 - NAP dispute accept events across all networks — consumed by NAP Outcome Processor to notify NAP-DPS
 
@@ -1189,59 +732,6 @@ When a dispute belonging to the NAP acquiring platform is accepted or contested,
 
 NotificationOrchestrator consumes from `outgoing-events` and routes dispute lifecycle events to external notification targets based on business logic defined in code.
 
-```mermaid
-graph LR
-    subgraph INPUT["Input"]
-        OE[outgoing-events]
-    end
-
-    subgraph NO["NotificationOrchestrator\nroutes by business logic in code"]
-    end
-
-    subgraph TOPICS["Output Topics"]
-        EXT[external-request-events]
-        CORE_T[core-request-events DB2]
-        EXPIRY[case-action-events expiry]
-    end
-
-    subgraph FILE_TABLE["File Notifications"]
-        FN[(wdp.file_generation_event\nDB table - Aurora PostgreSQL)]
-    end
-
-    subgraph CONSUMERS["Consumers"]
-        TP3[ThirdPartyNotification\nConsumer]
-        BEN_C[BEN Consumer]
-        EDIA_C[EDIA Consumer\n🔴 Planned]
-        CORE_C[CoreNotification\nConsumer]
-        CEUC[CaseExpiry\nUpdateConsumer]
-    end
-
-    subgraph TARGETS["External Targets"]
-        SIGNIFY[SignifyD\nREST API]
-        JUSTAI[JustAI\nREST API]
-        BEN[BEN\nWebhook]
-        CORE_P[CORE\nDB2]
-        EDIA_P[EDIA Platform\n🔴 Planned]
-    end
-
-    subgraph FILE_GEN["File Generation Components"]
-        CAP_P[CapitalOne Response\nfile processor]
-        DIA_P[Dialogu Issuer\ndocument Processor]
-        NET_P[NetworkResponse\nFileProcessor]
-        FA[FileAcknowledgement\nProcessor]
-        NYCE_P[NYCE File Generation\nProcessor 🔴 Planned]
-    end
-
-    OE --> NO
-    NO --> EXT & CORE_T & EXPIRY & FN
-    EXT --> TP3 --> SIGNIFY & JUSTAI
-    EXT --> BEN_C --> BEN
-    EXT --> EDIA_C --> EDIA_P
-    CORE_T --> CORE_C --> CORE_P
-    EXPIRY --> CEUC
-    FN --> CAP_P & DIA_P & NET_P & FA & NYCE_P
-```
-
 | Target | Consumer | Protocol | Callback |
 |---|---|---|---|
 | SignifyD | ThirdPartyNotificationConsumer | REST API | Calls ChargebackService |
@@ -1254,61 +744,7 @@ graph LR
 
 ### 8.5 File-Based Outbound
 
-Three file generation components read from the `wdp.file_generation_event` DB table (Aurora PostgreSQL) and generate files placed in target-specific folders in S3 `/outbound` for ControlM to transfer to Sterling Mailbox for onward delivery.
-
-```mermaid
-graph LR
-    subgraph FILE_GEN["File Generation Components - AWS EKS"]
-        CAP_P[CapitalOne Response\nfile processor]
-        FA[FileAcknowledgement\nProcessor]
-        NET_P[NetworkResponse\nFileProcessor]
-        DIA_P[Dialogu Issuer\ndocument Processor]
-        NYCE_P[NYCE File Generation\nProcessor 🔴 Planned]
-    end
-
-    subgraph S3_OUT["S3 /outbound - Dedicated folder per target"]
-        S3_CAP[outbound/capitalOne]
-        S3_WAL[outbound/walmart]
-        S3_MEI[outbound/meijer]
-        S3_AMEX[outbound/amex]
-        S3_AMEXH[outbound/amexHybrid]
-        S3_DISC[outbound/discover]
-        S3_DISCH[outbound/discoverHybrid]
-        S3_DIA[outbound/dialogu]
-        S3_PIN[outbound/pinNetworks\n🔴 Planned]
-    end
-
-    subgraph ON_PREMISE["On-Premise File Infrastructure"]
-        CONTROLM[ControlM\nEnterprise Shared]
-        STERLING[Sterling Mailbox\nEnterprise Shared]
-        DM[DM Mainframe\nWDP Owned]
-        FTB[File Transfer Batch\nWDP Owned]
-        NAS[NAS\nRMO Servers]
-    end
-
-    subgraph TARGETS["External Targets"]
-        WAL[Walmart]
-        PIN[PIN Networks NYCE]
-        CAP[CapitalOne BJs]
-        DISC[Discover]
-        MEI[Meijer]
-        DIA[Dialogue]
-        AMEX_T[Amex/AmexHybrid]
-        DISC_H[DiscoverHybrid]
-    end
-
-    CAP_P --> S3_CAP
-    FA --> S3_CAP & S3_WAL & S3_MEI
-    NET_P --> S3_AMEX & S3_AMEXH & S3_DISC & S3_DISCH
-    DIA_P --> S3_DIA
-    NYCE_P --> S3_PIN
-
-    S3_CAP & S3_WAL & S3_AMEX & S3_AMEXH & S3_DISC & S3_DIA & S3_MEI & S3_PIN --> CONTROLM
-    CONTROLM --> STERLING
-    STERLING --> DM -->|mainframe-to-mainframe| WAL & PIN & CAP & DISC
-    STERLING -->|SFTP| MEI & DIA & AMEX_T
-    S3_DISCH -->|SFTP pull| FTB --> NAS --> DISC_H
-```
+Three file generation components read from the `file_notifications` DB table (Aurora PostgreSQL) and generate files placed in target-specific folders in S3 `/outbound` for ControlM to transfer to Sterling Mailbox for onward delivery.
 
 #### 8.5.1 File Generation Components
 
@@ -1365,51 +801,6 @@ Acquiring platforms are the financial platforms that hold merchant accounts and 
 ### 9.1 Overview
 
 When a dispute is resolved in WDP, the outcome must be communicated back to the acquiring platform so that funds can be settled. The strategic direction is to migrate all acquiring platform integrations to the enterprise EDIA streaming platform over time.
-
-```mermaid
-graph LR
-    subgraph INBOUND["Inbound Dispute Sources"]
-        VISA_N[Visa API\nbatch pull]
-        MC_N[MasterCard API\nbatch pull]
-        FILE_N[File-only Networks\nvia DM Mainframe]
-        NAP_SRC[NAP-DPS\nAPI push]
-        LATAM_F[LATAM Regional\nFiles via SFTP]
-    end
-
-    subgraph ENRICHMENT["Enrichment at Case Creation"]
-        MTS[MerchantTransactionService\nCORE enrichment]
-        LATAM_API[LATAM API\ndirect call]
-        VAP_API[VAP API\ndirect call]
-        NAP_PRE[Pre-enriched\nby NAP-DPS]
-    end
-
-    subgraph OUTBOUND["Outbound Dispute Outcomes"]
-        NOP[NAP Outcome Processor\ndirect API current]
-        CORE_C[CoreNotificationConsumer\nDB2]
-        EDIA_C[EDIA Consumer\n🔴 Planned]
-        EDIA_P[EDIA Platform\n🔴 Planned]
-    end
-
-    subgraph ACQUIRING["Acquiring Platforms"]
-        NAP_P[NAP]
-        CORE_P[CORE\nWDP Owned]
-        LATAM_P[LATAM\n🔴 In Progress]
-        VAP_P[VAP\n🔴 In Progress]
-    end
-
-    VISA_N & MC_N & FILE_N --> CORE_P & VAP_P
-    VISA_N & MC_N & FILE_N & LATAM_F --> LATAM_P
-    NAP_SRC --> NAP_P
-
-    MTS --> CORE_P
-    LATAM_API --> LATAM_P
-    VAP_API --> VAP_P
-    NAP_PRE --> NAP_P
-
-    NOP -->|current| NAP_P
-    CORE_C --> CORE_P
-    EDIA_C --> EDIA_P -->|planned| NAP_P & LATAM_P & VAP_P
-```
 
 **Acquiring Platform Integration Summary:**
 
@@ -1507,47 +898,6 @@ NotificationOrchestrator → external-request-events → EDIA Consumer (WDP owne
 
 WDP enforces a strict PAN security boundary across the entire platform. PAN data is never stored in plaintext anywhere in the system.
 
-```mermaid
-graph LR
-    subgraph INBOUND["Inbound Processors"]
-        FP[FileProcessor]
-        VISA_B[VisaDisputeBatch]
-        MC_B[MC Batch Jobs]
-        NAP_EX[NAPDisputeEventProcessor\nNo PAN - no call needed]
-    end
-
-    subgraph ENC_SVC["EncryptionService - PAN Boundary"]
-        HMAC[HMAC-SHA256\nHPAN generation\ndeterministic non-reversible]
-        AES[AES-256-GCM\nEPAN generation\nreversible]
-        MAP[(EPAN to HPAN\nmapping table)]
-        DEK[DEK cache\n6 hour window]
-    end
-
-    subgraph KMS["AWS KMS"]
-        CMK[Customer Master Key\nFIPS 140-2 Level 3 HSM]
-    end
-
-    subgraph STORAGE["Storage - Never plaintext"]
-        OUTBOX[(chbk_outbox_row\nHPAN reference)]
-        CASE[(Case Table\nHPAN only)]
-    end
-
-    subgraph CASE_CREATION["Case Creation"]
-        CCC[CaseCreationConsumer\ndecrypt transiently\nclear PAN in memory only]
-        API[Acquiring Platform API\nclear PAN in request]
-    end
-
-    FP & VISA_B & MC_B -->|plaintext PAN| ENC_SVC
-    ENC_SVC -->|DEK refresh| KMS
-    HMAC -->|HPAN| OUTBOX
-    AES -->|EPAN| MAP
-    OUTBOX --> CCC
-    CCC -->|decrypt EPAN| ENC_SVC
-    ENC_SVC -->|clear PAN transient| CCC
-    CCC -->|clear PAN in request| API
-    CCC -->|store HPAN only| CASE
-```
-
 #### PAN Security Boundary Rules
 
 | Rule | Detail |
@@ -1597,19 +947,17 @@ WDP uses two tokens generated from every PAN, each serving a different purpose:
 
 ### 10.2 Resilience Patterns
 
-⚠️ **NOTE:** WDP does not implement circuit breakers or fallback mechanisms.
-DEC-014 (Resilience4j) is formally ⛔ VOID — confirmed absent across all 40
-component files as of April 2026. See WDP-DECISIONS.md v2.0 for the full void record.
-If circuit breakers are introduced in a future hardening sprint, a new ADR must be raised.
+⚠️ **NOTE:** WDP does not currently implement circuit breakers or fallback mechanisms.
+
+⚠️ **Discussion point:** Circuit breaker strategy and fallback mechanisms to be evaluated as a future architectural decision.
 
 Resilience in WDP is currently built around three patterns:
 
-**Idempotency & At-Most-Once Delivery:**
-- All confirmed Kafka consumers use pre-ACK or mid-flow ACK — offset committed
-  BEFORE full processing completes. DEC-005 (at-least-once) is aspirational;
-  the platform-wide pattern is at-most-once. See WDP-DECISIONS.md v2.0 DEC-005.
+**Idempotency & At-Least-Once Delivery:**
+- Manual Kafka offset commit — committed only after full processing completes
 - Per-consumer outbox tables track processing state and idempotency keys
 - Deduplication keys at every processing boundary
+- All consumers handle redelivery safely
 
 **Retry & Backoff:**
 - Exponential backoff with jitter applied to all external API calls
@@ -1653,340 +1001,47 @@ Prometheus scrapes all services. Grafana provides operational dashboards. CloudW
 
 ---
 
-## 11. Deployment Context
+## 11. Deployment Context — TO BE COMPLETED
 
-### 11.1 AWS Infrastructure
+⚠️ This section is pending. To be completed in the next documentation session.
 
-All WDP services and components run on AWS. The following managed services form the core infrastructure:
+Confirmed infrastructure components to be documented:
 
-**AWS EKS (Elastic Kubernetes Service)**
-All WDP microservices, event consumers, batch jobs, and file processing components run on a shared AWS EKS cluster. Components are stateless and horizontally scalable. Both portal UIs also run on the same EKS cluster.
+**AWS:**
+- AWS EKS — all WDP services
+- AWS MSK — managed Kafka
+- Aurora PostgreSQL — primary operational database
+- DynamoDB — document metadata
+- S3 — inbound, staging, outbound, documents
+- SQS — file processing trigger
+- AWS KMS — key management
+- AWS ElastiCache — JWT token caching (TokenService)
 
-**AWS MSK (Managed Streaming for Apache Kafka)**
-Kafka is managed via AWS MSK with brokers across multiple availability zones. All asynchronous communication between WDP components flows through MSK.
-
-**Aurora PostgreSQL**
-Primary operational database for WDP. Runs in a multi-AZ configuration with read replicas for query offload. Holds the canonical case record, all outbox tables, rules, notes, questionnaires, org and user data, wdp.file_generation_event table, and all operational state.
-
-**DynamoDB**
-Used exclusively by DocumentManagementService for evidence document metadata storage.
-
-**Amazon S3**
-Object storage used for multiple purposes across the platform:
-
-| Folder | Purpose |
-|---|---|
-| S3 /inbound | Landing zone for all inbound files from ControlM |
-| S3 /staging | Evidence and issuer documents extracted by FileProcessor |
-| S3 /outbound | Generated outbound files picked up by ControlM |
-| S3 Documents | Evidence documents stored by DocumentManagementService |
-
-**Amazon SQS**
-Receives S3 event notifications when files land in the S3 `/inbound` bucket. Triggers FileProcessor to begin processing each arriving file.
-
-**AWS KMS (Key Management Service)**
-Manages the Customer Master Key (CMK) used to encrypt Data Encryption Keys (DEKs) that protect PAN data. Uses FIPS 140-2 Level 3 validated hardware security modules.
-
-**AWS ElastiCache**
-Used by TokenService for JWT token caching. Stores JWT tokens obtained from IDP and serves them to consumers and batch jobs without requiring a new IDP call for every request.
-
-**AWS Secrets Manager**
-Stores the HMAC key used for HPAN generation.
-
-⚠️ Detailed infrastructure configuration — instance sizes, broker counts, replica counts, storage provisioning, retention settings — to be documented in dedicated infrastructure documentation.
+**On-Premise:**
+- DM Mainframe
+- Sterling Mailbox
+- ControlM
+- File Transfer Batch (DiscoverHybrid special flow)
 
 ---
 
-### 11.2 On-Premise Components — WDP Owned
+## 12. Component Status Registry — TO BE COMPLETED
 
-These components are owned and operated by the WDP team but run on on-premise infrastructure.
+⚠️ This section is pending. To be completed in the next documentation session.
 
-**DM Mainframe**
-On-premise mainframe system owned by the WDP team. Provides direct mainframe-to-mainframe connectivity with external systems. Acts as the file exchange gateway for all mainframe-connected card networks and merchants, receiving inbound files and delivering outbound files. Exchanges files with Sterling Mailbox in both directions.
+Will contain a single reference table covering all WDP components with their current production status and planned items clearly flagged.
 
-**File Transfer Batch**
-On-premise batch process owned by the WDP team. Specific to the DiscoverHybrid special outbound flow. Makes an SFTP call to WDP's S3 `/outbound/discoverHybrid/` folder to pull files and deposits them to a NAS location on RMO servers. This is the only outbound flow where the on-premise system pulls from AWS rather than ControlM pushing to Sterling.
-
----
-
-### 11.3 On-Premise Components — Enterprise Shared Services
-
-These components are enterprise-level shared services provided across all teams. They are not owned or operated by the WDP team. WDP consumes these services as part of its file exchange infrastructure.
-
-**Sterling Mailbox**
-Enterprise universal file aggregation and distribution hub. All inbound files arrive at Sterling regardless of transport mechanism — whether via DM Mainframe or direct SFTP. All outbound files leave Sterling either via DM Mainframe or SFTP. Sterling is the single convergence point for all file-based traffic between WDP and external systems.
-
-**ControlM**
-Enterprise file transfer agent that bridges Sterling Mailbox and AWS S3 in both directions:
-- Inbound: Sterling Mailbox → S3 `/inbound` (source-specific folder per source)
-- Outbound: S3 `/outbound` (target-specific folder per target) → Sterling Mailbox
-
----
-
-### 11.4 Infrastructure Overview
-
-```mermaid
-graph LR
-    subgraph AWS["AWS Cloud — WDP Owned"]
-        subgraph EKS["AWS EKS"]
-            SVCS[Core Services]
-            CONS[Event Consumers]
-            BATCH[Batch Jobs &\nFile Processors]
-        end
-        subgraph DATA["Data Layer"]
-            AURORA[(Aurora PostgreSQL)]
-            DYNAMO[(DynamoDB)]
-            ELASTIC[(ElastiCache)]
-        end
-        subgraph STORAGE["S3 Storage"]
-            S3_IN[(S3 /inbound)]
-            S3_STAGE[(S3 /staging)]
-            S3_OUT[(S3 /outbound)]
-            S3_DOCS[(S3 Documents)]
-        end
-        subgraph MESSAGING["Messaging"]
-            MSK[AWS MSK\nKafka]
-            SQS[SQS Queue]
-        end
-        subgraph SECURITY["Security"]
-            KMS[AWS KMS]
-            SECRETS[AWS Secrets\nManager]
-        end
-    end
-
-    subgraph WDP_ONPREM["On-Premise — WDP Owned"]
-        DM[DM Mainframe]
-        FTB[File Transfer\nBatch]
-        NAS[NAS\nRMO Servers]
-    end
-
-    subgraph ENT_ONPREM["On-Premise — Enterprise Shared Services"]
-        STERLING[Sterling Mailbox]
-        CONTROLM[ControlM]
-    end
-
-    subgraph EXTERNAL["External Systems"]
-        NETWORKS[Card Networks]
-        MERCHANTS[Merchants &\nAcquiring Platforms]
-    end
-
-    EKS <--> DATA & STORAGE & MESSAGING & SECURITY
-    S3_IN -->|S3 event| SQS --> BATCH
-    CONTROLM <-->|inbound & outbound| S3_IN & S3_OUT
-    STERLING <--> CONTROLM
-    DM <-->|files| STERLING
-    DM <-->|mainframe-to-mainframe| NETWORKS & MERCHANTS
-    STERLING <-->|SFTP| NETWORKS & MERCHANTS
-    FTB -->|SFTP pull| S3_OUT
-    FTB --> NAS
-```
-
----
-
-## 12. Component Status Registry
-
-This section provides a single reference table covering all WDP components with their current production status. Use this as the definitive source for understanding what is live, what is planned, and what is in progress.
-
-**Status legend:**
-- ✅ Production — component is live and in production
-- 🔄 In Progress — component is being built or partially in production
-- 🔴 Planned — component is planned but not yet started
-- ⚠️ Migration Planned — component is live but has planned migration work
-
----
-
-### 12.1 UI & Access Layer
-
-| Component | Status | Notes |
-|---|---|---|
-| WDP Merchant Portal | ✅ Production | |
-| WDP Ops Portal | ✅ Production | |
-| Disputes Section | ✅ Production | Both portals |
-| Queues Section | ✅ Production | Ops Portal only |
-| User Management Section | ✅ Production | Both portals |
-| Org Management Section | ✅ Production | Both portals |
-| Dashboard Section | 🔴 Planned | Dispute analytics for merchants — not yet developed |
-| Akamai | ✅ Production | CDN & edge security — Merchant Portal and B2B path |
-| APIGEE | ✅ Production | B2B / system-to-system path only |
-| API Gateway | ✅ Production | Single entry point for all traffic |
-| IDP | ✅ Production | Shared enterprise OAuth 2.0 |
-| UserAccessManagementService | ✅ Production | ⚠️ Detailed behaviour to be confirmed |
-
----
-
-### 12.2 WDP Core Services
-
-| Component | Status | Notes |
-|---|---|---|
-| AcceptService | ✅ Production | |
-| ContestService | ✅ Production | |
-| ChargebackService | ✅ Production | Externally exposed via APIGEE |
-| DisputeService | ✅ Production | |
-| CaseManagementService | ✅ Production | |
-| CaseActionService | ✅ Production | |
-| NotesService | ✅ Production | |
-| QuestionnaireService | ✅ Production | |
-| DocumentManagementService | ✅ Production | |
-| CaseSearchService | ✅ Production | |
-| DisplayCodeService | ✅ Production | |
-| FaxQueueService | ✅ Production | Ops Portal only — fax detail section pending |
-| UserQueueSkillService | ✅ Production | |
-| BusinessRulesService | ✅ Production | Rule management only — does not execute rules |
-| RulesService | ✅ Production | |
-| OrgManagementService | ✅ Production | |
-| CoreHierarchyAuthorizationService | ✅ Production | |
-| MerchantTransactionService | ✅ Production | CORE enrichment only |
-| EncryptionService | ✅ Production | Sole PAN handler |
-| TokenService | ✅ Production | JWT management via ElastiCache |
-| APILogService | ✅ Production | |
-
----
-
-### 12.3 Core Data Stores
-
-| Component | Status | Notes |
-|---|---|---|
-| Aurora PostgreSQL | ✅ Production | Multi-AZ — primary operational database |
-| DynamoDB | ✅ Production | DocumentManagementService exclusive |
-| S3 /inbound | ✅ Production | Source-specific folders per inbound source |
-| S3 /staging | ✅ Production | Evidence and issuer documents |
-| S3 /outbound | ✅ Production | Target-specific folders per outbound target |
-| S3 Documents | ✅ Production | Evidence documents |
-| AWS ElastiCache | ✅ Production | JWT token cache for TokenService |
-| AWS KMS | ✅ Production | CMK for PAN encryption |
-| AWS Secrets Manager | ✅ Production | HMAC key storage |
-
----
-
-### 12.4 Inbound Processing
-
-| Component | Status | Notes |
-|---|---|---|
-| NAPDisputeEventService | ✅ Production | ⚠️ Migration planned to common path |
-| NAPDisputeEventProcessor | ✅ Production | ⚠️ Migration planned to write to chbk_outbox_row |
-| NAPDisputeDeclineBatch | ✅ Production | NAP-specific — polls Visa for issuer-declined events |
-| VisaDisputeBatch | ✅ Production | Polls multiple Visa queues every 2 minutes |
-| FirstChargebackBatch | ✅ Production | Polls MasterCard for first chargeback events |
-| CaseFillingBatch | ✅ Production | Polls MasterCard for subsequent dispute events |
-| FileProcessor | ✅ Production | Triggered by SQS — processes all inbound files |
-| InboundDisputeEventScheduler | ✅ Production | Polls chbk_outbox_row every 2 minutes |
-| FileAcknowledgementProcessor | ✅ Production | Generates ACK files for Meijer, Walmart, CapitalOne |
-
----
-
-### 12.5 Outbox Tables
-
-| Component | Status | Notes |
-|---|---|---|
-| chbk_outbox_row | ✅ Production | Central outbox — all inbound paths converge here |
-| file_job | ✅ Production | File-level processing status tracker |
-| file_evidence | ✅ Production | Evidence document metadata + S3 staging path |
-| file_notifications | ✅ Production | Triggers file-based outbound generation |
-
----
-
-### 12.6 Kafka Event Bus
-
-| Component | Status | Notes |
-|---|---|---|
-| AWS MSK | ✅ Production | 3 brokers across 3 AZs |
-| nap-dispute-events | ✅ Production | |
-| new-case-events | ✅ Production | |
-| case-evidence-events | ✅ Production | |
-| business-rules | ✅ Production | Publisher to be confirmed |
-| outgoing-events | ✅ Production | |
-| internal-integration-events | ✅ Production | |
-| case-action-events (expiry) | ✅ Production | |
-| external-request-events | ✅ Production | |
-| core-request-events (DB2) | ✅ Production | |
-| EDIA events | 🔴 Planned | Enterprise Kafka topic on EDIA platform |
-
----
-
-### 12.7 Event Consumers
-
-| Component | Status | Notes |
-|---|---|---|
-| CaseCreationConsumer | ✅ Production | Does not handle NAP disputes currently |
-| EvidenceConsumer | ✅ Production | |
-| BusinessRulesProcessor | ✅ Production | Makes direct DB calls — does not call BusinessRulesService |
-| CaseExpiryUpdateConsumer | ✅ Production | Updates case expiry status only |
-| NotificationOrchestrator | ✅ Production | Routes by business logic in code |
-| NAP Outcome Processor | ✅ Production | ⚠️ Migration planned to EDIA route |
-| VisaResponseQuestionnaire | ✅ Production | |
-| ThirdPartyNotificationConsumer | ✅ Production | Delivers to SignifyD and JustAI via REST API |
-| BEN Consumer | ✅ Production | Delivers to BEN via webhook |
-| EDIA Consumer | 🔴 Planned | WDP owned — converts to EDIA enterprise format |
-| CoreNotificationConsumer | ✅ Production | Delivers to CORE via DB2 |
-
----
-
-### 12.8 Outbound File Generation
-
-| Component | Status | Notes |
-|---|---|---|
-| CapitalOne Response file processor | ✅ Production | Generates CapitalOne response file |
-| FileAcknowledgementProcessor | ✅ Production | Generates ACK files for Meijer, Walmart, CapitalOne |
-| NetworkResponseFileProcessor | ✅ Production | Generates Amex, AmexHybrid, Discover, DiscoverHybrid files |
-| Dialogu Issuer document Processor | ✅ Production | Generates ZIP of issuer documents |
-| NYCE File Generation Processor | 🔴 Planned | Will generate PIN Networks outbound files |
-
----
-
-### 12.9 Notification Targets
-
-| Target | Status | Integration |
-|---|---|---|
-| SignifyD | ✅ Production | REST API via ThirdPartyNotificationConsumer |
-| JustAI | ✅ Production | REST API via ThirdPartyNotificationConsumer |
-| BEN | ✅ Production | Webhook via BEN Consumer |
-| CORE | ✅ Production | DB2 via CoreNotificationConsumer |
-| NAP | 🔴 Planned | Via EDIA platform |
-| LATAM | 🔴 Planned | Via EDIA platform |
-| VAP | 🔴 Planned | Via EDIA platform |
-
----
-
-### 12.10 Acquiring Platform Integration
-
-| Platform | Inbound Status | Outbound Status | Notes |
-|---|---|---|---|
-| NAP | ✅ Production | ✅ Production | ⚠️ Both inbound and outbound migration planned |
-| CORE | ✅ Production | ✅ Production | ⚠️ Future EDIA migration consideration |
-| LATAM | 🔄 In Progress | 🔴 Planned | Regional file path + Visa/MC batch |
-| VAP | 🔄 In Progress | 🔴 Planned | Visa/MC batch + file-only networks |
-
----
-
-### 12.11 On-Premise Infrastructure
-
-| Component | Owned By | Status | Notes |
-|---|---|---|---|
-| DM Mainframe | WDP team | ✅ Production | Mainframe-to-mainframe connectivity |
-| File Transfer Batch | WDP team | ✅ Production | DiscoverHybrid special outbound flow |
-| Sterling Mailbox | Enterprise shared service | ✅ Production | Universal file hub — not WDP owned |
-| ControlM | Enterprise shared service | ✅ Production | File transfer agent — not WDP owned |
-
----
-
-### 12.12 Planned Work Summary
-
-A consolidated list of all planned work items across the platform:
-
-| # | Item | Section | Type |
-|---|---|---|---|
-| 1 | Dashboard Section (UI) | 3.1 | New feature |
-| 2 | NAP inbound migration to chbk_outbox_row → CaseCreationConsumer | 5.1 / 9.3 | Migration |
-| 3 | NAP outbound migration from direct API to EDIA route | 8.3 / 9.3 | Migration |
-| 4 | EDIA Consumer | 7.4 | New component |
-| 5 | EDIA events Kafka topic | 6.2 | New topic |
-| 6 | NAP acquiring platform via EDIA | 9.3 | New integration |
-| 7 | LATAM acquiring platform integration | 9.4 | New integration |
-| 8 | VAP acquiring platform integration | 9.5 | New integration |
-| 9 | NYCE File Generation Processor | 8.5 | New component |
-| 10 | AMEX/Discover SFTP outbound | 8.5 | New integration |
-| 11 | Circuit breaker strategy evaluation | 10.2 | Architectural decision |
-| 12 | CORE DB2 → EDIA migration | 9.2 | Future consideration |
+**Known planned items to include:**
+- Dashboard Section (UI)
+- NYCE File Generation Processor
+- EDIA Consumer
+- EDIA events topic
+- NAP → EDIA migration
+- LATAM platform integration
+- VAP platform integration
+- NAP inbound migration to common path
+- AMEX/Discover SFTP outbound (previously documented)
+- JWKS URL-based key discovery (Phase 2 IDP)
 
 ---
 
