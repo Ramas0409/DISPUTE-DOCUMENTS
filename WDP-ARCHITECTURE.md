@@ -1,6 +1,9 @@
 # WDP-ARCHITECTURE.md
 **Worldpay Dispute Platform — Architecture Reference**
-*Version: 2.0 | April 2026 | Source: WDP Architecture Review*
+*Version: 2.1 | Reconciled: 2026-04-25*
+*Source: v2.0 (April 2026) + 2026-04-18/23/24/25 source-verification reconciliation*
+
+*v2.1 reconciliation scope: minor topology-level clarifications only. The 20 component-file audits surfaced primarily component-level findings recorded in WDP-NFRS.md v2.1 and WDP-DECISIONS.md v2.1. Architecture-level changes are limited to: (a) ChargebackService externally-exposed scope and serial-under-load footnote, (b) BEN delivery mechanism corrected to Kafka publish, (c) JustAI scope split between COMP-21 inbound and COMP-41 outbound, (d) Card Network Direct API Calls AMEX/DISCOVER + MC CHI silent no-op + NAP-publish split-brain note, (e) Data Storage note for COMP-37 unique pattern, (f) Resilience pattern strengthened with COMP-21 38-sites evidence, (g) Component Status Registry updated.*
 
 ---
 
@@ -39,19 +42,21 @@ toward the right source of truth.
 | How does a dispute flow end to end? | WDP-FLOW-INDEX.md → WDP-FLOW-*.md |
 | What are the architecture decisions and tradeoffs? | WDP-DECISIONS.md |
 | What does WDP integrate with externally? | WDP-INTEGRATIONS.md |
-| What are the performance and resilience constraints? | WDP-NFRS.md ⚠️ confirm with Ram — may be outdated |
+| What are the performance and resilience constraints? | WDP-NFRS.md |
 | What is the current work position and session context? | WDP-HANDOVER.md |
 
-**Document status as of April 2026:**
-- WDP-ARCHITECTURE.md — ✅ Current (this document)
-- WDP-COMP-INDEX.md — ✅ Current (50 components registered)
-- WDP-KAFKA.md — ✅ Skeleton (topic registry, enrichment in progress)
-- WDP-DB.md — ✅ Skeleton (schema map, enrichment in progress)
+**Document status as of 2026-04-25:**
+- WDP-ARCHITECTURE.md — ✅ Current v2.1 (this document)
+- WDP-COMP-INDEX.md — 🔄 v2.0 — pending v2.1 reconciliation (status updates for 20 components)
+- WDP-KAFKA.md — ✅ Current v2.1 (reconciled 2026-04-25)
+- WDP-DB.md — ✅ Current v2.1 (reconciled 2026-04-25)
 - WDP-FLOW-INDEX.md — ✅ Skeleton (11 flows identified, none documented yet)
-- WDP-COMP-[NN]-*.md — 📋 Migration in progress (13 complete, 37 pending)
-- WDP-DECISIONS.md — ✅ Current v2.0 (rebuilt April 2026 — DEC-011 and DEC-014 voided)
-- WDP-INTEGRATIONS.md — ✅ Current v2.0 (rebuilt April 2026)
-- WDP-NFRS.md — ✅ Current v2.0 (rebuilt April 2026 — Risk Register added)
+- WDP-COMP-[NN]-*.md — 📋 40 DRAFT (20 source-verified between 2026-04-18 and 2026-04-25; architect confirmation pending), 1 COMPLETE, 6 NOT STARTED, 3 special status
+- WDP-DECISIONS.md — ✅ Current v2.1 (deviation maps enriched, 22 candidate ADRs added)
+- WDP-INTEGRATIONS.md — ✅ Current v2.1 (JustAI scope corrected, COMP-21 added, Cert eAPI added)
+- WDP-NFRS.md — ✅ Current v2.1 (60 new RISK rows added, RISK-009 withdrawn)
+- WDP-HANDOVER.md — ✅ Current v3.1 (reconciled 2026-04-25)
+- WDP-CHANGE-LOG.md — Active append-only log; 20 entries reconciled 2026-04-25
 
 ---
 
@@ -376,9 +381,11 @@ These services handle all actions that can be taken on a dispute case. They are 
 - NAP dispute events across all networks — for NAP Outcome Processor to notify NAP-DPS
 - Visa dispute events across all acquiring platforms — for VisaResponseQuestionnaire to retrieve and attach the Visa questionnaire to the dispute case
 
-**ChargebackService** is the externally exposed service available to merchant systems via APIGEE and Akamai. It is the only WDP Core service accessible programmatically to external merchants. It supports both read and action operations. Third-party systems (SignifyD, JustAI) and merchant notification systems (BEN) call back ChargebackService after receiving notifications to get dispute details and act on disputes.
+**ChargebackService** is the **sole externally-exposed WDP REST API** and the primary merchant-facing and partner-facing gateway, available to merchant systems via APIGEE → Akamai. It supports both read operations (case search, case detail, activity search, document retrieval) and action operations (contest, accept, add note, change owner, document upload). Two partner identities are coded for the simplified-authorization flow: SignifyD and JustAI (consumer name `JUSTTAI`, double-T spelling in source — active in production). After receiving outbound notifications, third-party systems (SignifyD, BEN, JustAI) call back ChargebackService for full dispute details and actions.
 
-**DisputeService** manages the core dispute lifecycle — state transitions, dispute data retrieval, and dispute-level operations.
+⚠️ ChargebackService is the largest single-component outbound-integration owner in WDP — 38 distinct downstream call sites across 12 target applications, all on a single shared `RestTemplate` with no pool, no timeouts, no retries, no circuit breaker. The documented "concurrent ACL+case-lookup" pattern is **effectively serial under current production sizing** (`asyncExecutor` core=1, max=1, queue=5) — see WDP-NFRS.md RISK-026.
+
+**DisputeService** manages the core dispute lifecycle — state transitions, dispute data retrieval, and dispute-level operations. It is read-only at runtime — owns no database state and performs no writes. A Kafka producer to `business-rules` is wired in source but all publish call sites are commented out (Kafka-free at runtime).
 
 **CaseManagementService** owns the dispute case record. It is responsible for case creation, case updates, and maintaining the integrity of the case state machine. It is the authoritative source for all case data in WDP.
 
@@ -439,6 +446,10 @@ For other acquiring platforms, enrichment works differently:
 **DynamoDB** is used exclusively by DocumentManagementService for evidence document metadata storage. It provides fast, scalable access to document metadata without impacting the primary Aurora PostgreSQL instance.
 
 **S3 Documents** is the object store for all evidence documents attached to dispute cases. DocumentManagementService writes documents here and stores the S3 path reference in DynamoDB.
+
+**IBM DB2** is the CORE platform enterprise database. WDP has one writer (COMP-43 CoreNotificationConsumer, sole writer to BC schema) and two read-only consumers (COMP-03 CHAS, COMP-34 MerchantTransactionService).
+
+⚠️ **Storage pattern note (added 2026-04-23):** COMP-37 DocumentManagementService is the **only WDP component** using AWS S3 and DynamoDB as primary data stores. It also has two PostgreSQL datasources (NAP and WDP) for desk-blanking column-level updates. The S3 + DynamoDB + dual-PostgreSQL pattern is unique to COMP-37 and should not be replicated without explicit architectural review.
 
 ---
 
@@ -1090,14 +1101,18 @@ VisaResponseQuestionnaire consumes from `internal-integration-events` and retrie
 
 Consumes from `external-request-events` and delivers dispute events to third-party fraud and intelligence systems via REST API.
 
-| Target | Protocol | Callback |
-|---|---|---|
-| SignifyD | REST API | Calls ChargebackService for dispute details and actions |
-| JustAI | REST API | Calls ChargebackService for dispute details and actions |
+| Target | Protocol | Status | Callback |
+|---|---|---|---|
+| SignifyD | REST API | ✅ Production | Calls ChargebackService for dispute details and actions |
+| JustAI (outbound) | REST API | 🔴 Planned — not in COMP-41 codebase | Will call ChargebackService for dispute details (when implemented) |
+
+⚠️ **JustAI scope clarification (2026-04-25):** JustAI is **planned only for outbound notification in COMP-41** — no JustAI reference exists in the COMP-41 codebase. Spring Retry imports are present but dead. JustAI **is active for inbound partner identification in COMP-21** ChargebackService — partners are identified at auth time via the JWT `entitlement_params` consumer name (`SIGNIFYD`, `JUSTTAI`). The v1.0 statement that "JustAI is planned" was over-broad.
 
 #### BEN Consumer
 
-Consumes from `external-request-events` and delivers dispute lifecycle notifications to the BEN merchant notification platform via webhook. Merchants receive notifications via BEN and call back ChargebackService to get dispute case details and act on disputes.
+Consumes from `external-request-events` and **publishes dispute lifecycle notifications to a BEN-owned AWS MSK Kafka cluster** (separate from WDP's MSK, with its own SASL/JAAS credentials). Merchants enrolled in BEN receive notifications via BEN and call back ChargebackService (COMP-21) to get dispute case details and act on disputes.
+
+⚠️ **(2026-04-25) Delivery mechanism corrected:** v1.0 described BEN delivery as "via webhook." The actual delivery is **Kafka publish to a BEN-owned MSK cluster** — there is no REST or webhook call to BEN. WDP has no visibility into BEN cluster health.
 
 #### EDIA Consumer 🔴 Planned
 
@@ -1168,6 +1183,14 @@ graph LR
 **ContestService publishes to `internal-integration-events`:**
 - NAP dispute contest events across all networks — consumed by NAP Outcome Processor to notify NAP-DPS
 - Visa dispute contest events across all acquiring platforms — consumed by VisaResponseQuestionnaire
+
+⚠️ **(2026-04-23) AMEX / DISCOVER and MC CHI silent no-op note:**
+
+The Section 8.1 diagram shows AMEX and DISCOVER as Visa/MC siblings, but in practice **AcceptService has no implementation path for either network** — both fall through to `log.warn` with no card-network call. Similarly, **MC CHI on both NAP and PIN platforms** is a silent no-op in `MasterCardServiceImpl.accept` (only PAB and ARB invoke an MCM call).
+
+**🔴 NAP-publish split-brain consequence:** On NAP, when the inbound `actionCode` is eligible by the Step 8 Kafka-gate criteria (`FCHG/IPAB/IARB/IDCL`), AcceptService still publishes `AcceptEvent` to `internal-integration-events` — **even though no card network was actually notified** (silent no-op for MC CHI, AMEX, DISCOVER). NAPOutcomeProcessor consumers must not assume that an `AcceptEvent` implies the network was successfully notified. This is the same severity class as DEC-019 / DEC-020 risk-accepted ADRs. See WDP-NFRS.md RISK-028 and WDP-DECISIONS.md ADR-CAND-001.
+
+For the file-based path that does deliver AMEX and Discover responses, see Section 8.5.
 
 ### 8.2 Visa Questionnaire Retrieval Flow
 
@@ -1451,6 +1474,8 @@ NAP is the acquiring platform with the most complex integration pattern. It curr
 - Outbound: NAP Outcome Processor to migrate from direct API to EDIA route
 - Goal: NAP processing fully uniform with all other acquiring platforms
 
+⚠️ **(2026-04-25) PIN/CORE migration filter is operational:** COMP-43 CoreNotificationConsumer is the live consumer of `core-request-events` and uses `migrationStatus = Y` to gate which events it processes — `platform = CORE` events are unconditionally processed; `platform = PIN` events are processed only when `migrationStatus = Y`. Other platforms (NAP, VAP, LATAM) are silently discarded at this consumer. This filter is operational, not aspirational.
+
 ### 9.4 LATAM Platform 🔴 In Progress
 
 **Inbound:** Disputes arrive from Visa and MasterCard via card network batch path and additionally from LATAM-specific regional networks via the file-based path (SFTP → Sterling → ControlM → S3).
@@ -1597,29 +1622,33 @@ WDP uses two tokens generated from every PAN, each serving a different purpose:
 
 ### 10.2 Resilience Patterns
 
-⚠️ **NOTE:** WDP does not implement circuit breakers or fallback mechanisms.
-DEC-014 (Resilience4j) is formally ⛔ VOID — confirmed absent across all 40
-component files as of April 2026. See WDP-DECISIONS.md v2.0 for the full void record.
+⚠️ **NOTE:** WDP does not implement circuit breakers or fallback mechanisms. DEC-014 (Resilience4j) is formally ⛔ VOID — confirmed absent across all 40 component files. See WDP-DECISIONS.md v2.1.
+
+⚠️ **(2026-04-25) Strengthened evidence:** COMP-21 ChargebackService alone has **38 unprotected outbound call sites** across 12 target applications, all on a single shared `RestTemplate` with no pool, no connect timeout, no read timeout, no retry, no circuit breaker. Strongest single-component evidence for the platform-wide DEC-014 void.
+
 If circuit breakers are introduced in a future hardening sprint, a new ADR must be raised.
 
 Resilience in WDP is currently built around three patterns:
 
 **Idempotency & At-Most-Once Delivery:**
-- All confirmed Kafka consumers use pre-ACK or mid-flow ACK — offset committed
-  BEFORE full processing completes. DEC-005 (at-least-once) is aspirational;
-  the platform-wide pattern is at-most-once. See WDP-DECISIONS.md v2.0 DEC-005.
+- All confirmed Kafka **consumers** use pre-ACK or mid-flow ACK — offset committed BEFORE full processing completes. DEC-005 (at-least-once) is aspirational; the platform-wide pattern is at-most-once. See WDP-DECISIONS.md DEC-005.
+- COMP-12 outbox-relay is the inverse pattern: **at-least-once with duplicate-possible** — mark-and-send within `@Transactional`, broker ACK precedes TX commit. Consumer-side `idempotency-key` dedup is the contracted mitigation.
 - Per-consumer outbox tables track processing state and idempotency keys
 - Deduplication keys at every processing boundary
 
-**Retry & Backoff:**
-- Exponential backoff with jitter applied to all external API calls
-- Transient failures (timeouts, 5xx) are retried
-- Permanent failures (400, 404, auth failures) are recorded as errors and not retried
+⚠️ **(2026-04-25) Distinct silent-loss class:** Empty anonymous `CommonErrorHandler{}` is registered platform-wide on multiple consumers (COMP-14, 15, 16, 17, 18, 39, 41, 42, 43). Combined with `ErrorHandlingDeserializer` and pre-ACK, deserialisation exceptions and unhandled application exceptions are silently swallowed — a *distinct* silent-loss class from the pre-ACK offset window. See WDP-NFRS.md RISK-025.
 
-**Error Tracking via Outbox Tables:**
-- Each consumer maintains its own outbox table
-- All error states are recoverable and auditable
-- No event is silently lost
+**Retry & Backoff:**
+- Spring Retry (`@Retryable`) is the sole active retry mechanism, present in a subset of components only — typically 3 attempts with fixed delay. Components without `@Retryable` make a single attempt; failure propagates immediately.
+- Permanent failures (400, 404, auth failures) are recorded as errors and not retried.
+
+⚠️ **(2026-04-25) Dead retry imports:** COMP-41 imports `@Retryable`/`@Backoff` but never applies them at runtime. Class names containing "Retry" describe custom try/catch, not the framework.
+
+**Error Tracking via Outbox / Error Tables:**
+- Each consumer maintains its own outbox or error table (DEC-016)
+- All error states are recoverable and auditable in nominal cases
+
+⚠️ **(2026-04-25) Orphan-path gaps:** PUBLISHED-status orphan rows on `wdp.outgoing_event_outbox` and `wdp.bre_orchestration_outbox` have no automatic re-drive mechanism — Scheduler3/4 read only FAILED/PENDING_DEFERRED rows. COMP-41 has three distinct PUBLISHED-orphan paths (RISK-040 extends RISK-015); COMP-43 has a silent-loss window between ACK and FAILED-write (RISK-036). Manual operator runbook required pending OQ-COMP41-1.
 
 ⚠️ Per-consumer outbox table details deferred to component-level documentation.
 
@@ -1786,6 +1815,8 @@ graph LR
 ## 12. Component Status Registry
 
 This section provides a single reference table covering all WDP components with their current production status. Use this as the definitive source for understanding what is live, what is planned, and what is in progress.
+
+⚠️ **(2026-04-25) Source-verification status:** 20 of the 40 DRAFT component files have undergone source-verified correction passes between 2026-04-18 and 2026-04-25. Detailed component-by-component status (vX.Y DRAFT — source-verified [date], architect confirmation pending) is maintained in **WDP-COMP-INDEX.md** (pending v2.1 reconciliation). The tables below show production-deployment status only — they are unchanged at the topology level by the v2.1 reconciliation.
 
 **Status legend:**
 - ✅ Production — component is live and in production
@@ -1992,29 +2023,34 @@ A consolidated list of all planned work items across the platform:
 
 ## Open Discussion Points & Follow-Ups
 
-The following items have been flagged during the architecture review and require further discussion or confirmation:
+The following items have been flagged during the architecture review and require further discussion or confirmation. Several entries have been marked ✅ resolved by the 2026-04-18 to 2026-04-25 source-verification reconciliation pass.
 
-| # | Topic | Section | Priority |
-|---|---|---|---|
-| 1 | Discover vs DiscoverHybrid — detailed file flow differences | 5.4 | High |
-| 2 | Amex vs AmexHybrid — detailed file flow differences | 5.4 | High |
-| 3 | File content classification per source — dispute events only, merchant response docs, issuer docs, combined | 5.4 | High |
-| 4 | Acknowledgement file rules — which sources require ACK and which do not | 5.4 | High |
-| 5 | S3 folder key structure and naming conventions per source and target | 5.4 | Medium |
-| 6 | File-only network issuer documents — confirm if sent in separate files via DM Mainframe | 5.3 | Medium |
-| 7 | Visa & MasterCard issuer document retrieval — confirm at which processing stage and which component | 5.3 / 7 | High |
-| 8 | Circuit breaker strategy — evaluate and document as future architectural decision | 10.2 | Medium |
-| 9 | business-rules topic publisher — confirm which component publishes | 6.2 | Medium |
-| 10 | case-action-events partition key — confirm merchant_id or case_id | 6.2 | Low |
-| 11 | Consumer group names — confirm exact names at component level | 6.3 | Low |
-| 12 | UserAccessManagementService — detailed behaviour to be confirmed | 3.4 | Medium |
-| 13 | Fax functionality — dedicated section needed under Queues | 4.3 | Medium |
-| 14 | CORE DB2 → EDIA migration — capture as open architectural decision | 9.2 | Low |
-| 15 | Observability tooling — document in dedicated operational architecture pass | 10.3 | Medium |
-| 16 | Compliance frameworks — verify and update current list | 10.4 | Medium |
-| 17 | Per-consumer outbox tables — document at component level | 7 | High |
-| 18 | NAP CB911 migration timeline and completion criteria | 9.3 | Medium |
+| # | Topic | Section | Priority | Status |
+|---|---|---|---|---|
+| 1 | Discover vs DiscoverHybrid — detailed file flow differences | 5.4 | High | Open |
+| 2 | Amex vs AmexHybrid — detailed file flow differences | 5.4 | High | Open |
+| 3 | File content classification per source — dispute events only, merchant response docs, issuer docs, combined | 5.4 | High | Open |
+| 4 | Acknowledgement file rules — which sources require ACK and which do not | 5.4 | High | Open |
+| 5 | S3 folder key structure and naming conventions per source and target | 5.4 | Medium | Open |
+| 6 | File-only network issuer documents — confirm if sent in separate files via DM Mainframe | 5.3 | Medium | Open |
+| 7 | Visa & MasterCard issuer document retrieval — confirm at which processing stage and which component | 5.3 / 7 | High | Open |
+| 8 | Circuit breaker strategy — evaluate and document as future architectural decision | 10.2 | Medium | Open — see WDP-DECISIONS.md ADR-CAND-007 candidate (No K8s probes — same hardening sprint) |
+| 9 | business-rules topic publisher — confirm which component publishes | 6.2 | — | ✅ Resolved 2026-04-25 — six confirmed publishers (COMP-12 Scheduler4, COMP-15, COMP-23, COMP-24, COMP-25, COMP-37). COMP-14 confirmed NOT a publisher. |
+| 10 | case-action-events partition key — confirm merchant_id or case_id | 6.2 | Low | ✅ Resolved 2026-04-25 — pass-through `RECEIVED_KEY` from upstream COMP-18 (consumer-side variable name `caseNumber`). See WDP-DECISIONS.md DEC-003 deviation map. |
+| 11 | Consumer group names — confirm exact names at component level | 6.3 | Low | ✅ Resolved across 9 reconciled consumers. See WDP-KAFKA.md v2.1. |
+| 12 | UserAccessManagementService — detailed behaviour to be confirmed | 3.4 | Medium | Open |
+| 13 | Fax functionality — dedicated section needed under Queues | 4.3 | Medium | Open |
+| 14 | CORE DB2 → EDIA migration — capture as open architectural decision | 9.2 | Low | Open |
+| 15 | Observability tooling — document in dedicated operational architecture pass | 10.3 | Medium | Partial — WDP-OBSERVABILITY-ARCHITECTURE.md exists; not yet integrated into Section 10.3 |
+| 16 | Compliance frameworks — verify and update current list | 10.4 | Medium | ✅ Captured in WDP-NFRS.md v2.1 Section 3 |
+| 17 | Per-consumer outbox tables — document at component level | 7 | High | ✅ Captured in WDP-DB.md v2.1 Section 4 |
+| 18 | NAP CB911 migration timeline and completion criteria | 9.3 | Medium | Open |
+| 19 | AcceptService NAP split-brain (MC CHI / AMEX / DISCOVER) — fail-close, accept-and-document, or remediate? | 8.1 | High | Open — same severity class as DEC-019/020. ADR-CAND-001 in WDP-DECISIONS.md. |
+| 20 | COMP-43 DB2 clear PAN — extend DEC-019 or remediate? | 4.8 | High | Open — architect decision required. RISK-035, ADR-CAND-004. |
+| 21 | COMP-12 production replica count — replicas > 1 produces guaranteed duplicate Kafka publishes | 11 | High | Open — confirmation pending from deployment team. RISK-038. |
 
 ---
 
 *This document contains architecture-level content only. Implementation details, database schemas, configuration values, code patterns, and deployment specifications are maintained separately at component level.*
+
+*v2.1 reconciled 2026-04-25 — minor topology-level clarifications: ChargebackService externally-exposed scope and serial-under-load footnote; BEN delivery mechanism corrected (Kafka, not webhook); JustAI scope split between COMP-21 inbound and COMP-41 outbound; AMEX/DISCOVER + MC CHI silent no-op + NAP-publish split-brain note in Section 8.1; COMP-37 unique storage pattern note in Section 4.8; Resilience pattern strengthened with COMP-21 evidence and orphan-path gaps; Open Discussion Points partially resolved.*
