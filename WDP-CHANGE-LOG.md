@@ -2204,7 +2204,277 @@ not enforced by code.
 consume entries from this section and move them to the most recent **Reconciled**
 section above.*
 
-*(currently empty — last reconciliation: 2026-04-25)*
+### 2026-04-25 — COMP-51 CaseExpiryProcessor (NEW COMPONENT) · v1.0 DRAFT
+
+**Source:** `gcp-case-expiry-processor-batch` — source-verified by Claude Code
+2026-04-25. Architect confirmation pending.
+
+**Nature of change:** New component registration. CaseExpiryProcessor is the
+deadline-enforcement reader half of the case-expiry subsystem; COMP-17
+CaseExpiryUpdateConsumer is the writer half. The two share `wdp.case_expiry`
+as their coordination surface and write to `wdp.outgoing_event_outbox` with
+distinct `channel_type` discriminators. No prior architecture documentation
+existed for COMP-51.
+
+#### Platform-level impacts
+
+**WDP-COMP-INDEX.md**
+
+- Add new row in the registry table: `| 51 | CaseExpiryProcessor |
+  Batch/Scheduler | ✅ Production | 📝 DRAFT |
+  WDP-COMP-51-CASE-EXPIRY-PROCESSOR.md |`. Insert in numerical order
+  immediately after COMP-50 WDP Ops Portal.
+- Add a one-line responsibility entry in the responsibility-summary
+  section: "COMP-51 — CaseExpiryProcessor: Scheduled batch that scans
+  `wdp.case_expiry` for past-due deadlines and acts on each row by calling
+  Case Action / Case Management / Expiry Rules APIs and one of three
+  terminal APIs (Update Action / Accept / Add Action). Reader half of the
+  case-expiry subsystem; COMP-17 is the writer half. Captures retry-
+  exhausted failures into `wdp.outgoing_event_outbox` with
+  `channel_type = EXPIRY_BATCH`."
+- Add a "Case Expiry Subsystem" cross-reference note linking COMP-17 and
+  COMP-51 — both share `wdp.case_expiry` coordination.
+
+**WDP-DB.md**
+
+- **Section 2 · `wdp.case_expiry` row:** change Owning Component(s) from
+  "COMP-17 CaseExpiryUpdateConsumer" to **"COMP-17 CaseExpiryUpdateConsumer
+  (INSERT/UPSERT/DELETE on action close); COMP-51 CaseExpiryProcessor (SELECT
+  page-fetch, UPDATE i_retry_count, DELETE on success/CLOSED-action/retry-
+  exhaustion)"**.
+- **Section 2 · `wdp.case_expiry` row · Notes:** append "⚠️ Shared write
+  boundary between COMP-17 and COMP-51 with no coordination — no row-level
+  lock, no version column, no SELECT FOR UPDATE. Race between COMP-17
+  upsert and COMP-51 retry-counter UPDATE possible. Documented and pending
+  architect decision."
+- **Section 2 · `wdp.case_expiry` row · Open question:** resolved partially
+  — COMP-51 confirmed as the primary downstream reader. Other downstream
+  readers (if any) still need cross-component sweep on remaining WDP repos.
+- **Section 2 · `wdp.outgoing_event_outbox` row:** add COMP-51 to the
+  Owning Component(s) list with discriminator: **"COMP-51 CaseExpiryProcessor
+  (channel_type=EXPIRY_BATCH, created_by=WCSEEXPB, status=ERROR direct
+  on retry exhaustion)"**.
+- **Section 2 · `wdp.outgoing_event_outbox` row · Notes:** append "COMP-51
+  writes status=ERROR directly (no transition through PUBLISHED→FAILED)
+  and channel_type=EXPIRY_BATCH. ⚠️ No platform component currently
+  identified as consumer of EXPIRY_BATCH rows — COMP-12 Scheduler3 reads
+  FAILED and PENDING_DEFERRED only, so COMP-51 outbox rows may be terminal-
+  write-only. Architect decision required."
+- **Section 4 · Shared Table Risk Register · `wdp.case_expiry` row:** add
+  new entry — "🔴 HIGH — Shared write between COMP-17 and COMP-51 with no
+  coordination mechanism. COMP-17 upserts on Kafka events; COMP-51 reads,
+  UPDATEs retry counter, and DELETEs. Race conditions possible between the
+  two components on the same row (i_retry_count overwrite, mid-flight
+  upsert during chunk processing). No row-level lock, no version column."
+- **Section 4 · Shared Table Risk Register · `wdp.outgoing_event_outbox`
+  row:** update existing 🟢 LOW entry to add: "COMP-51 added 2026-04-25
+  with channel_type=EXPIRY_BATCH (distinct from COMP-17's EXPIRY_EVENTS).
+  Discriminator isolation maintained — no cross-component reads of each
+  other's channel_type rows. Logical isolation remains intact at LOW
+  severity."
+
+**WDP-KAFKA.md**
+
+- **Section 5 — Components without Kafka involvement:** add COMP-51
+  CaseExpiryProcessor to the list. Note: declares `spring-kafka`,
+  `kafka-clients`, and `aws-msk-iam-auth` as POM dependencies but no
+  producer or consumer code exists; staged-but-unwired.
+- **Sections 3 and 4:** no change. COMP-51 has no active topic or
+  consumer-group registration.
+
+**WDP-FLOW-INDEX.md**
+
+- Candidate new flow document: **WDP-FLOW-CASE-EXPIRY-LIFECYCLE.md** —
+  end-to-end deadline-tracking workflow covering COMP-18 (publishes to
+  `case-action-events` when an action's expiry data changes), COMP-17
+  (consumes and maintains `wdp.case_expiry`), COMP-51 (scans and acts on
+  past-due deadlines), and the COMP-51 → outbox `EXPIRY_BATCH` failure
+  path. Recommend creation at next flow-document rebuild window.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+Add or correct:
+- COMP-51 CaseExpiryProcessor exists as a standalone Spring Batch
+  Deployment in `gcp-case-expiry-processor-batch` repository. Deadline-
+  enforcement reader half of the case-expiry subsystem; COMP-17 is the
+  writer half.
+- COMP-51 trigger is a Spring `@Scheduled` cron — NOT a Kubernetes CronJob.
+  Cron expression and page size are env-templated and not in source.
+- COMP-51 chunk size = 1; reader paginates with PageRequest.of(0, pageSize,
+  Sort.by("z_insrt")) plus monotonic-id cursor.
+- COMP-51 calls 7 distinct upstream services: IDP token, Case Action API,
+  Case Management API, Expiry Rules API, Update Action API, Accept API,
+  Add Action API.
+- COMP-51 retry mechanism is hand-rolled — increment `i_retry_count` on
+  `wdp.case_expiry` if < 3, write outbox + delete row on 3rd consecutive
+  failure. `spring-retry` is on classpath but unused.
+- COMP-51 writes outbox rows with `channel_type=EXPIRY_BATCH` (distinct
+  from COMP-17's `EXPIRY_EVENTS`), `created_by=WCSEEXPB` (distinct from
+  COMP-17's `WCSEEXPC`), and `status=ERROR` direct (no PUBLISHED→FAILED
+  transition).
+- COMP-51 has no `@SchedulerLock`, no ShedLock, no advisory lock. DEC-023
+  operational-only — replicas must be 1.
+- COMP-51 has no liveness/readiness/startup probes wired.
+- COMP-51 has no test coverage. `src/test/` is empty.
+- COMP-51 generates a fresh random `v-correlation-id` UUID per outbound
+  REST call — same anti-pattern as COMP-17. End-to-end audit trail across
+  the 4–5 calls per record cannot be reconstructed from headers alone.
+- COMP-51 IDP token call does NOT carry `v-correlation-id` — same gap as
+  COMP-17.
+- COMP-51 uses `DriverManagerDataSource` (not pooled) — acceptable for
+  low-frequency batch.
+- COMP-51 outbox INSERT and `wdp.case_expiry` DELETE share the Spring
+  Batch chunk transaction (atomic by chunk boundary).
+- COMP-17 and COMP-51 share `wdp.case_expiry` as their coordination
+  surface — COMP-17 is the inserter / upserter / closure-deleter, COMP-51
+  is the deadline-enforcement-deleter and retry-counter updater. No lock
+  or version column between them.
+
+Resolved open questions (remove from HANDOVER):
+- "Downstream consumers of `wdp.case_expiry` not yet confirmed" —
+  partially resolved: COMP-51 confirmed as primary reader. Cross-component
+  sweep on remaining WDP repos still pending for any other potential
+  readers.
+
+New open questions (add to HANDOVER):
+- COMP-51 writes outbox rows with `channel_type=EXPIRY_BATCH` and
+  `status=ERROR`. **No platform component currently identified as
+  consumer of these rows.** COMP-12 Scheduler3 reads only FAILED and
+  PENDING_DEFERRED, so EXPIRY_BATCH ERROR rows may be terminal-write-only
+  with no recovery path. Architect decision required: define consumer or
+  accept as audit-only sink.
+- COMP-51 ↔ COMP-17 race conditions on `wdp.case_expiry`: COMP-17 upsert
+  may collide with COMP-51 retry-counter UPDATE or with COMP-51 success-
+  path DELETE. Architect decision required: accept as risk or remediate
+  via row-version / SELECT FOR UPDATE.
+- COMP-51 cron value, page size, table prefix, and replica count — all
+  env-templated; XLD config inspection needed.
+- COMP-51 `v-correlation-id` regenerated per call — bug or intentional?
+  Same question as COMP-17. Likely a platform-wide remediation candidate.
+- COMP-51 Discover hybrid-merchant RE2/REPR special case — permanent
+  regulatory rule or migration-era workaround? Hardcoded constants
+  (`RE2`, `REPR`, `WPAYOPS`, `EXPIRY_DAYS=32`).
+- COMP-51 HTTP 504 retry on POST endpoints (Accept, Add Action, Rules) —
+  is repeating a 504-timed-out POST safe across all 7 upstream services?
+  Architect / team confirmation needed.
+- COMP-51 hardcoded user IDs `WCSEEXPB` (this component) and `WCSEEXPC`
+  (COMP-17) — confirm distinction is intentional and recorded in the
+  platform user-ID registry.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+
+- **HIGH candidate:** "EXPIRY_BATCH outbox channel — terminal write-only
+  vs. recoverable" — COMP-51 writes `status=ERROR` rows that no platform
+  consumer currently picks up. Architecture decision needed: define a
+  consumer (manual ops portal? automated retry scheduler?) or formally
+  accept as audit-only failure sink. Affects every future component that
+  uses outbox-as-failure-sink pattern.
+- **HIGH candidate:** "Shared-table coordination on `wdp.case_expiry`" —
+  COMP-17 and COMP-51 are co-writers with no coordination. Pattern is
+  novel for WDP (unlike `chbk_outbox_row` which has clear LOADING/PENDING/
+  PUBLISHED hand-off semantics). Architectural decision needed on
+  coordination strategy: row-version, advisory lock, SELECT FOR UPDATE,
+  or accept-as-low-probability.
+- **MEDIUM candidate:** "v-correlation-id propagation — per-call UUID
+  regeneration anti-pattern" — confirmed in COMP-17 and COMP-51. Likely
+  platform-wide. Could be one ADR mandating per-record (or per-message)
+  correlation IDs across all outbound REST calls within a single
+  processing unit.
+- **MEDIUM candidate:** "Hand-rolled retry counter persistence vs.
+  spring-retry" — COMP-51 (and COMP-07/08/09 via similar pattern) uses
+  hand-rolled retry counters persisted to the source table. Worth
+  formalising as a platform pattern or replacing with a uniform retry
+  abstraction.
+- **LOW candidate:** "No probes on polling batches" — already raised by
+  COMP-07 entry. COMP-51 confirms the pattern. Strengthens the case for
+  remediation across all batch components.
+
+**WDP-ARCHITECTURE.md**
+
+- Add COMP-51 to the platform-summary topology / component list. Group
+  with COMP-17 under a "Case Expiry Subsystem" sub-heading if applicable
+  to the topology diagram structure.
+- No principle change; topology evolves only by addition of one new
+  Deployment in the `wdp-micro` namespace.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+
+- Add new RISK row: "RISK-NN — `EXPIRY_BATCH` outbox rows have no
+  identified consumer. COMP-51 writes failure-capture rows with
+  channel_type=EXPIRY_BATCH and status=ERROR. No platform component is
+  currently confirmed to read them. Severity 🔴 HIGH until a consumer is
+  defined or the rows are formally accepted as audit-only."
+- Add new RISK row: "RISK-NN — Shared write to `wdp.case_expiry` between
+  COMP-17 and COMP-51 has no coordination mechanism. Race conditions on
+  retry counter and deletion possible. Severity 🟡 MEDIUM until coordination
+  strategy decided."
+- The existing RISK on at-most-once delivery and the existing RISK on
+  no-DLQ posture cover COMP-51's per-record failure modes generically; no
+  new entries needed there.
+
+**WDP-INTEGRATIONS.md**
+
+- No change. COMP-51's REST dependencies are all internal `wdp-micro`
+  namespace services. No external integrations.
+
+#### Deviation flags for COMP-51
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ⚠️ PARTIAL | 🟡 MEDIUM |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE | — |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⚠️ PARTIAL | 🟡 MEDIUM |
+| DEC-023 Replica = 1 Hard Constraint | ⚠️ OPERATIONAL ONLY | 🟡 MEDIUM |
+| DEC-014 Resilience4j (platform-VOID) | ✅ ABSENT (factual record only) | — |
+
+**DEC-001 PARTIAL detail:** Outbox is used as a failure-capture sink, not
+as a transactional producer outbox. Outbox INSERT and `wdp.case_expiry`
+DELETE share the Spring Batch chunk transaction (atomic), but the business
+state changes already executed by the failed REST call (Update Action /
+Accept / Add Action) are NOT reconstructable from the outbox row — the
+entry contains the source `CaseExpiryEntity` only, not the in-flight
+downstream payload. Recovery requires manual reasoning.
+
+**DEC-020 PARTIAL detail:** Idempotency is only via `wdp.case_expiry` row
+deletion after success or retry exhaustion. No idempotency key stored or
+checked against downstream APIs. If the job re-runs after a crash that
+occurred after a successful Update Action / Accept / Add Action call but
+before the row was deleted, the call would be re-issued — downstream-side
+dedup must protect, not COMP-51-side. Two replicas have no guard — see
+DEC-023.
+
+**DEC-023 OPERATIONAL ONLY detail:** No `@SchedulerLock`, no ShedLock,
+no advisory lock. Concurrency safety relies entirely on K8s `replicas: 1`.
+Same posture as COMP-07 / COMP-08 / COMP-09 polling batches.
+
+#### Cross-component coordination notes
+
+**Impact on COMP-17 (CaseExpiryUpdateConsumer):**
+
+The COMP-51 audit confirms COMP-17's previously-open question on downstream
+readers of `wdp.case_expiry` — COMP-51 is the primary reader (cross-repo
+sweep still pending for any other readers). This does NOT trigger a
+parallel COMP-17 file revision; the next COMP-17 reconciliation will
+absorb this fact via the HANDOVER update above.
+
+The COMP-17 v1.1 DRAFT note "Downstream consumers of wdp.case_expiry not
+yet confirmed" should be updated at next COMP-17 reconciliation to read:
+"COMP-51 CaseExpiryProcessor confirmed as primary reader; cross-repo
+sweep for any other readers still pending."
+
+#### Doc status after this change
+
+- `WDP-COMP-51-CASE-EXPIRY-PROCESSOR.md` → `v1.0 DRAFT` — source-verified
+  2026-04-25 · architect confirmation pending
+- `WDP-COMP-INDEX.md` → registry needs new row at position 51 (next
+  reconciliation session)
+- `WDP-DB.md` → `wdp.case_expiry` and `wdp.outgoing_event_outbox`
+  ownership changes pending (next reconciliation session)
+- `WDP-KAFKA.md` → Section 5 addition pending (next reconciliation session)
+- `WDP-FLOW-INDEX.md` → new flow document candidate pending
 
 ---
 
