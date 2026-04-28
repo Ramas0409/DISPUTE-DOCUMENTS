@@ -1,0 +1,444 @@
+You are auditing the WDP component QuestionnaireService in the repository
+mdvs-gcp-questionnaire-service. A prior pass already produced a DRAFT
+architecture document. Your job is to CONFIRM OR CORRECT the items listed
+under 'ALREADY DOCUMENTED' from source, and to CLOSE the items listed under
+'GAPS TO FILL' by reading the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you read
+it from. Where source does not show the answer, state that explicitly and
+label it 'not determinable from source'. Do NOT guess. Do NOT summarise
+without evidence. Do NOT use the existing document as a substitute for
+source — treat it as a hypothesis to verify.
+
+═══════════════════════════════════════════
+REFERENCE DOCUMENT
+═══════════════════════════════════════════
+The existing component file WDP-COMP-26-QUESTIONNAIRE-SERVICE.md (v1.0
+DRAFT) is provided alongside this prompt. Treat every claim in it as a
+HYPOTHESIS to verify against source — NOT as ground truth.
+
+For each documented claim, you must either:
+  (a) confirm — write "Still accurate — <file>:<lines>"; OR
+  (b) correct — write a CORRECTION block with three lines:
+        DOC SAYS: <existing claim verbatim>
+        SOURCE SHOWS: <actual value>, cited <file>:<lines>
+        UPDATE NEEDED IN: <section heading of the existing doc>
+
+At the end of the report (Section 10), list every documented claim that
+could NOT be verified from source — neither confirmed nor contradicted.
+
+═══════════════════════════════════════════
+ALREADY DOCUMENTED — CONFIRM OR CORRECT EACH
+═══════════════════════════════════════════
+Do NOT re-document these from scratch. For each, output either
+"Still accurate — <file>:<lines>" or a CORRECTION block.
+
+Identity & framework
+- Spring Boot version 3.5.4, Java 17
+- Maven artifactId `questionnaire-service`, version `2.1.8`
+- Spring application name `Questionnaire-Service`
+- Base path `/merchant/gcp/questionnaire` from env `SERVER_SERVLET_CONTEXT_PATH`
+- No Kafka dependency in pom.xml (neither producer nor consumer)
+- No Spring Batch / scheduler dependency
+- No transactional outbox table written
+- No EncryptionService dependency, no PAN field anywhere
+
+Auth (inbound)
+- Spring OAuth2 Resource Server using JwtIssuerAuthenticationManagerResolver
+- Trusted issuers from config key `jwt.trustedIssuers` (env `jwt_trusted_issuer_urls`)
+- JWT exempt paths: `/actuator/health`, `/livez`, `/readyz`, Swagger UI in non-prod only
+- No `@PreAuthorize` anywhere in source; no scope checks; any valid JWT from a trusted issuer is accepted
+
+Auth (outbound)
+- Client-credentials grant, registration ID `wdp-internal-auth`, scope `openid`
+- Bearer token attached on outbound calls to case-actions-service
+- IdP token URL from env `idp_token_url`
+
+Controllers and endpoints
+- VisaQuestionnaireController (prefix `/visa`): 5 POST, 5 PUT, 5 GET
+- DisputeQuestionnaireController (no prefix): B1 PUT /document UPSERT, B2 POST /representment, B3 GET /representment, B4 PUT /representment, B5 GET /document
+- Visa POST returns `{"qstnnairId":"<id>"}` — confirm exact JSON shape
+- Non-Visa B2 POST returns 201 with empty body — confirm
+- Total endpoint count = 16 (5+5+5+1+1+1+1+1+1)
+
+Processing flow (mutating path 11 steps)
+- JWT validation → HttpInterceptor.preHandle correlation-id → controller routing → `@Valid` + QuestionnaireValidator → (PUT only) findByCaseNumberAndActionSeq 404 if absent → SearchActionDetailsService.getCaseAction REST call → NAP branch → amount validation → CalculationUtil.setAmountPercentage → QuestionnaireMapper → DB save
+
+NAP branch
+- platform == "NAP" → validate responseAmount vs disputeWorkableAmount
+- otherwise → validate responseAmount vs disputeSourceAmount
+
+Allocation Arbitration (A4) specifics
+- amount validation uses `caseFilingAmount` not `responseAmount`
+- contactFax + contactOther in issuerAcquirerContactInfo cannot both be set → HTTP 400
+
+GET path
+- pure DB read via findByCaseNumberAndActionSeq → mapEntityToModel deserialises JSON blob
+- no outbound call to case-actions-service
+
+B5 GET /document multi-fallback chain
+- attempt 1: exact (responseReason, reasonCode, compEvidenceType)
+- attempt 2: (responseReason, "NA", compEvidenceType)
+- attempt 3: (responseReason, reasonCode, "NA")
+- still null → 404
+
+Validation
+- `checkWriteOffReasonWriteOffNote` is commented out on every POST handler (all 5 Visa POSTs and Non-Visa B2 POST), but ACTIVE on every PUT handler — confirm exhaustively
+- `checkCTMTemplate` method BODY is fully commented out in QuestionnaireValidator → no-op on every endpoint
+- A2 cross-field: preCompResponse==DECL → continuePreFilingReason required + partialAcceptanceReason absent; PART → partialAcceptanceReason required
+- A3 prearbresp: reasonForNotFullResponsibility `@NotBlank`
+- A5 allocprearb: validatePreArbitrationResponseReason applies CREDIT_PROCESSED / COMPELLING_EVIDENCE
+- Non-Visa: caseNetwork `@NotBlank`, comments `@NotBlank`
+
+Outbound dependency
+- Service: mdvs-gcp-case-actions-service
+- Endpoint: `GET /merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions/{actionSequence}`
+- Returns ActionSummary (disputeWorkableAmount, disputeSourceAmount, stageCode, creditDebitIndicator)
+- RestTemplate constructed as `new RestTemplate()` with no HttpComponentsClientHttpRequestFactory, no setConnectTimeout, no setReadTimeout
+- No retry, no fallback, no circuit breaker
+- RestClientException rethrown → HTTP 500
+
+Database
+- Write target: `wdp.disputes_questionnaire`
+- Read-only target: `wdp.disputes_questionnaire_doc_status_rules`
+- JPA entity has `@Index` on (I_CASE, I_ACTION_SEQ) — confirm column names exactly
+- JPA entity has NO `@UniqueConstraint`
+- PK column `I_QSTNNAIR_ID`, auto-increment sequence
+- JSON blob column `C_QSTNNAIR`
+- Document name column `N_DOCUMENT_NAME`
+
+Error handling
+- Error body shape: `{"errors":[{"message":"...","target":"..."}]}` — confirm
+- StandardEntityError class exists in GlobalExceptionHandler but is not wired to any active exception path
+- TODO comment exists at GlobalExceptionHandler.java:167 referencing METHOD_NOT_ALLOWED
+- HTTP statuses observed in handlers: 200, 201, 400, 401, 404, 500 only — confirm there are NO 403, 409, 422 paths
+
+B1 PUT /document UPSERT semantics
+- If row not found → create new QuestionnaireEntity with `qstnnairRequest = "{}"` + insert timestamps
+- If row found → reuse existing entity
+- Set documents list, updatedBy, updatedTimestamp
+- DOES NOT call case-actions-service
+
+Deployment (resources.yaml)
+- Kind: Deployment
+- Replicas: `{{ replicas-gcp-questionnaire-service }}` template placeholder
+- Memory: limit 2048Mi, request 1024Mi
+- CPU: NEITHER limit nor request configured
+- HPA: ABSENT
+- PodDisruptionBudget: ABSENT
+- Strategy: RollingUpdate, maxSurge=1, maxUnavailable=0, minReadySeconds=30
+- Topology spread: maxSkew=1, ScheduleAnyway, kubernetes.io/hostname, matchLabels app=mdvs-gcp-questionnaire-service
+- OTel injection annotation `instrumentation.opentelemetry.io/inject-java`
+- K8s namespace: not explicitly declared in resources.yaml — confirm
+
+Observability
+- Actuator endpoints exposed: info, health, prometheus
+- Liveness probe: /livez ; readiness probe: /readyz
+- Server port 8082
+- Logstash appender: LogstashTcpSocketAppender named `awselk`
+- Destination from env `logstash.server.host.port`
+- Two commented-out hardcoded Logstash IPs `10.43.145.125:5044` in logback-spring.xml
+
+Other
+- `${app.name}` referenced as metrics tag but env var not declared in application.yaml or resources.yaml
+
+═══════════════════════════════════════════
+GAPS TO FILL — ANSWER FROM SOURCE
+═══════════════════════════════════════════
+For each numbered task, answer the explicit sub-questions, citing file:lines.
+
+1. DB constraint reality on `wdp.disputes_questionnaire`
+   - Does the repo contain Liquibase / Flyway / Spring Boot SQL migration files? List every changelog or migration file path.
+   - If yes: do any of them create a UNIQUE constraint on (I_CASE, I_ACTION_SEQ) on `wdp.disputes_questionnaire`?
+   - If yes: also list every NOT NULL constraint and every index defined on this table by migrations.
+   - If no migration files exist: state "no DDL or migration in repo — DB constraints managed externally".
+
+2. POST idempotency mechanism
+   - For each POST handler (A1–A5 Visa, B2 Non-Visa): is there ANY pre-save check that detects an existing row for the same (caseNumber, actionSeq)? Cite file:lines.
+   - Is there any `@Idempotency` annotation, `Idempotency-Key` header reading, or dedupe table read?
+   - State explicitly: "POST does/does not check for existing row before insert".
+
+3. Concurrent-write protection
+   - Is `@Version` (JPA optimistic locking) declared on QuestionnaireEntity?
+   - Is any `SELECT ... FOR UPDATE` or `@Lock(LockModeType.PESSIMISTIC_*)` used on the read-before-write paths (PUT, B1 UPSERT)?
+   - Cite file:lines for findings or state "not present".
+
+4. Transaction boundaries
+   - Which service or controller methods are annotated `@Transactional`? Cite each.
+   - Does the case-actions REST call execute INSIDE or OUTSIDE the transaction that contains the DB save? Confirm by inspecting method boundaries.
+   - Is the B1 UPSERT (find-then-create-or-update-then-save) executed inside a single `@Transactional`?
+
+5. Outbound REST timeout configuration
+   - Search exhaustively for `setConnectTimeout`, `setReadTimeout`, `HttpComponentsClientHttpRequestFactory`, `ClientHttpRequestFactory`, `RestTemplateBuilder` usage related to the case-actions-service RestTemplate.
+   - Search application.yaml and any application-{profile}.yaml for keys matching `*.connect-timeout`, `*.read-timeout`, `*.timeout`, `spring.cloud.openfeign.client.config.*`.
+   - State explicitly the connect timeout value, read timeout value, OR "not configured — JVM default applies".
+
+6. Resilience4j footprint
+   - Confirm pom.xml contains no artifact with groupId `io.github.resilience4j`.
+   - Confirm no source file uses `@CircuitBreaker`, `@Retry`, `@Bulkhead`, `@RateLimiter`, `@TimeLimiter`.
+   - Confirm no `resilience4j.*` keys in any application.yaml or application-{profile}.yaml.
+   - State explicitly: "Resilience4j absent" with three citations OR list every reference found.
+
+7. Cross-component ownership of `wdp.disputes_questionnaire`
+   - Confirm the JPA entity (likely `QuestionnaireEntity`) `@Table` annotation resolves to schema `wdp` and table `disputes_questionnaire`. Cite file:lines.
+   - Search for any other entity class (across the entire repo) that maps to the same physical table.
+   - Does any code path in THIS repo write to the table from anywhere other than the `questionnaireRepository.save` calls already documented? List every save/update call site.
+
+8. `disputes_questionnaire_doc_status_rules` writer
+   - In THIS repo: is there ANY INSERT/UPDATE/DELETE on this table, or strictly read-only?
+   - List every JPA repository method that touches it; classify each as read or write.
+   - If strictly read-only here: state "writer not in this repo — owner unknown".
+
+9. Spring profiles and environment overrides
+   - List every application*.yaml / application*.properties file in the repo.
+   - For each, list any keys that override values from the base application.yaml.
+   - Specifically flag overrides on: `jwt.trustedIssuers`, `idp_token_url`, the case-actions-service base URL, server port, `logstash.server.host.port`.
+
+10. Replica count and namespace overrides
+    - Search for any environment-specific manifests (values-dev.yaml, values-prod.yaml, prod/resources.yaml, etc.).
+    - Confirm whether `{{ replicas-gcp-questionnaire-service }}` is the ONLY replica reference, or whether any override file specifies a numeric value.
+    - Search every YAML file for `namespace:` and report results.
+
+11. Unread properties / dead config
+    - Search application.yaml for keys that are NOT injected anywhere via `@Value`, `@ConfigurationProperties`, or `Environment.getProperty`.
+    - Specifically check `${app.name}` — is it injected anywhere or strictly referenced in metrics tag config?
+    - List every TODO / FIXME / XXX comment in source with file:line and verbatim text.
+
+12. StandardEntityError wiring
+    - Locate every reference to `StandardEntityError`. Is it referenced by any active `@ExceptionHandler` method, or strictly defined-but-unused?
+
+13. HTTP status code completeness
+    - Walk every controller method and every `@ExceptionHandler`. Confirm the only HTTP statuses producible are 200, 201, 400, 401, 404, 500.
+    - If any 403, 409, 422, 415, 405, 503 path exists, document it with the trigger condition.
+
+14. Inbound interceptors / filters
+    - List every `HandlerInterceptor`, `Filter`, or `OncePerRequestFilter` registered. For each, state what it does (correlation-id, logging, MDC, etc.).
+    - Confirm HttpInterceptor.preHandle reads or generates `v-correlation-id`, sets it in MDC, and writes it back to the response header.
+
+═══════════════════════════════════════════
+REPORT STRUCTURE — USE THESE HEADINGS IN THIS ORDER
+═══════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ──────────────────
+
+1a) STEPS IN ORDER
+For each of the four canonical paths, list every step from trigger to final
+output, with what happens, what is called, what the output of that step is.
+Cite file:lines for each step.
+- Path 1: Mutating path (Visa POST/PUT, Non-Visa B2 POST / B4 PUT — converged 11-step flow)
+- Path 2: GET path (Visa GET A6–A10, Non-Visa B3 GET)
+- Path 3: B1 PUT /document UPSERT
+- Path 4: B5 GET /document multi-fallback rule lookup
+
+1b) DECISION POINTS
+List every branch with the condition evaluated and every possible outcome.
+Specifically include: PUT-vs-POST branch on findByCaseNumberAndActionSeq;
+NAP-vs-other-platform amount validation branch; A4 amount uses caseFilingAmount;
+A2 preCompResponse DECL/PART branch; A4 contactFax XOR contactOther; B1 UPSERT
+exists/not-exists branch; B5 multi-fallback exhaustion. Cite file:lines.
+
+1c) SKIP AND BYPASS CONDITIONS
+List every condition that short-circuits processing. Specifically:
+- B1 PUT /document does NOT call case-actions-service — confirm the skip is unconditional
+- GET endpoints do not call case-actions-service — confirm
+- Any commented-out validators effectively become unconditional skips —
+  list each (checkCTMTemplate body, checkWriteOffReasonWriteOffNote on POSTs)
+
+1d) FAILURE PATH PER STEP
+For each step that calls an external dependency (case-actions REST call,
+JPA save, JPA find), state the exception type caught, retry behaviour,
+and post-exhaustion behaviour. Cite the exact handler.
+- RestClientException → HTTP 500 (no retry, no fallback) — confirm no @Retryable, no Resilience4j
+- SQLException / DataAccessException → HTTP 500
+- HttpMessageNotReadableException, MethodArgumentNotValidException, BusinessValidationException → HTTP 400
+- Generic Exception → HTTP 500
+
+1e) MULTIPLE ENTRY PATHS
+This component has 16 REST endpoints across 2 controllers. State explicitly
+that there is NO Kafka listener, NO scheduler / @Scheduled method, NO message
+consumer of any kind, NO webhook controller distinct from the documented two.
+Confirm each "no" with a search.
+
+1f) STATE AT EACH STEP
+QuestionnaireService is largely stateless at the row level — there is no
+status column transition documented. Confirm whether QuestionnaireEntity
+carries any status / lifecycle column. If yes, document the transitions.
+If no, state "no per-row lifecycle status — every save is terminal".
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ─────────────
+
+2a) CLASSIFICATION AND ROUTING LOGIC
+- URL prefix `/visa` vs no prefix → controller selection
+- Path parameter `{platform}` valid values (CORE, NAP, VAP, LATAM, PIN) — is this enforced anywhere or accepted as free string?
+- HTTP method (POST vs PUT vs GET) → handler selection
+- POST vs PUT difference: PUT requires existing row (404 if absent); POST inserts unconditionally
+
+2b) BUSINESS RULES APPLIED
+List every validation rule applied INSIDE this component (not delegated to case-actions-service or to JSR-303 alone):
+- responseAmount validation against disputeWorkableAmount or disputeSourceAmount per platform
+- A4 caseFilingAmount usage
+- A2 preCompResponse cross-field rules
+- A4 contactFax / contactOther exclusivity
+- A5 prearbitrationReason validation
+- writeOffReason / writeOffNote rule (PUT only)
+- ctmTemplate rule (commented out — confirm)
+- B5 multi-fallback document-status lookup
+
+2c) DATA TRANSFORMATIONS
+- Inbound request POJO → JSON blob → `C_QSTNNAIR` column
+- Service overwrites `writeOffAmountPercentage`, `ctmAmountPercentage`, `responseAmountPercentage` from CalculationUtil regardless of inbound values
+- Service sets userId, timestamps, stageCode from ActionSummary
+- mapEntityToModel inverse: deserialise JSON blob, set documents list from `N_DOCUMENT_NAME`
+
+2d) IDEMPOTENCY MECHANISM
+- Detection key fields: should be (caseNumber, actionSeq) but no application-level check on POST
+- Duplicate behaviour on POST: insert new row (row count grows) — confirm with citation
+- PUT: 404 if not found, no duplicate possible
+- B1 UPSERT: protected by find-then-decide pattern but vulnerable to TOCTOU race between concurrent B1 calls
+- DB-level uniqueness: see Gap 1
+- Crash-window analysis: state whether the PUT / B1 UPSERT can produce duplicate inserts under concurrent execution given that the find-then-save pattern is not within an explicit pessimistic lock
+
+── SECTION 3 — CONTRACTS ────────────────────────
+
+REST API (applies):
+- For every endpoint: method, full path (after base), request POJO, response shape, every HTTP status code and its trigger, auth requirement
+- Auth model: as documented above; reconfirm
+- Known callers: state "not determinable from source" if no caller stub or feign client elsewhere in the repo references this service
+
+Kafka Consumer: NOT PRESENT — confirm no `@KafkaListener`, no `ConcurrentKafkaListenerContainerFactory`, no `org.springframework.kafka` dependency in pom.xml.
+
+Kafka Producer: NOT PRESENT — confirm no `KafkaTemplate`, no `ProducerFactory`, no topic reference in source.
+
+Batch / Scheduler: NOT PRESENT — confirm no `@Scheduled`, no `@EnableScheduling`, no `org.springframework.batch` or Quartz dependency.
+
+── SECTION 4 — DEPENDENCIES ─────────────────────
+
+For each outbound call, document:
+  Service / target name
+  Protocol and auth
+  Purpose (which step in flow)
+  Connection timeout (state "not configured" if absent)
+  Read timeout (state "not configured" if absent)
+  Retry: count, delay, backoff
+  Circuit breaker: Resilience4j present or "not configured"
+  Behaviour if unavailable: halt / skip / degrade / item lost
+
+Outbound calls to document:
+1. mdvs-gcp-case-actions-service REST GET — purpose, auth, every timeout/retry/CB property
+2. IdP token endpoint — for client_credentials; confirm whether the OAuth2 client itself has any timeout configured
+3. PostgreSQL (Aurora) JPA — datasource pool config (HikariCP keys), connection-timeout, query-timeout, max-pool-size
+
+For each, also document behaviour on failure: case-actions failure → HTTP 500;
+DB failure → HTTP 500; IdP failure → HTTP 500.
+
+── SECTION 5 — DATABASE ─────────────────────────
+
+For each table touched:
+  Schema and exact table name
+  Read or write — explicit
+  Purpose at which step
+  Key columns used
+  Whether writes are in same transaction as other writes at that step
+  Transaction manager bean used (if explicit)
+  Whether SELECT FOR UPDATE / row locks used
+
+Tables to document:
+- `wdp.disputes_questionnaire` — write (POST insert, PUT update, B1 UPSERT save)
+- `wdp.disputes_questionnaire_doc_status_rules` — read only
+
+Confirm explicitly: NO other tables touched by this service. State the audited
+list of repositories (Spring Data JPA interfaces) and the entity → table
+mapping for each.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ─────
+
+For each, output COMPLIES / DEVIATES / NOT APPLICABLE with file:line evidence.
+
+DEC-001 Transactional outbox
+  Used? Which table? Outbox write in same transaction as business write?
+
+DEC-003 Kafka partition key = merchantId
+  Apply only if Kafka involved.
+
+DEC-004 PAN encryption
+  Encrypted before any persistent write? Clear PAN ever written?
+
+DEC-005 Manual Kafka offset commit
+  Apply only if Kafka consumer.
+
+DEC-019 Clear PAN
+  Does this component write clear PAN to any persistent store?
+
+DEC-020 Idempotency
+  Full at-least-once implemented? If not, what gap exists? (POST insert
+  duplicate-row gap is a known concern — confirm.)
+
+── SECTION 7 — SCALING AND DEPLOYMENT ───────────
+
+Document from `resources.yaml` (and any environment-specific override files):
+- K8s resource type
+- Replica count — state value or placeholder + variable name
+- Memory and CPU limits and requests
+- HPA — present or absent
+- Rolling update strategy
+- minReadySeconds
+- PodDisruptionBudget — present or absent
+- Topology spread — functional or label-mismatch
+- Liveness / readiness / startup probes (paths, port, initial delay)
+- Ports exposed
+- Observability — OTel agent, Actuator endpoints, Logstash appender configuration
+- K8s namespace — state if found in repo or "not in repo"
+
+If `resources.yaml` / Helm chart / values.yaml is NOT present, state "not in
+repo" for the entire section AND list explicitly what IS in the repo
+(Dockerfile, application.yaml, etc.) so the gap is unambiguous.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ──────
+
+- Commented-out code — file:line, verbatim text, what it would have done
+  Specifically: every `checkWriteOffReasonWriteOffNote` commented-out call site;
+  the entire commented-out body of `checkCTMTemplate`; commented Logstash IPs
+- Unused dependencies in pom.xml — list each suspect, justify
+- Feature flags active in production — list every property gating behaviour
+  with default value if env unset
+- TODO / FIXME / XXX references — file:line and verbatim text
+- Stub implementations returning fixed responses
+- Properties configured but never read — search for yaml keys with no
+  `@Value` / `@ConfigurationProperties` / `Environment.getProperty` reference
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ────────────
+
+For EACH of Sections 1 through 8, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE
+
+List every claim from the existing component document that you could NOT
+cross-check against code or config — neither confirmed nor contradicted.
+These will need follow-up from the team or runtime observation.
+Specifically expect at least:
+- Known callers of this service
+- ContestService relationship
+- Replica count exact value
+- K8s namespace
+- DB-level UNIQUE constraint on (I_CASE, I_ACTION_SEQ)
+- Owner of `wdp.disputes_questionnaire_doc_status_rules`
+- Whether DEC-014 deviation has been formally accepted
+
+═══════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════
+- Cite file paths and line ranges for every concrete claim. Format: <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does not reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms existing
+  documentation, a one-paragraph "still accurate — file:lines" is acceptable.
+- If you would restate something the reference document already states
+  verbatim, replace that prose with "Document accurate — <file>:<lines>".
+  Do not restate.
+- Do not invent file paths. If a file is referenced in the existing doc but
+  you cannot locate it, list it under "REFERENCED BUT NOT FOUND IN REPO" at
+  the very end of the report.
