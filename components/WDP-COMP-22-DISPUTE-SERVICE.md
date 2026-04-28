@@ -1,34 +1,33 @@
 # WDP-COMP-22-DISPUTE-SERVICE
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: mdvs-gcp-disputes-service using GitHub Copilot CLI |
-Architect-confirmed: PENDING*
+*Version: 2.0 DRAFT | April 2026*
+*Source-verified from `mdvs-gcp-disputes-service` by GitHub Copilot CLI on 2026-04-28. Architect-confirmed: PENDING. Supersedes v1.0 DRAFT.*
 
 ---
 
 ## ━━━ CORE SKELETON ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-*Mandatory for every component regardless of type.*
 
 ---
 
 ## Identity
 
-| Field             | Value |
-|-------------------|-------|
+| Field             | Value                                                        |
+|-------------------|--------------------------------------------------------------|
 | **Name**          | `DisputeService` (spring.application.name: `Disputes-Service`) |
-| **Type**          | `REST API` |
-| **Repository**    | `mdvs-gcp-disputes-service` |
-| **K8s deployment**| `mdvs-gcp-disputes-service` |
-| **Context path**  | `/merchant/gcp/disputes` (port 8082) |
-| **Status**        | `✅ Production` |
-| **Doc status**    | `📝 DRAFT` |
-| **Sections present** | `Core \| Block A — REST` |
+| **Type**          | `REST API`                                                   |
+| **Repository**    | `mdvs-gcp-disputes-service`                                  |
+| **Runtime**       | `Java 17 / Spring Boot 3.5.12 / port 8082`                   |
+| **Context path**  | `/merchant/gcp/disputes`                                     |
+| **K8s deployment**| `mdvs-gcp-disputes-service`                                  |
+| **Status**        | `✅ Production`                                              |
+| **Doc status**    | `📝 DRAFT v2.0`                                              |
+| **Sections present** | `Core \| Block A — REST API`                              |
 
-> ⚠️ **Name mismatch warning:** The WDP-COMP-INDEX.md entry for this
-> component describes it as "Authoritative service for dispute state."
-> This is **incorrect**. Copilot CLI confirms this service performs
-> **no database writes and owns no dispute state**. It is a
-> read-and-orchestration layer. WDP-COMP-INDEX.md must be corrected.
+> ⚠️ **Name mismatch warning (carried from v1.0):** The WDP-COMP-INDEX.md
+> entry described this component as "Authoritative service for dispute
+> state." This is **incorrect**. Source verification confirms this service
+> performs **no database writes and owns no dispute state**. It is a
+> read-and-orchestration layer. WDP-COMP-INDEX.md has been corrected.
 
 ---
 
@@ -36,18 +35,21 @@ Architect-confirmed: PENDING*
 
 **What it does**
 
-DisputeService is a Spring Boot 3.5 / Java 17 read-and-orchestration
+DisputeService is a Spring Boot 3.5.12 / Java 17 read-and-orchestration
 service. It exposes two independent REST endpoints — a dispute summary
-reporting endpoint and a document-upload orchestration endpoint.
+reporting endpoint and a document-upload orchestration endpoint. The two
+endpoints share no service code path and can be reasoned about
+independently.
 
 The **summary endpoint** (`POST /summary`) reads dispute case data
 in parallel from two databases — WDP Aurora PostgreSQL (PIN platform
-and CORE platform when migrated) and a legacy IBM DB2 system (CORE
+always; CORE platform when migrated) and a legacy IBM DB2 system (CORE
 platform only, when not yet migrated). It aggregates counts, amounts,
 and win/loss outcomes grouped by dispute stage and returns a combined
-response. A data-migration flag (`core_migration_status`) switches the
-CORE platform data source between DB2 and PostgreSQL, supporting an
-in-flight platform migration without a code deployment.
+response with three sections — `dsptSummary`, `creditDsptSummary`, and
+`debitDsptSummary`. A data-migration flag (`core_migration_status`)
+switches the CORE platform data source between DB2 and PostgreSQL,
+supporting an in-flight platform migration without a code deployment.
 
 The **document-upload endpoint**
 (`POST /{platform}/cases/{caseNumber}/documents`) orchestrates a
@@ -55,110 +57,140 @@ multi-step document delivery flow. It accepts an internal-firm-only
 multipart upload, looks up the target case via CaseSearchService,
 uploads the document to DocumentManagementService, conditionally
 transfers action ownership via CaseActionService, and updates document
-metadata. For NAP platform cases that are not yet migrated to WDP, it
-falls back to a legacy SFG SFTP delivery path.
+metadata. For NAP platform cases — on any error or when migration
+status is not `Y` — it falls back to a legacy SFG SFTP delivery path.
 
 The service is also wired as a Kafka producer to the `business-rules`
 topic, but the publish call site is **commented out in production code**
-and is not active at runtime.
+(disabled 2025-08-08 by commit `c29018cd`, message "code changes (#93)";
+no in-source rationale recorded). The producer infrastructure
+(`KafkaProducerConfig`, `BusinessRuleServiceImpl`, MSK dependencies in
+`pom.xml`) remains wired and present at runtime.
 
 **What it does NOT do**
 
-- Does NOT own or write dispute state. No `INSERT`, `UPDATE`, or
-  `DELETE` statement exists in the codebase. This service is read-only
-  against its two databases.
-- Does NOT manage case state transitions. The `StageCode` enum values
-  (REQ, CH1, RE2, PAB, ARB, APC, CH2, ACF) are read from the database
-  for filtering — this service does not trigger or validate transitions.
+- Does NOT own or write dispute state. Source-verified: zero `INSERT`,
+  `UPDATE`, or `DELETE` statements anywhere; zero Spring Data
+  repositories; zero `@Modifying` annotations; zero `JdbcTemplate`
+  usage. All DAO classes use `entityManager.createNativeQuery(...)
+  .getResultList()` — read-only SELECT only.
+- Does NOT manage case state transitions. The dispute stage codes (REQ,
+  CH1, RE2, PAB, ARB, APC, CH2, ACF) are read for filtering — this
+  service does not trigger or validate transitions.
 - Does NOT call CaseManagementService (COMP-23). Case lookup is
   delegated to CaseSearchService (COMP-27).
 - Does NOT call ChargebackService (COMP-21). No runtime dependency
   exists in either direction.
-- Does NOT expose any endpoint to external merchants. The document-upload
-  endpoint enforces an internal-firm JWT claim (`us_worldpay_fis_int`);
-  external callers receive HTTP 403.
-- Does NOT consume from any Kafka topic. No `@KafkaListener` or
-  consumer group is configured.
+- Does NOT expose any endpoint to external merchants. The
+  document-upload endpoint enforces a `contains` check for
+  `us_worldpay_fis_int` on the JWT `iss` claim — external callers
+  receive HTTP 403.
+- Does NOT consume from any Kafka topic. Source-verified zero
+  `@KafkaListener`, `@JmsListener`, `@RabbitListener`, WebSocket / SSE
+  endpoints, or `@Scheduled` annotations anywhere in the repo.
 - Does NOT publish to Kafka at runtime. The `business-rules` producer
   is wired but its call site is commented out.
 - Does NOT use the transactional outbox pattern. No outbox table exists
   in this service.
+- Does NOT propagate the inbound `v-correlation-id` header to any
+  outbound call. The interceptor places it in MDC for logs but the
+  REST invokers do not forward it. **Distributed tracing is broken
+  at every service boundary out of this component.**
 
 ---
 
 ## Internal Processing Flow
 
-*Two independent entry paths. They do not converge.*
+*Two independent entry paths. They do not converge — different
+controllers, different services, no shared call chain. Path 1 is a
+read-only aggregation; Path 2 is an orchestration with a fully
+fire-and-forget SFTP fallback.*
 
 ```mermaid
 flowchart TD
 
-    %% ══════════════════════════════════
+    %% ═══════════════════════════════════
     %% PATH 1 — POST /summary
-    %% ══════════════════════════════════
+    %% ═══════════════════════════════════
 
-    P1_IN["POST /summary\nJWT Bearer required\n(multi-issuer)"]
-    P1_AUTH{{"JWT valid?"}}
-    P1_AUTHFAIL["HTTP 400/500\nAuth failure"]
-    P1_VAL{{"dateRange present?\nenums valid?"}}
-    P1_VALFAIL["HTTP 400 Bad Request\nValidation failure"]
-    P1_FLAG{{"CORE platform?\ncoreMigrationStatus?"}}
-    P1_PG["Query WDP PostgreSQL\nWDP.CASE + WDP.action\n(CORE migrated + PIN — parallel async)"]
-    P1_DB2["Query CORE DB2\nBC.TBC_DM_CASE + BC.TBC_DM_OCCUR\n(CORE legacy — parallel async)"]
-    P1_DBERR["HTTP 400\nDB query exception"]
-    P1_MERGE["Merge CORE + PIN results\nDisputeSummaryResponse\n(deptSummary, creditDeptSummary, debitDeptSummary)"]
-    P1_OUT["HTTP 200\nDisputeSummaryResponse"]
+    subgraph PATH1[Path 1 — POST /summary — read-only aggregation]
+        direction TB
+        P1_IN["POST /merchant/gcp/disputes/summary<br/>JWT Bearer (multi-issuer)"]
+        P1_AUTH{{"JWT valid?<br/>Spring Security<br/>multi-issuer JWKS"}}
+        P1_AUTHFAIL["HTTP 401<br/>Unauthorized"]
+        P1_VAL{{"Validation passes?<br/>dateRange ≤ 90 days<br/>fromDate ≤ toDate<br/>stage / entity enums valid<br/>merchantId XOR entities"}}
+        P1_VALFAIL["HTTP 400<br/>BusinessValidationException"]
+        P1_FLAG{{"For each fan-out:<br/>which platform<br/>and migration status?"}}
+        P1_PG["WDP Aurora PG<br/>SELECT WDP.CASE + WDP.action<br/>(PIN always; CORE when<br/>coreMigrationStatus=true)"]
+        P1_DB2["IBM DB2<br/>SELECT BC.TBC_DM_CASE +<br/>BC.TBC_DM_OCCUR<br/>(CORE when migration=false)"]
+        P1_DBERR["HTTP 400<br/>ExecutionException via<br/>CompletableFuture.join"]
+        P1_OUT_ITEMS["Outstanding-items DAO<br/>(separate query;<br/>0/0 if empty)"]
+        P1_MERGE["Merge CORE + PIN<br/>DisputeSummaryResponse:<br/>dsptSummary +<br/>creditDsptSummary +<br/>debitDsptSummary"]
+        P1_OUT["HTTP 200<br/>DisputeSummaryResponse"]
+    end
 
     P1_IN --> P1_AUTH
-    P1_AUTH -->|"Invalid"| P1_AUTHFAIL
+    P1_AUTH -->|"Missing or invalid"| P1_AUTHFAIL
     P1_AUTH -->|"Valid"| P1_VAL
     P1_VAL -->|"Invalid"| P1_VALFAIL
     P1_VAL -->|"Valid"| P1_FLAG
-    P1_FLAG -->|"true / PIN platform"| P1_PG
-    P1_FLAG -->|"false — CORE not yet migrated"| P1_DB2
+    P1_FLAG -->|"PIN — always<br/>CORE — migration=true"| P1_PG
+    P1_FLAG -->|"CORE — migration=false"| P1_DB2
     P1_PG -->|"DB exception"| P1_DBERR
     P1_DB2 -->|"DB exception"| P1_DBERR
-    P1_PG -->|"Success"| P1_MERGE
-    P1_DB2 -->|"Success"| P1_MERGE
+    P1_PG -->|"Success"| P1_OUT_ITEMS
+    P1_DB2 -->|"Success"| P1_OUT_ITEMS
+    P1_OUT_ITEMS --> P1_MERGE
     P1_MERGE --> P1_OUT
 
-    %% ══════════════════════════════════
+    %% ═══════════════════════════════════
     %% PATH 2 — POST /{platform}/cases/{caseNumber}/documents
-    %% ══════════════════════════════════
+    %% ═══════════════════════════════════
 
-    P2_IN["POST /{platform}/cases/{caseNumber}/documents\nJWT Bearer + internal-firm claim required\nmultipart/form-data"]
-    P2_ISS{{"JWT iss contains\nus_worldpay_fis_int?"}}
-    P2_403["HTTP 403 Forbidden"]
-    P2_FILE{{"File null or empty?"}}
-    P2_400FILE["HTTP 400 Bad Request\nEmpty file"]
-    P2_TOKEN["Fetch IDP token\nwdp-idp-token-service GET\n(request-scoped cache)"]
-    P2_TOKFAIL["HTTP 500\nWebServiceException"]
-    P2_LOOKUP["Case lookup by caseNumber\ncase-search-service GET"]
-    P2_LOOKUP_ERR{{"HTTP error on lookup?"}}
-    P2_LOOKUP_RES{{"Results empty?"}}
-    P2_LOOKUP2["Retry: lookup by sourceSystemCaseId\ncase-search-service GET"]
-    P2_LOOKUP2_RES{{"Results empty?"}}
-    P2_PLATFORM1{{"NAP platform?"}}
-    P2_400CL["HTTP 400\nCase not found"]
-    P2_SFG["SFG SFTP fallback\n@Async write /Outgoing/filename\nHTTP 200 migrationStatus=N"]
-    P2_STAGE{{"disputeStage param\nprovided?"}}
-    P2_FILTER{{"Matching actions found?"}}
-    P2_PLATFORM2{{"NAP platform?"}}
-    P2_400STAGE["HTTP 400\nNo matching actions"]
-    P2_MAXACT["Select max action\nhighest actionSequence"]
-    P2_UPLOAD["Upload document\ndocument-management-service POST\nmultipart: file, uploadedBy, actionSequence, documentType=RESPDOC"]
-    P2_UPLOAD_ERR{{"Upload error?\nUPLOAD_BUSINESS_ERROR\nor HTTP 5xx on NAP?"}}
-    P2_400UP["HTTP 400/500\nUpload failure — non-NAP"]
-    P2_MIGFLAG{{"NAP AND\nmigrationStatus not Y?"}}
-    P2_OWNER{{"Action owner\n= MERCHANT?"}}
-    P2_XFER["Transfer ownership\ncase-actions-service PUT\nMERCHANT → WPAYOPS"]
-    P2_XFERFAIL["HTTP 500\nException propagated"]
-    P2_UPDATE["Update doc metadata\ndocument-management-service PUT\nnotifyBRQueue=true"]
-    P2_UPDFAIL["HTTP 500\nException propagated"]
-    P2_KAFKA["⚠️ DISABLED — Kafka publish\nbusiness-rules topic\ncommented out in production"]
-    P2_OUT["HTTP 200\nDocUploadResponse\nmigrationStatus from max action"]
+    subgraph PATH2[Path 2 — POST /documents — orchestration with NAP SFG fallback]
+        direction TB
+        P2_IN["POST /{platform}/cases/{caseNumber}/documents<br/>JWT Bearer + multipart/form-data"]
+        P2_JWT{{"Spring Security<br/>JWT valid?"}}
+        P2_401["HTTP 401<br/>Unauthorized"]
+        P2_ISS{{"AuthorizationServiceImpl<br/>iss claim contains<br/>us_worldpay_fis_int?"}}
+        P2_403["HTTP 403<br/>Forbidden"]
+        P2_FILE{{"file null or empty?"}}
+        P2_400FILE["HTTP 400<br/>BusinessValidationException"]
+        P2_TOKEN["Fetch IDP token<br/>via IdpTokenService<br/>(request-scoped cache)"]
+        P2_TOKFAIL["HTTP 500<br/>WebServiceException"]
+        P2_LOOKUP["Case lookup by caseNumber<br/>via CaseSearchService"]
+        P2_LOOKUP_ERR{{"Exception on lookup?"}}
+        P2_LOOKUP_RES{{"Empty results?"}}
+        P2_LOOKUP2["Retry lookup<br/>by sourceSystemCaseId<br/>via CaseSearchService"]
+        P2_LOOKUP2_ERR{{"Exception on retry?"}}
+        P2_LOOKUP2_RES{{"Still empty?"}}
+        P2_PLATFORM_LOOKUP{{"NAP?"}}
+        P2_400CL["HTTP 400<br/>Case not found"]
+        P2_SFG[/"SFG SFTP fallback<br/>@Async — write file to<br/>/Outgoing/{originalFilename}<br/>HTTP 200 migrationStatus=N<br/>⚠️ exception loss possible"/]
+        P2_STAGE{{"disputeStage param<br/>provided?"}}
+        P2_FILTER{{"Any action.stageCode<br/>.equals(disputeStage)?<br/>(case-sensitive)"}}
+        P2_PLATFORM_STAGE{{"NAP?"}}
+        P2_400STAGE["HTTP 400<br/>No matching actions"]
+        P2_MAXACT["Select max actionSequence"]
+        P2_UPLOAD["DocumentManagementService POST<br/>multipart: file, uploadedBy,<br/>actionSequence, documentType=RESPDOC"]
+        P2_UPLOAD_ERR{{"Upload exception?"}}
+        P2_UPLOAD_5XX{{"HttpServerErrorException<br/>(5xx)?"}}
+        P2_UPLOAD_4XX{{"HttpClientErrorException<br/>+ NAP?"}}
+        P2_500UP["HTTP 500<br/>rethrow"]
+        P2_400UP["HTTP 400<br/>rethrow (non-NAP)"]
+        P2_MIGFLAG{{"NAP AND<br/>migrationStatus != Y?"}}
+        P2_OWNER{{"current owner<br/>== MERCHANT?"}}
+        P2_XFER["CaseActionService PUT<br/>ownership MERCHANT → WPAYOPS"]
+        P2_XFERFAIL["HTTP 500<br/>exception propagated"]
+        P2_UPDATE["DocumentManagementService PUT<br/>metadata + notifyBRQueue=true"]
+        P2_UPDFAIL["HTTP 400<br/>BusinessValidationException"]
+        P2_KAFKA[("⚠️ DISABLED<br/>sendBusinessRules<br/>commented out<br/>2025-08-08")]
+        P2_OUT["HTTP 200<br/>DocUploadResponse{migrationStatus}"]
+    end
 
-    P2_IN --> P2_ISS
+    P2_IN --> P2_JWT
+    P2_JWT -->|"Invalid"| P2_401
+    P2_JWT -->|"Valid"| P2_ISS
     P2_ISS -->|"No internal-firm claim"| P2_403
     P2_ISS -->|"Claim present"| P2_FILE
     P2_FILE -->|"Null or empty"| P2_400FILE
@@ -166,26 +198,30 @@ flowchart TD
     P2_TOKEN -->|"WebServiceException"| P2_TOKFAIL
     P2_TOKEN -->|"Token acquired"| P2_LOOKUP
     P2_LOOKUP --> P2_LOOKUP_ERR
-    P2_LOOKUP_ERR -->|"HTTP error + NAP"| P2_SFG
-    P2_LOOKUP_ERR -->|"HTTP error + non-NAP"| P2_400CL
-    P2_LOOKUP_ERR -->|"No error"| P2_LOOKUP_RES
-    P2_LOOKUP_RES -->|"Non-empty"| P2_STAGE
+    P2_LOOKUP_ERR -->|"Yes"| P2_PLATFORM_LOOKUP
+    P2_LOOKUP_ERR -->|"No"| P2_LOOKUP_RES
     P2_LOOKUP_RES -->|"Empty"| P2_LOOKUP2
-    P2_LOOKUP2 --> P2_LOOKUP2_RES
-    P2_LOOKUP2_RES -->|"Resolved"| P2_STAGE
-    P2_LOOKUP2_RES -->|"Still empty"| P2_PLATFORM1
-    P2_PLATFORM1 -->|"NAP"| P2_SFG
-    P2_PLATFORM1 -->|"Non-NAP"| P2_400CL
+    P2_LOOKUP_RES -->|"Non-empty"| P2_STAGE
+    P2_LOOKUP2 --> P2_LOOKUP2_ERR
+    P2_LOOKUP2_ERR -->|"Yes"| P2_PLATFORM_LOOKUP
+    P2_LOOKUP2_ERR -->|"No"| P2_LOOKUP2_RES
+    P2_LOOKUP2_RES -->|"Empty"| P2_PLATFORM_LOOKUP
+    P2_LOOKUP2_RES -->|"Non-empty"| P2_STAGE
+    P2_PLATFORM_LOOKUP -->|"NAP"| P2_SFG
+    P2_PLATFORM_LOOKUP -->|"Non-NAP"| P2_400CL
     P2_STAGE -->|"Not provided"| P2_MAXACT
     P2_STAGE -->|"Provided"| P2_FILTER
-    P2_FILTER -->|"Match found"| P2_MAXACT
-    P2_FILTER -->|"No match"| P2_PLATFORM2
-    P2_PLATFORM2 -->|"NAP"| P2_SFG
-    P2_PLATFORM2 -->|"Non-NAP"| P2_400STAGE
+    P2_FILTER -->|"Match"| P2_MAXACT
+    P2_FILTER -->|"No match"| P2_PLATFORM_STAGE
+    P2_PLATFORM_STAGE -->|"NAP"| P2_SFG
+    P2_PLATFORM_STAGE -->|"Non-NAP"| P2_400STAGE
     P2_MAXACT --> P2_UPLOAD
     P2_UPLOAD --> P2_UPLOAD_ERR
-    P2_UPLOAD_ERR -->|"Error + NAP"| P2_SFG
-    P2_UPLOAD_ERR -->|"Error + non-NAP"| P2_400UP
+    P2_UPLOAD_ERR -->|"5xx"| P2_UPLOAD_5XX
+    P2_UPLOAD_5XX -->|"Yes"| P2_500UP
+    P2_UPLOAD_ERR -->|"4xx"| P2_UPLOAD_4XX
+    P2_UPLOAD_4XX -->|"NAP"| P2_SFG
+    P2_UPLOAD_4XX -->|"Non-NAP"| P2_400UP
     P2_UPLOAD_ERR -->|"Success"| P2_MIGFLAG
     P2_MIGFLAG -->|"Yes — NAP fallback"| P2_SFG
     P2_MIGFLAG -->|"No"| P2_OWNER
@@ -196,6 +232,7 @@ flowchart TD
     P2_UPDATE -->|"Exception"| P2_UPDFAIL
     P2_UPDATE -->|"Success"| P2_KAFKA
     P2_KAFKA --> P2_OUT
+    P2_SFG --> P2_OUT
 ```
 
 ---
@@ -206,22 +243,27 @@ flowchart TD
 
 | Source | Protocol | Endpoint | Payload / Description |
 |--------|----------|----------|-----------------------|
-| Portal UIs / internal WDP services (callers unconfirmed from source) | REST | `POST /merchant/gcp/disputes/summary` | JWT Bearer required. `DisputeSummaryRequest` JSON body. No internal-firm restriction — any authenticated caller. |
-| Internal WDP services / Worldpay staff portal (internal firm only) | REST | `POST /merchant/gcp/disputes/{platform}/cases/{caseNumber}/documents` | JWT Bearer required + `us_worldpay_fis_int` issuer claim. `multipart/form-data`. Path: platform, caseNumber. Query: uploadedBy (required), disputeStage (optional). |
+| Portal UIs / internal WDP services (callers unconfirmed from source) | REST | `POST /merchant/gcp/disputes/summary` | JWT Bearer (multi-issuer). `DisputeSummaryRequest` JSON body. No internal-firm restriction — any authenticated caller. |
+| Internal WDP services / Worldpay staff portal (internal firm only) | REST | `POST /merchant/gcp/disputes/{platform}/cases/{caseNumber}/documents` | JWT Bearer + `iss` contains `us_worldpay_fis_int`. `multipart/form-data`. Path: platform, caseNumber. Query: `uploadedBy` (required), `disputeStage` (optional). |
 
 ### Outbound Interfaces
 
 | Target | Protocol | Endpoint / Resource | Purpose | On failure |
 |--------|----------|---------------------|---------|------------|
-| CaseSearchService (COMP-27) | REST in-cluster | `GET /merchant/gcp/case-search/{platform}/case/lookup` | Case lookup by caseNumber (primary) then sourceSystemCaseId (fallback) | NAP: SFG SFTP fallback; non-NAP: HTTP 400 |
-| DocumentManagementService (COMP-37) | REST in-cluster | `POST /merchant/gcp/document-management/{platform}/documents/{caseNumber}` | Upload document file for the target action | NAP: sets UPLOAD_BUSINESS_ERROR → SFG fallback; non-NAP: rethrow 400/500 |
-| DocumentManagementService (COMP-37) | REST in-cluster | `PUT /merchant/gcp/document-management/{platform}/document/{caseNumber}/action/{actionSeq}` | Update document metadata, set notifyBRQueue=true | Exception rethrown → HTTP 500 |
-| CaseActionService (COMP-24) | REST in-cluster | `PUT /merchant/gcp/case-actions/{platform}/case/{caseNumber}/action` | Transfer action ownership MERCHANT → WPAYOPS when owner=MERCHANT | Exception rethrown → HTTP 500 |
-| IDP Token Service (wdp-idp-token-service) | REST in-cluster | `GET /merchant/gcp/idp-token/token` | Obtain service-to-service bearer token. Request-scoped cache via RequestTokenHolder. | WebServiceException → HTTP 500 |
-| SFG SFTP Server | SFTP (Spring Integration) | `/Outgoing/{filename}` port 3222 | NAP platform fallback: deliver document when WDP document management unavailable or migrationStatus ≠ Y. Runs @Async. | InternalServerError → HTTP 500 |
-| WDP Aurora PostgreSQL | PostgreSQL read-only | `WDP.CASE`, `WDP.action` | Dispute summary — PIN always; CORE when coreMigrationStatus=true | BusinessValidationException → HTTP 400 |
-| CORE DB2 — BC schema (legacy) | IBM DB2 read-only | `BC.TBC_DM_CASE`, `BC.TBC_DM_OCCUR` | Dispute summary — CORE platform only when coreMigrationStatus=false | BusinessValidationException → HTTP 400 |
-| AWS MSK Kafka (`business-rules`) | Kafka synchronous | `business-rules` topic | ⚠️ WIRED BUT INACTIVE — intended to publish business-rule trigger after document upload. Call site commented out in production. | N/A — not invoked |
+| CaseSearchService (COMP-27) | REST in-cluster | `GET …/case-search/{platform}/case/lookup` | Case lookup by `caseNumber` (primary) then `sourceSystemCaseId` (retry) | NAP: SFG SFTP fallback (HTTP 200, migrationStatus=N); non-NAP: HTTP 400 |
+| DocumentManagementService (COMP-37) | REST in-cluster | `POST …/document-management/{platform}/documents/{caseNumber}` | Upload document file for the target action (`documentType=RESPDOC`) | 5xx → rethrow HTTP 500. 4xx + NAP → SFG SFTP fallback. 4xx + non-NAP → HTTP 400. |
+| DocumentManagementService (COMP-37) | REST in-cluster | `PUT …/document-management/{platform}/document/{caseNumber}/action/{actionSeq}` | Update document metadata; sets `notifyBRQueue=true` | Any exception → HTTP 400 BusinessValidationException |
+| CaseActionService (COMP-24) | REST in-cluster | `PUT …/case-actions/{platform}/case/{caseNumber}/action` | Transfer action ownership MERCHANT → WPAYOPS when current owner is MERCHANT | Exception rethrown → HTTP 500 |
+| IDP Token Service (`wdp-idp-token-service`) | REST in-cluster | `GET …/idp-token/token` | Obtain service-to-service Bearer token. Cache scope: per-request via `RequestTokenHolder`. | Caught and wrapped — `WebServiceException` → HTTP 500 |
+| SFG SFTP Server | SFTP (Spring Integration), private-key auth, port 3222 | `/Outgoing/{originalFilename}` | NAP fallback: deliver document when WDP doc-management path is unavailable or migrationStatus ≠ Y | **Fully `@Async` — fire-and-forget on every code path.** Exception caught → wrapped to `InternalServerError` (500), but @Async dispatch may swallow before propagation. |
+| WDP Aurora PostgreSQL | JDBC (HikariCP defaults) | `WDP.CASE`, `WDP.action` | Dispute summary read — PIN always; CORE when `coreMigrationStatus=true` | Native exception caught at CompletableFuture join → HTTP 400 BusinessValidationException |
+| CORE DB2 — BC schema (legacy) | JDBC (HikariCP defaults) | `BC.TBC_DM_CASE`, `BC.TBC_DM_OCCUR` | Dispute summary read — CORE platform only when `coreMigrationStatus=false` | Native exception caught at CompletableFuture join → HTTP 400 BusinessValidationException |
+| AWS MSK Kafka (`business-rules`) | Kafka (SASL_SSL / AWS_MSK_IAM) | `business-rules` topic | ⚠️ **WIRED BUT INACTIVE** — intended `DOCUMENT_ATTACHED_TO_OPEN_CASE` trigger after document upload. Call site commented out 2025-08-08. | N/A — never invoked at runtime |
+
+**Outbound header set per REST call** — `Authorization: Bearer {idpToken}`,
+`Content-Type` (JSON or multipart per call), `Accept: application/json`.
+**No `v-correlation-id` is propagated** to any downstream call — confirmed
+absent from both `RestInvoker` and `IdpRestInvoker`.
 
 ---
 
@@ -229,139 +271,158 @@ flowchart TD
 
 ### Tables Owned (written by this component)
 
-This component owns no database state. It is a read-only orchestration
-layer. No `INSERT`, `UPDATE`, or `DELETE` statements exist in the
-codebase.
+This component owns no database state. **Source-verified zero writes** —
+no `INSERT`, `UPDATE`, or `DELETE` statements; no Spring Data
+repositories; no `@Modifying`; no `JdbcTemplate`. All DAO classes use
+read-only `entityManager.createNativeQuery(...).getResultList()`.
+
+The `wdp.CASE` shared-table risk register entry in WDP-DB.md previously
+implied COMP-22 might be the INSERT/DELETE owner. **That speculation is
+disproven.** COMP-22 is a reader of `wdp.CASE` only.
 
 ### Tables Read (not owned by this component)
 
-**Data Source 1: WDP Aurora PostgreSQL (`spring.datasource.wdp`)**
-Used for: PIN platform always; CORE platform when `coreMigrationStatus=true`
+**Data source 1: WDP Aurora PostgreSQL (`spring.datasource.wdp`)**
+*Used for: PIN platform always; CORE when `coreMigrationStatus=true`.
+Transaction manager: `wdpTransactionManager`. Read-only — no SELECT
+FOR UPDATE.*
 
 | Schema.Table | Owned by | Why accessed | Key columns |
 |--------------|----------|--------------|-------------|
-| `WDP.CASE` | CaseManagementService (COMP-23) — TBC | Case-level header data for dispute summary aggregation | `I_CASE_ID`, `C_CASE_STA`, `C_LEVEL1_ENTITY`, `C_IR_TYPE`, `C_CASE_FINAL_LIABILITY`, `i_case_action_max_seq`, `i_action_seq`, `E_PRE_NOTE` |
-| `WDP.action` | ⚠️ Multiple writers — TBC | Action/stage-level data: amounts, stage, type, dates, status | `I_CASE_ID`, `A_DISPUTE_AMT`, `C_CASE_STAGE`, `C_ACTION_TYPE`, `D_ACTION_REPORTED`, `D_ACTION_PROCESSED`, `C_ACTION_STA` |
+| `WDP.CASE` | COMP-23 CaseManagementService | Case-level header data for dispute summary aggregation | `I_CASE_ID`, `C_CASE_STA`, `C_LEVEL1_ENTITY`–`C_LEVEL10_ENTITY`, `C_TR_TYPE`, `C_CASE_FINAL_LIABILITY` |
+| `WDP.action` | ⚠️ Multiple writers (COMP-23, COMP-24, COMP-15) | Action/stage-level data: amounts, stage, type, dates, status | `I_CASE_ID`, `I_ACTION_SEQ`, `C_CASE_STAGE`, `C_ACTION_TYPE`, `C_PRE_NOTE`, `C_ACTION_STA`, `A_DISPUTE_AMT`, `D_ACTION_REPORTED`, `D_ACTION_PROCESSED` |
 
-**Data Source 2: CORE DB2 — BC schema (`spring.datasource.core`)**
-Used for: CORE platform only when `coreMigrationStatus=false`
+**Data source 2: CORE DB2 — BC schema (`spring.datasource.core`)**
+*Used for: CORE platform only when `coreMigrationStatus=false`.
+Transaction manager: `coreTransactionManager`. Read-only.*
 
 | Schema.Table | Owned by | Why accessed | Key columns |
 |--------------|----------|--------------|-------------|
-| `BC.TBC_DM_CASE` | Enterprise — not WDP owned | Legacy CORE case-level data for dispute summary | `I_CASE_ID`, `I_CASE_OCCR_MAX`, `C_CASE_STA`, `C_CC_TYPE`, `C_CASE_RSLT`, `I_CHK`, `I_MRCHNT`, `I_ISO`, `I_ISC` |
-| `BC.TBC_DM_OCCUR` | Enterprise — not WDP owned | Legacy CORE occurrence/action-level data for dispute summary | `I_CASE_OCCUR`, `A_DISPUTE`, `C_REC_TYPE`, `X_DSPT_AMT_SGN`, `C_OCCUR_STA`, `D_OCCUR`, `D_OCCUR_ACTN`, `C_OCCUR_ACTN`, `C_PRE_NOTE` |
+| `BC.TBC_DM_CASE` | Enterprise — not WDP owned | Legacy CORE case-level data for dispute summary | `I_CASE_ID`, `I_MRCHNT`, `I_CHN`, `I_ISO`, `I_ISC`, `I_CHN_SUPR`, `I_DIV`, `I_STORE`, `C_CASE_STA`, `C_CC_TYPE`, `C_CASE_RSLT` |
+| `BC.TBC_DM_OCCUR` | Enterprise — not WDP owned | Legacy CORE occurrence/action-level data for dispute summary | `I_CASE_ID`, `I_CASE_OCCUR`, `A_DISPUTE`, `C_REC_TYPE`, `X_DSPT_AMT_SGN`, `C_OCCUR_STA`, `D_OCCUR`, `C_OCCUR_ACTN`, `C_PRE_NOTE` |
 
-**Transaction note:** All interactions are read-only selects. Two separate
-`JpaTransactionManager` instances (`coreTransactionManager` and
-`wdpTransactionManager`) — neither used for write transactions. No
-cross-datasource transactions.
+**Cross-datasource transactions:** none. Two separate
+`JpaTransactionManager` instances — no `@Transactional` spans both. Both
+managers are used for read-only selects only.
 
 ---
 
-## Resilience and Operational Posture
+## Configuration and Scaling
 
-**No timeout configuration on any outbound call.** All downstream REST
-calls use a plain `RestTemplate` with no connection timeout, read timeout,
-or circuit breaker. A slow or unresponsive downstream service will block
-the HTTP thread indefinitely. Under load this will exhaust the thread pool.
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Replica count | `{{ replicas-mdvs-gcp-disputes-service }}` | XL Deploy / Helm placeholder. Production value not in repo. |
+| HPA | None | Not present in `resources.yaml`. |
+| Memory request | `1024Mi` | |
+| Memory limit | `2048Mi` | |
+| CPU request | **Not set** | No `cpu` key under `requests` in `resources.yaml`. |
+| CPU limit | **Not set** | No `cpu` key under `limits` in `resources.yaml`. |
+| Deployment type | Kubernetes Deployment | |
+| Rollout strategy | RollingUpdate — `maxSurge: 1`, `maxUnavailable: 0` | |
+| PodDisruptionBudget | None | Not present. |
+| Topology spread | `ScheduleAnyway` | `topologyKey: kubernetes.io/hostname`, `maxSkew: 1`. Label selector matches pod label — **no mismatch** (corrected from v1.0). |
+| Liveness probe | HTTP `/livez` on port 8082 | initialDelay 30s, period 10s, failureThreshold 3 |
+| Readiness probe | HTTP `/readyz` on port 8082 | initialDelay 20s, period 10s, failureThreshold 3. **Corrected from v1.0 — port 8052 was not real.** |
+| Startup probe | None | |
+| Database connection pool | HikariCP **defaults** on both datasources | No `spring.datasource.*.hikari.*` properties anywhere in source. Defaults: `maximumPoolSize=10`, `connectionTimeout=30s`, `idleTimeout=10m`, `maxLifetime=30m`. |
+| Tomcat thread pool | Spring Boot **defaults** | No `server.tomcat.*` properties anywhere. Defaults: `threads.max=200`, `threads.min-spare=10`, `accept-count=100`, `connection-timeout=20s`. |
+| Async executor (SFTP) | Externalised env vars | `corePoolSize=${gcp_async_corepoolsize}`, `maxPoolSize=${gcp_async_maxpoolsize}`, `queueCapacity=${gcp_async_queuecapacity}`. **No defaults** — startup-fails-if-absent. Rejection policy default `AbortPolicy`. Thread name prefix `AsynchThread-`. |
+| Observability | OpenTelemetry Java agent (auto-injected via `instrumentation.opentelemetry.io/inject-java`); Spring Boot Actuator (`/info`, `/health`, `/prometheus`); Logstash TCP appender (`LOGSTASH_SERVER_HOST_PORT` env var) + console; Micrometer Prometheus tagged `application=${app.name}`; correlation ID via `HttpInterceptor` writing `v-correlation-id` to MDC | |
 
-**No Resilience4j circuit breakers on any dependency** — confirmed absent
-from `pom.xml`. Spring Retry `@Retryable` is present on the disabled Kafka
-publish path only (3 attempts, 100ms fixed delay) — not on any active REST
-call path.
+**Manifest inventory:** `resources.yaml` (Deployment + Service +
+Ingress), `deployit-manifest.xml` (XL Deploy), `Jenkinsfile`, `pom.xml`.
+**No** Dockerfile (kpack `jammy-base` builder), no Helm chart, no
+values.yaml, no kustomization, no HPA manifest, no PDB manifest.
 
-**SFG SFTP fallback** provides graceful degradation for the NAP platform
-document-upload path. All NAP error paths return HTTP 200 — callers must
-inspect `migrationStatus` in the response body to determine which delivery
-path was used.
+**Active feature flag — `core_migration_status`** — env var
+`core_migration_status` bound at `app.core-migration-status`. **No
+default in YAML.** When unset, Spring placeholder resolution fails and
+the application will not start.
 
-**`core_migration_status` flag** is an active in-production feature flag
-(env var `core_migration_status`). When `true`, CORE platform queries run
-against WDP PostgreSQL. When `false`, they run against legacy CORE DB2.
-This is the primary in-flight migration control for the CORE platform data
-source.
+**Trusted JWT issuers** — `jwt.trustedIssuers` is bound from env var
+`jwt_trusted_issuer_urls`. Per-environment values are not in repo.
+
+**Internal-firm enforcement** — application-layer (not Spring Security),
+`contains` check on JWT `iss` claim against literal `us_worldpay_fis_int`.
+
+**Swagger / OpenAPI** — `/disputes-service-api-docs`,
+`/disputes-service-api-docs/swagger-config`, `/swagger-ui/**` are
+whitelisted in `SecurityConfig` and exposed in **non-prod environments
+only**.
 
 ---
 
 ## Key Architectural Decisions
 
-| Decision ID | Decision | Status | Notes |
-|-------------|----------|--------|-------|
-| DEC-001 | Transactional outbox | ❌ DOES NOT APPLY | No Kafka writes at runtime — disabled. No database writes exist. No outbox table. |
-| DEC-003 | merchantId partition key | ⚠️ COMPLIANT WHEN ACTIVE | Disabled Kafka producer uses merchantId as message key. Not active in production. |
-| DEC-004 | PAN encryption | ✅ NOT APPLICABLE | No PAN, card number, or payment credential fields handled anywhere in this service. |
-| DEC-005 | Manual Kafka offset commit | ✅ NOT APPLICABLE | No Kafka consumer. |
-| DEC-014 | Resilience4j circuit breakers | ❌ DEVIATION | No Resilience4j dependency in pom.xml. No circuit breaker on any of 6 outbound dependencies. Plain RestTemplate with no timeouts. **HIGH severity.** |
+| Decision | ADR reference | Notes |
+|----------|---------------|-------|
+| Two datasources read in parallel via `CompletableFuture` for `/summary` | Local | CORE and PIN fan-out joined before mapping. Default `ForkJoinPool.commonPool()` (no dedicated executor). |
+| Migration via runtime feature flag (`core_migration_status`) | Local | Switches CORE platform reads between WDP PG and DB2 without a deploy. Flag has no default — environment must set it. |
+| NAP failure paths return HTTP 200 with `migrationStatus=N` | Local | Operational graceful-degradation contract. Callers must inspect `migrationStatus` to know which delivery path was used. |
+| No transactional outbox | DEC-001 — NOT APPLICABLE | No DB writes, no Kafka writes at runtime. |
+| Disabled producer key = `merchantId` | DEC-003 — COMPLIES (when active) | Matches platform standard but call site is commented out. |
+| No PAN handled anywhere | DEC-004, DEC-019 — NOT APPLICABLE | Source-verified clean — no PAN field in any DTO, log, or DAO. |
+| No Kafka consumer | DEC-005 — NOT APPLICABLE | |
+| **No Resilience4j, no client timeouts** | **DEC-014 — DEVIATION** | Plain `RestTemplate` with no connect or read timeout on every outbound REST call. No circuit breaker on any of the 6 active outbound dependencies. **🔴 HIGH severity.** Compounded by HikariCP and Tomcat defaults (no bulkhead). |
+| **No idempotency on `POST /documents`** | **DEC-020 — DEVIATION** | No idempotency-key header, no dedup table, no replay-protection filter. Duplicate calls re-upload, re-transfer ownership, re-publish metadata. **🟡 MEDIUM severity.** |
+| Kafka publish disabled in source | Local | Commented out 2025-08-08 (commit `c29018cd`). Producer infrastructure remains wired. Re-enabling would require an outbox pattern to satisfy DEC-001. |
 
 ---
 
-## Risk Register
+## Risks and Constraints
 
-| Risk | Severity | Detail |
-|------|----------|--------|
-| No timeouts on REST dependencies | 🔴 HIGH | All 5 active outbound REST calls use plain `RestTemplate` with no connection or read timeout. A single slow dependency (CaseSearchService, DocumentManagementService, CaseActionService, IDP Token Service) blocks the HTTP thread until OS TCP timeout fires — typically minutes. Systemic thread pool exhaustion risk under load. |
-| No circuit breakers — DEC-014 deviation | 🔴 HIGH | Confirmed absent from pom.xml. Any downstream service failure causes unbounded blocking or exception cascades. No automated recovery. |
-| NAP error path silently returns HTTP 200 | 🟡 MEDIUM | Any exception in the NAP document-upload flow routes to SFG SFTP fallback and returns HTTP 200. Callers cannot distinguish successful WDP delivery from SFG fallback without inspecting `migrationStatus` in the response body. Operational visibility gap. |
-| Kafka producer wired but inactive | 🟡 MEDIUM | `business-rules` Kafka infrastructure fully configured but call site commented out. If uncommented without an outbox write in the same transaction, event loss is possible on Kafka unavailability. DEC-001 deviation risk if publish path is ever re-enabled. |
-| CORE DB2 dependency with no resilience | 🟡 MEDIUM | DB2 is a legacy enterprise system not owned by WDP. No timeout, retry, or circuit breaker on the DB2 JDBC connection. CORE platform summary unavailable when DB2 is down. No graceful degradation. |
-| `constructNativeQuery` dead method | 🟢 LOW | A DB query-building method exists in USDisputeSummaryDaoImpl but is never called at runtime. Only `constructNativeFilterQuery` is invoked. No production impact — technical debt, should be removed. |
-
----
-
-## Scaling and Deployment
-
-| Parameter | Value |
-|-----------|-------|
-| Kubernetes resource type | Deployment |
-| Replica count | `{{ replicas-mdvs-gcp-disputes-service }}` — XL Deploy / Helm variable. Exact production value not in source. |
-| Memory limit | `2048Mi` |
-| Memory request | `1024Mi` |
-| CPU limit | Not configured — absent from resources.yaml |
-| CPU request | Not configured — absent from resources.yaml |
-| HPA | Absent |
-| PodDisruptionBudget | Absent |
-| Topology spread | Configured — `topologyKey: kubernetes.io/hostname`, `whenUnsatisfiable: ScheduleAnyway`. No label mismatch. Best-effort preference, not hard requirement. |
-
-### Observability
-
-| Feature | Status | Detail |
-|---------|--------|--------|
-| OTel agent | ✅ Present | Pod annotation `instrumentation.opentelemetry.io/inject-java` — OTel Operator auto-injection |
-| Actuator | ✅ Present | `/info`, `/health`, `/prometheus` exposed. Liveness port 8082. Readiness port 8052. `show-details: never`. |
-| Logstash | ✅ Present | `LogstashTcpSocketAppender` in logback-spring.xml. Destination via env var `${LOGSTASH_SERVER_HOST_PORT}`. JSON encoding via LogstashEncoder. Console appender also present. |
-| Prometheus | ✅ Present | Metrics endpoint enabled; tagged with `application: ${app.name}`. |
-| Correlation ID | ✅ Present | `HttpInterceptor` reads/generates `v-correlation-id` header, placed in MDC for all requests. |
+| Severity | Risk | Consequence |
+|----------|------|-------------|
+| 🔴 HIGH | No timeouts on any of 6 outbound REST dependencies (CaseSearch, DocMgmt POST, DocMgmt PUT, CaseAction, IDP token) — DEC-014 deviation | A slow dependency blocks Tomcat threads until OS TCP timeout fires. With Tomcat defaults (200 threads, 100 accept-queue) and HikariCP defaults (10 connections), a single sluggish dependency can saturate the entire pod. **No bulkhead** — `/summary` and `/documents` share the same Tomcat pool, so a stuck `/documents` flow degrades reporting too. |
+| 🔴 HIGH | No circuit breakers — confirmed absent from `pom.xml` | Any downstream service failure cascades unbounded. No automated recovery. No fail-fast. |
+| 🟡 MEDIUM | NAP error paths silently return HTTP 200 | Caller cannot distinguish successful WDP delivery from SFG SFTP fallback without inspecting `migrationStatus` in the response body. Observability gap for upstream callers. |
+| 🟡 MEDIUM | **SFG SFTP fallback is fully `@Async`** (corrected from v1.0) | Both happy-path and error-path SFTP writes run on the async executor. The HTTP 200 response is returned **before** the SFTP write is attempted. If `SftpServiceImpl` throws, the exception is caught inside the executor and may be lost. **The caller has no signal that the file actually landed.** |
+| 🟡 MEDIUM | SFG SFTP filename is the raw `getOriginalFilename()` — no namespacing | Two simultaneous uploads with the same filename overwrite each other on the SFTP target. No case-number prefix, no action-sequence, no timestamp. |
+| 🟡 MEDIUM | Required env vars have no defaults — `core_migration_status`, `gcp_async_corepoolsize`, `gcp_async_maxpoolsize`, `gcp_async_queuecapacity` | Application fails to start (`IllegalArgumentException` on placeholder resolution) if any one is unset. Migration-flag absence is silent: operators may assume a default that does not exist. |
+| 🟡 MEDIUM | No idempotency on `POST /documents` — DEC-020 deviation | Network-retried uploads re-execute the entire chain: re-upload to DocMgmt, re-transfer ownership, re-publish metadata, re-trigger any downstream BR queue work via `notifyBRQueue=true`. |
+| 🟡 MEDIUM | Inbound `v-correlation-id` is **not** propagated on any outbound call | MDC has the correlation ID for local logs only. Distributed traces break at every service boundary out of this component. Cross-service incident triage on the `/documents` flow is degraded. |
+| 🟡 MEDIUM | No CPU limit and no CPU request | No K8s scheduler signal, no QoS guarantee, no cgroup throttling. Pod can be evicted under node pressure regardless of priority. |
+| 🟡 MEDIUM | CORE DB2 dependency with no resilience | DB2 is a legacy enterprise system not owned by WDP. No timeout, no retry, no circuit breaker on the DB2 JDBC connection. CORE summary unavailable when DB2 is down — no graceful degradation. |
+| 🟢 LOW | 401 vs 403 status-code inconsistency | `AuthorizationServiceImpl` constructs `ForbiddenException` with `HttpStatus.UNAUTHORIZED`, but `GlobalExceptionHandler` returns 403. Constructor's status code is dead code. |
+| 🟢 LOW | Kafka producer wired but inactive | If re-enabled without an outbox write in the same transaction, event loss is possible on Kafka unavailability — DEC-001 deviation risk surfaces immediately. Producer infrastructure carries dead weight at runtime. |
+| 🟢 LOW | `spring-boot-starter-oauth2-client` declared in `pom.xml` but unused | No `@EnableOAuth2Client`, no `ClientRegistration`, no client flow. Dead dependency. |
+| 🟢 LOW | `app.name` referenced in Prometheus metric tag config but never defined | Metric tag `application` likely resolves to empty string. Cardinality / dashboard-grouping gap. |
+| 🟢 LOW | `kafka.retry-count` and `kafka.retry-delay` configured in YAML but never injected | `BusinessRuleServiceImpl` hardcodes `maxAttemptsExpression="3"` and `delayExpression="100"`. Operators changing the YAML values get no behaviour change. |
+| 🟢 LOW | Dead method `constructNativeQuery` at `USDisputeSummaryDaoImpl.java:108-122` | Never called. References non-existent helper methods. Technical debt. |
 
 ---
 
-## Incomplete and Planned Work
+## Planned Changes
 
-### Commented-Out Code
+- ⚠️ **OPEN QUESTION:** Why was the Kafka publish at
+  `DocumentServiceImpl.java:174` commented out on 2025-08-08?
+  Commit message ("code changes (#93)") is generic. PR review or
+  team confirmation needed. If it is intended to be re-enabled,
+  DEC-001 transactional outbox must be designed in first.
+- ⚠️ **OPEN QUESTION:** Known callers of both endpoints — no contract
+  tests, postman collections, or docs in repo. Architect / team
+  confirmation needed for the integration map.
+- ⚠️ **OPEN QUESTION:** Production replica count
+  (`{{ replicas-mdvs-gcp-disputes-service }}`) — XL Deploy / K8s env
+  config. Any value > 1 is fine for a stateless reader but matters
+  for the `@Async` SFTP executor capacity sizing review.
+- ⚠️ **OPEN QUESTION:** JWT trusted-issuer URLs per environment —
+  externalised via `jwt_trusted_issuer_urls` env var; not in repo.
+- ⚠️ **OPEN QUESTION:** Whether the unconfigured HikariCP and Tomcat
+  pools are intentional defaults or an oversight. Given the
+  no-timeouts / no-CB posture, defaults expose the service to
+  full-pod saturation under any single slow dependency.
+- ⚠️ **OPEN QUESTION:** SFG SFTP filename collision — is namespacing
+  required (case-number / action-seq / timestamp prefix)? Architect
+  decision.
+- ⚠️ **OPEN QUESTION:** Should `v-correlation-id` propagation be added
+  to outbound REST calls platform-wide? COMP-22 is one of multiple
+  components missing this — candidate for a platform-level decision.
+- No quarterly migration confirmed for COMP-22 itself. CORE platform
+  data-source migration (`core_migration_status` flag) is in flight
+  at the platform level but is not COMP-22-specific.
 
-| Block | Location | What it did | Reason disabled |
-|-------|----------|-------------|-----------------|
-| Kafka publish — `sendBusinessRules()` | DocumentServiceImpl.java line 174 | Would have published a `business-rules` trigger event to Kafka after successful document upload to an open case (`DOCUMENT_ATTACHED_TO_OPEN_CASE` rule group). Synchronous with 3-attempt Spring Retry. Idempotent producer configured. | Not determinable from source. Infrastructure wired and ready. |
-| DB2 `WITH DR` hint — `constructNativeQuery()` | USDisputeSummaryDaoImpl.java line 120 | DB2 uncommitted-read isolation hint. Entire parent method (`constructNativeQuery`) is dead code — replaced by `constructNativeFilterQuery`. | Not determinable from source. Method never called at runtime. |
-| Logstash hardcoded IPs | logback-spring.xml | Previous Logstash destination with hardcoded IP addresses. | Replaced by env-var-driven `${LOGSTASH_SERVER_HOST_PORT}`. |
-
-### Active Feature Flags
-
-| Flag | Config Key | Behaviour |
-|------|------------|-----------|
-| Core migration status | `app.core-migration-status` / env var `core_migration_status` | `true` → CORE platform queries run against WDP PostgreSQL (USDisputeSummaryDaoImpl). `false` → queries run against CORE DB2 (CoreDisputeSummaryDaoImpl). **Active in production.** |
-
-### TODO / FIXME
-
-| Location | Comment | Impact |
-|----------|---------|--------|
-| ApplicationProps.java line 10 | `// TODO: Utilize this going forward` — ApplicationProps introduced as placeholder; not all consumers refactored to use it yet | Low — technical debt |
-| GlobalExceptionHandler.java line 185 | `// TODO` on HttpRequestMethodNotSupportedException handler | Low — handler functional, TODO is refinement only |
-
-### Configured Properties Not Used at Runtime
-
-| Property | Configured | Actual behaviour |
-|----------|------------|-----------------|
-| `kafka.retry-count`, `kafka.retry-delay` | Set in all environment application-*.yaml files (retry-count: 3, retry-delay: 100) | Never injected via @Value — retry in BusinessRuleServiceImpl is hardcoded. Kafka path disabled. |
+---
 
 ---
 
@@ -371,166 +432,142 @@ source.
 
 ## REST API Contracts
 
-**Framework:** Spring Boot 3.5 / Spring MVC
-**Auth model:** OAuth2 Resource Server — multi-issuer JWT Bearer token.
-Trusted issuers configured in `jwt.trustedIssuers`.
-**Context path (production):** `/merchant/gcp/disputes` (port 8082)
-**Internal-firm restriction:** Document upload endpoint additionally
-enforces `us_worldpay_fis_int` issuer claim — external callers receive
-HTTP 403.
+**Authentication model:** OAuth2 Resource Server — multi-issuer JWT
+Bearer token. Trusted issuers configured via env var
+`jwt_trusted_issuer_urls`. All endpoints require a valid Bearer JWT
+(Spring Security 401 on missing or invalid token). The
+document-upload endpoint **additionally** enforces a `contains` check
+for `us_worldpay_fis_int` on the JWT `iss` claim — applied in the
+controller method via `AuthorizationService`, not in the Spring
+Security filter chain.
+
+**Base URL pattern:** `https://<host>/merchant/gcp/disputes` (port 8082)
+
+**Whitelisted paths** (Spring Security): `/livez`, `/readyz`,
+`/actuator/**`, and (non-prod only) `/disputes-service-api-docs/**`,
+`/swagger-ui/**`.
 
 ---
 
-### Endpoint Group A — Dispute Summary Reporting
+### Endpoint: `POST /summary`
 
-#### POST /summary
+**Full path:** `POST /merchant/gcp/disputes/summary`
+**Purpose:** Aggregated dispute summary — counts, amounts, win/loss
+outcomes grouped by dispute stage, plus outstanding items. CORE and
+PIN data fetched in parallel and merged.
+**Caller(s):** Not determinable from source. Likely portal UIs or
+internal reporting consumers.
+**Auth required:** Bearer JWT (multi-issuer). No internal-firm
+restriction.
 
-**Full in-cluster path:** `POST /merchant/gcp/disputes/summary`
-
-**Purpose:** Returns an aggregated dispute summary — counts and amounts
-grouped by dispute stage (`C_CASE_STAGE`), plus win/loss outcome totals
-and outstanding item figures. Data is fetched in parallel from CORE
-platform (DB2 or WDP PostgreSQL depending on `core_migration_status`
-flag) and PIN platform (WDP PostgreSQL only). Results are merged into a
-single combined response.
-
-**Known callers:** Not determinable from source. Likely portal UIs or
-internal reporting consumers. No caller annotation present in source.
-
-**Auth:** JWT Bearer required. No internal-firm restriction — any
-authenticated caller may use this endpoint.
-
-**Request body — `DisputeSummaryRequest`:**
+**Request — `DisputeSummaryRequest`**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `dateType` | Enum | No | `REPORT_DATE` or `DISPUTE_ACTION_DATE` — selects which date column drives the query filter |
-| `dateRange` | Object | Yes | `startDate` and `endDate` date range (inclusive) |
-| `merchantId` | List\<String\> | No | Filter by merchant IDs |
-| `entities` | EntityListType | No | Hierarchical entity filter — SO/SA/SC/CM/MT/DV/ST entity types |
-| `getOpenAction` | Boolean | No | If true, restricts to max-sequence action per case only |
+| `dateType` | Enum | No | `REPORT_DATE` or `DISPUTE_ACTION_DATE` — selects the date column for the filter |
+| `dateRange` | Object `{fromDate, toDate}` | Yes | Inclusive date range, max 90 days, `fromDate ≤ toDate` |
+| `merchantId` | List\<String\> | Conditional | Mutually exclusive with `entities` |
+| `entities` | EntityListType | Conditional | Hierarchical entity filter — parent must be `CH`, child must be `DV`/`ST`/`MT` |
+| `getOpenAction` | Boolean | No | If true, restricts to max-sequence action per case |
 | `groupby` | Enum | No | Currently only `DISPUTE_STAGE` is valid |
-| `disputeStage` | List\<String\> | No | Filter to specific stage codes: REQ, CH1, RE2, PAB, ARB, APC, CH2, ACF |
+| `disputeStage` | List\<String\> | No | Filter to specific stage codes: `REQ`, `CH1`, `RE2`, `PAB`, `ARB`, `APC`, `CH2`, `ACF` |
 
-**Response body — `DisputeSummaryResponse`:**
+**Response — Success**
 
-| Field | Description |
-|-------|-------------|
-| `deptSummary` | Combined summary — CORE + PIN data merged |
-| `creditDeptSummary` | CORE platform dispute summary |
-| `debitDeptSummary` | PIN platform dispute summary |
+| HTTP Status | Condition | Body |
+|-------------|-----------|------|
+| 200 | Successful summary retrieval | `DisputeSummaryResponse` — `dsptSummary` (combined), `creditDsptSummary` (CORE), `debitDsptSummary` (PIN). Each section: `groupByType`, `totalAmount`, `totalCount`, `outstandingDsptAmount`, `outstandingDsptCount`, `groupedResults[]`, `dsptOutcome[]`. |
 
-Each `DisputeSummary` contains: `totalAmount`, `totalCount`,
-`outstandingAmount`, `outstandingItems`, `groupByType`,
-`groupedResults` (list of stage/amount/count), `deptOutcome`
-(WIN/LOSS breakdown).
+**Response — Error**
 
-**HTTP status codes:**
+| HTTP Status | Condition | Body |
+|-------------|-----------|------|
+| 400 | Validation failure (date range > 90 days, fromDate > toDate, invalid enum, malformed entity, mutual-exclusion violation), DB query exception, parallel-thread interruption | `BusinessValidationException` body — message + code |
+| 401 | Missing or invalid JWT | Spring Security default body |
+| 404 | No handler for the URL | Spring Boot default |
+| 405 | Wrong HTTP method | Spring Boot default |
+| 500 | Unhandled runtime exception, message parse failure | Generic error body |
 
-| Code | Trigger |
-|------|---------|
-| 200 OK | Successful summary retrieval |
-| 400 Bad Request | Validation failure — invalid enum, missing dateRange, illegal date format, DB query exception, interrupted parallel thread |
-| 404 Not Found | No handler found for the URL |
-| 405 Method Not Allowed | Wrong HTTP method |
-| 500 Internal Server Error | Unhandled runtime exception, message parse failure |
-
-**Notes:** Outstanding items figure is a separate DAO call. If the result
-list is empty, `outstandingAmount=0` and `outstandingItems=0` are set on
-the response — not a 400 error.
+**Notes:** Outstanding-items figure is fetched via a separate DAO call.
+Empty result yields `outstandingDsptAmount=0` and `outstandingDsptCount=0`
+on the response, not a 400 error. **Field-name correction from v1.0** —
+the response uses `dspt*` (not `dept*`) and `outstandingDspt*` (not
+`outstandingAmount` / `outstandingItems`).
 
 ---
 
-### Endpoint Group B — Document Operations
+### Endpoint: `POST /{platform}/cases/{caseNumber}/documents`
 
-#### POST /{platform}/cases/{caseNumber}/documents
-
-**Full in-cluster path:**
+**Full path:**
 `POST /merchant/gcp/disputes/{platform}/cases/{caseNumber}/documents`
-
-**Purpose:** Uploads a document to a case. Orchestrates: JWT
-internal-firm check → IDP token fetch → case lookup via CaseSearchService
-→ document upload via DocumentManagementService → conditional action
-ownership transfer via CaseActionService → document metadata update via
-DocumentManagementService. For NAP platform — falls back to SFG SFTP
-delivery when case is not yet migrated or any downstream call fails.
-
-**Known callers:** Internal WDP services or Worldpay staff portal only.
-Internal-firm JWT claim enforced — external merchants cannot call this
-endpoint.
-
-**Auth:** JWT Bearer required. Additionally, JWT `iss` claim must contain
-`us_worldpay_fis_int`. External callers receive HTTP 403.
-
+**Purpose:** Upload a document to a case. Orchestrates: IDP token
+fetch → case lookup via CaseSearchService → document upload via
+DocumentManagementService → conditional ownership transfer via
+CaseActionService → metadata update via DocumentManagementService.
+For NAP platform — falls back to SFG SFTP delivery on any error or
+when `migrationStatus != Y`.
+**Caller(s):** Internal WDP services or Worldpay staff portal only.
+External merchants cannot reach this endpoint — the internal-firm
+JWT issuer claim is enforced.
+**Auth required:** Bearer JWT (multi-issuer) **plus** `iss` claim
+contains `us_worldpay_fis_int`. The `contains` check is the exact
+predicate, not equals.
 **Content type:** `multipart/form-data`
 
-**Path parameters:**
+**Path parameters**
 
 | Parameter | Description |
 |-----------|-------------|
-| `platform` | Platform code — e.g. `NAP` |
+| `platform` | Platform code — `NAP`, `VAP`, `CORE`, or `LATAM`. NAP comparison is `equalsIgnoreCase`. |
 | `caseNumber` | WDP case number or source-system case ID |
 
-**Query parameters:**
+**Query parameters**
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `uploadedBy` | Yes | User ID of the uploader |
-| `disputeStage` | No | Filter actions to a specific stage code (e.g. `CH1`). If absent, all actions are included. |
+| `disputeStage` | No | Restrict matching actions to a specific stage code (e.g. `CH1`). Case-sensitive equality on `ActionDetailsResponse.stageCode`. If absent, all actions are considered. |
 
-**Request part:** `file` — multipart binary file (required, non-empty).
+**Request part**
 
-**Response body — `DocUploadResponse`:**
+| Part | Required | Description |
+|------|----------|-------------|
+| `file` | Yes | Multipart binary file. Must be non-null and non-empty — empty file → HTTP 400. Filename is forwarded verbatim (no namespacing) to SFG SFTP on fallback. |
 
-| Field | Description |
-|-------|-------------|
-| `migrationStatus` | `"Y"` = delivered to WDP document management; `"N"` = legacy SFG SFTP fallback used |
+**Response — Success**
 
-**HTTP status codes:**
+| HTTP Status | Condition | Body |
+|-------------|-----------|------|
+| 200 | Document processed — including any NAP fallback to SFG SFTP | `DocUploadResponse{ migrationStatus }` — `"Y"` = delivered to WDP DocumentManagementService; `"N"` = SFG SFTP fallback used |
 
-| Code | Trigger |
-|------|---------|
-| 200 OK | Document processed — including when routed to SFG SFTP fallback for NAP |
-| 400 Bad Request | Empty file; case not found (non-NAP); no matching actions for stage (non-NAP); case lookup or upload failure (non-NAP) |
-| 401 / 403 Forbidden | JWT has no issuer claim or issuer does not contain `us_worldpay_fis_int` |
-| 500 Internal Server Error | SFTP failure, IDP token failure, action update failure, document info update failure, unhandled exception |
+**Response — Error**
+
+| HTTP Status | Condition | Body |
+|-------------|-----------|------|
+| 400 | Empty file; case not found (non-NAP); no matching actions for stage (non-NAP); upload 4xx (non-NAP); metadata-update exception | `BusinessValidationException` / `BadRequestException` body |
+| 401 | Missing or invalid JWT | Spring Security default |
+| 403 | JWT present but `iss` does not contain `us_worldpay_fis_int` | `ForbiddenException` body |
+| 500 | Upload 5xx; IDP token failure (`WebServiceException`); ownership-transfer exception; SFG SFTP synchronous failure path; unhandled exception | Generic error body |
 
 **Notes:**
-- NAP platform errors are **never surfaced as 4xx/5xx** to the caller —
-  all error paths for NAP route to SFG SFTP fallback and return HTTP 200.
-  Callers must inspect `migrationStatus` in the response to determine
-  which delivery path was used.
-- The SFG SFTP write runs `@Async` (fire-and-forget) on the normal
-  processing path. On error paths it is called synchronously inline.
-- The Kafka `business-rules` publish that would follow document metadata
-  update is commented out in production and does not execute.
+- **NAP platform errors are never surfaced as 4xx/5xx to the caller.**
+  All error paths for NAP route to SFG SFTP fallback and return
+  HTTP 200. Callers must inspect `migrationStatus` in the response
+  body to determine which delivery path was used.
+- **The SFG SFTP write is fully `@Async`** — fire-and-forget on every
+  invocation, including error paths. The HTTP 200 response is returned
+  before the SFTP write completes. If the SFTP write fails, the
+  exception is caught inside the executor and may be lost — **the
+  caller has no signal that the file actually landed.**
+- The Kafka `business-rules` publish that would follow successful
+  metadata update is commented out (since 2025-08-08) and does not
+  execute.
+- `notifyBRQueue=true` is hardcoded on the metadata-update PUT —
+  every successful upload triggers BR-queue notification downstream
+  in DocumentManagementService.
 
 ---
 
-## Remaining Gaps
-
-| Gap | What is unknown | Resolution needed |
-|-----|-----------------|-------------------|
-| Callers of POST /summary | No caller annotation in source. Inferred as portal UIs or reporting consumers. | Confirm from team or API Gateway routing table. |
-| Callers of POST /documents | Internal-firm claim confirmed but which specific WDP services or portals invoke this endpoint is not determinable from source. | Confirm from team. |
-| Replica count | `{{ replicas-mdvs-gcp-disputes-service }}` — template variable, value not in source. | Confirm from XL Deploy / Helm environment config or ops team. |
-| CPU resource limits | Absent from resources.yaml — whether intentional or configuration gap is not determinable. | Confirm with platform team. |
-| Why Kafka publish was disabled | `sendBusinessRules()` is fully implemented and wired but commented out. Reason not in source. | Ask team — if planned for re-enablement, DEC-001 outbox gap must be addressed first. |
-
----
-
-## Documents to Update After Architect Confirmation
-
-| Document | What to update |
-|----------|---------------|
-| WDP-COMP-INDEX.md | COMP-22 description — replace with: "Read-and-orchestration service for dispute reporting and document delivery. Exposes POST /summary (aggregates dispute counts/amounts from WDP PostgreSQL and/or legacy CORE DB2 depending on migration flag) and POST /{platform}/cases/{caseNumber}/documents (orchestrates document upload via DocumentManagementService with SFG SFTP fallback for NAP platform). Performs no database writes and owns no dispute state. ⚠️ Previous description ('Authoritative service for dispute state') was incorrect." |
-| WDP-KAFKA.md | Update business-rules topic note [1] — add COMP-22 as inactive configured producer (merchantId key, synchronous, commented out in production). |
-| WDP-DB.md | Add COMP-22 to read-only accessor columns for WDP.CASE and WDP.action; add COMP-22 to IBM DB2 external dependency row (BC.TBC_DM_CASE, BC.TBC_DM_OCCUR). |
-| WDP-HANDOVER.md | Add to Confirmed Architectural Facts: "COMP-22 DisputeService is a read-and-orchestration layer — performs no database writes and owns no dispute state. The Kafka producer to business-rules is wired but commented out in production." |
-
----
-
-*End of WDP-COMP-22-DISPUTE-SERVICE.md*
-*File status: 📝 DRAFT — architect confirmation pending*
-*Update WDP-COMP-INDEX.md, WDP-KAFKA.md, WDP-DB.md, and WDP-HANDOVER.md
-after architect confirms this file.*
+*End of WDP-COMP-22-DISPUTE-SERVICE.md v2.0 DRAFT.*
+*Source-verified by GitHub Copilot CLI 2026-04-28. Architect
+confirmation pending.*

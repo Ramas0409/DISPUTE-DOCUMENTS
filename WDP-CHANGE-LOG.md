@@ -2204,6 +2204,240 @@ not enforced by code.
 consume entries from this section and move them to the most recent **Reconciled**
 section above.*
 
+### 2026-04-28 — COMP-22 DisputeService · v1.0 DRAFT → v2.0 DRAFT
+
+**Source:** `mdvs-gcp-disputes-service` — source-verified by GitHub
+Copilot CLI 2026-04-28. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source. No functional
+change in production. Six factual corrections to v1.0, five new
+findings, one cross-component shared-table speculation disproven.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- **Section 4 — Shared Table Risk Register · `wdp.CASE` row:** remove
+  the speculation that COMP-22 might be the INSERT/DELETE owner.
+  Source-verified zero writes from COMP-22 — no `INSERT`, `UPDATE`,
+  `DELETE`, no Spring Data repositories, no `@Modifying`, no
+  `JdbcTemplate`. The DocumentManagementService (COMP-37)
+  column-level UPDATE on `wdp.CASE` is now confirmed orphan to
+  COMP-22 — **the cross-component review item recorded in HANDOVER
+  for COMP-22/COMP-37 is closed on the COMP-22 side**. The COMP-37
+  write owner question stands.
+- **Section 2 · `wdp.CASE` row · Downstream readers:** no change —
+  COMP-22 already listed as read-only; this entry now stands on
+  source verification.
+- **Section 2 · `wdp.action` row · Downstream readers:** no change —
+  COMP-22 already listed as read-only.
+- **Section 3 · IBM DB2 cross-platform table — `BC.TBC_DM_CASE,
+  BC.TBC_DM_OCCUR · COMP-22` row:** confirm the existing entry —
+  no change required, source-verified read-only on
+  `coreTransactionManager` when `coreMigrationStatus=false`.
+
+**WDP-KAFKA.md**
+- **Section 3 — Topic registry · `business-rules` row · note [1]:**
+  enrich the existing "COMP-22 wired but commented out" note with
+  the disablement attribution: commit `c29018cd` by Shringi Nitin
+  (WP) on 2025-08-08, message "code changes (#93)". No in-source
+  rationale recorded.
+- **Section 4 — Kafka-Free components register · COMP-22 row:**
+  no change — entry remains accurate ("Kafka producer wired to
+  `business-rules` but call site commented out — effectively
+  Kafka-free at runtime").
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+Add or correct:
+- COMP-22 runtime is **Spring Boot 3.5.12** (not 3.5).
+- COMP-22 readiness probe is **port 8082 path `/readyz`** (not port
+  8052; 8052 does not exist anywhere in the repo — v1.0 was wrong).
+- COMP-22 SFG SFTP fallback is **fully `@Async`** end-to-end. The
+  v1.0 doc claim that error paths run synchronously is wrong — the
+  `@Async` annotation applies to all invocations of `writeFile`.
+  HTTP 200 is returned before the SFTP write completes. Exceptions
+  inside the executor may be lost.
+- COMP-22 SFG SFTP filename is `file.getOriginalFilename()` raw —
+  no case-number prefix, no action-sequence, no timestamp.
+  Filename collision is possible.
+- COMP-22 internal-firm enforcement is application-layer (not Spring
+  Security), `contains` check on the JWT `iss` claim against literal
+  `us_worldpay_fis_int`. `AuthorizationServiceImpl` constructs
+  `ForbiddenException` with `HttpStatus.UNAUTHORIZED` but the global
+  handler returns 403 — constructor's status code is dead.
+- COMP-22 does **not** propagate `v-correlation-id` on any outbound
+  REST call. The interceptor places it in MDC for local logs only;
+  `RestInvoker` and `IdpRestInvoker` do not forward it.
+- COMP-22 HikariCP pools are unconfigured on both datasources —
+  Spring Boot defaults apply (`maximumPoolSize=10`,
+  `connectionTimeout=30s`).
+- COMP-22 Tomcat threads are unconfigured — Spring Boot defaults
+  apply (`threads.max=200`, `accept-count=100`,
+  `connection-timeout=20s`).
+- COMP-22 `@Async` SFTP executor is sized via env vars
+  `gcp_async_corepoolsize`, `gcp_async_maxpoolsize`,
+  `gcp_async_queuecapacity` — **no defaults**, startup-fails-if-
+  absent. Same startup-fails-if-absent applies to
+  `core_migration_status`.
+- COMP-22 ships exactly two application endpoints. Sweep confirmed
+  zero `@KafkaListener`, zero `@Scheduled`, zero `@JmsListener`,
+  zero `@RabbitListener`, zero WebSocket / SSE handlers anywhere
+  in the repo.
+- COMP-22 platform set on the `/documents` path is `NAP`, `VAP`,
+  `CORE`, `LATAM`. NAP comparisons use `equalsIgnoreCase`.
+- COMP-22 Swagger / OpenAPI is exposed in non-prod environments
+  only — `/disputes-service-api-docs/**` and `/swagger-ui/**`
+  whitelisted in `SecurityConfig`.
+- COMP-22 Kafka publish disablement attribution: commit
+  `c29018cd`, Shringi Nitin (WP), 2025-08-08, message "code
+  changes (#93)". No in-source rationale.
+- COMP-22 response field names are `dsptSummary`,
+  `creditDsptSummary`, `debitDsptSummary` (not `dept*`), and
+  `outstandingDsptAmount` / `outstandingDsptCount` (not
+  `outstandingAmount` / `outstandingItems`).
+
+Resolved open questions (remove from HANDOVER):
+- "COMP-22/COMP-37 cross-component ownership of
+  `USCaseEntity`/`UKCaseEntity` — INSERT/DELETE owner vs
+  column-level UPDATE co-writer" — **resolved on COMP-22 side**:
+  COMP-22 owns zero writes. The COMP-37 ownership question stands
+  but is now a single-component question, not cross-component.
+
+New open questions (add to HANDOVER):
+- COMP-22 known callers of `POST /summary` and `POST /documents`
+  — no contract tests, postman collections, or docs in repo;
+  team confirmation needed.
+- COMP-22 reason for Kafka publish disablement on 2025-08-08
+  (PR #93 review or Shringi Nitin confirmation).
+- COMP-22 production replica count — XL Deploy placeholder; matters
+  for the `@Async` SFTP executor capacity sizing review.
+- COMP-22 JWT trusted-issuer URLs per environment —
+  `jwt_trusted_issuer_urls` env var, not in repo.
+- COMP-22 SFG SFTP filename collision — is namespacing required
+  (case-number / action-seq / timestamp prefix)? Architect decision.
+- COMP-22 unconfigured HikariCP and Tomcat pools — intentional
+  defaults or oversight given the no-timeouts / no-CB posture?
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **HIGH candidate:** "Mandatory client timeouts and circuit breakers
+  on all inter-service REST calls" — DEC-014 deviation in COMP-22 is
+  total: zero timeouts on six dependencies, zero circuit breakers,
+  HikariCP and Tomcat at defaults. Matches the same posture observed
+  on COMP-27 CaseSearchService (also `new RestTemplate()`, no
+  Resilience4j). Recommend a platform-level ADR mandating connect /
+  read timeouts and a circuit-breaker library on every active
+  outbound REST dependency.
+- **MEDIUM candidate:** "Mandatory `v-correlation-id` propagation on
+  outbound REST calls" — COMP-22 does not propagate. COMP-27 also
+  observed without propagation. Distributed tracing breaks at every
+  service boundary out of these components. Platform-level decision
+  needed.
+- **MEDIUM candidate:** "Required env vars must declare a default in
+  YAML (`${var:default}`) where startup is acceptable in the unset
+  case, otherwise startup-failure must be deliberate and documented"
+  — COMP-22 has four env vars with no default
+  (`core_migration_status`, three `gcp_async_*`), all
+  startup-blockers. Pattern likely applies platform-wide.
+- **MEDIUM candidate:** "SFG SFTP filename namespacing for the NAP
+  fallback path" — current behaviour writes
+  `getOriginalFilename()` raw, allowing collisions on the SFTP
+  target.
+
+**WDP-ARCHITECTURE.md**
+- No change. COMP-22 topology unchanged. The two-endpoint, no-Kafka,
+  no-DB-write reader-and-orchestrator pattern is consistent with
+  the existing platform topology description.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- **New RISK candidate:** "COMP-22 fully `@Async` SFG SFTP fallback —
+  HTTP 200 is returned before SFTP write completes; executor
+  exceptions may be lost; caller has no signal that file landed"
+  — 🟡 MEDIUM. NAP-platform-only. Fix candidate: add audit-row
+  write inside the executor to record SFTP outcome.
+- **New RISK candidate:** "COMP-22 SFG SFTP filename collision — raw
+  `getOriginalFilename()` written to `/Outgoing/`" — 🟡 MEDIUM.
+- **New RISK candidate:** "COMP-22 no idempotency on `POST /documents`
+  — DEC-020 deviation; network-retried uploads re-upload, re-transfer
+  ownership, re-publish metadata" — 🟡 MEDIUM.
+- **New RISK candidate:** "COMP-22 `v-correlation-id` not propagated
+  to any downstream REST call — distributed tracing breaks at every
+  service boundary" — 🟡 MEDIUM. Likely covers other components on
+  the same shared `RestTemplate` pattern; flag for platform sweep.
+- **New RISK candidate:** "COMP-22 four required env vars have no
+  defaults — `core_migration_status`, `gcp_async_corepoolsize`,
+  `gcp_async_maxpoolsize`, `gcp_async_queuecapacity`. Application
+  fails to start on placeholder resolution if any one is unset" —
+  🟡 MEDIUM. Pattern likely covers other components.
+- **New RISK candidate:** "COMP-22 HikariCP and Tomcat pools at
+  defaults compounded with no client timeouts and no circuit
+  breakers — single slow dependency saturates entire pod with no
+  bulkhead between `/summary` and `/documents`" — 🔴 HIGH (already
+  partly covered by DEC-014 deviation note; add the
+  pool-saturation-blast-radius detail).
+- **New RISK candidate:** "COMP-22 401/403 status-code inconsistency
+  — `ForbiddenException` constructed with `HttpStatus.UNAUTHORIZED`
+  but global handler returns 403; constructor's status is dead
+  code" — 🟢 LOW.
+
+**WDP-INTEGRATIONS.md**
+- No change to existing integration contracts. The CaseSearchService,
+  DocumentManagementService, CaseActionService, IDP Token Service,
+  and SFG SFTP integration mappings are already documented.
+- Worth recording at next reconciliation: COMP-22 makes no use of
+  the `business-rules` Kafka topic at runtime despite being
+  registered as a producer.
+
+#### Deviation flags for COMP-22
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ✅ NOT APPLICABLE | — |
+| DEC-003 Kafka Partition Key = merchantId | ✅ COMPLIES (when active; producer disabled) | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ NOT APPLICABLE | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE | — |
+| DEC-014 Resilience4j Circuit Breakers and Timeouts | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⛔ DEVIATES | 🟡 MEDIUM |
+
+**DEC-014 DEVIATES detail:** Plain `new RestTemplate()` with no
+connect or read timeout on every outbound REST call. No
+Resilience4j dependency in `pom.xml`. No circuit breaker on any of
+the six active outbound dependencies (CaseSearch, DocMgmt POST,
+DocMgmt PUT, CaseAction, IDP token, SFG SFTP). Compounded by
+HikariCP and Tomcat pools at defaults — no bulkhead between
+`/summary` and `/documents` flows on the same Tomcat thread pool.
+A single slow dependency saturates the entire pod.
+
+**DEC-020 DEVIATES detail:** No idempotency mechanism on
+`POST /documents`. No `Idempotency-Key` header check, no
+application-level dedup table, no replay-protection filter, no
+DB unique constraint (no DB writes at all). Duplicate calls
+re-execute the entire chain — re-upload to DocumentManagementService,
+re-transfer ownership, re-publish metadata with `notifyBRQueue=true`,
+re-trigger downstream BR-queue work.
+
+#### Remaining gaps
+
+| Gap | Resolution path |
+|-----|-----------------|
+| Reason for Kafka publish disablement on 2025-08-08 | Team confirmation — PR #93 review or ask Shringi Nitin (WP) |
+| Known callers of `POST /summary` and `POST /documents` | Team confirmation — no docs, contract tests, or postman in repo |
+| Production replica count | Environment config / ops team — XL Deploy placeholder `{{ replicas-mdvs-gcp-disputes-service }}` |
+| JWT trusted-issuer URLs per env | Environment config — `jwt_trusted_issuer_urls` env var, not in repo |
+| `app.name` resolution for Prometheus metric tag | Runtime observation — inspect a live `/prometheus` scrape to see whether the `application` tag has a value |
+| `max_req_header_size` runtime value | Environment config — not in repo |
+| `gcp_env` active-profile mapping | Environment config — not in repo |
+| Whether HikariCP and Tomcat defaults are intentional | Architect decision |
+| Whether SFG SFTP filename should be namespaced | Architect decision |
+| Whether DEC-014 / DEC-020 deviations are accept-and-document or remediate | Architect decision (same severity class as DEC-019/020 risk-accepted ADRs) |
+| Follow-up Copilot CLI question — none required for COMP-22 | All in-repo questions now answered. Future Copilot questions belong on COMP-37 to settle the remaining `wdp.CASE` write-ownership ambiguity for the column-level UPDATE on the desk-blanking branch. |
+
+#### Doc status after this change
+
+- `WDP-COMP-22-DISPUTE-SERVICE.md` → `v2.0 DRAFT` — source-verified
+  2026-04-28 by GitHub Copilot CLI · architect confirmation pending
+---
+
 ### 2026-04-25 — COMP-51 CaseExpiryProcessor (NEW COMPONENT) · v1.0 DRAFT
 
 **Source:** `gcp-case-expiry-processor-batch` — source-verified by Claude Code
