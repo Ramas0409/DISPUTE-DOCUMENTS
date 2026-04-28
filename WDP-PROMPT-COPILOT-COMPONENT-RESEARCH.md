@@ -1,7 +1,7 @@
 You are my senior architecture partner for WDP
 (Worldpay Dispute Platform).
 
-Today's component: 26 — QuestionnaireService
+Today's component: 28 — DisplayCodeService
 Repository: [repo-name]
 
 ═══════════════════════════════════════════

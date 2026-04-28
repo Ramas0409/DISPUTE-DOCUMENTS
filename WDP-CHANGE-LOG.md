@@ -2204,6 +2204,129 @@ not enforced by code.
 consume entries from this section and move them to the most recent **Reconciled**
 section above.*
 
+
+### 2026-04-28 — COMP-25 NotesService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `mdvs-gcp-notes-service` — source-verified by GitHub Copilot CLI 2026-04-28.
+Architect confirmation pending.
+
+**Nature of change:** Correction pass — 11 v1.0 claims corrected against source,
+9 new findings added, 6 new risk rows surfaced. No new component, no new flows,
+no new external integration boundaries.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- `wdp.NOTES` row — no change to writers, key columns, or shared-write
+  severity. Source verification confirms COMP-25 has no awareness of COMP-23
+  / COMP-24 co-writers (no `@UniqueConstraint`, no `@Version`, no advisory
+  lock, no co-ordination annotation). Existing 🟠 MEDIUM-HIGH severity rating
+  on COMP-23 duplicate-insert defect remains accurate.
+- `nap.NOTES` row — confirm COMP-25 as primary writer via `napTransactionManager`.
+  Note that COMP-23 also writes on the NAP create path (per COMP-23 transaction
+  boundary table) — this dual-writer fact is already documented in
+  WDP-DB.md against `wdp.NOTES`; consider adding equivalent shared-table
+  treatment for `nap.NOTES` at next reconciliation.
+
+**WDP-KAFKA.md**
+- Section 3 Topic Registry — COMP-25 row for `business-rules` (publisher):
+  no change to topic, key, or consumer side. Update **payload schema** to
+  reference the 11-field `AddNotesBREvent` structure now confirmed
+  (eventType=`"NOTE_ADDED"`, startRuleGroup=`"NOTE_ADDED_TO_CASE"`,
+  `previousActionSequence` and `documentNameList` always null).
+- Section 4 DEC-003 deviation map — COMP-25 row "Confirmed from source"
+  remains accurate. **Augment with mid-batch atomicity note**: per-event loop
+  inside `@Transactional` produces deterministic Kafka-orphan events on
+  partial-batch failure (not just JVM-crash window).
+- Add observation under "How to read this table" or component notes:
+  `kafka_business_event_topic` env var has no default in `application.yaml` —
+  service fails to start if unset. Same operational footgun as
+  `kafka_retry_count`.
+
+**WDP-NFRS.md** *(Section 6 Risk Register — candidate rows for next reconciliation)*
+- New 🔴 RISK — COMP-25 mid-batch Kafka orphan window: deterministic split-brain
+  on every multi-note POST that fails partway through publishing. K-1 events
+  on topic, 0 rows in DB after rollback. Reproducible, not crash-only. (Upgrade
+  from latent-edge-case framing in v1.0.)
+- New 🟡 RISK — COMP-25 `/actuator/prometheus` requires authentication: endpoint
+  exposed but not in Spring Security whitelist. Scraper auth required or silent
+  metrics blackout. Pattern audit owed against other WDP services.
+- New 🟡 RISK — COMP-25 `kafka_retry_count` has no default value: service fails
+  to start if env var unset. CrashLoopBackOff on misconfigured deployment
+  manifest.
+- New 🟡 RISK — COMP-25 `minReadySeconds: 30` misplaced inside PodSpec instead
+  of Deployment spec: Kubernetes silently ignores it. The 30-second rollout
+  stability gate is not actually applied at runtime. Pattern audit owed —
+  this is a copy-paste-class defect that may be replicated across other WDP
+  manifests.
+- New 🟡 RISK — COMP-25 `actionSequence` regex-injection latent bug: request
+  value used as a regex pattern in `String.matches()` against
+  `ActionSummary.actionSequence`. Currently mitigated by `@Pattern("^[0-9]*$")`
+  validation; defense-in-depth absent.
+- New 🟢 RISK — COMP-25 Swagger/code drift on NoteType: enum allows 16 values,
+  Swagger `@Schema` declares 14. `NOTE` and `SNOTE` accepted but undocumented.
+- Updated 🟡 RISK (existing) — COMP-25 DEC-014 deviation framing: stronger
+  finding than v1.0 implied. **No `RestTemplate` bean exists** — `new
+  RestTemplate()` per call. Even if a future fix adds a bean with timeouts,
+  the inline instantiations must be removed first.
+
+**WDP-DECISIONS.md** *(candidate ADR / deviation map enrichment)*
+- DEC-001 deviation map for COMP-25: existing entry "Synchronous publish
+  inside `@Transactional` boundary — not atomically coupled (broker ACK
+  pre-commit, commit-time exception emits ghost event)" is **incomplete**.
+  Update to include the mid-batch case: per-event loop inside the transaction
+  produces deterministic orphan events on partial-batch failure, not only
+  JVM-crash windows.
+- DEC-014 deviation map for COMP-25: confirmed pattern matches the
+  platform-wide DEC-014 VOID posture — no Resilience4j, no timeouts, no
+  `RestTemplate` bean. Stronger finding than v1.0.
+- DEC-020 deviation map for COMP-25: confirmed — `idempotency-key` forwarded
+  on Kafka header but never checked. Replays produce N additional rows AND
+  N additional Kafka events.
+
+**WDP-COMP-INDEX.md**
+- COMP-25 status row: `📋 PENDING → 📝 DRAFT` (per HANDOVER backlog).
+- Doc status: `📝 DRAFT v1.1 — source-verified 2026-04-28, architect
+  confirmation pending`.
+
+**WDP-INTEGRATIONS.md**
+- No external system contract changes. NotesService is internal-only — its
+  outbound dependencies (Action Service, Display-Code Service, IDP, MSK)
+  are all internal WDP services or platform-internal infrastructure. No
+  WDP-INTEGRATIONS row to add.
+
+**WDP-ARCHITECTURE.md**
+- No topology-level changes. NotesService remains a WDP Core Service in
+  Section 4. The mid-batch orphan finding is component-level, not
+  platform-level — it tightens the DEC-001 deviation language but does not
+  change the platform topology or principles.
+
+#### Deviation flags
+
+| DEC | Severity | Detail |
+|-----|----------|--------|
+| **DEC-001** | 🔴 HIGH | No transactional outbox. Two failure modes: (a) JVM crash between DB commit and Kafka publish, (b) **mid-batch publish failure produces deterministic orphan events on the topic — DB rolls back, Kafka does not**. Confirmed deterministic and reproducible. |
+| **DEC-003** | 🟡 MEDIUM | Kafka partition key is `caseNumber`, not `merchantId`. Consistent with all six confirmed publishers of `business-rules` topic. Candidate ADR pending platform-wide. |
+| **DEC-004** | 🟢 N/A | COMPLIANT — no PAN data path. |
+| **DEC-005** | 🟢 N/A | NOT APPLICABLE — no Kafka consumer. |
+| **DEC-014** | 🔴 HIGH | No Resilience4j. **No `RestTemplate` bean** — `new RestTemplate()` per call, no timeouts, no retries, no circuit breakers. Stronger finding than v1.0. |
+| **DEC-019** | 🟢 N/A | COMPLIANT — no PAN handling. |
+| **DEC-020** | 🟡 MEDIUM | `idempotency-key` forwarded but never checked. No DB unique constraint. Replays produce duplicate rows + duplicate Kafka events. |
+
+#### Remaining gaps
+
+| Gap | Type | Action |
+|-----|------|--------|
+| Literal name of `${kafka_business_event_topic}` | Environment config | Confirm with deployment / DevOps team. WDP-KAFKA.md cross-evidence indicates `business-rules` but not source-confirmed for this service. |
+| Downstream consumers of `AddNotesBREvent` from this service | Cross-repo | Cross-repo Copilot CLI sweep across `gcp-business-rules-processor` (COMP-16) and any other suspected consumer of `business-rules` topic. **Suggested follow-up Copilot question (run against COMP-16 repo):** "List every distinct event type / payload class that the `business-rules` Kafka consumer in this repo deserialises and processes. For each, cite file:lines and identify the source service if visible from `eventType` / `startRuleGroup` / `source` field discrimination." |
+| Case-status eligibility gates (notes on closed cases) | Cross-repo | Cross-repo investigation against COMP-24 CaseActionService — does it block notes on closed cases, or is no such check applied platform-wide? |
+| `minReadySeconds` misplacement — replicated in other WDP manifests? | Pattern audit | Run a one-line grep across all known component repo `resources.yaml` files for `minReadySeconds` indentation level. **Suggested follow-up Copilot question:** "In `resources.yaml` (or equivalent K8s manifest), is `minReadySeconds` defined at `spec.minReadySeconds` (Deployment-level, correct) or at `spec.template.spec.minReadySeconds` (PodSpec-level, ignored by Kubernetes)? Cite file:lines." |
+| `/actuator/prometheus` authentication — intentional or oversight? | Architect decision + pattern audit | Compare with COMP-23 / COMP-24 / COMP-27 Spring Security whitelist patterns. If platform standard is unauthenticated scraping, this is a deviation. If platform standard is authenticated scraping, scraper config must be confirmed. |
+| Production replica count for COMP-25 | Environment config | XL Deploy placeholder — confirm from environment config or team. Same posture as every other continuously-running WDP component. |
+| HikariCP pool sizes and connection timeouts (NAP + WDP datasources) | Runtime observation | Not configured in source — uses Spring Boot defaults or runtime env overrides. Confirm via runtime inspection. |
+| Whether `nap.NOTES` deserves its own shared-table row in WDP-DB.md | Architect decision | COMP-23 also writes `nap.NOTES` on NAP create path. Currently only `wdp.NOTES` carries an explicit shared-table risk row. Symmetry pass owed. |
+---
+
 ### 2026-04-28 — COMP-22 DisputeService · v1.0 DRAFT → v2.0 DRAFT
 
 **Source:** `mdvs-gcp-disputes-service` — source-verified by GitHub
