@@ -2205,6 +2205,224 @@ consume entries from this section and move them to the most recent **Reconciled*
 section above.*
 
 
+### 2026-04-28 — COMP-26 QuestionnaireService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `mdvs-gcp-questionnaire-service` — source-verified by GitHub
+Copilot CLI 2026-04-28. Architect confirmation pending.
+
+**Nature of change:** Correction pass. The v1.0 DRAFT was largely accurate
+on auth, controllers, validation rules, and surface contracts. Source
+audit confirmed the bulk of those claims and surfaced four material new
+findings that change the platform-level risk picture: (1) the codebase
+has NO `@Transactional` boundary anywhere, (2) the JPA datasource is
+`DriverManagerDataSource` rather than HikariCP, (3) malformed JSON bodies
+return HTTP 500 rather than 400, and (4) `minReadySeconds: 30` is
+mis-indented under Pod spec and is likely ignored by Kubernetes. Endpoint
+count corrected from 16 to 20 (15 Visa + 5 Dispute). Error body field
+name corrected from `message` to `errorMessage`. HTTP 405 added to the
+documented status set.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- Section 2 row for `wdp.disputes_questionnaire` — UPDATE: append to the
+  COMP-26 portion of the writer cell:
+  *"COMP-26 has NO `@Transactional` boundary on any path; every JPA call
+  runs in Spring Data JPA's per-call default transaction. PUT (find →
+  save) and B1 UPSERT (find → decide → save) span multiple short
+  transactions and are vulnerable to TOCTOU races. App tier uses
+  `DriverManagerDataSource` (no HikariCP); effective pooling depends on
+  PgBouncer / Aurora-side."*
+  Severity on the shared-table risk row stays 🔴 HIGH; reasoning extends
+  beyond the previously-documented duplicate-POST gap to also cover
+  concurrent B1 UPSERT inserts.
+- Section 2 row for `wdp.disputes_questionnaire_doc_status_rules` — ADD
+  if not present, with COMP-26 as read-only consumer and writer marked
+  ⚠️ TBC (no INSERT/UPDATE/DELETE in COMP-26's repo; no migration files;
+  writer must be located by cross-repo grep).
+
+**WDP-KAFKA.md**
+
+- No change. COMP-26 has no Kafka producer or consumer. Confirm by
+  reaffirming COMP-26 in the Kafka-Free component list at next
+  reconciliation.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+- Add: COMP-26 has NO `@Transactional` annotation anywhere in service or
+  controller code. Multi-step flows (PUT, B1 UPSERT) span multiple
+  per-call default transactions.
+- Add: COMP-26 uses `DriverManagerDataSource` (no HikariCP, no
+  application-tier connection pool). Every JPA call opens a new JDBC
+  connection.
+- Add: COMP-26 endpoint count is 20 (15 Visa controller + 5 Dispute
+  controller).
+- Add: COMP-26 error body field name is `errorMessage` (not `message`).
+- Add: COMP-26 produces HTTP 405 via `HttpRequestMethodNotSupportedException`
+  handler. Status set is {200, 201, 400, 401, 404, 405, 500}; no 403,
+  409, 415, 422, 503 paths.
+- Add: COMP-26 maps `HttpMessageNotReadableException` to HTTP 500 (not
+  the conventional 400). Invalid platform string also returns HTTP 500
+  via `IllegalArgumentException` → `RuntimeException` handler.
+- Add: COMP-26 has no Liquibase, Flyway, or SQL migration files in repo.
+  DB-level constraints (UNIQUE, NOT NULL) on `wdp.disputes_questionnaire`
+  are not determinable from source.
+- Add: COMP-26 deploys 3 K8s resources (Deployment + Service + Ingress)
+  with 6 ingress host rules via templated host names. No HPA, no PDB,
+  no startup probe, no CPU limit/request configured.
+- Add: COMP-26 `minReadySeconds: 30` is mis-indented under
+  `spec.template.spec` (Pod spec) rather than `spec` (Deployment spec)
+  and is likely ignored by Kubernetes — actual rolling-update behaviour
+  may differ from declared intent.
+- Add: COMP-26 has no `application-{profile}.yaml` files; profile
+  overrides are inline in `application.yaml` and only override the
+  `case-actions-service` URL. `local` profile uses HTTPS; all other
+  profiles use HTTP intra-cluster.
+- Add: COMP-26 `StandardEntityError` and `createDuplicateResponseEntity()`
+  helpers in `GlobalExceptionHandler` are dead code — not reachable from
+  any active `@ExceptionHandler`.
+- Add: COMP-26 A2 Pre-Compliance cross-field validation is symmetric —
+  DECL forbids `partialAcceptanceReason`; PART forbids
+  `continuePreFilingReason` (prior draft only documented the required-side
+  half).
+
+- Resolved open questions:
+  - "COMP-26 POST idempotency gap — duplicate POSTs insert new rows" —
+    confirmed: POST has no application-level pre-existing-row check and
+    no DB-level UNIQUE constraint visible. Open question now narrows to
+    the architect decision on remediation (see New open questions below).
+
+- New open questions:
+  - COMP-26 no-`@Transactional` posture — intentional design or
+    remediation needed? PUT and B1 UPSERT both span multiple short
+    transactions and have TOCTOU race exposure.
+  - COMP-26 `DriverManagerDataSource` choice — intentional (e.g. behind
+    PgBouncer) or remediate to HikariCP?
+  - COMP-26 `HttpMessageNotReadableException` → 500 mapping — intentional
+    or fix to 400?
+  - COMP-26 invalid platform string returns 500 — intentional or fix to
+    400 with explicit pre-validation?
+  - COMP-26 `checkWriteOffReasonWriteOffNote` commented out on POST but
+    active on PUT — restore symmetry or document the asymmetry?
+  - COMP-26 `checkCTMTemplate` body fully commented out — restore or
+    remove?
+  - COMP-26 `minReadySeconds: 30` indentation defect — DevOps fix?
+  - COMP-26 POST idempotency — add DB UNIQUE on (I_CASE, I_ACTION_SEQ)
+    and caller `Idempotency-Key`, or accept current behaviour?
+  - Cross-repo: writer of `wdp.disputes_questionnaire_doc_status_rules`?
+  - Cross-repo: ContestService (COMP-20) relationship to QuestionnaireService?
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+
+- Candidate ADR — COMP-26 `DriverManagerDataSource` over HikariCP.
+  Severity 🟡 MEDIUM. Decision needed: is this an accepted local
+  deviation (e.g. PgBouncer fronts the service) or a defect to remediate?
+- Candidate ADR — COMP-26 No `@Transactional` boundaries declared.
+  Severity 🔴 HIGH. Decision needed: accept the per-call default-tx
+  posture and the resulting TOCTOU exposure on PUT/B1, or introduce
+  service-method-level transactions and pessimistic locking on
+  read-before-write paths?
+- Candidate ADR — COMP-26 POST duplicate-row behaviour and DEC-020
+  posture. Severity 🔴 HIGH. Decision needed: DB UNIQUE + caller
+  `Idempotency-Key`, or formal acceptance of duplicate-row insertion?
+- Candidate ADR — COMP-26 outbound `case-actions-service` REST has no
+  timeout, retry, or circuit breaker. Severity 🔴 HIGH (thread-blocking
+  exposure). Same shape as the DEC-014-VOID factual record observed for
+  other components; needs a new local decision since DEC-014 is voided.
+
+**WDP-ARCHITECTURE.md**
+
+- No topology change. The Aurora connection-pool topology assumption
+  may need a footnote: COMP-26 (and possibly other services pending
+  audit) does not use HikariCP at the application tier — production
+  pooling depends on PgBouncer / Aurora-side, not visible from the
+  service repo.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+
+Candidate new RISK rows:
+
+- RISK — COMP-26 thread-blocking exposure: outbound REST to
+  `case-actions-service` has no connect/read timeout, no retry, no
+  circuit breaker. Severity 🔴 HIGH. Mitigation: configure timeouts
+  and Resilience4j circuit breaker; or accept and document.
+- RISK — COMP-26 connection-storm exposure: `DriverManagerDataSource`
+  opens a new JDBC connection per JPA call; throughput is bounded by
+  Postgres / PgBouncer accept rate. Severity 🟡 MEDIUM. Mitigation:
+  HikariCP with tuned pool, or confirm PgBouncer fronts the service
+  with adequate capacity.
+- RISK — COMP-26 concurrent-write race on B1 UPSERT and on PUT (no
+  `@Transactional`, no `@Version`, no DB UNIQUE confirmed). Severity
+  🔴 HIGH for B1 (duplicate-row insertion possible). Mitigation:
+  service-method `@Transactional`, DB UNIQUE on (I_CASE, I_ACTION_SEQ),
+  optimistic locking via `@Version`, or pessimistic lock on read.
+- RISK — COMP-26 POST duplicate-row insertion (no app-level check, no
+  confirmed DB UNIQUE). Severity 🔴 HIGH. Mitigation: DB UNIQUE +
+  caller `Idempotency-Key`.
+- RISK — COMP-26 declared `minReadySeconds: 30` is ineffective due to
+  manifest indentation. Severity 🟡 MEDIUM (rolling updates may proceed
+  without the intended cool-off). Mitigation: DevOps fix.
+- RISK — COMP-26 `HttpMessageNotReadableException` → 500 misleads
+  observability and breaks client error-handling conventions.
+  Severity 🟡 MEDIUM. Mitigation: map to 400 in
+  `GlobalExceptionHandler`.
+
+**WDP-INTEGRATIONS.md**
+
+- COMP-26 → `mdvs-gcp-case-actions-service` REST contract. ADD entry if
+  not present:
+  - Endpoint: `GET /merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions/{actionSequence}`
+  - Auth: client-credentials OAuth2, registration `wdp-internal-auth`,
+    scope `openid`
+  - Failure mode: hard fail, no retry, no circuit breaker, no timeout.
+    `RestClientException` rethrown → HTTP 500 to caller.
+  - `local` profile uses HTTPS; all other profiles use HTTP intra-cluster.
+- COMP-26 → enterprise IdP token endpoint contract. ADD entry if not
+  present.
+
+#### Deviation flags for COMP-26
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ⛔ DEVIATES (by design — REST API, no Kafka producer) | 🟢 LOW |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE (no Kafka) | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES (no PAN field exists) | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE (no Kafka consumer) | — |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⛔ DEVIATES — POST inserts unconditionally; no `Idempotency-Key`; no app-level pre-check; no DB UNIQUE confirmed | 🔴 HIGH |
+
+**DEC-001 deviation detail (LOW)**: Component is a pure synchronous CRUD
+REST API. Outbox pattern does not apply because there is no Kafka
+producer. Recorded as a deviation only if DEC-001 is interpreted as
+applying to all WDP services regardless of integration shape.
+
+**DEC-020 deviation detail (HIGH)**: POST handlers (5 Visa + B2 Non-Visa)
+build a new entity and call `save()` without any pre-existing-row check,
+without `Idempotency-Key` header handling, and without a dedupe table.
+The JPA entity has only a non-unique `@Index` on `(I_CASE, I_ACTION_SEQ)`;
+no DB-level UNIQUE constraint is visible in the repo (no Liquibase /
+Flyway / SQL migration files exist). Effective duplicate-row protection
+depends entirely on whether a DB UNIQUE was added externally. The B1
+UPSERT path additionally exposes a TOCTOU race because find-then-decide
+runs across separate per-call transactions with no pessimistic lock.
+
+#### Doc status after this change
+
+- `WDP-COMP-26-QUESTIONNAIRE-SERVICE.md` → `v1.1 DRAFT` —
+  source-verified 2026-04-28 · architect confirmation pending
+- `WDP-COMP-INDEX.md` → no count change (still 50 components); status
+  remains 📝 DRAFT
+- `WDP-DB.md` → `wdp.disputes_questionnaire` writer-cell amendment +
+  doc_status_rules row addition pending (next reconciliation session)
+- `WDP-KAFKA.md` → no change
+- `WDP-DECISIONS.md` → 4 candidate ADRs surfaced (next reconciliation)
+- `WDP-INTEGRATIONS.md` → 2 outbound contracts pending registration
+  (next reconciliation)
+- `WDP-NFRS.md` → 6 candidate RISK rows surfaced (next reconciliation)
+---
+
+
 ### 2026-04-28 — COMP-25 NotesService · v1.0 DRAFT → v1.1 DRAFT
 
 **Source:** `mdvs-gcp-notes-service` — source-verified by GitHub Copilot CLI 2026-04-28.

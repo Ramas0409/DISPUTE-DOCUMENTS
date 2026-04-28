@@ -1,0 +1,503 @@
+You are auditing the WDP component UserQueueSkillService in the repository
+gcp-user-queue-skill-service. A prior pass already produced a DRAFT
+architecture document. Your job is to CONFIRM OR CORRECT the items listed
+under 'ALREADY DOCUMENTED' from source, and to CLOSE the items listed
+under 'GAPS TO FILL' by reading the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that
+explicitly and label it 'not determinable from source'. Do NOT guess.
+Do NOT summarise without evidence. Do NOT use the existing document as
+a substitute for source — treat it as a hypothesis to verify.
+
+═══════════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT
+═══════════════════════════════════════════════════════════════════
+
+The file WDP-COMP-30-USER-QUEUE-SKILL-SERVICE.md is provided alongside
+this prompt. It is HYPOTHESES to verify — NOT ground truth.
+
+For each documented claim:
+  (a) Confirm: write "Document accurate — <file>:<lines>"
+  (b) Correct: write a CORRECTION block:
+        - What doc says
+        - What source shows (with file:lines)
+        - Which section of the document needs updating
+
+At the end of the report, list every documented claim that could NOT
+be verified from source under Section 10.
+
+═══════════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — CONFIRM OR CORRECT
+═══════════════════════════════════════════════════════════════════
+
+Identity & runtime:
+- Artifact `gcp-user-queue-skill-service`, Java 17, Spring Boot 3.5.5,
+  PostgreSQL, Version 1.1.7
+- Context path `/merchant/gcp/user-queue-skill`, port 8082
+- Whitelisted no-auth endpoints: `/actuator/health`, `/readyz`, `/livez`,
+  `/user-queue-skill-service-api-docs/**`, `/swagger-ui/**`
+
+Endpoint inventory:
+- User Management: GET /users/{loginName} (V1), GET /v2/users/{loginName}
+  (V2 DB-only no IDP fallback), POST /user, GET /users/search
+- Queue Management: POST /{region}/queue, PUT /{region}/queue
+- User View: POST /user-view, GET /user-view?gridName=<name>
+- LFT Report: POST /lft-report, GET /lft-report, DELETE /lft-report,
+  DELETE /lft-report/{reportName}, GET /lft-report/download/{reportName}
+  (returns 302 with S3 presigned URL)
+
+Auth model:
+- Spring Security JwtIssuerAuthenticationManagerResolver with trusted
+  issuers from `jwt.trustedIssuers`
+- Role enforcement done in application code (NOT filter chain) reading
+  `AuthorizationList` JWT claim against `user.roles.internal` and
+  `user.roles.external` config sets
+- Outbound auth:
+  * IDP internal: static Bearer `idp.internal.auth-token` +
+    `X-SunGard-IdP-API-Key`
+  * IDP external: token + Sungard key selected by `userFirm`
+    (`us_merchant` vs others)
+  * Display Code Service: OAuth2 client_credentials via
+    `TokenServiceImpl` from `us_worldpay_fis_int` IDP
+  * CHAS: caller's JWT forwarded as Bearer
+
+Behavioural assertions:
+- V1 GET: DB hit → return; DB miss → IDP call → if external user and
+  orgId mismatch → 401 → otherwise filter roles → insert into nap.users
+  → return; IDP returns null → 400; IDP throws RestClientException → 500
+- V2 GET: DB-only lookup; multiple records → 400; none → 404
+- POST /user: no request body — all data from JWT claims (LoginName,
+  FirstName, LastName, EmailAddress, ExternalID, AuthorizationList);
+  upsert on login name; if new internal user with recognised NAP queue
+  role and no existing queue assignments → auto-enrol into all
+  SKILLS_INTERNAL queues
+- POST /{region}/queue and PUT /{region}/queue: @Transactional(
+  rollbackOn = Exception.class) — queue + criterion + user_queue inserts
+  and deletes share ONE transaction per datasource
+- POST /lft-report: validates count caps; external PIN users gated by
+  CHAS authorization; INSERT into wdp.lft_report is NON-transactional
+  (no @Transactional on createUserReport)
+- GET /lft-report/download: 302 redirect to AWS S3 presigned URL,
+  region hardcoded us-east-2, TTL 15 min hardcoded; 404 if s3_key_path
+  is null
+
+Dependencies:
+- Five outbound: IDP internal, IDP external (two URLs — standard +
+  fraud-disputes-merchant), Display Code Service
+  `mdvs-gcp-display-code-service.wdp-micro:8082`, CHAS
+  `core-hierarchy-authorization-service.wdp-micro:8082`, AWS S3
+  (`wdp-lft-report` bucket, region `us-east-2`)
+- All REST calls use `CommonConfig.getRestTemplate()` returning plain
+  `new RestTemplate()` — no connection timeout, no read timeout
+- No `resilience4j` dependency in pom.xml — circuit breaker absent on
+  all five
+
+Tables owned (Read + Write):
+- nap.users, nap.queues, nap.queue_criterion, nap.user_queue,
+  nap.user_grid_preferences
+- wdp.queues, wdp.queue_criterion, wdp.user_queue, wdp.lft_report
+
+Tables read only (ownership unknown):
+- nap.nap_parent_entity (LFT validation lookup)
+- wdp.case (LFT PIN authorization merchant/chain ID lookup)
+- wdp.action (LFT PIN authorization source case ID fallback)
+
+Transactional posture:
+- nap and wdp use SEPARATE JPA EntityManagerFactory + transaction
+  manager; no XA/distributed transaction
+- Queue create/update: one transaction per datasource
+- LFT report insert: NOT transactional
+
+Platform deviations:
+- DEC-001 (Outbox): ABSENT — direct table mutations, no event publish
+- DEC-003 (Kafka partition key): NOT APPLICABLE — no Kafka
+- DEC-004 (PAN encryption): NOT APPLICABLE — no PAN data
+- DEC-005 (Kafka offset commit): NOT APPLICABLE — no Kafka consumer
+- DEC-014 (Resilience4j): DEVIATION — no `resilience4j` in pom.xml
+
+Scaling and deployment:
+- Replicas: XL Deploy placeholder `{{ replicas-gcp-user-queue-skill-service }}`
+- Memory: request 1024Mi / limit 2048Mi
+- CPU: NOT SET (no request, no limit)
+- HPA: absent
+- PDB: absent
+- Rollout: RollingUpdate maxSurge 1, maxUnavailable 0, minReadySeconds 30
+- Topology spread: ScheduleAnyway with `${BRANCH_NAME_PLACEHOLDER}` label
+- Probes: liveness `/livez`, readiness `/readyz`
+- OTel agent: instrumentation.opentelemetry.io/inject-java annotation
+- Spring Actuator: /info, /health, /prometheus
+- Logstash: configured · Prometheus: configured
+- Hardcoded: S3 region `us-east-2`, presigned URL TTL 15 min, internal
+  firm `us_worldpay_fis_int`
+
+Planned/incomplete work:
+- AsyncConfiguration.java present with async.corePoolSize / maxPoolSize /
+  queueCapacity configured — but no active async usage in any endpoint
+  (dead config)
+- validateUserRole commented out (replaced by single queue-type-based
+  validateRole); removed UK/US role config keys
+- spring-boot-devtools present in pom.xml WITHOUT <scope>runtime</scope>
+  — flagged as production deployment risk
+- No // TODO or // FIXME markers found
+
+═══════════════════════════════════════════════════════════════════
+GAPS TO FILL — RESEARCH FROM SOURCE
+═══════════════════════════════════════════════════════════════════
+
+1. KNOWN CALLERS OF EVERY ENDPOINT
+   For each controller method, search for:
+   - @KnownCallers annotation
+   - Swagger / OpenAPI tags or x-extensions
+   - Comment headers naming intended callers
+   - Spring Security configuration restricting callers
+   State per endpoint either "callers identified — <list>" or "no
+   caller identification in source".
+
+2. REGION ROUTING DISPATCH
+   For POST /{region}/queue and PUT /{region}/queue:
+   - How is the `{region}` path variable validated?
+   - What values does it accept? (NAP vs PIN, or UK vs US, or other?)
+   - How does the value translate to nap-datasource vs wdp-datasource
+     selection? Controller-level branch? Service strategy? Routing
+     config?
+   - What happens on an unknown region value?
+   Cite file:lines.
+
+3. AUTO-ENROL DECISION LOGIC ON POST /user
+   - Which JWT claim is read to determine queue role?
+   - What set of role values triggers SKILLS_INTERNAL enrolment?
+   - Is enrolment skipped for users who already have queue assignments?
+     If so, what is the check?
+   - Is the auto-enrol loop inside the same @Transactional boundary as
+     the user upsert?
+   - What happens if one of the SKILLS_INTERNAL queue assignments
+     fails — does the entire POST roll back?
+
+4. LFT REPORT STATUS STATE MACHINE
+   - List every value the code reads or writes for wdp.lft_report.status
+   - Confirm whether this service ONLY inserts PENDING and reads status,
+     or whether it ever updates status
+   - State which downstream component is expected to transition the
+     status (if any reference exists in source)
+
+5. READ-ONLY CONFIRMATION FOR EXTERNAL TABLES
+   For each of nap.nap_parent_entity, wdp.case, wdp.action:
+   - Search the entire repo for any write operation: @Modifying queries,
+     save() / saveAll() on entities mapped to these tables, native
+     UPDATE/INSERT/DELETE statements
+   - Confirm "READ ONLY in this repo" or list any write found
+   - For wdp.case and wdp.action — list every column read
+
+6. PIN AUTHORIZATION FLOW ON POST /lft-report
+   - Which CHAS endpoint is called: /hierarchy-authorization or
+     /entity-authorize? Both? Conditional?
+   - What is sent in the request body?
+   - How do reads from wdp.case and wdp.action feed into that request?
+   - What gates the lft_report INSERT — what response field is checked?
+   - What error path triggers the 403 response?
+   Cite file:lines for each step.
+
+7. DISPLAY CODE SERVICE CALL SITES
+   v1.0 says the only call is "validate LOGICAL_INTERNAL queue name is
+   not already a physical queue name". Confirm by listing every call
+   site to Display Code Service in source. State if any other call sites
+   exist.
+
+8. RESTTEMPLATE BEAN TOPOLOGY
+   - Is there a single shared RestTemplate bean, or does each REST
+     integration instantiate its own?
+   - Is CommonConfig.getRestTemplate() a @Bean method or a static
+     factory?
+   - List every place RestTemplate is constructed or injected.
+
+9. IDEMPOTENCY POSTURE PER WRITE ENDPOINT
+   For each of POST /user, POST /lft-report, POST /user-view,
+   POST /{region}/queue:
+   - What is the deduplication key (the field set used to detect a
+     duplicate)?
+   - Is there a DB unique constraint backing that key? Search Liquibase /
+     Flyway migrations or JPA @UniqueConstraint annotations.
+   - What is the behaviour on concurrent duplicate requests? Last-write-
+     wins? Constraint violation surfaces as what HTTP status?
+   - Is any idempotency-key header read or written?
+
+10. @TRANSACTIONAL PLACEMENT ON POST /user
+    - Where is @Transactional declared (controller / service / repo)?
+    - Is rollbackOn / noRollbackOn set?
+    - Is the auto-enrol loop inside or outside the boundary?
+
+11. FAILURE PATH PER OUTBOUND DEPENDENCY
+    Produce a structured per-dependency table:
+    - Caught exception type
+    - Retry count and backoff (zero expected)
+    - Behaviour after exception (rethrow as what / mapped to what HTTP
+      status)
+    - Whether any fallback or degraded response exists
+    Cover: IDP internal, IDP external standard, IDP external MFD,
+    Display Code Service, CHAS, AWS S3.
+
+12. PRODUCTION REPLICA COUNT
+    Search for default values of `replicas-gcp-user-queue-skill-service`
+    in: values.yaml, env-specific override files, deployit-manifest.xml,
+    any CI/CD config in the repo. If no default is found, state
+    "environment-config-only".
+
+13. CPU LIMIT ABSENCE — VERIFICATION
+    Confirm by reading resources.yaml directly that CPU limits and
+    requests are genuinely absent (not under a different key, not in a
+    separate fragment, not in a Helm template that overrides). State
+    the file path scanned.
+
+14. LOGBACK / LOGSTASH CONFIGURATION
+    - Is logback-spring.xml present? If yes, list the appenders
+      declared.
+    - What is the value source for `logstash.server.host.port`?
+    - Confirm Logstash is wired to a real appender, not just a property.
+
+15. PROPERTIES CONFIGURED BUT NEVER READ
+    - List every property in application.yaml (and profile-specific
+      YAMLs)
+    - For each, search for a matching @Value injection or
+      @ConfigurationProperties binding
+    - Report properties with NO injection point (dead config)
+    - Specifically confirm whether async.corePoolSize / maxPoolSize /
+      queueCapacity are actually injected anywhere — this confirms or
+      refutes the "dead config" claim
+
+16. SPRING PROFILES IN REPO
+    - List every application-*.yaml file
+    - State which profile each maps to
+    - Confirm profile selection mechanism (env var name)
+
+17. DATABASE CONNECTION POOL
+    - Is HikariCP used (default Spring Boot)?
+    - Are there pool sizing or timeout overrides per datasource (nap
+      vs wdp)? Cite the property keys if so.
+
+18. HEALTH PROBE ENDPOINT IMPLEMENTATION
+    - Are /livez and /readyz custom controllers or Actuator-backed?
+    - Cite file:lines of the endpoint implementation.
+
+═══════════════════════════════════════════════════════════════════
+REPORT STRUCTURE — USE THESE EXACT HEADINGS IN ORDER
+═══════════════════════════════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ────────────────────────────────────
+
+This component has FOUR endpoint groups. Document each as a separate
+flow under sub-section (e). Sub-sections (a) through (f) below apply
+to the union of those flows.
+
+a) STEPS IN ORDER
+   Per endpoint group, list every processing step from JWT decode to
+   final response. For each step state what happens, which service or
+   table is called, and what the output is. Cite file:lines.
+
+b) DECISION POINTS
+   Every branch — condition evaluated and every possible outcome with
+   the path it leads to. Cite file:lines.
+
+c) SKIP AND BYPASS CONDITIONS
+   Any condition that short-circuits processing — what is checked,
+   what value triggers skip, where control goes after.
+
+d) FAILURE PATH PER STEP
+   For each step that calls an external dependency, what happens if
+   the call fails. State exception type caught, number of retries
+   (zero expected), post-exhaustion behaviour. Per step, not globally.
+
+e) MULTIPLE ENTRY PATHS
+   This component has multiple entry paths. Document each endpoint
+   group separately. State whether they share any common service-
+   layer code path or are fully independent.
+   Confirm explicitly there is NO Kafka listener, NO scheduler,
+   NO webhook endpoint — REST is the only entry mechanism.
+
+f) STATE AT EACH STEP
+   Where applicable — primarily LFT report status. For the user
+   upsert path, state how is_active / role columns transition.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ───────────────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   - Region routing: how `{region}` path variable maps to datasource
+   - V1 vs V2 user lookup: what the version-controller difference
+     dispatches on
+   - Internal vs external user: how this is determined and what
+     behaviour differs
+
+b) BUSINESS RULES APPLIED
+   - V1 external-user orgId match check
+   - Role filtering against user.roles.internal / user.roles.external
+   - LFT count caps (max-inprogress-requests, max-total-requests)
+   - LFT input validation (merchantName length, merchantId numeric)
+   - PIN authorization gate via CHAS
+   - Queue criterion ID existence check on update path
+   - Display Code Service "physical queue name not in use" check on
+     LOGICAL_INTERNAL queue creation
+
+c) DATA TRANSFORMATIONS
+   - JWT claim → UserEntity field map (POST /user path)
+   - IDP response → UKUsersEntity field map (V1 IDP fallback path)
+   - QueueRequest → QueueEntity / QueueCriterionEntity / UserQueue
+     field map
+   - UserReportRequest → LftReportEntity field map (note JSON-serialised
+     fields: searchCriteria, user_entity)
+
+d) IDEMPOTENCY MECHANISM
+   See gap 9 above — produce structured per-write-endpoint table.
+
+── SECTION 3 — CONTRACTS ──────────────────────────────────────────
+
+REST API ONLY — confirm and state explicitly:
+- "Not present: Kafka consumer"
+- "Not present: Kafka producer"
+- "Not present: Batch / scheduler"
+
+For every endpoint:
+- Method, path, request fields, response fields
+- Every HTTP status code and trigger condition
+- Auth model (per-endpoint variation if any)
+- Known callers (or "not determinable from source")
+- Error body structure
+
+── SECTION 4 — DEPENDENCIES ───────────────────────────────────────
+
+Per-dependency table covering all six external dependencies plus the
+two internal datasources:
+
+  - IDP Internal
+  - IDP External (standard)
+  - IDP External (fraud-disputes-merchant)
+  - Display Code Service
+  - Core Hierarchy Authorization Service (CHAS)
+  - AWS S3 (wdp-lft-report bucket)
+  - PostgreSQL nap datasource
+  - PostgreSQL wdp datasource
+
+For each:
+- Service name / logical target
+- Protocol and auth method
+- Purpose — at which step in the flow
+- Connection timeout — state "not configured" if absent
+- Read timeout — state "not configured" if absent
+- Retry: count, delay, backoff type
+- Circuit breaker: Resilience4j configured? If no — state explicitly
+  "not configured".
+- Behaviour if unavailable: halt / skip / degrade / error code returned
+
+── SECTION 5 — DATABASE ───────────────────────────────────────────
+
+For every table read or written, produce a row:
+- Schema and exact table name
+- Read or write — state clearly
+- Purpose — at which step in the flow
+- Key columns used in queries or writes
+- Whether writes are in the same transaction as other writes at that
+  step
+- Transaction manager bean used (napTransactionManager vs
+  wdpTransactionManager — confirm the actual bean names)
+- Whether SELECT FOR UPDATE / row locks used
+
+Confirm explicitly whether each of these is read-only in this repo
+or has any write path:
+- nap.nap_parent_entity
+- wdp.case
+- wdp.action
+
+Confirm explicitly any tables NOT touched that the existing doc might
+have implied.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ───────────────────────
+
+For each standard, output COMPLIES / DEVIATES / NOT APPLICABLE with
+file:line evidence:
+
+DEC-001: Transactional outbox — used? Which table? Outbox write same
+         transaction as business write? Expected answer: ABSENT.
+DEC-003: Kafka partition key — N/A (no Kafka). Confirm zero
+         spring-kafka, KafkaTemplate, @KafkaListener, @EnableKafka
+         occurrences.
+DEC-004: PAN encryption — confirm no PAN data path. Search for any
+         column named card_number, pan, account_number, hpan, encrypted_pan.
+DEC-005: Kafka offset — N/A. Confirm.
+DEC-014: Resilience4j — confirm no resilience4j dependency in pom.xml.
+DEC-019: Clear PAN — does this component write clear PAN to any
+         persistent store? Expected: no.
+DEC-020: Idempotency — full at-least-once implemented? If not, what
+         gap exists? Tie this to the per-endpoint idempotency table
+         in Section 2(d).
+
+── SECTION 7 — SCALING AND DEPLOYMENT ─────────────────────────────
+
+Read resources.yaml directly. For each item:
+- Kubernetes resource type
+- Replica count — exact value or placeholder, state which and which
+  variable
+- Memory and CPU limits and requests — explicitly state CPU not
+  configured if absent
+- HPA — present or absent (cite the manifest)
+- Rolling update strategy
+- PodDisruptionBudget — present or absent
+- Topology spread — functional or label mismatch (confirm
+  ${BRANCH_NAME_PLACEHOLDER} usage)
+- Liveness / readiness / startup probes — endpoint paths and whether
+  custom or Actuator-backed
+- Ports exposed
+- Observability — OTel agent annotation, Actuator endpoints exposed,
+  Logstash appender wiring (confirm logback-spring.xml present), Prometheus
+
+If resources.yaml or values.yaml or deployit-manifest.xml is NOT in
+the repo, state "not in repo" and list what IS in the repo.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ────────────────────────
+
+- Commented-out code — what it did, why removed (cite verbatim if
+  short). Specifically the validateUserRole removal.
+- Unused dependencies in pom.xml. Confirm whether any spring-retry,
+  spring-kafka, or other framework dependencies appear unused.
+- Feature flags active in production — exact flag names, behaviour,
+  default if env var unset.
+- TODO / FIXME references — file:line and verbatim text. State "none
+  found" if absent.
+- Stub implementations returning fixed responses.
+- Properties configured but never read (close gap 15) — produce a list.
+- spring-boot-devtools scope verification.
+- AsyncConfiguration.java active-vs-dead confirmation.
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ──────────────────────────────
+
+For EACH of sections 1 through 8, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+  determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ──────────────────
+
+List every claim from the existing component document that could
+NOT be cross-checked against code or config — neither confirmed nor
+contradicted. These need follow-up from the team or runtime
+observation.
+
+═══════════════════════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════════════════════
+
+- Cite file paths and line ranges for every concrete claim. Format:
+  <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does not
+  reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms existing
+  documentation, a one-paragraph "still accurate — file:lines" is
+  acceptable.
+- If you would restate something the reference document already states
+  verbatim, replace that prose with "Document accurate — <file>:<lines>".
+  Do not restate.
+- Do not invent file paths. If a file is referenced in the existing
+  doc but you cannot locate it, list it under "REFERENCED BUT NOT
+  FOUND IN REPO" at the end of the report.
