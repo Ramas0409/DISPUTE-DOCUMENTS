@@ -2205,6 +2205,116 @@ consume entries from this section and move them to the most recent **Reconciled*
 section above.*
 
 
+### 2026-04-28 — COMP-28 DisplayCodeService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `gcp-display-code-service` (Worldpay-mdvs-gcp-display-code-service.git) — source-verified by GitHub Copilot CLI 2026-04-28. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source. No functional change in production. The v1.0 DRAFT (original GitHub Copilot CLI extraction) contained two version-string transcription errors, one config-key error in the Spring profile activation pattern, an incomplete K8s probes section, and missed one new architectural finding worth recording at risk level — the permission-shape divergence between POST /search and GET /privileges. One MEDIUM-HIGH risk and three new MEDIUM/LOW risks added.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- Section 2 — `wdp.display_codes` row: **No ownership change.** Reinforce: COMP-28 is a runtime READ-ONLY consumer; writes are by DBA scripts / migrations only. Existing reader attribution (COMP-28 DisplayCodeService; COMP-31 BusinessRulesService for criteria enrichment) is unchanged and remains accurate.
+
+- Section 2 — `wdp.dispute_static_tabs_rules` row: **No ownership change.** Reinforce: COMP-28 is a runtime READ-ONLY consumer; writes by DBA scripts / migrations only. Add to Notes: *"Two repository projections — `findByRoles` (used by POST /search) returns 11 Y/N flag columns; `getPermissions` (used by GET /privileges) returns 17 Y/N flag columns. The 6-column delta (`fax_match`, `fax_report`, `trans_detail`, `auth_detail`, `settle_detail`, `dispute_history`) is the source of the COMP-28 permission-shape divergence between endpoints."*
+
+- No new shared-table risk introduced. No new cross-component co-writer concerns.
+
+**WDP-KAFKA.md**
+
+- No change. COMP-28 remains in Section 4's Kafka-free components list. Audit re-confirms zero `spring-kafka`, `kafka-clients`, `aws-msk-iam-auth` in `pom.xml` and zero `@KafkaListener` / `KafkaTemplate` reference in source.
+
+**WDP-COMP-INDEX.md**
+
+- COMP-28 description correction (already flagged in v1.0 DRAFT, re-confirmed 2026-04-28): the existing entry implies this service "determines TIER1 sub-product eligibility from fraud and INR reason code lists." Source confirms this is incorrect — the service returns raw code lists; eligibility logic is the caller's responsibility (e.g. COMP-04 NAPDisputeEventService). COMP-INDEX entry should be updated at next reconciliation.
+
+- Doc status row update: COMP-28 → `📝 DRAFT v1.1 — source-verified 2026-04-28, architect confirmation pending`.
+
+**WDP-NFRS.md · Section 6 Risk Register** *(candidate new RISK rows)*
+
+- **🟠 MEDIUM-HIGH candidate:** *"Permission-shape divergence between COMP-28 POST /search and GET /privileges — same nominal `UserPermission` envelope returns 11 flags on /search vs 17 flags on /privileges. UI portals gated on the 6 extended flags (faxMatch, faxReport, transDetail, authDetail, settleDetail, disputeHistory) appear unauthorised when the page is rendered from /search response data even when caller's roles authorise them. Architect decision required: intentional minimisation or accidental drift?"* New finding.
+
+- **🟡 MEDIUM candidate:** *"COMP-28 `UnauthorizedException` (blank JWT `iss` claim) returns HTTP 500 instead of HTTP 401. No dedicated `@ExceptionHandler(UnauthorizedException.class)` exists; falls through catch-all `RuntimeException` handler. Defeats security-monitoring rules that key on auth-related response codes."* New finding.
+
+- **🟡 MEDIUM candidate (extension of existing pattern RISK):** *"COMP-28 `minReadySeconds: 30` misplaced inside Pod template spec — silently ignored at runtime."* Same copy-paste-class defect previously confirmed on COMP-25, COMP-34, COMP-08. Strengthens the case for a platform-wide manifest sweep. Recommend extending the existing pattern-audit RISK to include COMP-28 explicitly.
+
+- **🟡 MEDIUM candidate:** *"COMP-28 lazy JWKS resolution — `JwtIssuerAuthenticationManagerResolver` resolves issuer endpoints on first request per issuer, not at startup. Cold-start latency anomaly per impacted issuer; first impacted request returns 401 if IdP unreachable."* New finding.
+
+- Existing 🔴 HIGH RISK on `DriverManagerDataSource` (no connection pool, no timeouts) — re-confirmed 2026-04-28 with no remediation evidence in repo.
+
+- Existing 🟡 MEDIUM RISK on `userId` field declared but never read — re-confirmed.
+
+- Existing 🟢 LOW RISK on `hibernate.show-sql = true` in production — re-confirmed.
+
+- New 🟢 LOW candidates (code-quality / hygiene):
+  - `ValidationMessages.properties` contains messages from a different service (rules-service references — `stage`, `owner`, `network`, `actionCode`, etc.) not used by any validator in this service.
+  - `EnumName` / `EnumNameValidator` declared but applied to no field.
+  - Duplicate exception-handler helper methods in `GlobalExceptionHandler` (`createDuplicateResponseEntity`, `createErrorResponseEntity` patterns) appear unused.
+  - `spring-boot-devtools` present in `pom.xml` (auto-disabled when running from packaged jar but should be removed).
+
+**WDP-DECISIONS.md** *(candidate ADR / deviation map enrichment)*
+
+- **DEC-014 deviation map for COMP-28:** Re-confirm — no `io.github.resilience4j` dependency, no circuit breaker / retry / rate limiter / bulkhead annotations anywhere. Sole DB dependency runs with no retry, no circuit breaker, no socket timeout. Consistent with platform-wide DEC-014 VOID posture.
+
+- **Candidate new ADR — "Endpoint-pair contract divergence on shared response envelope":** The COMP-28 `UserPermission` envelope is shared between `POST /search` and `GET /privileges` but populated from two different repository projections (11 vs 17 columns) and two different platform-derivation strategies (substring match vs hardcoded role sets). Recommend a formal decision: align the two paths (defect remediation) or document the divergence as intentional API minimisation. Pattern is unique to COMP-28 in the audit corpus to date.
+
+- **Candidate clarification — DEC-019 / DEC-004 attestation for read-only services:** COMP-28 is a clean attestation that DEC-004 / DEC-019 compliance can be confirmed at architecture level by codebase scan for entity classes containing `pan` / `cardNumber` / `accountNumber` / `acctNum` fields plus absence of any persistent write. Worth documenting as a verifiable pattern when WDP-DECISIONS.md is rebuilt.
+
+**WDP-INTEGRATIONS.md**
+
+- No change. COMP-28 has no external integration contract — its outbound dependencies are PostgreSQL `wdp` schema (internal), the WDP-shared external IdP for JWKS (already documented platform-wide), and Logstash (internal observability infrastructure). No card-network, no acquiring-platform, no third-party integration.
+
+**WDP-ARCHITECTURE.md**
+
+- No change. Topology and principles unchanged. COMP-28 remains a WDP Core Service in Section 4. The permission-shape divergence is component-level, not platform-level.
+
+#### Deviation flags for COMP-28
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ✅ NOT APPLICABLE (no Kafka publish) | — |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE (no Kafka) | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES (no PAN handled; `fullPan` is a permission flag, not PAN data) | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE (no Kafka consumer) | — |
+| DEC-014 Resilience4j Circuit Breakers | ⛔ DEVIATES (platform-wide VOID) | 🟡 MEDIUM (accepted) |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES (no persistent writes at all) | — |
+| DEC-020 Full At-Least-Once Idempotency | ✅ NOT APPLICABLE (read-only service) | — |
+| DEC-023 Replica = 1 Hard Constraint | ✅ NOT APPLICABLE (standard scaled stateless service) | — |
+
+**DEC-014 detail:** Confirmed pattern matches the platform-wide DEC-014 VOID posture — no Resilience4j, no `RestTemplate` timeouts (no `RestTemplate` bean exists at all), no retry on the JDBC dependency. Consistent with COMP-25, COMP-31, COMP-37. Severity remains MEDIUM per platform-wide acceptance.
+
+**DEC-004 / DEC-019 detail:** Source-verified by full-codebase scan for `pan` / `cardNumber` / `accountNumber` / `acctNum` fields on entity classes — none found. `fullPan` field on `UserPermission` model is `Y` / `N` permission indicator only. No persistent writes occur at runtime.
+
+#### Remaining gaps
+
+| Gap | Type | Action |
+|-----|------|--------|
+| Production replica count | Environment config | Confirm via XL Deploy / Kubernetes for each environment — value is the template variable `{{ replicas-mdvs-gcp-display-code-service }}`. |
+| Actual JDBC URL host pattern (Aurora `globaldisputedatabase` vs separate GCP-hosted instance) | Environment config / team confirmation | `${wdp_datasource_jdbc_url}` injected from K8s secret bundle (`gcp-display-code-service-secrets` and/or `wdp-common-secrets`); host not in repo. |
+| Actual `jwt_trusted_issuer_urls` values | Environment config | Confirm IdP host(s) per environment from K8s secrets. |
+| Actual `logstash_server_host_port` values | Environment config | Confirm per environment from K8s secrets. |
+| Actual `display_code_types` SpEL map content | Environment config | Confirm per environment — runtime startup will fail if malformed (no try/catch around the `@Value("#{${displaycodes.map}}")` injection). |
+| Permission-shape divergence (11 vs 17 flags) — intentional or accidental? | **Architect decision** | If intentional, document the rationale; if accidental, raise as a defect and align both paths to use the 17-flag superset. |
+| `UnauthorizedException` → 500 instead of 401 — defect or accepted? | **Architect decision** | Affects security observability. Trivial fix (add a dedicated `@ExceptionHandler`). |
+| HikariCP migration plan for `DriverManagerDataSource` | **Architect decision** | No migration evidence in repo. Confirmed production throughput risk. Plan or accept the risk with documented operational ceiling. |
+| Full caller inventory beyond COMP-04 | **Follow-up Copilot CLI question on consumer repos** — exact question to ask: *"Does this repository call any endpoint matching `/merchant/gcp/display-code/search` or `/merchant/gcp/display-code/privileges`? If so, cite file:line of every call site, the HTTP client used, the request payload shape, and any caching of the response."* — to be run against COMP-49 (Merchant Portal) and COMP-50 (Ops Portal) repositories when those audits are performed. |
+| `minReadySeconds` misplacement — fix as part of platform-wide manifest sweep | **Architect decision** | Pattern confirmed on COMP-25, COMP-34, COMP-08, COMP-28. Recommend single coordinated PR. |
+| WDP-COMP-INDEX.md description correction (TIER1 eligibility) | Documentation | Update at next WDP-COMP-INDEX.md reconciliation session. |
+| Whether IdP JWKS unreachability has caused production failures | **Runtime observation** | Cannot be answered from source — Splunk / Kibana log analysis on 401 spikes correlated with IdP outages. Operational follow-up. |
+| `EnumName` / `EnumNameValidator` framework — keep for future use or remove? | **Architect decision** | Dead code currently; cheap to leave but cleaner to remove. |
+| `ValidationMessages.properties` rules-service residue | **Defect / hygiene** | Trivial PR — remove unused messages. |
+
+#### Doc status after this change
+
+- `WDP-COMP-28-DISPLAY-CODE-SERVICE.md` → `v1.1 DRAFT` — source-verified 2026-04-28 · architect confirmation pending
+- `WDP-COMP-INDEX.md` → COMP-28 description and status updates pending (next reconciliation session)
+- `WDP-DB.md` → `wdp.dispute_static_tabs_rules` row Notes update pending (next reconciliation session)
+- `WDP-KAFKA.md` → No change
+- `WDP-NFRS.md` → 4 candidate new RISK rows pending (next reconciliation session)
+- `WDP-DECISIONS.md` → 1 candidate new ADR (endpoint-pair contract divergence) pending architect decision
+---
+
 ### 2026-04-28 — COMP-26 QuestionnaireService · v1.0 DRAFT → v1.1 DRAFT
 
 **Source:** `mdvs-gcp-questionnaire-service` — source-verified by GitHub
