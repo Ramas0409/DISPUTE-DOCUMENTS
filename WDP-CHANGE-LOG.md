@@ -2204,6 +2204,236 @@ not enforced by code.
 consume entries from this section and move them to the most recent **Reconciled**
 section above.*
 
+### 2026-04-28 — COMP-32 RulesService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `gcp-rules-service` — source-verified by GitHub Copilot CLI 2026-04-28. Architect confirmation pending.
+
+**Nature of change:** Correction pass against source. The v1.0 DRAFT was largely accurate on the architectural core — endpoint inventory, backing tables, no-Kafka / no-PAN / no-writes posture, cache mechanics, and DEC deviation map. Source audit corrected a cluster of metadata errors (artifact version, security whitelist paths, K8s probe paths, liveness initialDelay, json-path version, `/actionrules` HTTP status set), surfaced one MEDIUM defect in JWT-claim-absence handling, and flagged three new MEDIUM-class concerns (cache-key bloat from null-vs-blank inputs, the empty-`AuthorizationList`-claim silent-no-permission path, and the coincidental rather than designed pattern of three endpoints returning HTTP 200 instead of 404 on no-rule-found). DEC-014 deviation re-confirmed; DEC-023 added as NOT APPLICABLE for completeness.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- Section 2 — 16 reader rows for COMP-32 (15 in `wdp` schema + 1 in `nap` schema): **No ownership change.** Reinforce: COMP-32 is a runtime READ-ONLY consumer of every row; writes are by DBA scripts / rule-administration tooling — write owner remains TBC for all 16 tables. Existing reader attribution is unchanged. List of reader rows (already present per existing reader-row addition in v1.0):
+  - `wdp.dispute_action_rules`, `wdp.business_event_rules`, `wdp.dispute_accept_item_rules`, `wdp.dispute_new_action_rules`, `wdp.dispute_new_case_action_respond_rules`, `wdp.dispute_first_action_rules`, `wdp.dispute_case_exp_rules`, `wdp.pre_action_status_rules`, `wdp.disputes_visa_queue_status_rules`, `wdp.notification_rules`, `wdp.nap_chbk_response_rules`, `wdp.workflow_rules`, `wdp.dispute_doc_details_type_rules`, `wdp.document_type_rules` (disabled endpoint, table still queryable), `wdp.dispute_update_event_log_rules` (disabled endpoint, table still queryable), `nap.dispute_nap_new_case_action_rules`.
+- Datasource bean-name confirmation: primary `wdpdataSource` (single word, lowercase d) with `@Primary`; secondary `napdataSource`. Add a Notes clarification on the primary-table cluster row that the JDBC URLs are externalised via K8s secrets — whether `wdp` and `nap` resolve to the same Aurora cluster is **not determinable from source**.
+- No new shared-table risk introduced. No cross-component co-writer concerns.
+
+**WDP-KAFKA.md**
+
+- No change. COMP-32 remains in Section 4's Kafka-free components list. Audit re-confirms zero `spring-kafka` / `kafka-clients` / `aws-msk-iam-auth` in `pom.xml`, zero `@KafkaListener` / `KafkaTemplate` / `ProducerFactory` references in source.
+
+**WDP-COMP-INDEX.md**
+
+- Doc status row update: COMP-32 → `📝 DRAFT v1.1 — source-verified 2026-04-28, architect confirmation pending`.
+- Description line is accurate; no correction required.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+- Add: COMP-32 RulesService is a pure read-only REST API. Zero writes, zero Kafka, zero PAN, zero outbound REST/HTTP, zero `@Transactional` mutations. Sole outbound dependency is two PostgreSQL datasources (`wdpdataSource` `@Primary` + `napdataSource`), both via `DataSourceBuilder.create().build()` with no explicit pool tuning.
+- Add: COMP-32 hosts 14 active REST endpoints + 2 controller-disabled endpoints with full backing code intact. The 14 active endpoints map 1:1 to 14 distinct `@Cacheable` cache names backed by Spring's default `ConcurrentMapCacheManager`.
+- Add: COMP-32 `/actionrules` is the sole endpoint that performs caller-identity-aware response shaping, via JWT `AuthorizationList` claim ∩ `app.action.roles` config list. All other 13 active endpoints return identical content for identical inputs regardless of caller.
+- Add: COMP-32 `/actionrules` `migrationStatus="N"` is an active production migration kill-switch — DB bypassed, hardcoded all-N response. Confirmed via `ApplicationConstants.NO = "N"`. Constant `MIGRATION_STATUS = "Y"` is misleadingly named (holds the non-bypass sentinel).
+- Add: COMP-32 K8s probes are Spring Boot Actuator health groups exposed via `additional-path` — `/livez` (liveness, initialDelay 40s) and `/readyz` (readiness, initialDelay 30s) under the servlet context `/merchant/gcp/rules`. No custom controller method backs these paths.
+- Resolved open questions: none (all open questions on COMP-32 in v1.0 DRAFT remain open — they are cross-component sweep questions, not in-repo gaps).
+- New open questions:
+  - **OQ-COMP-32-NEW-1:** `/actionrules` `AuthorizationList` claim absence (claims map non-null, key missing) returns HTTP 500 via uncaught NPE in `split`, not HTTP 400 with "Token is blank". Defect or accepted?
+  - **OQ-COMP-32-NEW-2:** `/actionrules` empty-string `AuthorizationList` claim splits to `[""]`, intersection yields empty set, DB query runs with empty IN clause, user sees no permissions silently. Defect or accepted?
+  - **OQ-COMP-32-NEW-3:** Three endpoints (`/notification`, `/business-event`, `/cbk-response`) return three different HTTP 200 shapes on no-rule-found while the other 11 throw 404. Source contains zero comment evidence of intent. Architect decision: align all to 404 (defect remediation) or document each as intentional API contract?
+  - **OQ-COMP-32-NEW-4:** `@Cacheable` key is computed from raw method args before in-method blank→"NA" normalisation, producing duplicate cache entries for null vs `""` inputs. Memory bloat / hit-rate halving. Architect decision: explicit `key` SpEL with normalisation, or accept?
+  - **OQ-COMP-32-NEW-5:** `/documentType` and `/eventRule` controller mappings commented out with full backing code intact and no comment / JIRA / feature flag explaining intent. Permanently abandon (delete code + tables) or re-enable?
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+
+- **DEC-014 deviation map for COMP-32:** Re-confirm — `io.github.resilience4j` absent from `pom.xml`; no circuit breaker / retry / bulkhead / rate limiter on either datasource; no socket or connection timeout configured. Consistent with platform-wide DEC-014 VOID posture (now confirmed on COMP-22, COMP-25, COMP-28, COMP-31, COMP-37, COMP-32 — read-only REST services consistently exhibit the deviation).
+- **Candidate clarification — DEC-004 / DEC-019 attestation pattern:** COMP-32 is a clean attestation that DEC-004 / DEC-019 compliance can be confirmed at architecture level by codebase scan for entity classes containing `pan` / `cardNumber` / `accountNumber` / `acctNum` fields plus absence of any persistent write. Same pattern as COMP-28. Worth documenting as a verifiable read-only-service compliance pattern when WDP-DECISIONS.md is rebuilt.
+- **Candidate new ADR — "Cache-key normalisation contract":** COMP-32 `@Cacheable` methods normalise blank → `"NA"` *inside* the method, but Spring computes the key *before* method entry. Result: two requests differing only in null vs `""` cache separately despite producing identical responses. Same anti-pattern likely exists in other read-only WDP services that follow this normalisation convention. Recommend a platform-wide cache-key contract: normalisation must occur in the controller or via explicit `key` SpEL, never inside the cached method body.
+- **Candidate new ADR — "Endpoint-pair contract divergence on no-rule-found":** COMP-32 has 14 active endpoints; 11 throw `RuleNotFoundException` → HTTP 404; 3 (`/notification`, `/business-event`, `/cbk-response`) return three different HTTP 200 shapes. No source-side comment establishes intent. Pair-class with the COMP-28 permission-shape divergence flagged 2026-04-28 — both are evidence that the platform lacks a documented "what does no-result-found return on a read-only configuration endpoint" convention. Recommend a formal platform read-only-API contract.
+- **Candidate new ADR — "JWT claim-absence error contract":** The COMP-32 `/actionrules` `AuthorizationList`-claim-absent → HTTP 500 path (vs the documented HTTP 400 "Token is blank") is a defect in classification. Worth documenting platform-wide that any auth-claim absence must produce a 4xx response, not a 5xx, for security-monitoring-rule integrity.
+
+**WDP-ARCHITECTURE.md**
+
+- No change. Topology and principles unchanged. COMP-32 remains a WDP Core Service in Section 4. The pattern observations (cache-key normalisation, no-rule-found contract divergence) are component-level rather than topology-level — they belong in WDP-DECISIONS.md.
+
+**WDP-NFRS.md · Section 6 Risk Register** *(candidate new RISK rows)*
+
+- **🟠 HIGH (re-confirmed):** *"COMP-32 — DB outage takes down all 14 endpoints simultaneously. No circuit breaker, no socket timeout, no retry, no fallback. All callers fail at the same instant. Same DEC-014-VOID pattern as COMP-22 / COMP-25 / COMP-28 / COMP-31 / COMP-37."*
+- **🟠 HIGH (re-confirmed):** *"COMP-32 — `migrationStatus="N"` is an undocumented production migration kill-switch on `/actionrules`. When triggered, every UI action is blocked for the affected case. Not in any runbook."*
+- **🟡 MEDIUM candidate (NEW):** *"COMP-32 — `/actionrules` `AuthorizationList` claim absence (claims map non-null, key missing) returns HTTP 500 via uncaught `NullPointerException` in `String.split`, not HTTP 400 'Token is blank' as documented. Defeats security-monitoring rules keyed on auth-related response codes. Trivial fix: add an explicit null check before split."*
+- **🟡 MEDIUM candidate (NEW):** *"COMP-32 — `/actionrules` empty-string `AuthorizationList` claim silently produces an empty role filter, which is passed as an empty IN clause to the DB. User receives no permissions despite a valid token; no error logged."*
+- **🟡 MEDIUM candidate (NEW):** *"COMP-32 — three endpoints (`/notification`, `/business-event`, `/cbk-response`) fall through to HTTP 200 on no-rule-found with three different response shapes (null body, empty fields, empty list) while the other 11 throw HTTP 404. Source contains no intent evidence. Callers must handle four distinct success-shapes per service. Pattern appears coincidental, not deliberate."*
+- **🟡 MEDIUM candidate (NEW):** *"COMP-32 — `@Cacheable` key is computed from raw method args before in-method blank→`NA` normalisation, producing duplicate cache entries for null vs `\"\"` inputs that resolve to identical DB queries. Inflates memory; halves the effective hit rate for fields routinely sent both ways by different callers."*
+- **🟡 MEDIUM candidate (extension of existing pattern):** *"COMP-32 — no CPU limit, no CPU request set in `resources.yaml`. Same class as COMP-28 / others. Recommend platform-wide manifest sweep."* Consistent with prior pattern findings on the platform.
+- **🟡 MEDIUM candidate:** *"COMP-32 — `/documentType` and `/eventRule` controller mappings commented out with full backing code intact (service, DAO, entity, repository) and zero source-side comment, JIRA, or feature flag explaining intent. Risk: rules tables `wdp.document_type_rules` and `wdp.dispute_update_event_log_rules` continue to be reachable via DB access; backing code rots; intent lost on team rotation."*
+- **🟢 LOW candidate (extension of existing topology-spread risk):** *"COMP-32 — topology spread `whenUnsatisfiable: ScheduleAnyway` plus `BRANCH_NAME_PLACEHOLDER` label-mismatch risk. No hard cross-AZ guarantee."* Extension of the existing platform-wide topology-spread RISK row.
+- **🟢 LOW candidate:** *"COMP-32 — no PodDisruptionBudget. Rolling updates and node maintenance can terminate all replicas simultaneously."* Same class as several other components.
+- **🟢 LOW candidate (hygiene cluster):** dead code in `GlobalExceptionHandler` (unused `errorCode` variables, two unused private helper methods); unused `<json-path.version>2.9.0</json-path.version>` property; unused `ApplicationProps.version` map; commented-out `partialIndicator` block in `NewActionRulesServiceImpl` alongside `releaseVersionMap`; commented-out alternative Logstash destination; stale Eclipse-generated TODO comments. No behavioural impact; trivial PRs.
+
+**WDP-INTEGRATIONS.md**
+
+- No change. COMP-32 has no external integration contract — all outbound calls are PostgreSQL JDBC to the WDP-internal Aurora cluster(s). The WDP-shared external IdP for JWKS validation is already documented platform-wide. Logstash is internal observability infrastructure.
+
+#### Deviation flags for COMP-32
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ✅ NOT APPLICABLE (no Kafka publish, no writes) | — |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE (no Kafka) | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES (no PAN handled — full-codebase scan for `pan` / `cardNumber` / `accountNumber` / `acctNum` returns zero matches; no persistent writes) | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE (no Kafka consumer) | — |
+| DEC-014 Resilience4j Circuit Breakers | ⛔ DEVIATES (platform-wide VOID posture — confirmed) | 🟡 MEDIUM (accepted) |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES (no persistent writes at all) | — |
+| DEC-020 Full At-Least-Once Idempotency | ✅ NOT APPLICABLE (read-only service, idempotency intrinsic) | — |
+| DEC-023 Replica = 1 Hard Constraint | ✅ NOT APPLICABLE (standard scaled stateless read service) | — |
+
+**DEC-014 detail:** Confirmed pattern matches the platform-wide DEC-014 VOID posture — no Resilience4j (`io.github.resilience4j` absent from `pom.xml`), no socket or connection timeout on either datasource, no retry. DB unavailability propagates as HTTP 500 to every caller simultaneously. Severity remains MEDIUM per platform-wide acceptance.
+
+**DEC-004 / DEC-019 detail:** Source-verified by full-codebase scan for `pan` / `cardNumber` / `accountNumber` / `acctNum` fields on entity classes — none found. No persistent writes occur at runtime. Same clean-attestation pattern as COMP-28.
+
+#### Remaining gaps
+
+| Gap | Type | Action |
+|-----|------|--------|
+| Production replica count (`{{ replicas-gcp-rules-service }}`) | Environment config | Confirm via XL Deploy / Kubernetes for each environment. |
+| Whether `wdp` and `nap` JDBC URLs resolve to the same Aurora cluster | Environment config / DBA confirmation | Externalised via K8s secrets; not in repo. |
+| Actual `${jwt.trustedIssuers}` allowlist values per environment | Environment config | Confirm IdP host(s) per environment from K8s secrets. |
+| Actual `${LOGSTASH_SERVER_HOST_PORT}` values | Environment config | Confirm per environment from K8s secrets. |
+| HikariCP pool sizing on both datasources (running with Spring Boot defaults) | **Architect decision** | No explicit pool config in repo. With 14 endpoints all hitting one of two datasources, the Spring Boot default pool (10) may be a production bottleneck. Confirm or remediate. |
+| Caller identity per endpoint | **Follow-up Copilot CLI question on consumer repos** — exact question to ask each candidate caller: *"Does this repository call any endpoint matching `/merchant/gcp/rules/*`? If so, cite file:line of every call site, the HTTP client used, the request payload shape, and any caching of the response."* — to be run against COMP-04, COMP-05, COMP-06, COMP-12, COMP-14, COMP-15, COMP-16, COMP-17, COMP-18, COMP-19, COMP-20, COMP-21, COMP-23, COMP-24, COMP-49 (Merchant Portal), COMP-50 (Ops Portal). |
+| DB-bypass pattern — do other components read these 16 rule tables directly from the DB? | **Follow-up Copilot CLI question on the same caller list** — exact question: *"Does this component read any of these tables directly from the database: `wdp.dispute_action_rules`, `wdp.business_event_rules`, `wdp.dispute_accept_item_rules`, `wdp.dispute_new_action_rules`, `wdp.dispute_new_case_action_respond_rules`, `wdp.dispute_first_action_rules`, `wdp.dispute_case_exp_rules`, `wdp.pre_action_status_rules`, `wdp.disputes_visa_queue_status_rules`, `wdp.notification_rules`, `wdp.nap_chbk_response_rules`, `wdp.workflow_rules`, `wdp.dispute_doc_details_type_rules`, `wdp.document_type_rules`, `wdp.dispute_update_event_log_rules`, `nap.dispute_nap_new_case_action_rules`?"* The COMP-16 → BusinessRulesService precedent makes this a real risk. |
+| Write owner of all 16 rule tables | **Team confirmation** | Whether rows are managed by a rule-administration UI (which service?), DBA scripts, Liquibase / Flyway migrations, or another component. Not answerable from this repo. |
+| `/notification`, `/business-event`, `/cbk-response` non-404 fall-through | **Architect decision** | Align all to 404 (defect remediation) or document each as intentional API contract. |
+| `/actionrules` `AuthorizationList`-claim-absent NPE → HTTP 500 | **Architect decision** | Trivial fix; affects security observability. |
+| `/actionrules` empty-`AuthorizationList`-claim silent-no-permission | **Architect decision** | Defect or accepted? |
+| Cache-key normalisation contract (null vs blank) | **Architect decision** | Component-level fix or platform-wide convention. |
+| `/documentType` and `/eventRule` re-enable / decommission decision | **Architect decision** | Permanently abandon (remove code + tables) or re-enable? |
+| `migrationStatus="N"` runbook documentation | **Team confirmation** | Add to ops runbook; rename `MIGRATION_STATUS` constant to remove the "Y"-as-default-value confusion. |
+| Whether IdP JWKS unreachability has caused production failures | **Runtime observation** | Cannot be answered from source. Splunk / Kibana log analysis. |
+| `WDP-COMP-INDEX.md` description correction | Documentation | Existing description is accurate per source — no change required. |
+
+#### Doc status after this change
+
+- `WDP-COMP-32-RULES-SERVICE.md` → `v1.1 DRAFT` — source-verified 2026-04-28 · architect confirmation pending
+- `WDP-COMP-INDEX.md` → COMP-32 status row update pending (next reconciliation session)
+- `WDP-DB.md` → existing 16 reader rows for COMP-32 confirmed accurate; minor Notes clarification on cluster-resolution pending (next reconciliation session)
+- `WDP-KAFKA.md` → No change
+- `WDP-NFRS.md` → 4 new MEDIUM-class candidate RISK rows + 1 MEDIUM candidate (CPU limits, extension) + 2 LOW candidates pending (next reconciliation session)
+- `WDP-DECISIONS.md` → 4 candidate new ADRs / clarifications pending architect decision (cache-key normalisation contract, no-rule-found platform contract, JWT claim-absence error contract, read-only-service DEC-004/019 attestation pattern)
+- `WDP-INTEGRATIONS.md` → No change
+- `WDP-ARCHITECTURE.md` → No change
+- `WDP-HANDOVER.md` → 5 new open questions to add (OQ-COMP-32-NEW-1 through -5); 5 new confirmed facts to add
+---
+### 2026-04-28 — COMP-30 UserQueueSkillService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `gcp-user-queue-skill-service` — source-verified by GitHub Copilot CLI 2026-04-28. Architect confirmation pending.
+
+**Nature of change:** Correction pass — confirms v1.0 structure and surfaces ten corrections, including two new 🔴 HIGH atomicity findings and one 🟡 MEDIUM observability gap that materially change the component's risk posture.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- No new tables — full owned-table list was already added in v1.0 reconciliation. Refinements:
+  - `nap.users` row: append note "POST /user has no @Transactional — auto-enrol side effect runs in a separate implicit transaction; failure leaves orphaned user row".
+  - `nap.queues`, `nap.queue_criterion`, `nap.user_queue` rows: append note "Service-level @Transactional on createQueue/updateQueue binds to @Primary usTransactionManager — UK writes NOT covered by the outer TX. Per-repository implicit TX only".
+  - `wdp.queues`, `wdp.queue_criterion`, `wdp.user_queue` rows: append note "Service-level @Transactional binds correctly here (US datasource is @Primary)".
+  - Tables-Read rows: append confirmation `nap.nap_parent_entity` / `wdp.case` / `wdp.action` are **READ-ONLY in COMP-30 source** — owners still TBC.
+
+**WDP-KAFKA.md**
+- No change. COMP-30 remains in the Kafka-Free list. Confirmed unchanged: zero `spring-kafka`, `KafkaTemplate`, `@KafkaListener`, `@EnableKafka` occurrences in repo.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: COMP-30 v1.1 DRAFT — source-verified 2026-04-28; architect confirmation pending.
+- Add: COMP-30 confirmed dual-datasource design with `ukTransactionManager` (UK / nap) and `usTransactionManager` (US / wdp, `@Primary`). No XA.
+- Add: COMP-30 confirmed Kafka-free at runtime — zero spring-kafka surface area.
+- Add: Maven artifactId is `user-queue-skill-service` (the `gcp-` prefix appears only in K8s deployment naming).
+- Add: Auto-enrol on POST /user targets queues of type `SKILLS_INTERNAL` **OR** `DEFAULT_QUEUE` (v1.0 said SKILLS_INTERNAL only).
+- Resolved open questions: none — the previously-resolved "COMP-30 is data provider only, not routing decision-maker" remains correct.
+- New open questions:
+  - **Queue `@Transactional` / `@Primary` mismatch** — UK queue writes are not covered by the service-level transaction. Architect decision needed: remediate or accept?
+  - **POST /user atomicity** — user upsert and auto-enrol run in separate implicit transactions. Architect decision needed: add `@Transactional` to wrap both?
+  - **CHAS infra → HTTP 403 conflation** — should infrastructure failure surface differently from authorization denial?
+  - **logback-spring.xml runtime source** — file is absent from repo; Logstash integration is non-functional unless mounted via ConfigMap/sidecar at runtime. Confirm with deployment team.
+  - **Owners of `nap.nap_parent_entity`, `wdp.case`, `wdp.action`** — read-only consumers in this repo, owners still TBC.
+  - **Component that transitions `wdp.lft_report.status`** beyond PENDING — COMP-30 only writes PENDING and reads INPROGRESS; downstream owner unidentified.
+  - **Known callers per endpoint** — no naming convention identifies callers in source.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **ADR candidate (HIGH severity):** Multi-datasource service-level `@Transactional` binding pattern. The `jakarta.transaction.Transactional` default-bean-selection behaviour silently picks the `@Primary` transaction manager. In dual-datasource components this fails to wrap operations against the non-primary datasource. Platform-level guidance needed: explicit `transactionManager` attribute, or `@Qualifier`-bound annotations, or a service-per-datasource decomposition.
+- **ADR candidate (HIGH severity):** Side-effect-with-no-transaction pattern. POST /user user-upsert + auto-enrol runs as two implicit transactions. Platform guidance needed on whether multi-step write paths require `@Transactional` even when the steps are on the same datasource.
+- **ADR candidate (MEDIUM severity):** Infrastructure-failure-vs-authorization-denial conflation. CHAS `RestClientException` → HTTP 403 in COMP-30 mirrors a similar pattern across the platform — should infra faults surface as 5xx (e.g. 503) to distinguish them from genuine auth denials?
+- **DEC-014 deviation map enrichment:** Add COMP-30 — five outbound REST integrations share a single `new RestTemplate()` bean with no timeouts and no Resilience4j. Same pattern as COMP-25 / COMP-31 / others. Reinforces the platform-wide DEC-014 VOID posture.
+- **DEC-020 deviation map enrichment:** Add COMP-30 — no `@UniqueConstraint` on any owned table. POST /{region}/queue has confirmed app-level race window between duplicate-name check and insert. POST /lft-report, POST /user, POST /user-view rely on load-then-save last-write-wins.
+- **Candidate observability ADR:** Logback configuration ownership. COMP-30 declares the `logstash-logback-encoder` dependency and the `logstash.server.host.port` property but ships no `logback-spring.xml`. Same pattern observed elsewhere — platform guidance needed on whether logback config is service-owned (in repo) or platform-owned (mounted at runtime).
+
+**WDP-ARCHITECTURE.md**
+- No topology change. COMP-30 remains a Queue & Workflow Service (Section 4.4.2). The dual-datasource pattern is component-internal and does not change the platform topology.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- Add 🔴 HIGH RISK-NEW: COMP-30-A — Queue `@Transactional` binds to @Primary US TX manager; UK writes not wrapped. Mid-operation UK failure leaves partially committed queue + criterion + user_queue rows.
+- Add 🔴 HIGH RISK-NEW: COMP-30-B — POST /user user-upsert and auto-enrol are separate implicit transactions. Auto-enrol failure leaves orphaned user with no queue assignments.
+- Add 🔴 HIGH RISK-NEW: COMP-30-C — CHAS infra failure mapped to HTTP 403; indistinguishable from auth denial. Silent service degradation pattern.
+- Add 🔴 HIGH RISK-NEW: COMP-30-D — `USCaseSearchDaoImpl` swallows DB exceptions during PIN authorization lookup; cascades to misleading 403.
+- Add 🔴 HIGH RISK-NEW: COMP-30-E — No XA between nap and wdp datasources; current paths don't write both schemas atomically, but the pattern is one architectural change away from real data inconsistency.
+- Add 🔴 HIGH RISK-NEW: COMP-30-F — No Resilience4j on IDP calls; portal-access failure cascade for users not yet in local DB during IDP outage.
+- Add 🟡 MEDIUM RISK-NEW: COMP-30-G — All five REST integrations share one `new RestTemplate()` with no timeouts. Sustained slow-response from any dependency exhausts Tomcat threads.
+- Add 🟡 MEDIUM RISK-NEW: COMP-30-H — POST /lft-report insert is non-transactional; partial-write windows possible.
+- Add 🟡 MEDIUM RISK-NEW: COMP-30-I — No `@UniqueConstraint` on any owned table. POST /{region}/queue has confirmed race window.
+- Add 🟡 MEDIUM RISK-NEW: COMP-30-J — Logstash integration non-functional without externally-mounted logback-spring.xml. Same pattern as other components.
+- Add 🟢 LOW RISK-NEW: COMP-30-K — `AsyncConfiguration` is dead config (`@EnableAsync`, executor bean created, but no `@Async` anywhere).
+- Add 🟢 LOW RISK-NEW: COMP-30-L — `spring-boot-devtools` in pom.xml without `<scope>runtime</scope>`. Likely benign due to Spring Boot Maven plugin repackage exclusion, but best-practice deviation.
+
+**WDP-INTEGRATIONS.md**
+- No external system contract changes. All five integrations (IDP internal, IDP external standard, IDP external MFD, Display Code Service, CHAS, AWS S3) are internal WDP services or platform-internal infrastructure. No external partner contract affected.
+
+#### Deviation flags for COMP-30
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 | ⛔ DEVIATES | 🟡 MEDIUM |
+| DEC-003 | ✅ NOT APPLICABLE | — |
+| DEC-004 | ✅ NOT APPLICABLE | — |
+| DEC-005 | ✅ NOT APPLICABLE | — |
+| DEC-014 | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-019 | ✅ NOT APPLICABLE | — |
+| DEC-020 | ⛔ DEVIATES | 🟡 MEDIUM |
+
+**DEC-001 detail:** No transactional outbox. All writes are direct table mutations. No event publication accompanies any write. Severity is MEDIUM rather than HIGH because COMP-30 publishes no Kafka events at all — there is no event-loss-on-rollback hazard, only the absence of downstream notifications when state changes.
+
+**DEC-014 detail:** Confirmed by absence of `resilience4j` dependency in pom.xml. All five outbound REST integrations (IDP internal, IDP external standard, IDP external MFD, Display Code Service, CHAS) plus AWS S3 SDK have no circuit breaker, no bulkhead, no rate-limiter. All share a single `new RestTemplate()` bean with no connect timeout and no read timeout. HIGH severity driven by IDP and CHAS being session-establishing dependencies — outage of either produces user-visible portal failure.
+
+**DEC-020 detail:** No `idempotency-key` header read or written. No `@UniqueConstraint` on any owned table. POST /{region}/queue has confirmed race window between application-level duplicate-name check and insert — concurrent requests can both pass the check and both insert. POST /user, POST /lft-report, POST /user-view rely on load-then-save patterns that produce last-write-wins under concurrent traffic.
+
+#### Remaining gaps
+
+| Gap | Type | Action required |
+|-----|------|-----------------|
+| Production replica count | Environment config | Check XL Deploy / Helm variable `{{ replicas-gcp-user-queue-skill-service }}` value per environment. |
+| Owner of `nap.nap_parent_entity` | Team confirmation | Identify owning component — read-only consumer in COMP-30. |
+| Owner of `wdp.case` and `wdp.action` | Team confirmation | Confirm CaseManagementService (COMP-23) vs DisputeService (COMP-22) vs CaseActionService (COMP-24). |
+| Component that transitions `wdp.lft_report.status` from PENDING → INPROGRESS → terminal | Architect decision / cross-component review | COMP-30 only writes PENDING and reads INPROGRESS. Cross-repo sweep needed to identify the report-generation worker. |
+| Known callers per endpoint | Follow-up Copilot CLI question | Ask in caller repos: *"Is there any client implementation, OpenAPI tag, or comment in [Merchant Portal / Ops Portal / report worker repos] that identifies the gcp-user-queue-skill-service endpoints they call?"* |
+| Live case-to-queue eligibility matcher | Architect decision / cross-component review | Identify the component that reads `nap.queue_criterion` and `wdp.queue_criterion` rows and applies them against live cases. |
+| `logback-spring.xml` runtime source | Runtime observation / team confirmation | Inspect deployed pod for mounted ConfigMap or sidecar-provided logback config. Cannot answer from source — Copilot CLI re-run will not help. |
+| AWS credentials mechanism for S3 presigner | Runtime observation / team confirmation | Confirm whether IRSA, env vars, or instance profile provides credentials in production. Cannot answer from source. |
+| `@Transactional` / `@Primary` mismatch on queue ops — remediate? | Architect decision | Three remediation paths: (a) explicit `transactionManager` attribute, (b) split into UK and US sub-services, (c) accept current state and document. |
+| POST /user atomicity — add `@Transactional`? | Architect decision | Same datasource (nap), so `@Transactional` would correctly wrap both writes. Decide whether the auto-enrol failure mode is tolerable. |
+| CHAS infra → HTTP 403 — remediate? | Architect decision | Pattern repeats across platform; this might warrant a platform-level ADR rather than a component fix. |
+| Whitelist endpoint specificity (two paths, not wildcard) — intentional? | Team confirmation | Confirm whether `/user-queue-skill-service-api-docs/swagger-config` is the only ancillary swagger path needed, or whether a wildcard was intended. |
+| `validateUserRole` removal ADR | Team confirmation | Confirm whether the region-specific role validation was removed deliberately and whether an ADR or ticket exists. |
+| `app.name` env var | Environment config | Confirm whether `APP_NAME` is set in deployment manifests; referenced in `management.metrics.tags.application` but never defined in YAML. |
+
+#### Doc status after this change
+
+- `WDP-COMP-30-USER-QUEUE-SKILL-SERVICE.md` → `v1.1 DRAFT` — source-verified 2026-04-28 · architect confirmation pending
+- `WDP-DB.md` → annotation refinements pending (next reconciliation session)
+- `WDP-KAFKA.md` → no change
+- `WDP-HANDOVER.md` → Confirmed Architectural Facts and Open Questions updates pending (next reconciliation session)
+- `WDP-DECISIONS.md` → 3 new candidate ADRs + 3 deviation-map enrichments pending (next reconciliation session)
+- `WDP-ARCHITECTURE.md` → no change
+- `WDP-NFRS.md` → 12 new RISK rows pending (next reconciliation session)
+- `WDP-INTEGRATIONS.md` → no change
+---
+
 
 ### 2026-04-28 — COMP-28 DisplayCodeService · v1.0 DRAFT → v1.1 DRAFT
 
