@@ -1,0 +1,466 @@
+You are auditing the WDP component DisputeService in the repository
+mdvs-gcp-disputes-service. A prior pass already produced a DRAFT
+architecture document. Your job is to CONFIRM OR CORRECT the items
+listed under 'ALREADY DOCUMENTED' from source, and to CLOSE the
+items listed under 'GAPS TO FILL' by reading the code and config
+directly.
+
+Produce a single structured research report organised under the
+section headings below. For every claim, cite the file path and line
+range you read it from. Where source does not show the answer, state
+that explicitly and label it 'not determinable from source'. Do NOT
+guess. Do NOT summarise without evidence. Do NOT use the existing
+document as a substitute for source — treat it as a hypothesis to
+verify.
+
+═══════════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT
+═══════════════════════════════════════════════════════════════════
+The file WDP-COMP-22-DISPUTE-SERVICE.md is provided alongside this
+prompt. It is the v1.0 DRAFT architecture document for this service.
+
+- Treat every claim in that file as a HYPOTHESIS to verify, not as
+  ground truth.
+- For each documented claim, EITHER:
+   (a) confirm with file:line — "Still accurate — <file>:<lines>"
+   (b) raise a CORRECTION block in this format:
+         CORRECTION
+         Doc says: <verbatim or paraphrased claim>
+         Source shows: <actual value, with file:line>
+         Section needing update: <section heading from draft>
+- At the end of your report, list every documented claim that you
+  could NOT verify from source (neither confirmed nor contradicted).
+
+═══════════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — confirm or correct, do not redocument
+═══════════════════════════════════════════════════════════════════
+
+Identity & runtime
+- spring.application.name = Disputes-Service
+- Spring Boot 3.5, Java 17
+- Context path /merchant/gcp/disputes, server port 8082, readiness
+  port 8052
+
+Endpoints
+- POST /summary — JWT multi-issuer Bearer required, no internal-firm
+  restriction, parallel async fetch from WDP PG + CORE (DB2 or PG
+  depending on core_migration_status flag), merged response of
+  deptSummary / creditDeptSummary / debitDeptSummary
+- POST /{platform}/cases/{caseNumber}/documents — JWT Bearer plus
+  us_worldpay_fis_int issuer claim, multipart/form-data;
+  orchestrates: case lookup via CaseSearchService → document upload
+  via DocumentManagementService → conditional ownership transfer via
+  CaseActionService → metadata update via DocumentManagementService.
+  NAP failure paths fall back to SFG SFTP and return HTTP 200 with
+  migrationStatus=N
+
+Outbound dependencies
+- CaseSearchService (COMP-27) — GET case lookup by caseNumber then
+  sourceSystemCaseId
+- DocumentManagementService (COMP-37) — POST upload, PUT metadata
+  update with notifyBRQueue=true
+- CaseActionService (COMP-24) — PUT MERCHANT→WPAYOPS ownership
+  transfer when current owner is MERCHANT
+- IDP Token Service — GET token; request-scoped cache via
+  RequestTokenHolder
+- SFG SFTP — write to /Outgoing/{filename} port 3222; @Async on
+  happy path, synchronous on error paths
+- WDP Aurora PG — read-only on WDP.CASE and WDP.action
+- IBM DB2 BC schema — read-only on BC.TBC_DM_CASE and
+  BC.TBC_DM_OCCUR
+- AWS MSK 'business-rules' topic — wired but call site commented
+  out at DocumentServiceImpl.java:174
+
+Database posture
+- Two JpaTransactionManager beans: coreTransactionManager and
+  wdpTransactionManager
+- No cross-datasource transactions
+- DRAFT CLAIM TO VERIFY DEFINITIVELY: zero INSERT, UPDATE, or DELETE
+  anywhere in the service. NO entity is persisted by this service.
+
+Resilience
+- No connection or read timeout on any outbound REST call
+- Plain RestTemplate, no Resilience4j on pom.xml, no circuit breaker
+  anywhere
+- Spring Retry @Retryable only on the disabled Kafka publish path
+  (3 attempts, 100 ms fixed delay)
+
+Decisions
+- DEC-001 N/A (no Kafka writes at runtime, no DB writes)
+- DEC-003 disabled producer uses merchantId as message key
+- DEC-004 N/A (no PAN handled)
+- DEC-005 N/A (no consumer)
+- DEC-014 DEVIATION — no circuit breakers, no timeouts, HIGH
+
+K8s & observability
+- Deployment, replicas templated as {{ replicas-mdvs-gcp-disputes-
+  service }}
+- Memory limit 2048Mi, request 1024Mi
+- No CPU limit, no CPU request — absent from resources.yaml
+- No HPA, no PDB
+- Topology spread: kubernetes.io/hostname / ScheduleAnyway, no
+  label mismatch
+- OTel auto-injection annotation present
+- Actuator: /info, /health, /prometheus
+- Logstash via env var LOGSTASH_SERVER_HOST_PORT, JSON encoding via
+  LogstashEncoder, console appender also present
+- Prometheus metrics enabled, tagged with application = ${app.name}
+- Correlation ID via HttpInterceptor reading/generating
+  v-correlation-id header into MDC
+
+Tech-debt items
+- Commented Kafka publish at DocumentServiceImpl.java:174
+- Dead method constructNativeQuery at USDisputeSummaryDaoImpl.java:120
+- TODO at ApplicationProps.java:10
+- TODO at GlobalExceptionHandler.java:185
+- kafka.retry-count and kafka.retry-delay set in YAML but never
+  injected
+
+Active feature flag
+- core_migration_status env var switches CORE platform reads between
+  WDP PG and DB2
+
+For each bullet above, either output "Still accurate —
+<file>:<lines>" or a CORRECTION block. Do NOT redocument from
+scratch.
+
+═══════════════════════════════════════════════════════════════════
+GAPS TO FILL — answer from source
+═══════════════════════════════════════════════════════════════════
+
+1. USCaseEntity / UKCaseEntity write ownership.
+   - List every JPA @Entity in the repo and the table it maps to.
+   - For each Spring Data repository in the repo, list every
+     non-read method invoked from production code paths
+     (save, saveAndFlush, delete, deleteById, etc.).
+   - List every native query, JPQL @Modifying, and any direct
+     JdbcTemplate / NamedParameterJdbcTemplate update or insert.
+   - Definitively answer: does mdvs-gcp-disputes-service ever write
+     to wdp.CASE, wdp.action, BC.TBC_DM_CASE, or BC.TBC_DM_OCCUR
+     under any code path? Cite file:line for each finding.
+
+2. Why was the Kafka publish disabled?
+   - At DocumentServiceImpl.java:174 (or current location of
+     sendBusinessRules), use git blame to identify the commit that
+     commented it out, the commit message, the author date, and any
+     surrounding comments left in the file.
+
+3. Known callers of POST /summary and POST /documents.
+   - Search README, docs/, openapi/, swagger/, postman/, any
+     integration-test fixture, any contract-test definition.
+   - List anything that names a calling service, a portal, or a
+     gateway route. State "not determinable from source" if none.
+
+4. Manifest inventory.
+   - List every K8s, Helm, kustomize, XL Deploy, and CI/CD manifest
+     present in the repo (path only).
+   - Confirm exact placeholder name for replica count.
+   - State explicitly which of the following are PRESENT vs ABSENT:
+     deployment.yaml, service.yaml, resources.yaml, values.yaml,
+     Chart.yaml, kustomization.yaml, Dockerfile, helmfile, XL
+     Deploy descriptors.
+
+5. CPU limit absence.
+   - Confirm there is no CPU limit or CPU request anywhere in any
+     manifest. Cite the file searched and confirm absence.
+
+6. JWT trustedIssuers list.
+   - Find jwt.trustedIssuers (or equivalent) in config files.
+   - List every issuer URI per environment (dev / qa / preprod /
+     prod) with file:line.
+
+7. Internal-firm claim mechanism.
+   - Locate the predicate that enforces us_worldpay_fis_int.
+   - State: is it matched against the iss claim, a scope claim, a
+     role claim, an authorities list, or something else? Is it a
+     contains-check, equals, prefix? Where does it run — Spring
+     Security filter chain, controller method, AOP, custom
+     interceptor? Cite file:line.
+
+8. SFG SFTP filename format.
+   - Find the code that constructs the filename written to
+     /Outgoing/. Document the exact pattern (case-number, action-
+     sequence, timestamp, original filename, etc.). Cite file:line.
+
+9. HikariCP pool sizing for both datasources.
+   - Per env file, list min-idle, maximum-pool-size, connection-
+     timeout, idle-timeout, max-lifetime for spring.datasource.wdp
+     and spring.datasource.core.
+
+10. Tomcat thread pool sizing.
+    - server.tomcat.threads.max, server.tomcat.threads.min-spare,
+      server.tomcat.accept-count, server.tomcat.connection-timeout
+      per env file.
+
+11. @Async executor configuration.
+    - List every @Async-annotated method in the repo.
+    - For each, identify the Executor bean used (or the default).
+    - Document corePoolSize, maxPoolSize, queueCapacity,
+      rejectionPolicy, threadNamePrefix per executor bean. Cite
+      file:line.
+
+12. In-cluster base URLs of dependencies.
+    - Per env file, list the base URL config for: case-search-
+      service, document-management-service, case-actions-service,
+      idp-token-service. Cite file:line.
+
+13. disputeStage action-matching predicate.
+    - Find the code that filters actions by disputeStage on the
+      /documents endpoint. List every column compared and the
+      exact predicate (e.g. C_CASE_STAGE = ? AND C_ACTION_STA
+      <> 'CLOSED'). Cite file:line.
+
+14. disputeStage no-match on NAP.
+    - Confirm the diagram claim that "no matching actions for
+      stage" on NAP routes to SFG SFTP fallback (HTTP 200) rather
+      than 400. Cite file:line on the branch.
+
+15. DEC-019 — clear PAN.
+    - Confirm explicitly that no PAN, FPAN, token, or payment
+      credential is read, logged, or held in any DTO, request,
+      response, or log statement. State "no PAN-related field
+      present in any code path" or list any matches with file:line.
+
+16. DEC-020 — idempotency on POST /documents.
+    - Document whether any idempotency mechanism exists: header
+      check (Idempotency-Key), application-level dedup table,
+      replay-protection filter, or DB unique constraint enforcing
+      single delivery per upload. State "no idempotency mechanism
+      present" if none.
+
+17. JDBC connection / read timeout per env.
+    - For both datasources, list any connection or socket timeout
+      configured at the JDBC URL level or HikariCP level.
+
+18. Auth header propagation.
+    - For each outbound REST call (CaseSearch, DocumentManagement,
+      CaseAction, IDP), list every HTTP header set on the request
+      — Authorization, X-WPAY-USER, V-Correlation-Id, etc. Cite
+      file:line on the header builder.
+
+19. Response code on missing vs invalid JWT.
+    - Confirm response status for each: missing JWT, invalid JWT,
+      JWT present but iss does not contain us_worldpay_fis_int.
+      State 401 vs 403 with file:line.
+
+20. Endpoint completeness.
+    - Sweep every @RestController and @RequestMapping in the repo.
+    - Confirm the only application-owned endpoints are POST
+      /summary and POST /{platform}/cases/{caseNumber}/documents.
+    - List any others found (including admin / debug endpoints).
+
+21. Inbound entry-type completeness.
+    - Confirm explicitly: zero @KafkaListener, zero @Scheduled,
+      zero @JmsListener, zero @RabbitListener, zero MDB, zero
+      WebSocket or SSE endpoints. Cite the search.
+
+22. core_migration_status default behaviour.
+    - Find the @Value or YAML default for the flag.
+    - State the behaviour when the env var is unset — does the
+      service default to PG or DB2?
+
+23. NAP literal comparison.
+    - Find every place the platform path variable is compared to a
+      string literal. List the exact literal (e.g. "NAP"), the
+      comparator (equals, equalsIgnoreCase, contains), and the file:
+      line.
+
+═══════════════════════════════════════════════════════════════════
+REPORT STRUCTURE — use these section headings, in this order
+═══════════════════════════════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ──
+
+a) STEPS IN ORDER
+   For each of the two endpoints (POST /summary and POST
+   /documents), list every processing step from request entry to
+   final response or fallback. Per step: what happens, which
+   downstream service or table is called, what the output is. Cite
+   file:line.
+
+b) DECISION POINTS
+   Every branch — condition evaluated, every outcome, where each
+   leads. Cite file:line.
+
+c) SKIP AND BYPASS CONDITIONS
+   Any short-circuit — including the JWT internal-firm 403 path,
+   empty-file 400 path, NAP-fallback short-circuit, no-matching-
+   actions short-circuit. Cite file:line.
+
+d) FAILURE PATH PER STEP
+   For every external call (CaseSearch, DocMgmt POST, DocMgmt PUT,
+   CaseAction PUT, IDP token, SFG SFTP, WDP PG query, DB2 query) —
+   what happens on failure: retry, skip, halt, fallback. State
+   exception type caught, retry count if any, post-exhaustion
+   behaviour. Per step, not globally.
+
+e) MULTIPLE ENTRY PATHS
+   Confirm there are exactly two REST entry paths and zero other
+   inbound triggers (no Kafka listener, no scheduler, no webhook,
+   no JMS, no MDB). Confirm the two paths do not converge — they
+   are fully independent. Cite file:line.
+
+f) STATE AT EACH STEP
+   Not applicable — this is a stateless read-and-orchestration
+   service. State "not applicable — no stateful record managed by
+   this service" and move on.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ──
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   How the service decides between PG vs DB2 (summary endpoint),
+   and between WDP-managed vs SFG-fallback path (documents
+   endpoint). Field, value, branch. Cite file:line.
+
+b) BUSINESS RULES APPLIED
+   Validation rules at request entry — date range, enum values,
+   internal-firm claim, file presence, action-matching. State
+   what is checked, expected value, failure outcome, file:line.
+
+c) DATA TRANSFORMATIONS
+   Inbound-to-outbound field map for /summary aggregation — how
+   PG and DB2 results are merged into deptSummary /
+   creditDeptSummary / debitDeptSummary. For /documents — what is
+   passed to DocumentManagementService.
+
+d) IDEMPOTENCY MECHANISM
+   State explicitly whether any idempotency or replay-protection
+   exists. If absent, label "absent — gap" and describe the
+   resulting duplicate behaviour on retry.
+
+── SECTION 3 — CONTRACTS ──
+
+REST API
+  For each endpoint: method, full path, request body fields,
+  response body fields, every HTTP status code with trigger, auth
+  model, known callers, error body structure. Cite file:line.
+
+Kafka Consumer
+  Not present — confirm zero @KafkaListener and state
+  "not present".
+
+Kafka Producer
+  business-rules topic — wired but call site commented out at
+  DocumentServiceImpl.java:174. Document: configured topic name,
+  configured key field, sync vs async, idempotence setting,
+  configured retry, intended publish trigger, what state the call
+  site is in (commented out, throw not-implemented, etc.). Cite
+  file:line for each. Confirm no other producer call sites exist.
+
+Batch / Scheduler
+  Not present — confirm zero @Scheduled and state "not present".
+
+── SECTION 4 — DEPENDENCIES ──
+
+For every outbound call, output a row with:
+  Logical target
+  Protocol and auth
+  Purpose / step in flow
+  Connection timeout — cite file:line or "not configured"
+  Read timeout — cite file:line or "not configured"
+  Retry — count, delay, backoff or "not configured"
+  Circuit breaker — Resilience4j present? state "not configured"
+    explicitly if absent
+  Behaviour if unavailable — halt, skip, degrade, fallback
+
+Targets to cover: CaseSearchService, DocumentManagementService
+(POST), DocumentManagementService (PUT), CaseActionService, IDP
+Token Service, SFG SFTP, WDP Aurora PG, IBM DB2 BC schema, AWS
+MSK (inactive).
+
+── SECTION 5 — DATABASE ──
+
+For every table referenced by the service:
+  Schema and exact table name
+  Read or write — state clearly
+  Purpose — at which step in the flow
+  Key columns used in queries
+  If any write — same transaction as what other write?
+  Transaction manager bean used
+  Whether SELECT FOR UPDATE / row locks used
+
+Confirm explicitly:
+  - No INSERT, UPDATE, or DELETE statements anywhere — OR list
+    them with file:line.
+  - Tables NOT touched that the existing draft might imply are.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ──
+
+For each, output COMPLIES / DEVIATES / NOT APPLICABLE with
+evidence cited to file:line.
+
+DEC-001 Transactional outbox — used? Which table? Outbox write
+  in same transaction as business write?
+DEC-003 Kafka partition key = merchantId? If not, what and why?
+DEC-004 PAN encryption — encrypted before any persistent write?
+  Clear PAN ever written? Which service handles encryption?
+DEC-005 Kafka offset — committed manually after all processing?
+  Or auto / pre-ACK? Exact timing.
+DEC-019 Clear PAN — does this component write clear PAN to any
+  persistent store?
+DEC-020 Idempotency — full at-least-once implemented? If not,
+  what gap exists?
+
+── SECTION 7 — SCALING AND DEPLOYMENT ──
+
+Kubernetes resource type
+Replica count — exact value or placeholder, state which
+Memory and CPU limits and requests
+HPA — present or absent, cite manifest
+Rolling update strategy
+PodDisruptionBudget — present or absent
+Topology spread — functional or label mismatch
+Liveness / readiness / startup probes
+Ports exposed
+Observability — OTel agent, Actuator, Logstash
+
+If the K8s manifest, Helm chart, or values.yaml is NOT in the
+repo, state "not in repo" for this entire section and explicitly
+list what IS in the repo (Dockerfile, application.yaml, etc.) so
+the architect knows what is missing vs absent.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ──
+
+Commented-out code — what it did and why
+Unused dependencies in pom.xml
+Feature flags active in production — exact flag names and
+behaviour, plus default value if env var unset
+TODO / FIXME — file:line and verbatim text
+Stub implementations returning fixed responses
+Properties configured but never read — search for @Value or yaml
+keys with no injection point
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ──
+
+For EACH of sections 1 through 8, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+  determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ──
+
+List every claim from the existing v1.0 DRAFT document that you
+could NOT cross-check against code or config — neither confirmed
+nor contradicted. These will need follow-up from the team or
+runtime observation.
+
+═══════════════════════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════════════════════
+
+- Cite file paths and line ranges for every concrete claim.
+  Format: <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does
+  not reveal. Do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms
+  existing documentation, a one-paragraph "still accurate —
+  file:lines" is acceptable.
+- If you would restate something the reference document already
+  states verbatim, replace that prose with "Document accurate —
+  <file>:<lines>". Do not restate.
+- Do not invent file paths. If a file is referenced in the
+  existing doc but you cannot locate it, list it under
+  "REFERENCED BUT NOT FOUND IN REPO" at the end.
