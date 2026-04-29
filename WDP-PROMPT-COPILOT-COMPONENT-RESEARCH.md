@@ -1,7 +1,7 @@
 You are my senior architecture partner for WDP
 (Worldpay Dispute Platform).
 
-Today's component: 36 — TokenService
+Today's component: 42 — BENConsumer
 Repository: [repo-name]
 
 ═══════════════════════════════════════════
