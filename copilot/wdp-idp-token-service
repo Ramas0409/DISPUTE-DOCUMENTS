@@ -1,0 +1,492 @@
+You are auditing the WDP component TokenService in the repository
+wdp-idp-token-service. A prior pass already produced a DRAFT architecture
+document. Your job is to CONFIRM OR CORRECT the items listed under
+"ALREADY DOCUMENTED" from source, and to CLOSE the items listed under
+"GAPS TO FILL" by reading the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that explicitly
+and label it "not determinable from source". Do NOT guess. Do NOT summarise
+without evidence. Do NOT use the existing document as a substitute for
+source — treat it as a hypothesis to verify.
+
+================================================================
+REFERENCE DOCUMENT — TREAT AS HYPOTHESIS, NOT GROUND TRUTH
+================================================================
+
+The existing component file WDP-COMP-36-TOKEN-SERVICE.md is provided
+alongside this prompt. It is a v1.0 DRAFT extracted from this same
+repository in a prior pass and is awaiting architect confirmation.
+
+Rules for using it:
+  - Treat every claim in it as a hypothesis to verify against source.
+  - For each claim listed under "ALREADY DOCUMENTED" below: either
+      (a) confirm with "Still accurate — <relative/path>:Lstart-Lend", OR
+      (b) write a CORRECTION block of the form:
+            CORRECTION
+            Doc says:    <verbatim or paraphrased existing claim>
+            Source shows: <what the code or config actually shows>
+            File:line:    <relative/path>:Lstart-Lend
+            Section to update: <which section of the existing doc>
+  - Do NOT re-document items in this block from scratch. A one-line
+    confirmation with file:lines is the expected positive output.
+  - At the end of the report (Section 10) list every documented claim
+    that you could NOT verify either way from source — neither confirmed
+    nor contradicted. These are runtime / environment / cross-repo gaps.
+
+================================================================
+ALREADY DOCUMENTED — CONFIRM OR CORRECT EACH ITEM
+================================================================
+
+For each item below, output either "Still accurate — file:lines" or a
+CORRECTION block. Do not re-derive these from scratch.
+
+Identity & stack
+  D-1  Image name `frauddispute/globalswitch/wdp-idp-token-service`
+       (Jenkinsfile)
+  D-2  Namespace `gcp-ff` (Jenkinsfile)
+  D-3  Java 17, Spring Boot 3.5.6, Spring Security OAuth2, Spring Data
+       Redis (Jedis)
+  D-4  Server port 8082; context path `/merchant/gcp/idp-token`
+
+Inbound surface
+  D-5  Single endpoint `GET /merchant/gcp/idp-token/token`
+  D-6  `SecurityConfig` builds an empty Spring Security filter chain
+       (`http.build()` with no rules) — no inbound JWT validation enforced
+  D-7  Swagger advertises a Bearer JWT requirement but this is
+       documentation metadata only, not enforced
+  D-8  `@Validated` is declared on the controller but there are no
+       constraint annotations on any request parameter
+
+Processing flow
+  D-9  Redis HGET on hash `wdpinternalidptoken`, field `"token"`, called
+       on every request
+  D-10 On non-null Redis result: deserialise JSON to `IdpToken` POJO via
+       ObjectMapper
+  D-11 Expiry check uses `tokenExpirationDate.isBefore(now)` — strict
+       past-expiry, no lead-time buffer
+  D-12 On warm cache hit: `expiresIn` is recalculated via
+       `ChronoUnit.SECONDS.between(now, expirationDate)` and returned
+  D-13 On Redis miss / expired / Redis exception: control passes to
+       `TokenServiceImpl.getAuthorizationTokenFromAuthServer()`
+  D-14 Spring `InMemoryOAuth2AuthorizedClientService` is consulted before
+       any IDP call; if it has a valid client, IDP is not called
+  D-15 On IDP fetch: `formatIdpToken(OAuth2AccessToken)` converts to
+       `IdpToken` POJO — there is NO write-back to Redis at any point
+  D-16 Redis exception handling: broad `catch(Exception)` → log ERROR with
+       stack trace → fall through to IDP path (no rethrow)
+  D-17 IDP exception handling: caught → log ERROR → re-thrown → propagates
+       as HTTP 500 to the caller
+
+Dependency: ElastiCache Redis
+  D-18 Connection mode: Standalone (`RedisStandaloneConfiguration`) — not
+       cluster, not sentinel
+  D-19 Jedis connection pooling: enabled via
+       `jedisClientConfiguration.usePooling()` with Jedis defaults — no
+       custom pool sizing properties set
+  D-20 SSL: conditional on `${redis_ssl_enabled}` — `useSsl()` is called
+       only when this property is true
+  D-21 Redis connection timeout: 60 seconds
+       (`connectTimeout(Duration.ofSeconds(60))`)
+  D-22 Redis read timeout: not configured — Jedis default applies
+  D-23 Redis commands issued: HGET only
+       (`opsForHash().get("wdpinternalidptoken", "token")`)
+  D-24 Redis commands NOT issued anywhere in this repo: HSET, SET, SETEX,
+       DEL, EXPIRE — confirm by exhaustive grep
+
+Dependency: IDP Token Endpoint
+  D-25 URL is `${idp_token_url}` env var — exact URL not in source
+  D-26 OAuth2 grant type `client_credentials` (in `application.yml`)
+  D-27 Scope `openid`
+  D-28 Client registration ID `wdp-internal-auth`
+  D-29 Client ID `${idp_client_id}` and client secret `${idp_client_secret}`
+       env vars from K8s secret `wdp-token-service-secrets` via
+       `secretRef` in `resources.yaml`
+  D-30 HTTP client: Spring default `RestTemplate`-based
+       `DefaultClientCredentialsTokenResponseClient`
+  D-31 IDP connection timeout: not configured
+  D-32 IDP read timeout: not configured
+  D-33 IDP retry: none
+  D-34 Resilience4j: absent — `io.github.resilience4j:*` not in `pom.xml`
+  D-35 Success handler: `authorizedClientService.saveAuthorizedClient(...)`
+       — saves to in-memory store only
+  D-36 Failure handler:
+       `RemoveAuthorizedClientOAuth2AuthorizationFailureHandler` —
+       removes failed client from in-memory store
+
+Database
+  D-37 No JPA dependency, no `DataSource` bean, no `@Repository`, no entity
+       class, no SQL — confirm by exhaustive scan of pom.xml and src tree
+
+Kafka
+  D-38 No `spring-kafka` dependency, no `@KafkaListener`, no `KafkaTemplate`,
+       no `KafkaConsumer`, no `KafkaProducer` — confirm by pom.xml and src
+       tree scan
+
+Deployment (resources.yaml)
+  D-39 Replica count is `{{ replicas-wdp-idp-token-service }}` — XL Deploy
+       placeholder; no default value present in the repo
+  D-40 No `HorizontalPodAutoscaler` manifest exists in the repo
+  D-41 No `PodDisruptionBudget` manifest exists in the repo
+  D-42 Memory request 1024Mi / limit 2048Mi
+  D-43 CPU request and limit: not set
+  D-44 Rollout strategy: `RollingUpdate`, maxSurge 1, maxUnavailable 0,
+       minReadySeconds 30 — confirm whether `minReadySeconds` is at the
+       Deployment-spec level (correct) or mis-indented under
+       `spec.template.spec` (silently ignored — same defect class
+       previously found on COMP-25 / COMP-28 / COMP-34)
+  D-45 Topology spread: maxSkew 1, ScheduleAnyway, topologyKey
+       `kubernetes.io/hostname`, selector label
+       `app: wdp-idp-token-service${BRANCH_NAME_PLACEHOLDER}` — confirm
+       no label mismatch against pod template
+  D-46 Container port 8082; Service ClusterIP on 8082
+  D-47 Liveness probe path `/merchant/gcp/idp-token/livez` on port 8082
+  D-48 Readiness probe path `/merchant/gcp/idp-token/readyz` on port 8082
+  D-49 OTel Java agent injected via annotation
+       `instrumentation.opentelemetry.io/inject-java`
+  D-50 Actuator exposes `info`, `health`, `prometheus`;
+       `management.endpoint.health.show-details: never`
+  D-51 Logstash via `logstash-logback-encoder` v7.4,
+       `LogstashTcpSocketAppender`, destination
+       `${logstash_server_host_port}`, `keepAliveDuration: 5 minutes`
+  D-52 Two hardcoded Logstash destinations `10.43.145.125:5044` are
+       commented out in `logback-spring.xml` and inactive
+  D-53 Ingress: Nginx, two host entries (external `{{ hostName }}` and
+       internal `{{ internalHostName }}`), CORS enabled with permissive
+       defaults, TLS via `{{ ingressTLSSecretName }}`
+
+Deviations
+  D-54 DEC-001 not applicable — no Kafka publish path
+  D-55 DEC-003 not applicable — no Kafka publish path
+  D-56 DEC-004 compliant / not applicable — no PAN data anywhere
+  D-57 DEC-005 not applicable — no Kafka consumer
+  D-58 DEC-019 compliant / not applicable — no persistent store
+  D-59 DEC-020 not applicable — read-only retrieval
+  D-60 DEC-014 DEVIATING — no Resilience4j on Redis or IDP
+
+Known risks already documented (confirm each by reading the cited code path)
+  R-1  Latent NPE: in
+       `TokenServiceImpl.getAuthorizationTokenFromAuthServer()`, when
+       `authorizedClient` is null, the code logs an error but does NOT
+       return early and proceeds to `formatIdpToken(authorizedClient
+       .getAccessToken())`, which throws NPE
+  R-2  `jwt.trustedIssuers` is declared in `application.yml` and injected
+       from K8s secret `wdp-common-secrets`, but no class reads this
+       property — confirm via grep for `jwt.trustedIssuers` and
+       `trustedIssuers`
+  R-3  Unused dependencies: `spring-security-oauth2-resource-server`,
+       `spring-boot-starter-validation`, `commons-lang3` — confirm none
+       are wired
+
+================================================================
+GAPS TO FILL — ANSWER FROM SOURCE
+================================================================
+
+For each gap below, perform the stated investigation and report findings
+with file:line citations.
+
+G-1  External Redis WRITER for `wdpinternalidptoken:token`
+     Confirm by exhaustive scan of this repo that NO class issues a write
+     to this Redis key. Specifically search for:
+       (i)   `opsForHash().put` / `opsForHash().putAll`
+       (ii)  `HSET` literal usage
+       (iii) any `redisTemplate.execute` block doing a SET / HSET path
+       (iv)  any background `@Scheduled` job, runtime listener, or
+             `ApplicationRunner` / `CommandLineRunner` that touches Redis
+     Report: confirmed read-only, with file:line evidence of every Redis
+     call site reached, and the absence of any write call site.
+
+G-2  Inbound authentication wiring — is `spring-security-oauth2-resource-server`
+     truly inert?
+     Confirm there is NO `JwtIssuerAuthenticationManagerResolver` bean,
+     NO `http.oauth2ResourceServer(...)` configuration, NO `@Value` or
+     `@ConfigurationProperties` reading `jwt.trustedIssuers`. Cite
+     `SecurityConfig` in full (file:lines) and grep the entire codebase.
+
+G-3  Spring Cache abstraction — present or absent?
+     Search for `@EnableCaching`, `@Cacheable`, `@CacheEvict`,
+     `@CachePut`, any `CacheManager` bean. State whether the only
+     caching mechanism is the manual Redis HGET path plus the
+     `InMemoryOAuth2AuthorizedClientService`.
+
+G-4  JVM timezone for `IdpToken.expirationDate` comparison
+     `expirationDate` is described as `LocalDateTime` (no timezone). Find:
+       (i)   any `TZ` env var declared in `resources.yaml` or Dockerfile
+       (ii)  any `user.timezone` JVM arg in startup config
+       (iii) `spring.jackson.time-zone` in `application.yml`
+       (iv)  any `ZoneId.of(...)` usage in expiry-comparison code
+     Report exactly what governs the time comparison and whether the
+     behaviour is JVM-locale-dependent.
+
+G-5  Probes — startup probe present?
+     Search `resources.yaml` for `startupProbe`. State present or absent.
+     Cite the full probe block (liveness + readiness + startup) with
+     file:lines.
+
+G-6  Spring profile activation
+     Which mechanism activates Spring profiles? List all
+     `application*.yml` / `application*.yaml` files in the repo. State
+     whether profile-specific files exist or whether everything is
+     env-var driven from a single `application.yml`.
+
+G-7  Secrets inventory
+     List every K8s secret mounted (via `secretRef`, `valueFrom.secretKeyRef`,
+     or `volumes`/`volumeMounts`) in `resources.yaml`, with the env-var
+     keys consumed from each. State which secret supplies `idp_client_id`,
+     `idp_client_secret`, `redis_*`, `jwt.trustedIssuers`,
+     `logstash_server_host_port`.
+
+G-8  Commented-out code, TODO, FIXME
+     Full sweep. For each occurrence give file:line and verbatim text.
+     Include the two `10.43.145.125:5044` entries in
+     `logback-spring.xml` and any other dead code.
+
+G-9  IdpToken POJO contract
+     Confirm the exact field set: `tokenValue`, `expiresIn`, `tokenType`,
+     `expirationDate`. State each field's Java type. List every Jackson
+     annotation (`@JsonProperty`, `@JsonFormat`, etc.). State whether any
+     additional fields exist.
+
+G-10 Feature flags / environment-conditional behaviour
+     List any `@ConditionalOnProperty`, `@Profile`, `@Conditional*`, or
+     env-var-gated branches anywhere in source. Specifically: is
+     `${redis_ssl_enabled}` the only conditional? Are there any others?
+
+G-11 Dependency-managed Jedis version
+     Confirm Jedis is brought in transitively via `spring-data-redis` or
+     directly. State the exact version pinned by Spring Boot 3.5.6 BOM
+     if available; otherwise state "version not pinned in pom.xml,
+     managed by Spring Boot BOM".
+
+G-12 Properties declared but never read
+     For every key in `application.yml` and every `${...}` placeholder
+     in `resources.yaml`, confirm whether the corresponding Java code
+     reads it (search for `@Value("${KEY}")` or
+     `@ConfigurationProperties` bindings). Flag every orphaned property.
+
+G-13 Caller inventory — local evidence only
+     This repo cannot confirm callers, but check whether any
+     `application.yml`, README, deployment manifest, or comment names
+     specific consumer services that should call this endpoint. Report
+     "no caller list in repo" if nothing surfaces.
+
+================================================================
+REPORT STRUCTURE — USE THESE EXACT SECTION HEADINGS, IN THIS ORDER
+================================================================
+
+── SECTION 1 — PROCESSING FLOW ──────────────────────────────────
+
+Use these exact sub-headings:
+
+  a) STEPS IN ORDER
+     Every step from the inbound HTTP request to the response. For each
+     step: what happens, which class/method or external dependency is
+     called, what the output of that step is. Cite file:lines.
+
+  b) DECISION POINTS
+     Every branch: (1) Redis result null vs non-null vs exception;
+     (2) `tokenExpirationDate.isBefore(now)` true vs false;
+     (3) Spring `InMemoryOAuth2AuthorizedClientService` has-valid-token
+     vs not. State the condition evaluated, every outcome, and the path
+     each outcome takes. Cite file:lines.
+
+  c) SKIP AND BYPASS CONDITIONS
+     Any condition that short-circuits processing (e.g. warm cache hit
+     short-circuits IDP). State the check and where control goes.
+
+  d) FAILURE PATH PER STEP
+     For each external call (Redis HGET, IDP `client_credentials` POST,
+     Spring in-memory store lookup): what happens on failure. State
+     the exception type caught, retry count (none expected), and
+     post-exhaustion behaviour. Per step, not globally.
+
+  e) MULTIPLE ENTRY PATHS
+     This service exposes ONE REST endpoint. Confirm explicitly that no
+     other entry exists: no `@KafkaListener`, no `@Scheduled`, no
+     `ApplicationRunner` / `CommandLineRunner`, no webhook, no
+     additional REST endpoint. Cite the controller package contents.
+
+  f) STATE AT EACH STEP
+     Not applicable — token retrieval is stateless w.r.t. persistent
+     state. Note this explicitly. The Spring `InMemoryOAuth2AuthorizedClientService`
+     is in-process JVM state only, lost on pod restart.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ─────────────────────────────
+
+  a) CLASSIFICATION AND ROUTING LOGIC
+     This component manages exactly one token type and one OAuth2
+     registration (`wdp-internal-auth`). Confirm there is NO per-caller
+     routing, NO per-scope routing, NO platform-specific branch
+     (NAP / PIN / CORE / VAP / LATAM). Cite the controller and service
+     classes.
+
+  b) BUSINESS RULES APPLIED
+     The only rule applied is the past-expiry check. State the rule
+     verbatim from source and the code path that enforces it.
+
+  c) DATA TRANSFORMATIONS
+     (i)  Redis JSON string → `IdpToken` POJO via ObjectMapper —
+          confirm and cite
+     (ii) `OAuth2AccessToken` → `IdpToken` POJO via `formatIdpToken()` —
+          confirm field-level mapping (tokenValue, expiresIn, tokenType,
+          expirationDate)
+     (iii) `expiresIn` recomputed via `ChronoUnit.SECONDS.between(now,
+          expirationDate)` on every response — confirm and cite
+
+  d) IDEMPOTENCY MECHANISM
+     Not applicable — read-only retrieval. State this and confirm no
+     `idempotency-key` header is read or written.
+
+── SECTION 3 — CONTRACTS ────────────────────────────────────────
+
+REST API CONTRACT (this section applies):
+  - Endpoint: GET `/token` (full path
+    `/merchant/gcp/idp-token/token`)
+  - Request: confirm no body, no query params, no path variables
+  - Response 200 body: confirm the exact `IdpToken` JSON structure
+  - Every HTTP status code that can be returned (200, 500 from IDP
+    failure) and the trigger for each. State whether 4xx is ever
+    emitted. State the exact response body on 500.
+  - Auth model: confirm none enforced
+  - Caller list: confirm not determinable from this repo (per G-13)
+
+KAFKA CONSUMER CONTRACT: not present — state "not present".
+KAFKA PRODUCER CONTRACT: not present — state "not present".
+BATCH / SCHEDULER CONTRACT: not present — state "not present".
+
+── SECTION 4 — DEPENDENCIES ─────────────────────────────────────
+
+For each outbound call:
+  Service / logical target
+  Protocol & auth method
+  Purpose — at which step in the flow
+  Connection timeout (state "not configured" if absent)
+  Read timeout (state "not configured" if absent)
+  Retry: count, delay, backoff type (state "none" if absent)
+  Circuit breaker (Resilience4j): state "not configured" — confirm
+    by pom.xml inspection
+  Behaviour if unavailable: halt / skip / degrade / item lost
+
+Two outbound calls expected:
+  Dep-1: AWS ElastiCache (Redis) — Jedis Standalone, HGET only
+  Dep-2: IDP Token Endpoint — `client_credentials` grant
+
+If any other outbound call exists (e.g. an unexpected webhook, health
+check to an external service, etc.), document it.
+
+── SECTION 5 — DATABASE ─────────────────────────────────────────
+
+State explicitly:
+  - No relational database is touched by this component
+  - No JPA dependency
+  - No `DataSource` bean
+  - No entity, no `@Repository`, no SQL, no JDBC template
+  - The only persistent-store dependency is AWS ElastiCache (Redis),
+    which the component reads (HGET) but does not write
+  - Confirm by pom.xml and full src/main/java scan
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ─────────────────────
+
+For each standard, output COMPLIES / DEVIATES / NOT APPLICABLE with
+evidence cited to file:lines.
+
+  DEC-001: Transactional outbox — N/A (no Kafka publish). Cite pom.xml.
+  DEC-003: Kafka partition key = merchantId — N/A (no Kafka). Cite
+    pom.xml.
+  DEC-004: PAN encryption before any persistent write — COMPLIES /
+    N/A. Confirm by full src scan for any field named `pan`,
+    `cardNumber`, `accountNumber`, `acctNum`, `i_acct_cdh`. State
+    "no PAN data handled" if confirmed.
+  DEC-005: Kafka offset committed manually after all processing — N/A.
+    Cite pom.xml.
+  DEC-014: Resilience4j on outbound calls — DEVIATES. Cite pom.xml
+    showing `io.github.resilience4j` absent. Cite the Redis and IDP
+    call sites showing no `@CircuitBreaker`, no `@Bulkhead`, no
+    `@TimeLimiter`.
+  DEC-019: Clear PAN never written to persistent store — COMPLIES /
+    N/A. No persistent writes occur.
+  DEC-020: Full at-least-once idempotency — N/A. Read-only service.
+
+── SECTION 7 — SCALING AND DEPLOYMENT ───────────────────────────
+
+For each item, cite the manifest file:lines that supplies it. Mark "not
+in repo" if the relevant file does not exist.
+
+  Kubernetes resource type
+  Replica count (state placeholder text and which file/line)
+  Memory and CPU limits and requests
+  HPA — present or absent
+  Rolling update strategy (maxSurge, maxUnavailable, minReadySeconds —
+    confirm minReadySeconds placement is at Deployment spec level, not
+    nested under spec.template.spec)
+  PodDisruptionBudget — present or absent
+  Topology spread — confirm selector label matches pod template (no
+    label mismatch)
+  Liveness / readiness / startup probes — list paths, ports,
+    initialDelaySeconds, periodSeconds, timeoutSeconds, failureThreshold
+  Ports exposed
+  OTel Java agent injection annotation
+  Spring Actuator endpoints exposed
+  Logstash appender configuration (destination, keep-alive, dead
+    hardcoded destinations)
+  Ingress configuration (Nginx, host count, CORS, TLS)
+  Service account, security context (if present)
+
+If `resources.yaml`, Helm chart, or `values.yaml` is NOT in the repo,
+state "not in repo" for the missing artefact and list explicitly what
+IS in the repo (Dockerfile, Jenkinsfile, application.yml, Helm
+chart, etc.).
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ──────────────────────
+
+  Commented-out code blocks — what they did and why (if comment
+    explains)
+  Unused dependencies in pom.xml — list each with the conclusion
+    "imported but never wired" plus file:line where you confirmed
+    absence of usage
+  Feature flags / `@ConditionalOnProperty` / `@Profile` branches —
+    name and behaviour, plus default value if env var unset
+  TODO / FIXME / XXX / HACK references — file:line and verbatim text
+  Stub implementations returning fixed responses
+  Properties declared but never read — full list (per G-12)
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ────────────────────────────
+
+For EACH of Sections 1 through 8 above, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+    determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ────────────────
+
+List every claim from the existing component document that you could
+NOT cross-check against code or config — neither confirmed nor
+contradicted. These will need follow-up from the team or from runtime
+observation. Examples to address:
+  - Production replica count (XL Deploy placeholder)
+  - Identity of the external Redis writer for `wdpinternalidptoken:token`
+  - Caller inventory of WDP consumers/batch jobs
+  - Production IDP URL value
+  - Production Redis endpoint, SSL flag, and credentials
+  - Whether the in-memory OAuth2 store actually mitigates concurrent
+    load in production
+
+================================================================
+OUTPUT RULES
+================================================================
+
+- Cite file paths and line ranges for every concrete claim. Format:
+  <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does not
+  reveal. Do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms existing
+  documentation, "Document accurate — <file>:<lines>" is acceptable.
+- Do not restate prose that the existing document already states
+  verbatim. Replace with "Document accurate — <file>:<lines>".
+- Do not invent file paths. If a file is referenced in the existing
+  doc but you cannot locate it, list it under "REFERENCED BUT NOT
+  FOUND IN REPO" at the end of the report.

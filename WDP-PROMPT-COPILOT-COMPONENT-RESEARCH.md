@@ -1,7 +1,7 @@
 You are my senior architecture partner for WDP
 (Worldpay Dispute Platform).
 
-Today's component: 32 — RulesService
+Today's component: 36 — TokenService
 Repository: [repo-name]
 
 ═══════════════════════════════════════════
