@@ -1,0 +1,387 @@
+You are auditing the WDP component CoreHierarchyAuthorizationService (CHAS) in the repository gcp-core-hierarchy-authorization-service. A prior pass already produced a DRAFT architecture document. Your job is to CONFIRM OR CORRECT the items listed under "ALREADY DOCUMENTED" from source, and to CLOSE the items listed under "GAPS TO FILL" by reading the code and config directly.
+
+Produce a single structured research report organised under the section headings below. For every claim, cite the file path and line range you read it from. Where source does not show the answer, state that explicitly and label it "not determinable from source". Do NOT guess. Do NOT summarise without evidence. Do NOT use the existing document as a substitute for source — treat it as a hypothesis to verify.
+
+---
+
+## REFERENCE DOCUMENT
+
+The existing component file `WDP-COMP-03-CHAS.md` v1.0 DRAFT is provided alongside this prompt. Treat it as HYPOTHESES to verify, not ground truth. For each documented claim:
+
+- (a) confirm with file:line range — `Still accurate — <relative/path>:Lstart-Lend`, OR
+- (b) write a CORRECTION block stating: what the doc says / what source shows / which section of the doc needs updating / file:line evidence.
+
+At the end, list every documented claim that could NOT be verified from source under "ITEMS NOT VERIFIABLE FROM SOURCE".
+
+If you would otherwise restate something the reference document already states verbatim and source confirms, replace your text with `Document accurate — <relative/path>:Lstart-Lend`. Do not restate.
+
+If a file is referenced in the existing doc but you cannot locate it in the repo, list it under `REFERENCED BUT NOT FOUND IN REPO` at the end of the report.
+
+---
+
+## ALREADY DOCUMENTED — confirm or correct each item
+
+### Identity, technology, deployable
+
+- Spring Boot version 3.4.7, Java 17 (`pom.xml`)
+- Repository name `gcp-core-hierarchy-authorization-service`
+- K8s deployment name `core-hierarchy-authorization-service` with `${BRANCH_NAME_PLACEHOLDER}` suffix on non-main branches
+- Stateless, read-only — no INSERT, UPDATE, or DELETE anywhere in the codebase
+- No Kafka producer (no `KafkaTemplate.send`)
+- No Kafka consumer (no `@KafkaListener`)
+- No scheduler (no `@Scheduled`, no Spring Batch, no Kubernetes CronJob)
+- No cache (no `@Cacheable`, no `CacheManager` bean, no Redis, no Caffeine)
+- Resilience4j absent from `pom.xml` and absent from all source
+
+### Authentication and authorization model
+
+- Spring Security OAuth2 Resource Server validates Bearer JWT
+- Trusted issuers via `${jwt_trusted_issuer_urls}` env var, bound to `jwt.trustedIssuers` (or equivalent property)
+- Multi-issuer via `JwtIssuerAuthenticationManagerResolver`
+- CSRF disabled
+- Unauthenticated paths: `/actuator/health`, `/livez`, `/readyz`. In non-prod, Swagger UI paths are also permitted
+- Internal firm bypass on `/authorize`: JWT `iss` claim containing `us_worldpay_fis_int` (case-insensitive, via `containsAnyIgnoreCase` on `ApplicationConstants.INTERNAL_FIRM`) returns HTTP 200 immediately with no DB lookup
+- Internal firm bypass does NOT apply to the four merchant-hierarchy data API endpoints
+- `validateOrgId()` is commented out in `MerchantController.getMerchantHierarchyByOrgId()` — `//RequestValidator.validateOrgId(orgId, jwt);` — any authenticated PIN-platform caller can query any orgId
+
+### Endpoint inventory (six)
+
+- `POST /merchant/gcp/hierarchy-authorization/authorize`
+- `POST /merchant/gcp/hierarchy-authorization/entity-authorize`
+- `GET /merchant/gcp/hierarchy-authorization/{platform}/merchant/orgentity/{orgId}` (platform must be PIN, returns 400 otherwise)
+- `POST /merchant/gcp/hierarchy-authorization/{platform}/merchant/entitytype` (platform must be PIN)
+- `POST /merchant/gcp/hierarchy-authorization/merchant` (no platform restriction)
+- `GET /merchant/gcp/hierarchy-authorization/productentitlement` (no platform restriction)
+
+### `/authorize` processing flow
+
+- `RequestValidator.validateAuthorizeRequest()` checks platform is in enum (CORE, NAP, VAP, LATAM, PIN)
+- If platform is non-NAP, at least one of `caseNumber`, `merchantId`, `level4Entity` must be non-blank
+- NAP requests pass the validator but are rejected at the service layer with HTTP 400 (`Platform is not supported`)
+- iqorgid and iqentities JWT claims are extracted from the decoded JWT
+- If both claims are blank, returns HTTP 403 with body `Token doesn't contain orgId & entities`
+- caseNumber resolution: `WDP.CASE.findByCaseNumber()` returns `C_LEVEL1_ENTITY` (merchantId/levelEntity) and `C_LEVEL4_ENTITY` (chainId/level4Entity)
+- The `findByCaseNumber()` call is OUTSIDE any try/catch — `DataAccessException` propagates uncaught to Spring Boot's default 500
+- CH-type (chain-level) DB2 lookup is wrapped in `catch (Exception e)` — DB2 failures are silently caught, control falls through to the MT-type lookup
+- MT-type (merchant-level) DB2 lookup is NOT inside a catch block — `DataAccessException` propagates uncaught to 500
+- 200 with empty body = authorization granted (`ResponseEntity.status(HttpStatus.OK).build()`)
+- 403 with JSON error body = denied
+- Edge case: when authorizeToken() falls through to the catch block AND `levelEntity` is also blank, `isAuthorized` stays false but no exception is thrown — service returns HTTP 200 (silent authorization bypass)
+
+### Database access
+
+PostgreSQL — WDP schema:
+- `WDP.CASE` — read-only via `findByCaseNumber()`. Columns read: `I_CASE`, `C_LEVEL1_ENTITY`, `C_LEVEL4_ENTITY`. PK column `I_CASE_ID` not projected.
+
+IBM DB2 — Core merchant master (read-only):
+- `MD.TMD_ENTY` (entity master) — entity class `EntityDetails`
+- `MD.TMD_ENTY_REL` (entity relationship) — entity class `EntityRelDetails`
+- `DC.TDC_VIQ_ORG_ENTY` (org-to-entity mapping) — entity class `OrgEntity`
+- `BC.TBC_MRCHNT_MAST_BO` (merchant master) — entity class `MerchantEntity`, used by `POST /merchant`
+- `MD.TMD_DISPLAY_CODES` — entity class `DisplayCode`, used by `GET /orgentity`
+- `MD.TMD_MRCHNT_WOMPLY` (DEFRDR + CHGBD lookups) — entity class `MerchantWomplyEntity`, used by `GET /productentitlement`
+- `BC.TMD_CHAIN` (pre-note indicator) — entity class `ChainEntity`, used by `GET /productentitlement`
+- `MD.TMD_CHAIN_ANALY` — entity class `ProductEntitlementEntity`. Mapped via `ProductEntitlementRepository`, **`@Autowired` into `ProductEntitlementServiceImpl` but never called** at runtime — claimed dead dependency
+
+DB2 native SQL (in `MerchantDaoImpl` — not via JPA entities):
+- `MD.TMD_CHAIN` (alias TMD1)
+- `MD.TMD_SUPR_CHAIN` (alias TMD4)
+- `MD.TMD_STORE` (alias TMD3)
+- `MD.TMD_MRCHNT` (alias TMD5)
+- `MD.TMD_DIVISION` (alias TMD2)
+- `MD.TMD_ADDRESS` (filter `C_ADR = 'PH'`)
+
+Transaction managers:
+- Two separate managers: `wdpTransactionManager` (PostgreSQL/JPA), `coreTransactionManager` (DB2/JPA)
+- Service methods in `AuthorizationServiceImpl` are NOT `@Transactional` — reads are independent, non-transactional, no shared transaction possible across PostgreSQL and DB2
+
+### Deployment
+
+- Replica count: `{{ replicas-core-hierarchy-authorization-service }}` — XL Deploy placeholder, actual value not in repo
+- HPA: absent
+- Memory request 1024Mi, limit 2048Mi
+- CPU request and limit: NOT configured
+- PodDisruptionBudget: absent
+- Topology spread constraint: PRESENT but NON-FUNCTIONAL — pod label is `app: core-hierarchy-authorization-service`, constraint `matchLabels` is `app: gcp-core-hierarchy-authorization-service` (`gcp-` prefix in selector but not on pods)
+- Liveness probe: HTTP `GET /livez` on port 8082, initialDelay 30s
+- Readiness probe: HTTP `GET /readyz` on port 8082, initialDelay 20s, period 10s, timeout 5s, failureThreshold 3
+- Neither probe checks DB2 or PostgreSQL connectivity — backed by Spring Actuator health groups only, `show-details: never`
+- HikariCP defaults on both datasources (no explicit `spring.datasource.*.hikari.*` overrides)
+- No JDBC `socketTimeout`, `queryTimeout`, or `connectTimeout` configured
+- OpenTelemetry Java agent injected via pod annotation
+- Swagger UI gated on `gcp_env` env var (non-prod only)
+
+### Planned and incomplete work
+
+- `ProductEntitlementResponse.java` — `chain` field removed from response model with `@Schema` annotation; `response.setChain()` calls commented out in `ProductEntitlementServiceImpl`
+- `MerchantDaoImpl.java` — three native SQL queries (`RETRIEVE_CHAIN_SUPERCHAIN_DETAILS`, `RETRIEVE_CUSTOM_ENTITY_DETAILS`, `RETRIEVE_ENTITY_DETAILS`) replaced with simplified versions; originals had MAX(TMD4.D_DEP_LST) joins, `TMD_AGT_BANK_BR`/`TMD_AGT_BANK_RGN`/`TMD_ISO`/`TMD_ISC` joins, and `GROUP BY` clauses
+- `MerchantController.java` — `//RequestValidator.validateOrgId(orgId, jwt);` commented out
+- `ProductEntitlementRepository` injected into `ProductEntitlementServiceImpl` but never called — implementation uses `MerchantWomplyRepository` and `ChainRepository`
+- No feature flags
+- No TODO / FIXME / XXX / HACK references in source
+- `${logstash_server_host_port}` declared as `logstash.server.host.port` in `application.yaml` but no `@Value` injection in any Java class — assumed consumed by Logback XML (medium confidence in v1.0 doc)
+
+---
+
+## GAPS TO FILL — research from source
+
+For each numbered gap, answer the sub-questions with file:line citations.
+
+1. **`POST /entity-authorize` full processing flow.**
+   - In `AuthorizationController.authorizeEntityHierarchy()` and the downstream service method, walk through every processing step from request receipt to response.
+   - For each step: (a) what happens, (b) which service or repository is called, (c) the outcome of that step, (d) the file:line citation.
+   - Include all decision points and failure paths.
+   - What DB2 queries (entities, repositories, native SQL) are issued?
+   - What is the full response contract — every HTTP status code and body structure (success and error)?
+   - Does the internal firm bypass apply to this endpoint?
+   - Are there any callers visible in the repo (integration tests, fixtures, Postman collections, doc strings)?
+
+2. **`POST /entitytype` empty-result-set behaviour.**
+   - In `MerchantController.getMerchantEntitiesByType()` and its service method, when no entities are found:
+     - Is `NotFoundException` thrown and caught internally (returning empty 200 body)?
+     - Or is it propagated to `GlobalExceptionHandler` (returning 404)?
+   - Cite the exact handler entry in `GlobalExceptionHandler` for `NotFoundException` if it exists.
+   - Confirm the actual HTTP response and body when the result set is empty.
+
+3. **DB2 and PostgreSQL query-level timeout posture.**
+   - HikariCP `connectionTimeout` covers pool acquisition only. Confirm whether ANY of the following are configured for either datasource:
+     - JDBC URL-level `socketTimeout=...` or `connectTimeout=...` parameter
+     - HikariCP `validationTimeout`, `idleTimeout`, `maxLifetime`, `maximumPoolSize` overrides
+     - `@Transactional(timeout=…)` anywhere in the codebase (even though service methods are not `@Transactional`, a repository or DAO may be)
+     - Spring Data JPA `query.setHint("javax.persistence.query.timeout", …)` or `@QueryHints`
+   - State the exact configured value, or "not configured" with file:line evidence.
+
+4. **Rolling update strategy in `resources.yaml`.**
+   - State exact values for `maxSurge`, `maxUnavailable`, `minReadySeconds`.
+   - Critical: confirm whether `minReadySeconds` is correctly placed at `spec.minReadySeconds` (effective) or misplaced under `spec.template.spec.minReadySeconds` (silently ignored). This is a recurring defect class across the platform — explicit verification required.
+
+5. **K8s manifest inventory in repo.**
+   - List every K8s manifest file present: `resources.yaml`, separate `deployment.yaml`, `service.yaml`, `ingress.yaml`, HPA, PDB, NetworkPolicy, ServiceAccount.
+   - Confirm presence or absence of: Helm chart (`Chart.yaml`), `values.yaml`, Kustomize directory, `Dockerfile`.
+   - State explicitly which deployment artefacts are NOT in repo so the report distinguishes "absent from repo" from "absent from production".
+
+6. **`GlobalExceptionHandler` exception-to-status map.**
+   - For every `@ExceptionHandler` method in `GlobalExceptionHandler`, list: exception type caught, HTTP status returned, response body structure, file:line.
+   - Confirm the v1.0 claim that `DataAccessException` is NOT handled and falls through to Spring Boot's default 500 — by showing absence of a handler.
+
+7. **The silent-200 edge case code path on `/authorize`.**
+   - Locate the exact code in `AuthorizationServiceImpl` (or equivalent) where, when `authorizeToken()` reaches the catch block AND `levelEntity` is also blank:
+     - `isAuthorized` stays false
+     - No exception is thrown
+     - Method returns false
+     - Controller returns HTTP 200
+   - Cite file:line for the catch block, the levelEntity blank check, the return-false path, and the controller's response construction.
+   - Confirm whether a successful return from `false` is genuinely treated as authorized at the controller layer, or whether there is a separate path that treats `false` as denied.
+
+8. **DEC-004 / DEC-019 attestation pattern (no-PAN read-only service).**
+   - Run a full-codebase scan for the following field names on entity classes, request/response models, and DTOs: `pan`, `cardNumber`, `accountNumber`, `acctNum`, `cardNum`, `primaryAccountNumber`.
+   - Report every match with file:line, or confirm zero matches.
+   - Confirm absence of any persistent write — no `save()`, `saveAll()`, `persist()`, `merge()`, `delete()`, `deleteAll()`, `EntityManager.persist`, custom `INSERT` / `UPDATE` / `DELETE` SQL — across all repositories and DAOs.
+
+9. **`logstash_server_host_port` consumption.**
+   - Confirm whether `logback-spring.xml`, `logback.xml`, or `logback-test.xml` exists in `src/main/resources` or any other location.
+   - If present, cite the appender configuration that consumes `logstash.server.host.port` (typically `LogstashTcpSocketAppender`).
+   - If absent, state explicitly "no logback config in repo" — Logstash routing depends on starter defaults plus injected configuration not visible in repo.
+
+10. **Container port and observability stack.**
+    - Confirm container port across: `application.yaml` `server.port`, `resources.yaml` `containerPort`, `Service` `targetPort`, `Ingress` backend port, both probe ports.
+    - Confirm presence of: `spring-boot-starter-actuator` in `pom.xml`, `instrumentation.opentelemetry.io/inject-java` pod annotation in `resources.yaml`, `logstash-logback-encoder` in `pom.xml`, `micrometer-registry-prometheus` in `pom.xml` (if present), exposed Actuator endpoints (`management.endpoints.web.exposure.include`).
+    - State whether `/actuator/prometheus` is exposed and whether it requires JWT.
+
+11. **Callers of `POST /entity-authorize` and the four merchant-hierarchy data API endpoints.**
+    - From CHAS repo alone: any integration test names, test fixtures, Postman collections, OpenAPI spec consumer references, or comments in source that name a calling component.
+    - If no caller evidence exists in the repo, state "not determinable from CHAS repo alone — cross-repo grep required".
+
+12. **Error response body structure consistency.**
+    - The v1.0 doc shows the error body as `{ "errors": [ { "errorMessage": "...", "target": "..." } ] }`. Confirm this is the structure on every endpoint's 4xx responses by inspecting the response model class (likely `ErrorResponses` containing `List<StandardError>` or equivalent).
+    - Cite file:line for the error model class.
+    - Confirm whether 500 responses use the same structure (Spring Boot default JSON if `DataAccessException` falls through) or the service error format.
+
+13. **Active feature flags / migration flags — explicit confirmation.**
+    - Confirm zero presence of: `@ConditionalOnProperty`, `@Profile` other than `default`/standard env profiles, feature-flag library imports (Togglz, Unleash, LaunchDarkly), `coreMigration`-style flag properties.
+    - The v1.0 doc says none exist except Swagger UI gating on `gcp_env`. Confirm or correct.
+
+14. **Properties configured but never read — full scan.**
+    - For every `@Value` injection point and every YAML key in `application.yaml` and any profile YAMLs, confirm there is a Java consumer.
+    - Report any orphaned configuration (declared but unread) with file:line.
+
+15. **DEC-014 evidence** (Resilience4j absence).
+    - Full codebase scan: zero matches for `io.github.resilience4j` in `pom.xml`, zero `@CircuitBreaker`, `@Bulkhead`, `@RateLimiter`, `@TimeLimiter`, `@Retry` in `src/main`. Cite negative results explicitly.
+    - Spring Retry (`@Retryable`, `@Backoff`): present or absent? If present, where applied? Cite file:line.
+
+---
+
+## REPORT STRUCTURE — use these section headings, in this order
+
+### SECTION 1 — PROCESSING FLOW
+
+#### a) STEPS IN ORDER
+Every processing step from trigger to final output, separately for each of the six endpoints. For each step: what happens, which service or repository is called, what the output of that step is. Cite file:line.
+
+#### b) DECISION POINTS
+Every branch in the flow — the condition evaluated and every possible outcome with the path it leads to. Include the platform-enum check, NAP-rejection branch, internal-firm bypass branch, claims-blank check, caseNumber-vs-merchantId-vs-level4Entity dispatch, CH-vs-MT fallback, levelEntity-blank-after-catch silent-200 path. Cite file:line.
+
+#### c) SKIP AND BYPASS CONDITIONS
+The internal firm bypass on `/authorize` (and confirm whether it applies on `/entity-authorize`). The `iqentities`-empty-list fallback to `OrgEntity` lookup. Any other short-circuits. What is checked, what value triggers the skip, where control goes after the skip.
+
+#### d) FAILURE PATH PER STEP
+For each step that calls a database — what happens if that call fails. Per step:
+- caseNumber resolution (PostgreSQL): exception type, retry count, post-exhaustion behaviour, controller-level translation
+- CH-type DB2 lookup: caught exception type, fall-through target
+- MT-type DB2 lookup: uncaught exception type, default Spring Boot translation
+- Hierarchy data endpoints: exception types, GlobalExceptionHandler translations
+
+#### e) MULTIPLE ENTRY PATHS
+Six REST endpoints. Describe each separately. State where they converge or confirm they are fully independent. Confirm explicitly: no Kafka listener, no scheduler, no message-driven bean, no webhook consumer.
+
+#### f) STATE AT EACH STEP
+This component is stateless. Confirm explicitly: no record state machine, no status field on any entity, no transitional states. State this by confirming the absence of state-tracking code.
+
+### SECTION 2 — FUNCTIONAL BEHAVIOUR
+
+#### a) CLASSIFICATION AND ROUTING LOGIC
+- How `RequestValidator` decides 400 vs proceed
+- How service layer decides NAP-reject vs proceed
+- How JWT iss claim drives internal-firm bypass
+- How presence of caseNumber vs merchantId vs level4Entity drives the resolution path
+- How presence of `iqorgid` vs `iqentities` drives DB2 query selection
+
+#### b) BUSINESS RULES APPLIED
+- Platform enum membership
+- At-least-one-non-blank rule on non-NAP /authorize
+- Platform-equals-PIN rule on `/orgentity` and `/entitytype`
+- merchantId numeric and 16-char-max rule on `/merchant`
+- Either `chain` or `mid` requirement (or neither?) on `/productentitlement`
+- For each: what is checked, expected value, failure outcome.
+
+#### c) DATA TRANSFORMATIONS
+- caseNumber → (levelEntity, level4Entity) mapping
+- DB2 entity rows → API response model mapping (per endpoint)
+- Conditional fields (e.g. `chain` field commented out in `ProductEntitlementResponse`)
+
+#### d) IDEMPOTENCY MECHANISM
+This component is fully read-only. Confirm explicitly: no idempotency mechanism required, no detection key fields, no duplicate-request handling — because no writes occur.
+
+### SECTION 3 — CONTRACTS
+
+#### REST API contracts
+For each of the six endpoints:
+- Method and path
+- Request fields (location: path / query / header / body), types, required/optional
+- Every HTTP status code and the trigger for each
+- Auth model (Bearer JWT, internal-firm bypass applicable or not)
+- Known callers (from repo evidence only)
+- Error body structure
+
+#### Kafka Consumer contracts
+**Not present.** Confirm explicitly: no `@KafkaListener`, no `KafkaConsumer` instantiation, no `spring-kafka` dependency consumed.
+
+#### Kafka Producer contracts
+**Not present.** Confirm explicitly: no `KafkaTemplate.send`, no `ProducerFactory`.
+
+#### Batch / Scheduler contracts
+**Not present.** Confirm explicitly: no `@Scheduled`, no Spring Batch `Job` / `Step` / `ItemReader`, no Kubernetes CronJob.
+
+### SECTION 4 — DEPENDENCIES
+
+For every outbound call (PostgreSQL, DB2, JWT issuer JWKS):
+- Service name / logical target
+- Protocol and auth method (JDBC + HikariCP for DBs; HTTPS GET for JWKS)
+- Purpose — at which step in the flow
+- Connection timeout (state "not configured" if absent)
+- Read / socket timeout (state "not configured" if absent)
+- Query timeout (state "not configured" if absent)
+- Retry: count, delay, backoff type — or "not configured"
+- Circuit breaker: confirm Resilience4j absent
+- Behaviour if unavailable: 500 (uncaught), 500 (caught and re-thrown), silent fall-through, partial degrade — per call site
+
+### SECTION 5 — DATABASE
+
+For every table read (no writes):
+- Schema and exact table name
+- Read-only — confirmed no writes
+- Purpose — at which step in the flow
+- Key columns used in queries (projection list and predicates)
+- Repository or DAO class
+- Whether any read uses `SELECT FOR UPDATE` (it should not)
+- Transaction manager bean used (`wdpTransactionManager` or `coreTransactionManager`)
+
+Confirm explicitly:
+- No table is written by this component
+- The two transaction managers are never combined in a single `@Transactional` boundary
+- Service methods in `AuthorizationServiceImpl` are not `@Transactional`
+
+### SECTION 6 — PLATFORM STANDARD DEVIATIONS
+
+For each, output: COMPLIES / DEVIATES / NOT APPLICABLE, with file:line evidence.
+
+- **DEC-001 Transactional Outbox** — NOT APPLICABLE expected (no Kafka publish, no writes). Confirm.
+- **DEC-003 Kafka Partition Key = merchantId** — NOT APPLICABLE expected (no Kafka). Confirm.
+- **DEC-004 PAN Encryption Before Persistence** — COMPLIES expected (no PAN handled, no writes). Confirm via field-name scan from gap 8.
+- **DEC-005 Manual Kafka Offset Commit** — NOT APPLICABLE expected (no Kafka consumer). Confirm.
+- **DEC-014 Resilience4j Circuit Breakers** — DEVIATES expected (platform-wide VOID). Confirm absence of Resilience4j from `pom.xml` and `src/main`.
+- **DEC-019 No Clear PAN in Persistent Store** — COMPLIES expected (no persistent writes at all). Confirm.
+- **DEC-020 Full At-Least-Once Idempotency** — NOT APPLICABLE expected (read-only service, idempotency intrinsic). Confirm.
+
+### SECTION 7 — SCALING AND DEPLOYMENT
+
+- Kubernetes resource type
+- Replica count (state placeholder verbatim)
+- Memory limit / request
+- CPU limit / request
+- HPA — present or absent (cite manifest)
+- Rolling update strategy — `maxSurge`, `maxUnavailable`, `minReadySeconds` (and confirm placement at `spec.minReadySeconds` vs `spec.template.spec.minReadySeconds`)
+- PodDisruptionBudget — present or absent
+- Topology spread — confirm the label-mismatch defect: pod label vs constraint matchLabels, with file:line for both
+- Liveness / readiness / startup probes — paths, ports, timing parameters, backing mechanism (Actuator group, additional-path)
+- Container port across all locations (consistency check)
+- Observability — OTel agent annotation, Actuator endpoints, Logstash appender, Micrometer Prometheus
+
+If `resources.yaml`, Helm chart, `values.yaml`, `Dockerfile`, HPA manifest, or PDB manifest is NOT in the repo, state "not in repo" for that item and list what IS in the repo so the report distinguishes absent-from-repo from absent-from-production.
+
+### SECTION 8 — PLANNED AND INCOMPLETE WORK
+
+- **Commented-out code** — every block, with file:line and what it did:
+  - `ProductEntitlementResponse.java` chain field
+  - `ProductEntitlementServiceImpl` `setChain()` calls
+  - `MerchantDaoImpl` three native SQL originals
+  - `MerchantController` `validateOrgId()` call
+  - Any others found
+
+- **Unused dependencies in `pom.xml`** — every dependency declared with zero `import` references in `src/`:
+  - `ProductEntitlementRepository` is the known Java-side dead injection. Look for pom-level dead deps too.
+
+- **Feature flags active in production** — confirm zero. List `gcp_env`-driven Swagger gate as the only environment-conditional logic.
+
+- **TODO / FIXME / XXX / HACK references** — full grep, file:line and verbatim text. Confirm zero or list every match.
+
+- **Stub implementations returning fixed responses** — confirm zero or list every site.
+
+- **Properties configured but never read** — every YAML key with no `@Value`, no `@ConfigurationProperties` binding, no profile-only consumer. Specifically resolve the `${logstash_server_host_port}` question from gap 9 — is it consumed by `logback-spring.xml` (in repo or not) or genuinely orphaned?
+
+### SECTION 9 — CONFIDENCE ASSESSMENT
+
+For each of Sections 1–8, state:
+- Confidence: High / Medium / Low
+- Basis: direct source reading / inferred from pattern / not determinable from source alone
+
+### SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE
+
+List every claim from the existing component document that you could NOT cross-check against code or config — neither confirmed nor contradicted. These will need follow-up from the team or runtime observation. Examples expected:
+- Production replica counts (XL Deploy values not in repo)
+- Production trusted JWT issuer URLs (env-var values not in repo)
+- Effective `gcp_env` values per environment
+- Actual cross-repo callers of the four hierarchy data API endpoints
+- Whether `logstash_server_host_port` is consumed by a runtime-mounted Logback config
+
+---
+
+## OUTPUT RULES
+
+- Cite file paths and line ranges for every concrete claim. Format: `<relative/path>:Lstart-Lend`
+- State "not determinable from source" for any item the code does not reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms existing documentation, a one-paragraph "still accurate — file:lines" is acceptable.
+- If you would restate something the reference document already states verbatim, replace that prose with `Document accurate — <file>:<lines>`. Do not restate.
+- Do not invent file paths. If a file is referenced in the existing doc but you cannot locate it, list it under `REFERENCED BUT NOT FOUND IN REPO` at the end.

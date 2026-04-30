@@ -1,0 +1,447 @@
+You are auditing the WDP component UserAccessManagementService (COMP-02)
+in the repository gcp-user-access-management-service. A prior pass already
+produced a DRAFT architecture document. Your job is to CONFIRM OR CORRECT
+the items listed under "ALREADY DOCUMENTED" from source, and to CLOSE the
+items listed under "GAPS TO FILL" by reading the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that explicitly
+and label it "not determinable from source". Do NOT guess. Do NOT
+summarise without evidence. Do NOT use the existing document as a
+substitute for source — treat it as a hypothesis to verify.
+
+================================================================
+REFERENCE DOCUMENT
+================================================================
+The reference document is WDP-COMPONENTS.md § 1.2 UserAccessManagementService
+(provided alongside this prompt). Treat every fact in it as a HYPOTHESIS,
+not ground truth. For each documented claim:
+
+  (a) Confirm with file:line, OR
+  (b) Write a CORRECTION block in this exact form:
+        DOC SAYS:        <verbatim claim from § 1.2>
+        SOURCE SHOWS:    <what the code actually says, with file:Lstart-Lend>
+        SECTION TO FIX:  <which section of the new component file
+                          this changes — e.g. "Authorization model",
+                          "Risks & Constraints", "Scaling and Deployment">
+
+At the end of the report, under Section 10, list every documented claim
+that could NOT be verified from source — neither confirmed nor contradicted.
+
+Do NOT re-document items in "ALREADY DOCUMENTED" from scratch. If the
+document is accurate verbatim for a given line, write:
+  "Document accurate — <file>:<lines>"
+and move on.
+
+================================================================
+ALREADY DOCUMENTED — confirm or correct each item
+================================================================
+A1.  Repository name is `gcp-user-access-management-service`.
+A2.  Tech stack: Spring Boot 3.5 / Java 17.
+A3.  Two responsibilities served by one deployable: (a) reference-data
+     CRUD for NAP merchant entity hierarchy + MIDs + ACL; (b) runtime
+     authorization via POST /authorize for NAP only.
+A4.  Acts as proxy/orchestrator to SunGard IdP (two instances,
+     firm-based routing) for all user lifecycle operations.
+A5.  No user credentials are stored by this service.
+A6.  Does NOT mint or issue JWT tokens.
+A7.  /authorize implements NAP only. CORE/VAP/LATAM/PIN return 400
+     "Implementation is in progress" (stub in production).
+A8.  Bulk onboarding writes CSV/XLSX to AWS S3 region eu-west-2 at
+     RECEIVED/{ENV}/{filename}. Downstream processing happens
+     elsewhere — UAMS does NOT process the file content.
+A9.  ACL is maintained for downstream consumers — UAMS does not
+     consult it for its own authorization decisions.
+A10. Authorization model is 2-layer: Spring Security JWT validation
+     + entity-scope check.
+A11. NAP-platform JWT claims: `napParentEntity`, `napChildEntities`
+     (distinct from PIN's `iqorgid`/`iqentities`).
+A12. Internal Worldpay callers (issuer-claim based) bypass all
+     entity-scoping. Confirm the exact issuer-claim pattern.
+A13. Two PostgreSQL datasources: `nap` schema (hierarchy / MIDs /
+     relationships / case read) + `wdp` schema (ACL).
+A14. HikariCP defaults of 10 connections per datasource. Not tuned.
+A15. Replica count is an XL-Deploy placeholder; actual values not in
+     repo.
+A16. Memory limit 2048Mi / request 1024Mi. No CPU limits or requests.
+A17. No HPA configured.
+A18. Topology spread constraint configured but non-functional —
+     label mismatch. Identify which label is on the constraint vs
+     which is on the pod template.
+A19. No timeouts on outbound RestTemplate — IdP calls can block
+     threads indefinitely.
+A20. NPE defect in `updateEntity` — entity-existence guard inverted,
+     producing 500 instead of 400 on missing entity.
+A21. @Async methods do not specify the executor by name — may fall
+     through to unbounded SimpleAsyncTaskExecutor.
+A22. S3 region hardcoded to eu-west-2 regardless of environment.
+A23. In-memory aggregation of entity/merchant counts — heap pressure
+     under volume.
+A24. DEC-021 confirmed defect: `saveChildWithMerchant` uses
+     `wdpTransactionManager` instead of `napTransactionManager`.
+A25. OpenTelemetry Java agent injected at runtime.
+
+For each A1–A25:
+  - Confirm with file:line, OR
+  - CORRECTION block as defined above.
+
+================================================================
+GAPS TO FILL — answer each from source
+================================================================
+G1.  Full REST endpoint inventory. Every controller class. For each
+     endpoint: HTTP method, URL path, controller method, request
+     body type, response body type, every HTTP status code returned
+     (and the trigger), authorization rule (annotation or in-method),
+     known callers if identifiable. Group by resource family
+     (entity / merchant / user / ACL / authorize / bulk-upload /
+     health / swagger).
+
+G2.  POST /authorize contract — request body field list, response
+     body on success (empty? echo? boolean?), error bodies on 400 /
+     403 / 500, exact triggers for each status. Cite the controller
+     method + service method.
+
+G3.  Internal-firm bypass — the exact JWT claim or issuer pattern
+     that triggers bypass. Cite the check. Compare the pattern to
+     COMP-03 CHAS (`iss contains us_worldpay_fis_int`) — same
+     string? Different?
+
+G4.  NAP entity-scope check — the exact SQL or JPA query against
+     `nap.nap_entity_rel`. Which JWT claims feed it. What
+     no-match path returns. Whether chain-first / merchant-fallback
+     applies (CHAS does this — check whether UAMS does too).
+
+G5.  `nap.case` read — confirm UAMS reads it for caseNumber→
+     merchantId resolution. If yes, cite the query and the calling
+     endpoint. If no, state that explicitly.
+
+G6.  Non-NAP platform stub — confirm 400 "Implementation is in
+     progress" returned for CORE / VAP / LATAM / PIN. Cite the
+     branch. State the exact response body.
+
+G7.  Entity management endpoints — enumerate every create / update /
+     delete / query endpoint for parent entity, child entity,
+     merchant, entity relationships. For `updateEntity`, locate the
+     inverted NPE branch and document the exact line and failure
+     mode.
+
+G8.  User lifecycle endpoints — every endpoint that proxies to
+     SunGard IdP. For each: HTTP path, IdP endpoint called, request
+     transformation, response transformation, error mapping.
+     Confirm zero credential persistence by grepping for any
+     password-shaped field write.
+
+G9.  SunGard IdP integration — the two-instance routing decision.
+     Which firm value selects which instance. Auth scheme on each
+     (static Bearer? API key header? OAuth2 client credentials?).
+     Per-call connect timeout, read timeout, retry, circuit breaker.
+     Compare to COMP-30 pattern (`Bearer + X-SunGard-IdP-API-Key`,
+     three IDP variants: internal / external standard / external MFD).
+
+G10. ACL — exact table name in `wdp` schema, full column list,
+     write triggers (which endpoints), read triggers, any inferred
+     downstream consumers (from comments, package names, or test
+     fixtures).
+
+G11. Cross-schema atomicity — every endpoint that writes both `nap`
+     and `wdp` schemas. For each: confirm there is no XA / no
+     ChainedTransactionManager. Document the failure-window: if the
+     `nap` write succeeds and the `wdp` write fails (or vice
+     versa), what state remains?
+
+G12. DEC-021 scope expansion — every method that uses
+     `wdpTransactionManager` while writing `nap.*` tables, OR uses
+     `napTransactionManager` while writing `wdp.*` tables. Not just
+     `saveChildWithMerchant`. Cite each occurrence.
+
+G13. S3 bulk upload — the controller endpoint, multipart vs base64,
+     file-size cap, S3 client configuration: region source
+     (hardcoded vs env), credential chain, connect/read timeouts,
+     retry, circuit breaker. The response payload (does it return
+     a job ID? a 200 with no body? a presigned URL?).
+
+G14. @Async inventory — every method bearing `@Async`. For each:
+     does it specify an executor name? Is a matching `TaskExecutor`
+     bean defined? If not, confirm fall-through to
+     `SimpleAsyncTaskExecutor` via grep on
+     `setTaskExecutor` / `@EnableAsync` config.
+
+G15. Kafka posture — grep for `KafkaTemplate`, `@KafkaListener`,
+     `ProducerFactory`, `ConsumerFactory`, `kafka` in
+     application*.yml. Confirm UAMS is Kafka-free OR document any
+     Kafka touchpoint found.
+
+G16. DEC compliance posture — produce a verdict per DEC:
+       DEC-001 Transactional Outbox — COMPLIES / DEVIATES / N/A
+       DEC-003 Kafka partition key = merchantId — COMPLIES / DEVIATES / N/A
+       DEC-004 PAN encryption before persistence — COMPLIES / DEVIATES / N/A
+       DEC-005 Manual Kafka offset commit — COMPLIES / DEVIATES / N/A
+       DEC-019 No clear PAN in persistent store — COMPLIES / DEVIATES / N/A
+       DEC-020 Full at-least-once idempotency — COMPLIES / DEVIATES / N/A
+     Each verdict cited to file:line.
+
+G17. K8s manifest (resources.yml / deployment.yml / values.yaml /
+     Helm chart) — capture: replicas (placeholder string verbatim),
+     liveness probe, readiness probe, startup probe, container
+     port, memory and CPU limits and requests, HPA, PDB, topology
+     spread (constraint label vs pod-template label), rolling
+     update maxSurge / maxUnavailable, OTel injection annotation,
+     Logstash appender config, secrets list, image pull policy.
+     If a K8s manifest, Helm chart, or values.yaml is NOT in the
+     repo, state "not in repo" for this section and explicitly list
+     what IS in the repo (Dockerfile, application.yaml,
+     resources.yaml, etc.) so we know what is missing vs absent.
+
+G18. Spring Security configuration — the JWT issuer trust list
+     (config key + how many issuers), every whitelisted path that
+     bypasses JWT validation (health, swagger, actuator, etc.),
+     method-level security annotations if present
+     (`@PreAuthorize`, `@Secured`).
+
+G19. Idempotency mechanisms — duplicate-detection on entity create,
+     child entity create, merchant create, user upsert, ACL write.
+     For each write endpoint state: detection-key, duplicate
+     behaviour, gap (crash window, replica race, no DB constraint).
+
+G20. `updateEntity` NPE — locate the inverted guard. Cite the line.
+     Document what the caller receives (exception type, mapped
+     status, response body).
+
+G21. In-memory aggregation — which endpoint(s) build the
+     aggregation, what tables they query, whether result-set size
+     is bounded, whether `Streamable`/`Page`/`Slice` is used vs
+     `findAll`.
+
+G22. Topology spread label drift — exact label key/value on the
+     constraint vs exact label key/value on the pod template.
+     Confirm the mismatch class.
+
+G23. `x-correlation-id` propagation — is the header read by an
+     `HttpInterceptor` or filter, written to MDC, and forwarded on
+     outbound IdP/S3 calls? Cite the interceptor or absence.
+
+G24. Logstash appender — `LogstashTcpSocketAppender` configured?
+     `logstash_server_host_port` populated as a non-empty config
+     value? Console-only fallback? (COMP-21 has the empty-secret
+     pattern — check for parity.)
+
+================================================================
+REPORT STRUCTURE — use these section headings, in order
+================================================================
+
+── SECTION 1 — PROCESSING FLOW ───────────────────────────────────
+Mandatory. Use these exact sub-headings.
+
+a) STEPS IN ORDER
+   Cover BOTH high-level paths separately:
+     - Path 1: POST /authorize (NAP runtime authorization)
+     - Path 2: Reference-data CRUD endpoints (entity, merchant,
+       child entity, merchant relationship, ACL)
+     - Path 3: User lifecycle proxy to SunGard IdP
+     - Path 4: S3 bulk onboarding upload
+   For each step in each path: what happens, which service or
+   table is called, what the output of that step is. Cite
+   file:lines.
+
+b) DECISION POINTS
+   Every branch in each flow — the condition evaluated and every
+   possible outcome with the path it leads to. Cite file:lines.
+   In particular:
+     - Internal-firm bypass branch
+     - Platform=NAP vs platform∈{CORE,VAP,LATAM,PIN} branch
+     - caseNumber-present vs merchantId-present vs both-absent
+       branch
+     - Firm-based IdP-instance routing branch
+
+c) SKIP AND BYPASS CONDITIONS
+   Any condition that short-circuits processing. What is checked,
+   what value triggers the skip, where control goes after the skip.
+   Internal-firm bypass is the primary one — capture its full
+   pre-bypass path coverage.
+
+d) FAILURE PATH PER STEP
+   For each step that calls an external dependency (IdP, S3,
+   PostgreSQL nap, PostgreSQL wdp), state what happens if that
+   call fails. Per step, not globally. State exception type
+   caught, retry count if any, post-exhaustion behaviour. Include
+   the cross-schema partial-failure window for endpoints that
+   write both schemas.
+
+e) MULTIPLE ENTRY PATHS
+   UAMS exposes multiple endpoint families. Describe each and
+   state where they converge or confirm they are fully
+   independent. Confirm that there is NO Kafka listener, NO
+   scheduler, NO webhook — REST is the only entry mechanism.
+
+f) STATE AT EACH STEP
+   For stateful endpoints (entity / user / merchant create &
+   update), state any status field on the row and how it
+   transitions. For /authorize this is N/A — state that
+   explicitly.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ──────────────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   Platform routing on /authorize. Firm routing on IdP calls
+   (which firm value → which IdP instance). Field-driven branches
+   on stateful endpoints (e.g. orgId match check). Cite each.
+
+b) BUSINESS RULES APPLIED
+   Validation, eligibility, or rule applied inside this component
+   (not delegated). What is checked, expected value, failure
+   outcome. Includes JWT claim presence checks, request body
+   field-presence checks, ACL constraint checks if any.
+
+c) DATA TRANSFORMATIONS
+   Mappings between request payload and stored entity for
+   create/update endpoints. Mappings between stored entity and
+   response payload. Mappings between WDP request and SunGard
+   IdP request shape. Note any unconditional defaults applied.
+
+d) IDEMPOTENCY MECHANISM
+   Per write-endpoint. Detection-key fields. Duplicate behaviour.
+   Gap analysis: crash windows, replica races, at-most-once
+   scenarios, absence of DB unique constraints.
+
+── SECTION 3 — CONTRACTS ─────────────────────────────────────────
+
+For REST API:
+  Every endpoint: method, path, request fields, response fields,
+  every HTTP status code and its trigger, auth model, known
+  callers (where identifiable from comments/tests/Swagger), error
+  body structure.
+
+For Kafka Consumer / Producer / Batch / Scheduler:
+  State "not present" — UAMS is REST-only.
+
+── SECTION 4 — DEPENDENCIES ──────────────────────────────────────
+
+For every outbound call:
+  Service name / logical target
+  Protocol and auth method
+  Purpose — at which step in the flow
+  Connection timeout (state "not configured" if absent)
+  Read timeout (state "not configured" if absent)
+  Retry: count, delay, backoff type
+  Circuit breaker: Resilience4j configured?
+    If yes — failure rate threshold, wait duration, half-open
+    permitted calls.
+    If no — state explicitly "not configured".
+  Behaviour if unavailable: halt / skip / degrade / item lost
+
+Targets to cover:
+  - SunGard IdP — two instances (state both, with the routing
+    rule that selects between them)
+  - AWS S3 — bulk-upload bucket, region resolution
+  - PostgreSQL nap (HikariCP)
+  - PostgreSQL wdp (HikariCP)
+  - Any unexpected REST target found in source
+
+── SECTION 5 — DATABASE ──────────────────────────────────────────
+
+For every table read or written:
+  Schema and exact table name
+  Read or write — state clearly
+  Purpose — at which step in the flow
+  Key columns used in queries or writes
+  Whether writes are in the same transaction as other writes at
+  that step
+  Transaction manager bean used (`napTransactionManager` vs
+  `wdpTransactionManager`)
+  Whether SELECT FOR UPDATE / row locks used
+
+Confirm explicitly: any tables NOT touched that the existing doc
+might have implied. In particular, confirm whether `nap.case` is
+read by UAMS (legacy DRAFT implies it; verify).
+
+The DEC-021 occurrence on `saveChildWithMerchant` MUST be cited
+explicitly with file:lines, AND every other DEC-021-class
+occurrence (wrong TX manager for the schema being written) MUST
+be enumerated separately.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ──────────────────────
+For each standard, output:
+  COMPLIES / DEVIATES / NOT APPLICABLE
+with evidence cited to file:lines.
+
+  DEC-001: Transactional outbox — used? Which table? Outbox write
+    in same transaction as business write?
+  DEC-003: Kafka partition key = merchantId? If not, what is it
+    and why? (Likely N/A — no Kafka.)
+  DEC-004: PAN encryption — encrypted before any persistent write?
+    Clear PAN ever written? Which service handles encryption?
+    (Likely N/A — UAMS handles no PAN.)
+  DEC-005: Kafka offset — committed manually after all
+    processing? Or auto / pre-ACK? Exact timing relative to each
+    write. (Likely N/A — no Kafka consumer.)
+  DEC-019: Clear PAN — does this component write clear PAN to any
+    persistent store? (Likely N/A.)
+  DEC-020: Idempotency — full at-least-once implemented? If not,
+    what gap exists? (Almost certainly DEVIATES on entity/user/
+    merchant/ACL writes.)
+  DEC-021: Wrong transaction manager — confirm the
+    `saveChildWithMerchant` occurrence. Enumerate any other
+    occurrence of TX-manager / target-schema mismatch.
+
+── SECTION 7 — SCALING AND DEPLOYMENT ────────────────────────────
+  Kubernetes resource type
+  Replica count — exact placeholder string and the variable name
+  Memory and CPU limits and requests
+  HPA — present or absent (cite the manifest)
+  Rolling update strategy
+  PodDisruptionBudget — present or absent
+  Topology spread — functional or label mismatch (cite the exact
+  drifted label)
+  Liveness / readiness / startup probes
+  Ports exposed
+  Observability — OTel agent, Actuator, Logstash, Prometheus
+
+If the K8s manifest, Helm chart, or values.yaml is NOT in the
+repo, state "not in repo" for this entire section and explicitly
+list what IS in the repo (Dockerfile, application.yaml, etc.) so
+we know what is missing vs absent.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ───────────────────────
+  Commented-out code — what it did and why
+  Unused dependencies in pom.xml / build.gradle
+  Feature flags active in production — exact flag names and
+  behaviour, plus default value if env var unset
+  TODO / FIXME references — file:line and verbatim text
+  Stub implementations returning fixed responses (the non-NAP
+  platform branch in /authorize is the known case — list any
+  others)
+  Properties configured but never read (search for @Value or yaml
+  keys with no injection point)
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ─────────────────────────────
+For EACH of sections 1 through 8, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+  determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ─────────────────
+List every claim from § 1.2 and from the GAPS TO FILL list that
+could not be cross-checked against code or config — neither
+confirmed nor contradicted. These will need follow-up from the
+team or runtime observation.
+
+================================================================
+OUTPUT RULES
+================================================================
+- Cite file paths and line ranges for every concrete claim.
+  Format: <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does
+  not reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms
+  existing documentation, a one-paragraph "still accurate —
+  file:lines" is acceptable.
+- If you would restate something the reference document already
+  states verbatim, replace that prose with "Document accurate —
+  <file>:<lines>". Do not restate.
+- Do not invent file paths. If a file is referenced in the
+  existing doc but you cannot locate it, list it under
+  "REFERENCED BUT NOT FOUND IN REPO" at the end.

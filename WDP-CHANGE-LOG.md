@@ -2204,6 +2204,1039 @@ not enforced by code.
 consume entries from this section and move them to the most recent **Reconciled**
 section above.*
 
+
+
+---
+
+### 2026-04-29 — COMP-42 BENConsumer · v1.0 DRAFT → v2.0 DRAFT
+
+**Source:** `wdp-ben-consumer` — source-verified by GitHub Copilot CLI 2026-04-29.
+Architect confirmation pending.
+
+**Nature of change:** Correction pass — first source-verified audit of COMP-42
+(file was previously a v1.0 Copilot-extracted DRAFT that had not been reconciled
+in the 2026-04-18/23/25 cycle). Five material corrections identified, two new
+DEC ratings added, DEC-014 reframed as VOID (now Risk), three probe absences
+confirmed, container port surfaced, and the `wdp.outgoing_event_outbox` writers
+list corrected platform-wide.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- 🔴 **CRITICAL** — `wdp.outgoing_event_outbox` writers list correction.
+  Current Section 2 row (line 99) and Section 4 shared-table row (line 241)
+  list writers as **COMP-17, COMP-41, COMP-43**. **Add COMP-42** with:
+    - `channel_type = BEN_EVENTS`
+    - `created_by` / `updated_by` constant = `WBENC`
+    - Status set used: PUBLISHED / SUCCESS / FAILED / ERROR / PENDING_DEFERRED
+      (SKIPPED defined in enum but never written)
+- Update Section 4 shared-table risk note: now FOUR consumers writing
+  `wdp.outgoing_event_outbox` discriminated by `channel_type`. Each writer
+  uses its own constant. **No DB-level UNIQUE constraint visible in any of
+  the four repos** — DBA confirmation required.
+- Update Section 4 cross-action interference / predecessor-scope notes:
+  COMP-42 predecessor scope is `caseNumber + channel_type=BEN_EVENTS + id 
+  currentId` applied as in-memory filter after `findByCaseNumber` returns
+  ALL channel_types. Same scope-pattern class as COMP-17 (predecessor scope
+  is per-channel, not per-action_seq).
+
+**WDP-KAFKA.md**
+- Section 5 (Database-Backed Outbox Pattern) row for `wdp.outgoing_event_outbox`
+  — add COMP-42 to writers list with `channel_type=BEN_EVENTS` and
+  `created_by=WBENC`. Reflects the same correction as WDP-DB.md.
+- Section 3 (Pre-ACK consumers row, line 85) for COMP-42 — already lists
+  pre-ACK position but should be tagged as "✅ Confirmed from COMP-42 source"
+  (was unmarked).
+- Section 4 (Partition-key inbound observation, line 123) — confirmation
+  reaffirms variable name `caseNumber` of type `String` via
+  `@Header(KafkaHeaders.RECEIVED_KEY)`. Producer-side determination remains
+  a COMP-18 OQ.
+- No new topic, no new consumer group, no new producer cluster registration.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: COMP-42 is the FOURTH writer of `wdp.outgoing_event_outbox`
+  (`channel_type=BEN_EVENTS`, writer constant `WBENC`). Previous handover
+  fact list and WDP-DB.md v2.1 omitted COMP-42 from the writers list — this
+  is a known gap from the v1.0 doc not having been audited in the 2026-04-25
+  reconciliation pass.
+- Add: COMP-42 has zero `@Transactional` in `src/main` — all outbox writes
+  are bare auto-commit JPA `save()` calls. Same pattern class as COMP-14
+  (RISK-A) and COMP-43.
+- Add: COMP-42 has all three K8s probes ABSENT — no liveness, no readiness,
+  no startup. Same operational pattern as COMP-14, COMP-12, COMP-07,
+  COMP-21.
+- Add: COMP-42 BEN product cache is `@Cacheable` lazy with `@Scheduled`
+  `@CacheEvict` on `${app.cache-delay-hours}` fixed delay — NOT pre-warmed
+  at startup as v1.0 doc implied.
+- Add: COMP-42 IDP token is dual-mode — lazy ThreadLocal for per-event
+  CMS/CAS calls, eager (`fetchNewToken=true`) for the Display Code Service
+  startup call only.
+- Add: COMP-42 predecessor lookup loads ALL channel_types for the
+  caseNumber from DB then filters to BEN_EVENTS in-memory — unbounded
+  query per caseNumber.
+
+**Resolved open questions**
+- "COMP-42 outbox involvement" — RESOLVED. COMP-42 IS a writer of
+  `wdp.outgoing_event_outbox` with `channel_type=BEN_EVENTS`, `created_by=WBENC`.
+  WDP-DB.md v2.1 row needs correction.
+- "COMP-42 BEN delivery transport" — RESOLVED (was already in handover line
+  280). Confirmed Kafka-only via BEN-owned MSK cluster — no REST webhook.
+- "COMP-42 partition key on outbound BEN producer" — RESOLVED. `merchantId`
+  from `CaseSearchResponse`. DEC-003 compliant.
+- "COMP-42 PAN handling" — RESOLVED. DEC-019 / DEC-004 compliant.
+  `cardNumberLast4` is the only card field forwarded; full PAN never
+  persisted, never published.
+- "COMP-42 spring-retry direct-dependency status" — RESOLVED. Transitive
+  via spring-kafka — not declared in pom.xml. Same pattern as COMP-41
+  RISK-080.
+- "COMP-42 OAuth2 starters usage" — RESOLVED. Both
+  `spring-boot-starter-oauth2-resource-server` and
+  `spring-boot-starter-oauth2-client` are dead — zero usage in `src/main`.
+
+**New open questions**
+- **OQ-COMP42-1: Scheduler3 channel_type filter behaviour for BEN_EVENTS.**
+  Same filter-class question as COMP-41 (OQ-COMP41-1). Does Scheduler3 read
+  `channel_type=BEN_EVENTS` rows at FAILED / PENDING_DEFERRED? Does it ever
+  read PUBLISHED for any channel? Cross-component scan against COMP-12
+  source needed. **Action: Claude Code follow-up on COMP-12.**
+- **OQ-COMP42-2: BEN platform idempotency.** A retry-driven re-publish (or
+  a manual recovery of a PUBLISHED-orphan) will deliver the same
+  `BENNotificationEvent` to BEN twice. Does BEN deduplicate at its end?
+  Same question class as COMP-41 (Signifyd). **Action: BEN integration
+  team confirmation.**
+- **OQ-COMP42-3: DB-level UNIQUE constraint on
+  `(idempotency_id, channel_type, event_timestamp)`.** Now four repos
+  (COMP-17, COMP-41, COMP-42, COMP-43) all confirm "no UNIQUE visible in
+  source." **Action: DBA confirmation — does the constraint exist at the
+  DB level, or is per-`channel_type` race protection only operational
+  (`concurrency=1`)?**
+- **OQ-COMP42-4: Production runtime values** — `${ben_topic}`,
+  `${ben_bootstrap_servers}`, `${ben_product_url}`, `${ben_product_license}`,
+  `${max_poll_records}`, `${max_poll_interval}`, `${session_timeout_ms}`,
+  `${heartbeat_interval_ms}`, `${app.cache-delay-hours}`, `replicas-wdp-ben-consumer`.
+  All XL Deploy / K8s secret resolved — not in source. **Action: Environment
+  config / team confirmation.**
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **No new ADR candidates from COMP-42 alone.** All findings reinforce
+  existing ADR/RISK patterns:
+  - DEC-001 partial-deviation pattern (PUBLISHED-as-initial-status,
+    inline-publish-no-relay) — fourth instance after COMP-18, COMP-41, COMP-43
+  - DEC-005 pre-ACK pattern — fourth instance after COMP-14, COMP-41, COMP-43
+  - DEC-014 VOID — sixth-component evidence base
+  - DEC-020 deviation pattern — fourth instance after COMP-14, COMP-41, COMP-43
+- **Reaffirms existing candidate ADR backlog (handover line 128):**
+  - "PUBLISHED-orphan / Scheduler3 channel_type-filter contract" —
+    COMP-42 adds `channel_type=BEN_EVENTS` to the scope of this candidate
+  - "DB-level UNIQUE on `wdp.outgoing_event_outbox`" — COMP-42 is the
+    fourth writer requiring this contract clarification
+
+**WDP-ARCHITECTURE.md**
+- No topology change. COMP-42 is already shown in the BEN integration path.
+- Minor wording correction candidate for the next reconciliation pass:
+  if any version of WDP-ARCHITECTURE.md still describes BEN delivery as
+  "webhook," correct to "Kafka publish to BEN-owned MSK cluster (separate
+  SASL/JAAS)." Confirmed already corrected in WDP-INTEGRATIONS.md v2.0
+  per handover.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+
+New / updated RISK candidate rows for the next reconciliation pass:
+
+| Risk ID candidate | Severity | Detail |
+|---|---|---|
+| RISK-COMP42-A | 🔴 HIGH | PUBLISHED-orphan crash window Step 4 → Step 13. Same class as RISK-040 (COMP-41) and the COMP-43 crash-window. Scheduler3 invisibility — no automatic recovery. |
+| RISK-COMP42-B | 🟡 MEDIUM | All three K8s probes ABSENT — stuck consumer thread will not restart pod. Combined with `concurrency=1` and infinite REST timeouts → operational stall risk. |
+| RISK-COMP42-C | 🟡 MEDIUM | Bad payload silently dropped — `ErrorHandlingDeserializer` + empty `CommonErrorHandler`. Same class as RISK-077 (COMP-41). |
+| RISK-COMP42-D | 🟡 MEDIUM | All six outbound dependencies have no read/connect timeout configured. Hung downstream blocks consumer indefinitely. |
+| RISK-COMP42-E | 🟢 LOW | Predecessor lookup loads all channel_types for caseNumber, filters to BEN_EVENTS in memory. Unbounded per-case query, no pagination, no LIMIT. |
+| RISK-COMP42-F | 🟢 LOW | spring-retry transitive (not declared in pom.xml). Same class as RISK-080 (COMP-41). Future Spring Boot upgrade could break BEN Product retry silently. |
+| RISK-COMP42-G | 🟢 LOW | Outer-catch ERROR write may itself fail silently — same class as COMP-08 writer-ACK hazard. |
+| RISK-COMP42-H | 🟢 LOW | Two dead OAuth2 starter dependencies in pom.xml (resource-server + client) — security surface and confusion. |
+
+**WDP-INTEGRATIONS.md**
+- BEN integration entry — already corrected in v2.0 per handover
+  (Kafka-only via BEN-owned MSK cluster; no REST webhook). No further
+  change.
+- BEN Product API — confirm in next reconciliation pass: GET with
+  static license-key auth (`Bearer ${ben_product_license}`), Spring
+  Retry 3 × 1000ms, no timeout, no circuit breaker. Same dependency
+  resilience class as the other five COMP-42 dependencies.
+
+**WDP-COMP-INDEX.md**
+- Status update: line 642 row from `📝 DRAFT` to
+  `📝 DRAFT 🔍 v2.0 (2026-04-29)` — source-verified, architect
+  confirmation pending. Aligns with COMP-43's status format.
+- Description block (lines 663–669) — no rewrite needed; already
+  corrected in 2026-04-25 to confirm Kafka-only delivery via BEN-owned
+  MSK cluster. Optional minor addition: add `channel_type=BEN_EVENTS`
+  for parallelism with COMP-41 (`GP_EVENTS`) and COMP-43 (`CORE_EVENTS`)
+  description blocks.
+
+#### Deviation flags for COMP-42
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 | ⚠️ PARTIAL | 🔴 HIGH |
+| DEC-003 | ✅ COMPLIES (outbound producer; inbound consumer-side observation only — producer-side determination is COMP-18 OQ) | — |
+| DEC-004 | ✅ NOT APPLICABLE / COMPLIES | — |
+| DEC-005 | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-014 | ⛔ VOID — recorded as Risk only | 🟢 LOW (per-component evidence row) |
+| DEC-019 | ✅ COMPLIES | — |
+| DEC-020 | ⛔ DEVIATES | 🔴 HIGH |
+
+**DEC-001 PARTIAL narrative.** `wdp.outgoing_event_outbox` is used as an
+outbox table, but: (1) initial status is `PUBLISHED` (set before BEN Kafka
+publish), (2) outbox INSERT and offset commit are NOT atomic — zero
+`@Transactional` in `src/main`, (3) no relay/poller in this codebase —
+publish is inline in the consumer thread, (4) recovery depends on COMP-12
+Scheduler3 which reads only FAILED / PENDING_DEFERRED. Same pattern
+class as COMP-18, COMP-41, COMP-43 — fourth confirmed instance.
+
+**DEC-005 DEVIATES narrative.** `MANUAL_IMMEDIATE` + `syncCommits=true`
+acknowledge at Step 4 — after the idempotency DB INSERT, but BEFORE the
+CMS REST call (Step 6), BEN Product call (Step 7), CAS REST call
+(Step 10), BEN Kafka publish (Step 12), and the final outbox status
+UPDATE (Step 13). Crash between Step 4 and Step 12 → committed offset
+with no BEN notification, stale PUBLISHED row, no automatic recovery.
+
+**DEC-014 VOID narrative.** No Resilience4j artifact in `pom.xml`. Zero
+`@CircuitBreaker` / `@Bulkhead` / `@RateLimiter` / `@TimeLimiter` matches
+in `src/main`. Six outbound dependencies (IDP, CMS, CAS, BEN Product,
+Display Code, BEN Kafka) all unprotected. Per the 2026-04-25 strengthened
+evidence note in DEC-014, this is recorded as a Risk row, not a deviation.
+
+**DEC-020 DEVIATES narrative.** Pre-ACK at Step 4 means the broker will
+not redeliver if processing fails post-ACK. End-to-end at-least-once
+relies on Scheduler3 driving FAILED / PENDING_DEFERRED rows. PUBLISHED-
+orphans (Step 4 → Step 13 crash) have no recovery path. The idempotency
+SELECT-then-INSERT runs as separate short JPA transactions with no
+DB-level UNIQUE constraint visible — operational `concurrency=1` is the
+sole protection.
+
+#### Remaining gaps after this entry
+
+- **OQ-COMP42-1 (Scheduler3 BEN_EVENTS filter behaviour)** — needs Claude
+  Code follow-up on the COMP-12 source. Exact question to ask:
+  > In `wdp-inbound-dispute-event-scheduler` (COMP-12), specifically
+  > Scheduler3, does the FAILED / PENDING_DEFERRED query against
+  > `wdp.outgoing_event_outbox` filter by `channel_type` or by some other
+  > criterion? Does it read `channel_type='BEN_EVENTS'` rows? Does it
+  > ever read `status='PUBLISHED'` for any channel? Cite the JPQL/SQL
+  > and the schedule cron for Scheduler3.
+- **OQ-COMP42-2 (BEN-side idempotency)** — BEN integration team
+  confirmation. Cannot be answered from any WDP source.
+- **OQ-COMP42-3 (DB-level UNIQUE constraint)** — DBA confirmation. Now
+  spans four repos (COMP-17, COMP-41, COMP-42, COMP-43). Cannot be
+  answered from any component repo.
+- **OQ-COMP42-4 (production runtime values)** — environment config /
+  team confirmation. Replica count, BEN topic name, BEN bootstrap
+  servers, BEN product URL, BEN product license, all max-poll / session
+  / heartbeat / cache values. Not in source by design.
+- **Runtime observation gaps** (Copilot CLI cannot answer on a re-run):
+  - Whether the actual production `wdp.outgoing_event_outbox` table has
+    a UNIQUE constraint at the DB level.
+  - Whether BEN-side deduplicates duplicate `BENNotificationEvent`s.
+  - Actual production volumes of BEN_EVENTS rows accumulating in
+    `wdp.outgoing_event_outbox` (capacity-planning input).
+  - Frequency at which `@Scheduled` `@CacheEvict` clears the BEN product
+    cache — value held in `${app.cache-delay-hours}` K8s config.
+
+#### Doc status after this change
+- `WDP-COMP-42-BEN-CONSUMER.md` → `v2.0 DRAFT` — source-verified
+  2026-04-29 · architect confirmation pending.
+---
+### 2026-04-29 — COMP-40 VisaResponseQuestionnaire · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `gcp-visa-respond-questionnaire-consumer` — source-verified by
+GitHub Copilot CLI on 2026-04-29. Architect confirmation pending.
+
+**Nature of change:** Correction pass — line-number re-verification, gap closures
+on probes / observability / idempotency posture, and platform-pattern findings
+(misplaced `minReadySeconds`, IDP-token-per-message, Kafka-path MDC absence,
+unused `spring-boot-starter-cache`).
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- No change. COMP-40 owns no database state and reads no tables directly.
+  No JPA / JDBC / Hibernate / DynamoDB SDK on classpath. Confirms v1.0 posture.
+
+**WDP-KAFKA.md**
+
+*Section 3 — Topic Registry — `internal-integration-events`:* no row change.
+COMP-40 already listed as consumer with group `internal-integration-events-ques-group`
+(reconciled 2026-04-25). v1.1 audit re-confirms.
+
+*Section 4 — Consumer Map row for COMP-40:* no row change. Re-confirmed:
+
+| Component | Consumes from | Produces to | Notes |
+|---|---|---|---|
+| COMP-40 VisaResponseQuestionnaire | `internal-integration-events` | None | AckMode `MANUAL_IMMEDIATE`. Offset committed pre-ACK (at-most-once). Concurrency=1. Container factory `notificationListener`. No DLQ. No local error table. Stateless. Single `@KafkaListener` in codebase. |
+
+*Section "Confirmed DEC-005 Deviations":* COMP-40 row already present
+(reconciled 2026-04-25). v1.1 audit re-confirms `acknowledge()` at
+`KafkaConsumer.java:L30` precedes `processContestEvent()` at `:L32`.
+
+**WDP-DECISIONS.md** *(candidate inputs for next reconciliation)*
+
+- **DEC-019 attestation pattern — COMP-40 confirms.** Same verifiable
+  read-only-via-architecture pattern as COMP-28 / COMP-32 — DEC-019 compliance
+  can be asserted at architecture level by codebase scan for
+  `pan` / `cardNumber` / `accountNumber` / `acctNum` plus absence of any
+  persistent write surface. COMP-40 returns DTO declarations only, zero writes.
+- **DEC-020 platform-pattern reinforcement.** COMP-40 confirms that pre-ACK
+  consumers structurally cannot meet at-least-once idempotency. Add to the
+  candidate "DEC-020 formal void or scope-narrow" ADR — COMP-40 is now the
+  10th confirmed pre-ACK consumer with no compensating idempotency mechanism.
+- **DEC-023 scope clarification — COMP-40 stateless-Kafka-consumer pattern.**
+  COMP-40 documents the explicit "DEC-023 NOT APPLICABLE" reasoning for
+  multi-replica stateless Kafka consumers under at-most-once: concurrency=1
+  per pod, partition assignment distributes work, no duplication risk, no
+  scheduler-lock needed. Worth recording as a verifiable architecture-level
+  attestation pattern alongside the DEC-019 one.
+- **Candidate new ADR — "IDP token caching contract".** Same anti-pattern
+  class as COMP-21 (`CachedTokenServiceImpl` with no actual cache).
+  COMP-40 has `spring-boot-starter-cache` on classpath but no
+  `@EnableCaching` and no `@Cacheable` — fetches IDP token per message.
+  Recommend a platform-wide IDP token caching contract: required cache TTL,
+  required cache backend (Caffeine/Redis), and a positive test that a
+  second call within TTL does not hit IDP.
+- **Candidate new ADR — "minReadySeconds placement contract".** Fifth
+  confirmed component (COMP-25 / COMP-28 / COMP-34 / COMP-08 / COMP-40)
+  with `minReadySeconds: 30` declared inside `spec.template.spec` where
+  Kubernetes silently ignores it. This is a recurring K8s manifest-template
+  defect. Recommend a platform manifest-lint rule and a sweep across the
+  remaining 45 components.
+- **Candidate new ADR — "Kafka-path MDC enrichment contract".** Same gap
+  class as COMP-43 / COMP-17 / COMP-18 / COMP-51. COMP-40 has
+  `HttpInterceptor` for HTTP MDC but no equivalent on the Kafka listener
+  path. Recommend a platform-wide Kafka-listener MDC enrichment contract.
+
+**WDP-INTEGRATIONS.md** *(no contract changes)*
+
+- No external integration contract changes. The Visa RTSI integration
+  (NAP via `mdvs-gcp-visa-adapter` + Bearer IDP; non-NAP via DataPower with
+  `vantiveLicense` raw header) is already documented in Section 3.1.
+- Worth recording at next reconciliation: COMP-40 confirms "single
+  `${dispute_rtsi_url}` for all non-NAP platforms (CORE / VAP / LATAM / PIN)"
+  — no per-platform DataPower variant. Closes a latent ambiguity in
+  the Section 3.1 description.
+
+**WDP-NFRS.md · Section 6 Risk Register** *(candidate new RISK rows)*
+
+- **🔴 HIGH — RISK-COMP-40-A:** *"COMP-40 — `minReadySeconds: 30` misplaced
+  under `spec.template.spec.minReadySeconds`; silently ignored by Kubernetes
+  at runtime. The intended 30-second rollout stability gate is not actually
+  applied — pods become Ready as soon as readiness probe passes. Same defect
+  class as COMP-25 / COMP-28 / COMP-34 / COMP-08."* Pattern sweep candidate.
+- **🔴 HIGH — RISK-COMP-40-B:** *"COMP-40 — `allocarb` `responseType`
+  iterates all `visaResponseIds` with a separate RTSI call and document
+  upload per ID, with no transactional bracketing. Failure on iteration N
+  leaves iterations 1..N-1 successfully uploaded in DocumentManagementService
+  while iterations N+1..end are never attempted. Recovery requires manual
+  reasoning from SNOTE plus DocumentManagementService state."* Distinct
+  failure mode — does not fit existing partial-success risk classes.
+- **🟡 MEDIUM — RISK-COMP-40-C:** *"COMP-40 — IDP token fetched per Kafka
+  message with no caching. `spring-boot-starter-cache` on classpath but no
+  `@EnableCaching` and no `@Cacheable`. Compounds with the
+  IDP-call-before-filter path (every discarded message still incurs an IDP
+  RTT). Performance concern at high message volume."*
+- **🟡 MEDIUM — RISK-COMP-40-D:** *"COMP-40 — Kafka listener path performs
+  no MDC enrichment. `HttpInterceptor` is HTTP-only. Per-message log
+  correlation depends entirely on OTel agent context — no application-level
+  MDC fields. Same gap as COMP-43 / COMP-17 / COMP-18 / COMP-51."*
+- **🟡 MEDIUM — RISK-COMP-40-E:** *"COMP-40 — IDP token call positioned
+  BEFORE the entry filter (Decision A). Every COMP-19 `AcceptEvent` and every
+  event with null `visaResponseIds` still incurs a wasted IDP token RTT
+  before being silently discarded. Compounds with no-cache risk above."*
+- **🟡 MEDIUM — RISK-COMP-40-F:** *"COMP-40 — `additionalImagesList`
+  extracted from RTSI response but never uploaded to DocumentManagementService.
+  Confirmed incomplete work — no TODO, no issue reference. Production cases
+  may have evidence images that exist in Visa but never reach WDP storage."*
+  Pattern: re-evaluate after architect decision (intentional gap vs backlog item).
+- **🟡 MEDIUM — RISK-COMP-40-G:** *"COMP-40 — IDP token failure (Step 5)
+  is logged INFO and swallowed by the outer Kafka listener catch with offset
+  already committed. No SNOTE written, no error trail. Distinct from the
+  RTSI/upload failure path which does write an SNOTE."*
+- **🟢 LOW — RISK-COMP-40-H:** *"COMP-40 — `${app.name}` referenced in
+  `application.yml` for `management.metrics.tags.application` but never
+  defined. Only `spring.application.name` is set. Resolves to empty string
+  / produces startup warning. Prometheus tag is effectively unset."*
+- **🟢 LOW — RISK-COMP-40-I:** *"COMP-40 — `spring-boot-starter-cache`
+  on classpath but no `@EnableCaching` and no cache configuration. Dead
+  dependency. Best-practice deviation."*
+- **🟢 LOW — RISK-COMP-40-J:** *"COMP-40 — `KafkaConsumer.java` log label
+  reads `key-MerchantId` but binds the `caseNumber` variable. Stale label
+  following producer-side key-convention shift from `merchantId` to
+  `caseNumber`. No behavioural impact; observability noise."*
+- **🟢 LOW — RISK-COMP-40-K:** *"COMP-40 — happy-path
+  `testUploadDocument_valid` unit test commented out due to mock setup
+  incompatibility. The primary upload success path has no unit test coverage."*
+
+**WDP-ARCHITECTURE.md**
+- No change. Topology and principles unchanged. COMP-40 remains in
+  Section 8 Outbound Processing — Card Network Response. The findings are
+  component-level (defect class) rather than topology-level.
+
+**WDP-COMP-INDEX.md**
+- COMP-40 row: status indicator update from `📝 DRAFT` to
+  `📝 DRAFT 🔍 v1.1 (2026-04-29)` — same convention as COMP-41 (v1.1) and
+  COMP-43 (v2.0).
+- Description text: no change required. v1.0 description still accurate.
+
+**WDP-FLOW-INDEX.md**
+- No change. The "Visa contest end-to-end" flow involving COMP-20 →
+  Kafka → COMP-40 → COMP-37 will be authored when the flow document is
+  scheduled — partial-success behaviour on `allocarb` loops should be
+  captured at that point.
+
+#### Deviation flags for COMP-40
+
+| DEC | Status | Severity |
+|---|---|---|
+| DEC-001 Transactional Outbox | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-003 Kafka partition key = merchantId | ✅ NOT APPLICABLE | — |
+| DEC-004 PAN encryption before persistence | ✅ NOT APPLICABLE | — |
+| DEC-005 Manual offset commit | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-014 Resilience4j | ⛔ DEVIATES (platform-VOID) | 🟢 LOW (accepted) |
+| DEC-019 No clear PAN in persistent store | ✅ COMPLIES | — |
+| DEC-020 Full at-least-once idempotency | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-023 Replica = 1 hard constraint | ✅ NOT APPLICABLE | — |
+
+**DEC-001 detail:** No outbox table possible (no DB). Pure pass-through.
+Partial-success state on `allocarb` loops cannot be reconciled — uploaded
+documents persist without rollback; SNOTE records the failure but does not
+undo prior uploads.
+
+**DEC-005 detail:** `acknowledgement.acknowledge()` at `KafkaConsumer.java:L30`
+precedes `processContestEvent()` at `:L32`. Joins the platform-wide pre-ACK
+cluster (COMP-05/14/15/16/17/18/39/41/42/43 — COMP-40 is the 10th confirmed
+case after COMP-43 in 2026-04-25 reconciliation).
+
+**DEC-014 detail:** `io.github.resilience4j` absent from `pom.xml`. Spring
+Retry on `VisaRTSIService` and `DisputeService` interfaces only — IDP token
+and SNOTE calls have neither retry nor circuit breaker. No connect or read
+timeout on any of the five outbound REST calls (single shared
+`new RestTemplate()` in `CommonConfig`).
+
+**DEC-020 detail:** Pre-ACK at-most-once defeats the at-least-once
+idempotency contract. No `idempotency-key` header read, no dedup table, no
+DB UNIQUE (no DB). Severity tracks DEC-005.
+
+**DEC-023 detail:** Standard scaled stateless Kafka consumer. Concurrency=1
+per pod; multiple replicas distribute across consumer-group partitions with
+no duplication risk under at-most-once. No `@SchedulerLock`, ShedLock, or
+advisory lock — confirmed absent. Documents the verifiable
+architecture-level attestation pattern for stateless Kafka consumers.
+
+#### Remaining gaps
+
+| Gap | Type | Action required |
+|-----|------|-----------------|
+| Production replica count | Environment config | Confirm value for `{{ replicas-gcp-visa-respond-questionnaire-consumer }}` per environment via XL Deploy / Helm. |
+| Production `app.retrycount` and `app.retrydelay` values | Environment config | Confirm K8s secret values for `api_retrycount` / `api_retrydelay` per environment — no defaults in YAML. |
+| Production `dispute_rtsi_url` value | Environment config | Confirm DataPower URL per environment via K8s secret. |
+| Production `vantive_license` value | Environment config | Confirm DataPower licence secret per environment. |
+| Production `logstash_server_host_port` | Environment config | Confirm Logstash endpoint per environment. |
+| `additionalImagesList` — intentional gap or backlog item? | Architect decision | Decide whether (a) backlog item with user story exists, (b) record as approved gap in WDP-DECISIONS.md, or (c) remediate. Architect call. |
+| DEC-005 remediation posture for COMP-40 | Architect decision | Same as platform-wide pre-ACK posture. Either record formal acceptance with documented recovery procedure (manual log scan + RTSI re-pull + COMP-37 re-upload) or remediate by moving `acknowledge()` after `processContestEvent()` succeeds. |
+| `allocarb` partial-success recovery procedure | Architect decision | Mid-loop failure leaves uploaded documents from earlier iterations unreconciled. Either record formal acceptance with manual recovery runbook or remediate via per-iteration outbox / per-iteration SNOTE / loop-level transactional bracket. |
+| IDP-token-before-filter — accept or remediate? | Architect decision | Move IDP token fetch to AFTER Decision A short-circuit, or accept the wasted RTT and add IDP token caching to compensate. |
+| IDP token caching | Architect decision | Decide caching strategy (Caffeine TTL, Redis, OAuth2 client manager). Cross-component decision — same pattern needed at COMP-21. |
+| `${app.name}` undefined Prometheus tag | Team / runtime confirmation | Confirm whether the empty tag value causes any downstream Prometheus query / Grafana dashboard issue, or define `app.name` in `application.yml`. |
+| `spring-boot-starter-cache` removal | Team confirmation | Remove from `pom.xml` if no caching is planned, or wire `@EnableCaching` if IDP token caching is approved. |
+| `httpclient` 4.5.14 transitive vs explicit | Follow-up Copilot CLI question | Re-ask: *"Is `httpclient` 4.5.14 used by any class on classpath at runtime, or is it only present transitively from another dependency? If transitive, identify the parent dependency. If unused entirely, recommend removal."* |
+| Per-replica Kafka partition assignment in production | Runtime observation | At runtime, observe broker-side consumer-group state to confirm partition distribution under multi-replica deployment. Cannot be answered from source. |
+| Whether `micrometer-registry-prometheus` resolves transitively at runtime | Runtime observation / Maven dependency-tree | Confirm via `mvn dependency:tree` or runtime `/actuator/prometheus` smoke test that the registry is actually present. Source classpath scan was inconclusive. |
+| Cross-component impact of DEC-019 attestation pattern | Architect decision | Decide whether the COMP-28 / COMP-32 / COMP-40 verifiable architecture-level DEC-019 attestation pattern should be formalised in WDP-DECISIONS.md as a recognised compliance class. |
+---
+### 2026-04-29 — COMP-39 NAPOutcomeProcessor · v1.0 DRAFT → v2.0 DRAFT
+
+**Source:** `gcp-nap-dispute-update-consumer` — source-verified via GitHub
+Copilot CLI 2026-04-29. Architect confirmation pending.
+
+**Nature of change:** Source-verified correction pass. Surfaces a previously
+undocumented REST entry path (Block A added), corrects multiple field-name
+and constant transcription errors, sources rolling-update strategy and
+JWT auth posture, classifies dependency usage, surfaces a cross-component
+shared-table consumption hazard, and confirms `napcacrt.jks` is an
+unreferenced orphan in the repo (NAP-DPS auth model is therefore handled
+outside this component — Ingress / mesh / network).
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- **Section 2 — `nap` schema · `NAP.DISPUTE_EVENT_CONSUMER_ERROR` row:**
+  Add **COMP-39 NAPOutcomeProcessor** to the writers list. New writers
+  list reads:
+  *"COMP-05 NAPDisputeEventProcessor (primary; owns DDL); COMP-23
+  CaseManagementService (NAP create path blind-merge); COMP-24
+  CaseActionService (insert-path conditional, outbox-style UPDATE);
+  COMP-39 NAPOutcomeProcessor (writes outbound-delivery error rows
+  with C_ACQ_PLATFORM=`NAP`, C_EVENT_TYPE in {OUT_SRV118, OUT_SRV117};
+  also reads back the table on every Kafka message via prior-error
+  scan)."*
+
+- **Section 2 — add new row for `NAP.NAP_UPDATE_RESPONSE_RULES`:**
+  Read-only by COMP-39. Owner not determinable from this repo. JPA
+  entity declared in COMP-39 but no DDL/migration is present. Flag
+  for owner confirmation.
+
+- **Shared Table Risk Register — update existing row for
+  `NAP.DISPUTE_EVENT_CONSUMER_ERROR`:** Add a third risk note:
+
+  *"🔴 NEW (2026-04-29): COMP-39 prior-error scan filters on
+  `caseNumber` + `sourceSystemName="NAP"` + status IN (FAILED1, FAILED2)
+  with **no `C_EVENT_TYPE` filter**. Error records written by COMP-05,
+  COMP-23, and COMP-24 against the same case may be scooped up and
+  reprocessed through COMP-39's SRV118/SRV117 outbound pipeline
+  regardless of their original origin. Cross-component reprocessing
+  semantics undefined. Architect decision required — intentional
+  shared-recovery behaviour or defect."*
+
+  Severity remains 🔴 HIGH on this row; the new note expands the
+  failure mode rather than introducing a new row.
+
+**WDP-KAFKA.md**
+
+- **Section 3 / 4 — `internal-integration-events` consumer row for
+  COMP-39:** Refine — the topic config key is `${spring.kafka.consumer.topic}`
+  which resolves via `application.yml` to env var `${kafka_consumer_topic}`.
+  Runtime value `internal-integration-events` was already confirmed
+  2026-04-23. Confirm that v1.0's claim of pre-ACK (`acknowledgment.acknowledge()`
+  as first call in `onMessage()`) and concurrency=1 (Spring Kafka default,
+  `setConcurrency()` not invoked) are still accurate.
+
+- **Section "auto-offset-reset":** add COMP-39 to the `latest` group.
+
+- **No new producer entries.** COMP-39 is consumer-only — no
+  `KafkaTemplate`, no `ProducerFactory`, no outbox table.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+
+- Add: *"COMP-39 hosts the manual NAP error reprocessing REST endpoint
+  (`POST /event`, JWT-authenticated via `JwtIssuerAuthenticationManagerResolver`
+  resolved from `${trusted_issuers}`). This resolves the long-standing
+  question of which component hosts the manual reprocessing surface
+  referenced in COMP-05's documentation — it is COMP-39, not COMP-05."*
+
+- Add: *"COMP-39 is a fourth confirmed writer of
+  `NAP.DISPUTE_EVENT_CONSUMER_ERROR` (alongside COMP-05 primary,
+  COMP-23, COMP-24). Discriminator: `C_ACQ_PLATFORM` (mapped from
+  `sourceSystemName`); COMP-39 sets `"NAP"` constant on insert.
+  `C_EVENT_TYPE` values for COMP-39 rows: `OUT_SRV118`, `OUT_SRV117`."*
+
+- Add: *"COMP-39 has `@EnableRetry` wired on the application class —
+  Spring Retry is live (distinct from COMP-41 where the imports were
+  dead)."*
+
+- Add: *"COMP-39 confirms at-most-once pre-ACK as a second component
+  with this pattern (alongside COMP-05). Both write to the same
+  shared error table."*
+
+- Add: *"COMP-39 audit user constant is `\"NCSEUPDTC\"` (corrected from
+  v1.0 transcription `\"NCSEUDPTC\"`)."*
+
+- Add: *"COMP-39 has no `application-{env}.yml` profiles in repo —
+  every `${...}` placeholder resolves at runtime from environment
+  variables only."*
+
+- Resolved open questions: remove
+  *"COMP-24 ActionEvent topic name (`${kafka.topic}`) and consumer
+  identity"* row's "likely COMP-39 NAPOutcomeProcessor" hypothesis.
+  COMP-39 source confirms a **single** `@KafkaListener` on
+  `internal-integration-events` and no second listener — therefore
+  COMP-39 is **not** the consumer of COMP-24's `${kafka.topic}`
+  ActionEvent. The consumer of that topic remains unidentified.
+  Reword the open question accordingly.
+
+- New open questions to add to the Currently Open table:
+
+  | Question | Source | Action needed |
+  |----------|--------|---------------|
+  | NAP-DPS authentication mechanism — `napcacrt.jks` is an unreferenced orphan in COMP-39 repo. Auth must be handled at Ingress / service mesh / network layer outside this component. Where? | COMP-39 OQ | Team confirmation — infrastructure team |
+  | `NAP.NAP_UPDATE_RESPONSE_RULES` table owner | COMP-39 OQ | Team confirmation — no DDL in COMP-39 repo |
+  | COMP-39 prior-error scan has no `C_EVENT_TYPE` filter — does it scoop up COMP-05/23/24-originated rows for the same case and reprocess them through SRV118 pipeline? Intentional or defect? | COMP-39 risk | Architect decision |
+  | COMP-39 probe path mismatch — `resources.yaml` probes hit `/merchant/gcp/update-consumer/nap/livez` but actuator `additional-path: server:/livez` exposes endpoint at server root. Are probes resolving correctly via Ingress? | COMP-39 risk | Runtime observation (kubectl describe pod / probe failure logs) |
+  | COMP-39 `POST /event` — is the controller-level exception handling enumerated for response codes? Body schema for success and error responses? | COMP-39 contract | Follow-up Copilot question (see Remaining Gaps) |
+  | COMP-39 concurrency=1 — intentional or default-by-omission? No comment / commit message / property override documents intent | COMP-39 OQ | Architect decision |
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+
+- **Candidate ADR — Cross-component shared-table consumption pattern
+  on `NAP.DISPUTE_EVENT_CONSUMER_ERROR`:** 🔴 HIGH severity. Whether
+  the shared error table is intended as a single platform-wide DLQ
+  (in which case every co-writer's prior-error scan must coordinate
+  on `C_EVENT_TYPE`), or whether COMP-39's lack of `C_EVENT_TYPE`
+  filter is a defect, requires a formal decision. Same architectural
+  class as DEC-019/DEC-020 (risk-accepted shared-state ADRs).
+
+- **Candidate ADR — Manual operator reprocessing endpoint pattern:**
+  🟡 MEDIUM. COMP-39 exposes `POST /event` for one-record reprocess,
+  driving through the same business pipeline as the Kafka path with
+  no per-record locking. Two simultaneous reprocesses for the same
+  record (Kafka prior-error scan + operator POST) can race. Pattern
+  used elsewhere on the platform? Should this be a uniform pattern
+  with a coordination guarantee?
+
+- Note: COMP-39 reuses the existing DEC-005 pre-ACK at-most-once
+  pattern — no new ADR. It also reuses the platform-wide Spring Retry
+  / no-Resilience4j pattern (DEC-014 voided) — no new ADR.
+
+**WDP-ARCHITECTURE.md**
+
+- No topology change. COMP-39 was already shown as the NAP outcome
+  delivery consumer. Add a clarifying note that COMP-39 also exposes
+  a manual operator REST endpoint (`POST /event`) on the WDP Ops
+  Portal access path — this aligns the architecture diagram with
+  the discovered REST surface.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+
+- New RISK rows (candidate, to be reconciled in next NFR rebuild):
+
+  - **RISK-COMP39-A:** Cross-component shared-table consumption
+    hazard on `NAP.DISPUTE_EVENT_CONSUMER_ERROR` (no `C_EVENT_TYPE`
+    filter on prior-error scan) — 🔴 HIGH
+  - **RISK-COMP39-B:** NAP-DPS authentication relies on
+    out-of-repo network/mesh trust; `napcacrt.jks` is an unreferenced
+    orphan in this repo — 🔴 HIGH (cannot be remediated within
+    component)
+  - **RISK-COMP39-C:** RestTemplate without timeouts on a
+    single-thread consumer + 8 outbound REST hops; one hung dep
+    blocks the consumer — 🟡 MEDIUM
+  - **RISK-COMP39-D:** Silent deserialization drop via no-op
+    `CommonErrorHandler` — 🟡 MEDIUM
+  - **RISK-COMP39-E:** Probe path mismatch (resources.yaml vs
+    actuator additional-path) — 🟡 MEDIUM
+  - **RISK-COMP39-F:** No CPU limits/requests — 🟡 MEDIUM
+  - **RISK-COMP39-G:** No HPA, no PDB, single replica — 🟡 MEDIUM
+  - **RISK-COMP39-H:** Two unused dependencies in pom.xml
+    (`spring-boot-starter-cache`, `spring-boot-starter-oauth2-client`) — 🟢 LOW
+  - **RISK-COMP39-I:** `dataRecord` always null in SRV118 (notesLookUp
+    commented out); `checkCRMRAction()` commented out — 🟡 MEDIUM
+    (functional gap rather than runtime risk)
+  - **RISK-COMP39-J:** Manual REST reprocess + Kafka prior-error
+    scan can race on the same record (no per-record lock) — 🟡 MEDIUM
+
+**WDP-INTEGRATIONS.md**
+
+- **NAP-DPS contract row:** Update to clarify that COMP-39's outbound
+  HTTP calls set no Authorization header and no client cert is loaded
+  in source. Authentication is handled outside this component — to be
+  documented once team confirms the boundary (Ingress / mesh / network).
+
+- **JustAI / Signifyd:** No change. COMP-39 has no third-party
+  notification path.
+
+**WDP-COMP-INDEX.md**
+
+- COMP-39 entry — update Type to `Kafka Consumer + REST API` (was
+  `Kafka Consumer`).
+- COMP-39 entry — update Doc Status to `📝 DRAFT 🔍 v2.0 (2026-04-29)`.
+- COMP-39 description — replace with:
+  *"Consumes internal-integration-events and delivers dispute outcomes
+  to NAP-DPS for NAP platform money movement. Filters to platform=NAP
+  only — all other platform events silently discarded. Drives SRV118
+  (chargeback outcome / representment) and/or SRV117 (department
+  notice letter) outbound calls. Built-in prior-error reprocessing on
+  every Kafka message. Also exposes a JWT-authenticated `POST /event`
+  REST endpoint for manual operator reprocessing of a single error
+  record. ⚠️ Pre-ACK (DEC-005 deviation, same as COMP-05). ⚠️
+  notesLookup, checkCRMRAction commented out. ⚠️ napcacrt.jks
+  unreferenced — NAP-DPS auth handled outside the component. Planned
+  migration to EDIA route — no source scaffolding visible."*
+
+#### Deviation flags for COMP-39
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ✅ NOT APPLICABLE | — |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES | — |
+| DEC-005 Manual Kafka Offset Commit (after processing) | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⛔ DEVIATES | 🔴 HIGH |
+| DEC-014 Resilience4j (platform-VOID) | ✅ ABSENT (factual record only) | — |
+
+**DEC-005 DEVIATES detail:** `acknowledgment.acknowledge()` is the first
+call inside `KafkaConsumer.onMessage()`, before any downstream processing.
+Identical pattern to COMP-05. Recovery is application-level only via
+the shared error table — broker-level redelivery does not protect against
+JVM crash post-commit.
+
+**DEC-020 DEVIATES detail:** Pre-ACK pattern is structurally at-most-once.
+There is no inbound idempotency-key check; if duplicate delivery did
+occur (e.g. via a future at-least-once migration), NAP-DPS would be
+re-called. The `idempotencyId` constructed for the SRV118 payload
+(`caseNumber + actionSequences`) is for outbound consumption by NAP-DPS
+only — not used for inbound dedup.
+
+**DEC-004 / DEC-019 COMPLIES detail:** The `cardNumber` field in the
+SRV117 outbound payload is constructed as `BIN6 + "******" + last4` —
+masked PAN only. Inbound `NotificationEvent` schema has no PAN field.
+Raw `NotificationEvent` JSON persisted to `C_KAFKA_EVENT` on error
+contains no clear PAN. No encryption library imported.
+
+#### Remaining gaps
+
+| Gap | Classification | Detail |
+|-----|----------------|--------|
+| NAP-DPS authentication mechanism | **Team confirmation** (infrastructure / network team) | `napcacrt.jks` exists at repo root but is referenced by zero code paths — no `SSLContext`, `KeyStore`, `KeyManagerFactory`, `TrustManagerFactory`, `HttpClientBuilder`, `ClientHttpRequestFactory`, or `server.ssl.*` property loads it. Auth must therefore be handled outside this component. Confirm: Ingress mTLS? Service-mesh mutual TLS? Pure network-level trust? Cannot be answered by re-running Copilot on this repo. |
+| `NAP.NAP_UPDATE_RESPONSE_RULES` table owner | **Team confirmation** | No DDL/migration in this repo. Confirm which component or team owns the schema and the data lifecycle (static reference data vs dynamically maintained). |
+| Cross-component shared-table consumption hazard intent | **Architect decision** | Is COMP-39's lack of `C_EVENT_TYPE` filter on the prior-error scan intentional (single-pipeline recovery) or a defect (cross-pollination of error origin)? Decision should produce a formal ADR — same severity class as DEC-019/DEC-020. |
+| Probe path mismatch (resources.yaml vs actuator) | **Runtime observation** | kubectl describe pod / readiness/liveness probe success counts in production. Cannot be answered by Copilot — requires live cluster inspection. |
+| `POST /event` controller-level response contract (success body, error body, HTTP status mapping) | **Follow-up Copilot question** | *"In `controller/NapNotificationController.java`, enumerate the full request-body schema for `ConsumerErrorRequest`, the success response body, and any explicit `@ExceptionHandler` mappings. List each HTTP status code returned by the controller and the trigger condition for each."* |
+| NAP-DPS SRV118/SRV117 response body schema | **Follow-up Copilot question** | *"In `NotificationServiceImpl.processSrv118Notification()` and `processSrv117Notification()`, what response DTO is returned by NAP-DPS for SRV118 and SRV117 calls? What fields are checked beyond the HTTP status code? Is the response body parsed at all, or is only 2xx vs non-2xx evaluated?"* |
+| Concurrency = 1 intent | **Architect decision** | No comment / commit message / property documents the choice. Decide: explicitly raise to N>1, or codify =1 with operational rationale (and add per-record locking on the REST reprocess endpoint to prevent races with the Kafka prior-error scan). |
+| EDIA migration scaffolding absence | **Architect decision** | No feature flag, no commented-out alternative route, no TODO references EDIA in source. Confirm timeline for adding migration scaffolding, or accept that migration will be a hard cut-over rather than a flag-gated rollout. |
+| `migrationStatus` field intent | **Architect decision** | Field is read from action summaries and persisted on error rows but drives no branching logic. Is this passive observation only, or is conditional behaviour intended that has not been wired? |
+| Production replica count | **Environment config / team confirmation** | XL Deploy variable `{{ replicas-gcp-nap-dispute-update-consumer }}` — runtime value not in repo. |
+| Runtime values for all `${...}` env-injected properties | **Environment config / team confirmation** | No `application-{env}.yml` profiles in repo. Confirm topic, group ID, retry count, retry delay, max-poll values, all 8 URLs from XL Deploy / K8s secrets. |
+
+#### Doc status after this change
+
+- `WDP-COMP-39-NAP-OUTCOME-PROCESSOR.md` → `v2.0 DRAFT 🔍 source-verified
+  2026-04-29` · architect confirmation pending
+- `WDP-COMP-INDEX.md` → COMP-39 type, status, and description updates
+  pending (next reconciliation session)
+- `WDP-DB.md` → `NAP.DISPUTE_EVENT_CONSUMER_ERROR` writers list +
+  shared-table risk register update pending; new
+  `NAP.NAP_UPDATE_RESPONSE_RULES` row pending (next reconciliation
+  session)
+- `WDP-KAFKA.md` → topic-key-resolution clarification + auto-offset-reset
+  group update pending (next reconciliation session)
+- `WDP-NFRS.md` → 10 candidate RISK rows pending (next reconciliation
+  session)
+- `WDP-DECISIONS.md` → 2 candidate ADRs pending (cross-component
+  shared-table pattern; manual reprocess endpoint pattern)
+- `WDP-ARCHITECTURE.md` → minor REST surface annotation pending
+- `WDP-INTEGRATIONS.md` → NAP-DPS auth boundary clarification pending
+---
+
+### 2026-04-29 — COMP-36 TokenService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `wdp-idp-token-service` — source-verified by GitHub Copilot CLI
+2026-04-29. Architect confirmation pending.
+
+**Nature of change:** Correction pass — confirms most v1.0 claims, corrects
+four (D-10 Redis deserialisation mechanism, D-44 `minReadySeconds`
+mis-indentation defect, D-53 ingress placeholder casing, R-3
+`commons-lang3` usage), and surfaces three new findings (JVM/UTC timezone
+mismatch on IDP-fetch path; probe initialDelay values now exact;
+`{{ ingressTLSsecretName }}` mounted via `envFrom.secretRef` flagged as
+likely manifest defect).
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+
+- **Section 2 — ElastiCache row enrichment.** The current row
+  (`AWS ElastiCache | Redis | WDP Team | JWT token cache for TokenService
+  | COMP-36 TokenService (owns)`) overstates ownership. Source-verification
+  confirms COMP-36 performs **HGET only** — zero write operations exist in
+  the repository. Rewrite the row as:
+
+  > `AWS ElastiCache | Redis | WDP Team (writer unknown) | JWT token cache.
+  > Redis hash key: wdpinternalidptoken, field: token. Value:
+  > Jackson-serialised IdpToken (tokenValue, expiresIn, tokenType,
+  > expirationDate). COMP-36 TokenService reads this hash (HGET only — no
+  > writes anywhere in repo). Hash is populated by an UNKNOWN EXTERNAL
+  > COMPONENT not present in the wdp-idp-token-service repository. ⚠ External
+  > writer identity is an open question — see COMP-36 Planned Changes.
+  > | COMP-36 TokenService (reads only — does NOT own writes) |`
+
+- **No new shared-table risk** — ElastiCache remains used by exactly one
+  WDP component on the read side. The risk is the inverse of the usual
+  shared-write pattern: a single reader with no identifiable writer in
+  any documented WDP component.
+
+**WDP-KAFKA.md**
+
+- **No change.** COMP-36 has no Kafka involvement — confirmed by absence
+  of `spring-kafka` from `pom.xml` and full source scan. No additions to
+  Sections 3 or 4.
+
+#### Deviation flags for COMP-36
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ✅ NOT APPLICABLE — no Kafka publish | — |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE — no Kafka | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES — no PAN data handled (full-codebase scan for `pan` / `cardNumber` / `accountNumber` / `acctNum` returned zero matches) | — |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE — no Kafka consumer | — |
+| DEC-014 Resilience4j Circuit Breakers | ⛔ DEVIATES (platform-wide VOID) — no Resilience4j on Redis or IDP. Pattern matches the platform-wide void posture already recorded for COMP-21, COMP-28, COMP-31, COMP-37, COMP-43. | 🔴 HIGH |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES — no persistent writes at all (no relational DB; Redis read-only) | — |
+| DEC-020 Full At-Least-Once Idempotency | ✅ NOT APPLICABLE — read-only retrieval service; intrinsically idempotent | — |
+| DEC-023 Replica = 1 Hard Constraint | ✅ NOT APPLICABLE — standard scaled stateless service | — |
+
+**DEC-014 detail:** `io.github.resilience4j:*` absent from `pom.xml`. No
+`@CircuitBreaker`, `@Bulkhead`, `@TimeLimiter`, `@Retry` anywhere in
+source. Both Redis (Jedis) and IDP (`DefaultClientCredentialsTokenResponseClient`)
+calls have zero resilience patterns. Spring Retry is also absent. This is
+a clean addition to the DEC-014 evidence corpus.
+
+#### Candidate ADRs surfaced (for next WDP-DECISIONS.md reconciliation)
+
+1. **External Redis writer pattern** — formal decision needed on whether the
+   "shared cache populated by an external job, read by a service" pattern
+   is acceptable, and where the writer ownership lives. Either name the
+   writer or remove the pattern.
+2. **Inbound JWT validation on internal token-issuance endpoint** —
+   architectural intent for `jwt.trustedIssuers` /
+   `spring-security-oauth2-resource-server` (currently inert). Either
+   wire it up or remove the dependency and the property.
+3. **JVM timezone contract for services using `LocalDateTime` for time
+   comparisons** — pattern: rely on container-image `TZ=UTC`? Or mandate
+   `Instant`/`ZonedDateTime`? Cross-component review needed (COMP-36
+   first instance flagged).
+4. **`minReadySeconds` mis-indentation** — now confirmed on COMP-25,
+   COMP-28, COMP-34, COMP-36. Promote to platform-wide manifest-lint
+   recommendation (preflight CI check).
+
+#### Remaining gaps
+
+| Gap | Type | Action / exact follow-up question |
+|-----|------|-----------------------------------|
+| External Redis writer identity for `wdpinternalidptoken:token` | Team confirmation | Ask: *"Which component or process writes the Redis hash `wdpinternalidptoken:token` to ElastiCache? Is it a WDP component, an infrastructure bootstrap job, a Lambda, or something else? Is it running in production today, and what is its failure mode?"* |
+| Caller inventory of consumers/batches that call `GET /merchant/gcp/idp-token/token` | Copilot CLI follow-up across consumer repos | For each WDP service repo (COMP-07, 08, 09, 11, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 31, 34, 37, 41, 42, 43, 51), ask Copilot: *"Does this component call `GET /merchant/gcp/idp-token/token` or use the host pattern `/merchant/gcp/idp-token`? If yes, at which step in the flow and under what conditions?"* Aggregate the answers into a caller list. |
+| JVM timezone in production (kpack `jammy-base` builder) | Runtime observation / infra confirmation | Cannot be answered by Copilot CLI re-runs. Inspect a running pod's `date` / `/etc/timezone` / JVM `TimeZone.getDefault()` log line. Or confirm the kpack base image sets `TZ=UTC` via DevOps. **Critical for correctness of expiry comparison.** |
+| Production replica count for `wdp-idp-token-service` | Environment config | Confirm via XL Deploy / Helm values for each environment — placeholder `{{ replicas-wdp-idp-token-service }}` has no default in repo. |
+| Production IDP URL, Redis endpoint, SSL flag | Environment config | Values come from K8s secrets `wdp-token-service-secrets` and `wdp-common-secrets`. Confirm with DevOps per environment. |
+| `${app.name}` resolution mechanism | Environment config | Used in `management.metrics.tags.application` but not defined in `application.yml`. Confirm whether `APP_NAME` env var is set externally and where. |
+| `{{ ingressTLSsecretName }}` mounted via `envFrom.secretRef` | Architect / DevOps decision | Manifest defect (TLS material as env vars is unusual) or intentional? If defect, remediate at next manifest revision. |
+| `minReadySeconds: 30` mis-indentation defect | Architect decision | Lift to `spec.minReadySeconds` (apply intended 30-s gate) or remove the field and accept current behaviour? Pattern recurs across COMP-25, COMP-28, COMP-34, COMP-36 — candidate for platform-wide remediation sprint. |
+| Inbound JWT validation intent (`jwt.trustedIssuers` orphan + `spring-security-oauth2-resource-server` unused) | Architect decision | Either wire up resource-server JWT validation on this endpoint (the same trusted-issuer set every other WDP service uses) or remove the dependency and the property. Currently the token-issuance service is the *only* unauthenticated endpoint in the platform — security inversion. |
+| Latent NPE on null `authorizedClient` in `TokenServiceImpl.getAuthorizationTokenFromAuthServer()` | Architect decision (defect or design?) | Add the guard return, or rely on the NPE-as-HTTP-500 pathway and document explicitly? |
+
+#### Doc status after this change
+
+- `WDP-COMP-36-TOKEN-SERVICE.md` → `v1.1 DRAFT` — source-verified
+  2026-04-29 · architect confirmation pending
+- `WDP-COMP-INDEX.md` → no row addition; status text update at next
+  reconciliation: COMP-36 row to read *"📝 DRAFT 🔍 v1.1 (2026-04-29)"*
+  matching the COMP-37 pattern
+- `WDP-DB.md` → ElastiCache row rewrite pending (next reconciliation
+  session)
+- `WDP-KAFKA.md` → no change
+- `WDP-NFRS.md` → 4 new candidate RISK rows pending (next reconciliation
+  session): timezone-mismatch on IDP-fetch path; `minReadySeconds`
+  silently-ignored defect (extends the COMP-25/28/34 family);
+  `{{ ingressTLSsecretName }}` envFrom anomaly; orphan
+  `jwt.trustedIssuers` + inert resource-server dependency on the
+  unauthenticated token-issuance endpoint
+- `WDP-DECISIONS.md` → 4 candidate ADRs surfaced (see above) pending
+  architect promotion at next reconciliation
+- `WDP-INTEGRATIONS.md` → no change (no new external integration
+  contract; IDP and ElastiCache already documented platform-wide)
+- `WDP-ARCHITECTURE.md` → no change (topology unchanged; no new
+  component, no new flow)
+---
+
+### 2026-04-29 — COMP-35 EncryptionService · v1.0 DRAFT → v1.1 DRAFT
+
+**Source:** `wdp-encryption-service` — source-verified by Copilot CLI 2026-04-29.
+Architect confirmation pending.
+
+**Nature of change:** Correction pass. v1.0 DRAFT confirmed in substance;
+v1.1 absorbs five material corrections and adds two new findings.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- **NEW Section-2 row** — `wdp.hash_key_store` · primary writer COMP-35
+  EncryptionService (INSERT on encrypt-miss; UPDATE `last_seen_at` on
+  encrypt-hit and on every decrypt). Key cols: `id` (PK seq), `hpan`
+  (64-char hex), `pan_ct` (Base64 IV‖ciphertext‖GCM-tag), `dek_id` (FK),
+  `inserted_at`, `last_seen_at`. ⚠️ No JPA `unique=true` on `hpan`.
+  DB-level UNIQUE existence not determinable from repo (no migration
+  scripts present). No external readers — ciphertext never leaves this
+  service. Transaction manager: `wdpTransactionManager`.
+- **NEW Section-2 row** — `wdp.data_enc_key` · primary writer COMP-35
+  EncryptionService (INSERT on DEK rotation; SELECT-by-id on decrypt;
+  SELECT-top-by-inserted_at-desc on rotation). Key cols: `dek_id` (PK
+  seq `wdp.hash_key_store_dek_id_seq`), `dek_enc` (Base64 KMS-wrapped
+  DEK), `inserted_at`. ⚠️ `insertEncryptedDEK` runs in a Spring-Data
+  default short transaction — separate from the surrounding
+  `rotateDEK()` orchestration. Multi-pod DEK row proliferation is
+  uncontrolled (no distributed lock). No external readers.
+- **No shared-table risk introduced** — both tables are owned and
+  read exclusively by COMP-35.
+
+**WDP-KAFKA.md**
+- No change. COMP-35 has no Kafka involvement (no listener, no
+  template, no client dependency). It remains correctly absent from
+  Sections 3 and 4. Confirms Kafka-Free classification.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: COMP-35 owns `wdp.hash_key_store` and `wdp.data_enc_key` —
+  sole writer and sole reader of both. No shared-table writes.
+- Add: COMP-35 DEK rotation interval is **days**, configured via
+  `${dek_rotation_interval_days}`. Prior platform docs stating
+  "6-hour DEK cache" are incorrect.
+- Add: COMP-35 decrypt `@Transactional` boundary brackets the KMS
+  network call. A Hikari connection is held during the KMS round-trip
+  on every decrypt request.
+- Add: COMP-35 `/actuator/prometheus` and `/actuator/info` are NOT
+  in the security permit-all list; they require JWT.
+- Add: COMP-35 `rotateDEK()` reuse-existing-DEK branch carries a
+  Base64 bug — `dek_enc` is passed to KMS as raw UTF-8 bytes of the
+  Base64 string instead of decoded ciphertext. Symptom only manifests
+  on pod restart that finds a recent-enough DEK row to reuse.
+  Failure is silently swallowed; pod starts with `initialized=false`.
+- Add: COMP-35 has no method-level authorization on the decrypt
+  endpoint. Decrypt-caller policy (COMP-14 only) is convention,
+  not technical control.
+- Add: COMP-35 `PANHashingServiceImpl` logs last-4 PAN at DEBUG.
+  Production log level governance is operationally critical.
+- Add: COMP-35 Spring Boot version is 3.5.6 (precision).
+- Resolved open questions: none currently in the COMP-35 row of the
+  open-question table — all gaps recorded by v1.0 are now addressed
+  or restated as DBA / ops confirmations below.
+- New open questions:
+  - DB-level UNIQUE on `wdp.hash_key_store.hpan` — DBA confirmation
+    (no migration scripts in repo).
+  - Additional indexes / constraints on `wdp.data_enc_key` — DBA
+    confirmation.
+  - Production replica count for COMP-35 — XL Deploy / ops.
+  - Production value of `${dek_rotation_interval_days}` — ops.
+  - Production injected value of `${jwt_trusted_issuer_urls}` — ops.
+  - Prometheus scrape configuration for COMP-35 — does the scrape
+    job carry a JWT? If not, scrape is currently failing or the
+    whitelist needs updating.
+  - Log-pipeline PAN-scrubbing posture (Logstash target side) —
+    not verifiable from this repo.
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **ADR-CAND-035-A · Decrypt @Transactional spanning external KMS call**
+  Severity: 🟡 MEDIUM. The current method-level transaction holds a
+  Hikari connection for the duration of the KMS round-trip on every
+  decrypt request. Candidate decision: narrow the transaction to the
+  `last_seen_at` UPDATE only, or accept the pool-exhaustion risk
+  formally with capacity guidance.
+- **ADR-CAND-035-B · Multi-pod DEK rotation race accepted**
+  Severity: 🟡 MEDIUM. Source code carries an explicit comment
+  acknowledging that multiple pods can reach the DEK-generate path
+  concurrently. Candidate decision: formally accept the multi-DEK
+  posture (correct on decrypt, uncontrolled row proliferation) or
+  add a distributed lock (advisory lock / ShedLock).
+- **DEC-008 narrative correction** (not a new ADR — content fix)
+  DEC-008 still describes a 6-hour DEK cache. Source confirms the
+  unit is days. DEC-008 narrative, COMP-INDEX entry for COMP-35, and
+  any WDP-ARCHITECTURE.md reference to "6-hour DEK cache" must be
+  corrected at the next platform-level reconciliation.
+
+**WDP-ARCHITECTURE.md**
+- DEC-008 / COMP-35 narrative: replace "6-hour DEK cache" with
+  "DEK rotation interval configured in days
+  (`${dek_rotation_interval_days}`)". No topology change.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- **NEW** RISK-COMP35-A — Single global dependency for all PAN
+  ingestion paths (COMP-07/08/09/11). 🔴 HIGH availability impact.
+- **NEW** RISK-COMP35-B — `rotateDEK()` reuse-path Base64 bug.
+  🔴 HIGH for pod-restart hygiene during rotation window.
+- **NEW** RISK-COMP35-C — Decrypt `@Transactional` holds DB
+  connection during KMS call. 🟡 MEDIUM pool-exhaustion risk under
+  KMS slowdown plus sustained decrypt load.
+- **NEW** RISK-COMP35-D — Multi-pod DEK rotation race
+  (no distributed lock). 🟡 MEDIUM.
+- **NEW** RISK-COMP35-E — No DB-level UNIQUE on
+  `wdp.hash_key_store.hpan` verifiable from repo. 🟡 MEDIUM
+  duplicate-INSERT race across pods.
+- **NEW** RISK-COMP35-F — Crypto failures mapped to HTTP 404.
+  🟡 MEDIUM caller-error-handling correctness.
+- **NEW** RISK-COMP35-G — DEK startup failure silently swallowed;
+  probes do not check `initialized` flag. 🟡 MEDIUM.
+- **NEW** RISK-COMP35-H — DEK rotation failure silently swallowed;
+  service runs with expired DEK without alert. 🟡 MEDIUM.
+- **NEW** RISK-COMP35-I — `PANHashingServiceImpl` logs last-4 PAN
+  at DEBUG. 🟢 LOW (operational governance).
+- **NEW** RISK-COMP35-J — `/actuator/prometheus` requires JWT;
+  scrape posture must be confirmed. 🟢 LOW (observability gap if
+  scrape is unauthenticated).
+
+**WDP-INTEGRATIONS.md**
+- §6.2 AWS KMS — no contract change. v1.1 source-verifies the
+  existing entry. **Caller list update** for the "Key callers of
+  COMP-35" sub-bullet: confirm COMP-09 CaseFillingBatch and
+  COMP-27 CaseSearchService (v2 search path) are present alongside
+  COMP-07 / COMP-08 / COMP-11 / COMP-43.
+- **NEW §6 row candidate** — AWS Secrets Manager. Currently not
+  documented as a distinct §6 entry. WDP integration point: COMP-35
+  EncryptionService (sole caller, startup-only). Protocol: AWS SDK v2.
+  Auth: IAM role. Status: ✅ Production. Recommend adding alongside
+  AWS KMS §6.2.
+
+#### Deviation flags for COMP-35
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 Transactional Outbox | ✅ NOT APPLICABLE | — |
+| DEC-003 Kafka Partition Key = merchantId | ✅ NOT APPLICABLE | — |
+| DEC-004 PAN Encryption Before Persistence | ✅ COMPLIES (caveat) | 🟢 LOW |
+| DEC-005 Manual Kafka Offset Commit | ✅ NOT APPLICABLE | — |
+| DEC-019 No Clear PAN in Persistent Store | ✅ COMPLIES | — |
+| DEC-020 Full At-Least-Once Idempotency | ⚠️ PARTIAL | 🟡 MEDIUM |
+| DEC-008 AWS KMS — design narrative | ⚠️ DOC CORRECTION | 🟡 MEDIUM |
+| REST convention — crypto failure → 404 | ⛔ DEVIATES | 🟡 MEDIUM |
+| DEC-014 Resilience4j (platform-VOID) | ✅ ABSENT (factual record only) | — |
+
+**DEC-004 caveat detail:** Service IS the DEC-004 enforcement boundary
+— no clear PAN persisted, `@ToString(exclude='pan')` on both request
+and response, log statements reference only HPAN. ⚠️ Caveat:
+`PANHashingServiceImpl` writes the last 4 PAN digits to log at DEBUG.
+Production log level must remain INFO or higher; DEBUG would expose
+partial PAN. Operational governance, not architectural defect.
+
+**DEC-020 PARTIAL detail:** Encrypt path does an in-memory
+`findByHpan` idempotency check inside a single `@Transactional` on
+`encryptPAN()`, which protects against intra-pod duplicate INSERTs.
+However the JPA entity declares no `unique=true` on `hpan`, and no DB
+migration scripts are in this repository — DB-level UNIQUE existence
+is not verifiable. Two pods racing on the same PAN can both pass the
+SELECT and both INSERT. Subsequent `findByHpan` returns one of the
+duplicates non-deterministically. Decrypt is correct in this scenario
+because each row carries its own `dek_id`, so duplicates decrypt to
+the same plaintext PAN — but row proliferation is uncontrolled.
+
+**DEC-008 DOC CORRECTION detail:** DEC-008 narrative and the COMP-35
+description in WDP-COMP-INDEX.md state a "6-hour DEK cache". Source
+confirms the rotation interval unit is **days**, configured via
+`${dek_rotation_interval_days}`. No hardcoded default exists in any
+committed configuration profile. This is a content fix, not a
+runtime risk.
+
+**REST convention DEVIATES detail:** `GlobalExceptionHandler` maps
+both `PANEncryptionException` and `PANDecryptionException` to
+HTTP 404. On decrypt, four distinct conditions collapse to the same
+status code: HPAN not found in DB, DEK not found in DB, KMS unwrap
+failure, AES decrypt failure. Callers cannot distinguish via HTTP
+status alone. Operationally, alerting on "decrypt 404 rate" cannot
+separate "expected HPAN-miss from upstream typo" from "KMS dependency
+slipped".
+
+#### Doc status after this change
+
+- `WDP-COMP-35-ENCRYPTION-SERVICE.md` → `v1.1 DRAFT` —
+  source-verified 2026-04-29 · architect confirmation pending.
+- `WDP-COMP-INDEX.md` → COMP-35 description needs "6-hour DEK cache"
+  removed (next reconciliation session).
+- `WDP-DB.md` → two new Section-2 rows pending (next reconciliation
+  session).
+- `WDP-KAFKA.md` → no change.
+- `WDP-DECISIONS.md` → DEC-008 narrative correction, two
+  ADR-CAND-035-* candidates pending (next reconciliation session).
+- `WDP-NFRS.md` → ten new RISK-COMP35-* rows pending
+  (next reconciliation session).
+- `WDP-INTEGRATIONS.md` → §6.2 caller list refresh + new §6 row for
+  AWS Secrets Manager pending (next reconciliation session).
+- `WDP-ARCHITECTURE.md` → DEC-008 / COMP-35 narrative correction
+  pending (next reconciliation session).
+---
+
 ### 2026-04-28 — COMP-32 RulesService · v1.0 DRAFT → v1.1 DRAFT
 
 **Source:** `gcp-rules-service` — source-verified by GitHub Copilot CLI 2026-04-28. Architect confirmation pending.
