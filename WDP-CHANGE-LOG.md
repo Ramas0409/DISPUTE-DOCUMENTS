@@ -2205,6 +2205,97 @@ consume entries from this section and move them to the most recent **Reconciled*
 section above.*
 
 
+---
+
+### COMP-01 · API Gateway · v1.0 → v2.0
+
+**Date:** 2026-04-30
+**Source:** `wdp-gateway` (wp-mfd/wdp-gateway) — source-verified by Copilot CLI 2026-04-30.
+Architect confirmation pending.
+
+**Nature of change:** Full source-verification pass against existing DRAFT. Prior DRAFT
+contained one incorrect fact (port 9082), one overstated finding (duplicate web dependency),
+and one overstated security risk (null-platform auto-authorize bypass was unreachable from
+the filter). Three new findings added: dead correlation header, Ingress path-routing detail,
+dead `wdp-internal-auth` config confirmed across all 7 environment YAMLs.
+
+#### Platform-level impacts
+
+**WDP-DB.md**
+- `wdp.api_route` row: update `Confirmed` column from `⚠️ PENDING — confirm write owner` to
+  `✅ Column set confirmed from ApiRoute.java (id, path, original_path_regex, replacement_path,
+  uri, auth_exceptions). Write owner still TBC — team confirmation required.`
+
+**WDP-KAFKA.md**
+- No change. COMP-01 has no Kafka involvement — confirmed from source.
+
+**WDP-HANDOVER.md · Confirmed Architectural Facts**
+- Add: COMP-01 listen port is `8082` — confirmed in both `application.yml:L2` and K8s
+  manifest. Prior uncertainty about port 9082 was a documentation error; no discrepancy exists.
+- Add: COMP-01 `v-correlation-id` header on all UAMS and CHAS calls is always null.
+  `RequestCorrelation.setId()` is never called anywhere in the codebase. `ThreadLocal` is
+  also incompatible with reactive WebFlux threading model.
+- Add: COMP-01 null-platform auto-authorize path in `AuthorizationServiceImpl` is
+  **unreachable from `CaseNumberFilter`** — the filter guards `platform != null && caseId != null`
+  before calling the service. Risk is latent dead code, not active security bypass.
+- Add: COMP-01 `wdp-internal-auth` dead config confirmed across all 7 environment YAMLs
+  (local, dev, test, uat, stg, cert, prod) — all use wrong namespace
+  `spring.security.oauth2.resourceserver.client.*`.
+- Add: COMP-01 Ingress — all 7 hostname entries use path-based routing at
+  `/api/merchant/gcp` (`pathType: ImplementationSpecific`) to port 8082.
+- Resolved open questions: Remove `wdp.api_route` port discrepancy item from open questions.
+- New open questions: None beyond those already listed (`wdp.api_route` write owner,
+  CORE/VAP/LATAM authorization intentionality, replica counts, `minReadySeconds` remediation).
+
+**WDP-DECISIONS.md · Candidate new ADRs**
+- **Candidate: Blocking HTTP client in reactive gateway** (🔴 HIGH). `CaseNumberFilter`
+  invokes UAMS and CHAS using blocking `RestTemplate` on Netty event-loop threads with no
+  timeout. ADR should record: current state, risk accepted / remediate with `WebClient` +
+  timeout + circuit breaker, target timeline.
+- **Candidate: CORE/VAP/LATAM gateway authorization gap** (🔴 HIGH). These platform types
+  receive no role-level or case-level authorization at the gateway layer. ADR should record
+  whether this is intentional design (authorization delegated downstream) or a gap requiring
+  remediation.
+- **Candidate: `minReadySeconds` misplacement** (🟡 MEDIUM). Value `30` placed at
+  `spec.template.spec` level — silently ignored by Kubernetes. ADR or infra ticket to move
+  to `spec.minReadySeconds`.
+
+**WDP-ARCHITECTURE.md**
+- No change.
+
+**WDP-NFRS.md · Section 6 Risk Register**
+- Add RISK: COMP-01 blocking `RestTemplate` on Netty event-loop — UAMS/CHAS call with no
+  timeout. Single degraded auth service can exhaust all gateway threads. 🔴 HIGH.
+- Add RISK: COMP-01 `v-correlation-id` always null — cross-service tracing non-functional
+  for all gateway-proxied auth calls. 🟡 MEDIUM.
+- Add RISK: COMP-01 `authExceptions` trim bug — leading-space entries after comma-split
+  silently miss whitelist match. 🟡 MEDIUM.
+- Add RISK: COMP-01 two unhandled NPE paths → 500 (route attr null; `AuthorizationList`
+  claim absent). 🟡 MEDIUM.
+
+**WDP-INTEGRATIONS.md**
+- No change. UAMS and CHAS integration contracts unchanged — outbound auth call pattern
+  already documented.
+
+#### Deviation flags for COMP-01
+
+| DEC | Status | Severity |
+|-----|--------|----------|
+| DEC-001 | ✅ NOT APPLICABLE | — |
+| DEC-003 | ✅ NOT APPLICABLE | — |
+| DEC-004 | ✅ COMPLIES | — |
+| DEC-005 | ✅ NOT APPLICABLE | — |
+| DEC-019 | ✅ COMPLIES | — |
+| DEC-020 | ✅ NOT APPLICABLE | — |
+
+No DEC deviations. Three candidate ADRs raised above for platform-level risks confirmed
+in this pass.
+
+#### Doc status after this change
+- `WDP-COMP-01-API-GATEWAY.md` → `v2.0 DRAFT 🔍` — source-verified 2026-04-30 ·
+  architect confirmation pending
+---
+
 ### 2026-04-30 — COMP-06 NAPDisputeDeclineBatch · v1.1 source-verified
 
 **Component file rewritten.** Existing v1.0 DRAFT was high-level and carried
