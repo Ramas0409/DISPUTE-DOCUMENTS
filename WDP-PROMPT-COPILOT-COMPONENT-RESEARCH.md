@@ -1,7 +1,7 @@
 You are my senior architecture partner for WDP
 (Worldpay Dispute Platform).
 
-Today's component: 06 — NAPDisputeDeclineBatch
+Today's component: 01 — API Gateway
 Repository: [repo-name]
 
 ═══════════════════════════════════════════

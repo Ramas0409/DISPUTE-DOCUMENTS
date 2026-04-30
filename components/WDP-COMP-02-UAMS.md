@@ -1,29 +1,24 @@
 # WDP-COMP-02-UAMS
 **Worldpay Dispute Platform — Component Reference**
 *Version: 1.0 DRAFT | April 2026*
-*Extracted from: gcp-user-access-management-service using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Extracted from: `gcp-user-access-management-service` using GitHub Copilot CLI | Source-verified: 2026-04-29 | Architect-confirmed: PENDING*
 
 ---
 
 ## ━━━ CORE SKELETON ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-*Mandatory for every component regardless of type.*
 
 ---
 
 ## Identity
 
-| Field | Value |
-|---|---|
-| **Name** | `UserAccessManagementService (UAMS)` |
-| **Type** | `REST API` |
-| **Repository** | `gcp-user-access-management-service` |
-| **Technology** | Spring Boot 3.5.13 / Java 17 |
-| **Version** | 1.5.5 |
-| **Owner** | Core WDP Team |
-| **Status** | ✅ Production |
-| **Doc status** | 📝 DRAFT |
-| **Sections present** | `Core \| Block A — REST` |
-| **Context path** | `/merchant/gcp/access-management` (set via `SERVER_SERVLET_CONTEXT_PATH` environment variable) |
+| Field             | Value                                                        |
+|-------------------|--------------------------------------------------------------|
+| **Name**          | UserAccessManagementService (UAMS)                           |
+| **Type**          | REST API                                                     |
+| **Repository**    | `gcp-user-access-management-service`                         |
+| **Status**        | ✅ Production                                                 |
+| **Doc status**    | 📝 DRAFT — source-verified 2026-04-29, architect confirmation pending |
+| **Sections present** | Core, Block A (REST API)                                  |
 
 ---
 
@@ -31,138 +26,220 @@
 
 **What it does**
 
-UserAccessManagementService (UAMS) is the central access-control and user-lifecycle management service for the WDP NAP ecosystem. It serves two fully independent responsibilities from a single deployable.
+UserAccessManagementService is the access-control and user-lifecycle service for the **NAP** acquiring platform within WDP. A single deployable carries four largely independent responsibilities:
 
-The first responsibility is **runtime authorization**: it exposes a `POST /authorize` endpoint consumed exclusively by the API Gateway. When the API Gateway receives a NAP-platform request bearing a case number or merchant ID, it calls this endpoint to determine whether the JWT-bearer's entity claims grant access to that resource. UAMS resolves the merchant from the case if needed, then cross-references the entity relationship data it owns to make the allow/deny decision.
+1. **Runtime case-level authorization for NAP.** Exposes `POST /authorize`, called by the API Gateway (COMP-01) on every NAP request that contains a case ID. Determines whether a JWT-bearer's `napParentEntity` and `napChildEntities` claims grant access to the requested merchant — either supplied directly or resolved from a case number via the `nap.case` table. Returns 200 (authorized) or 403 (denied). This endpoint is the NAP-side counterpart of COMP-03 CHAS, which serves the same role for PIN / CORE / VAP / LATAM.
 
-The second responsibility is **reference data management and user lifecycle**: it owns and maintains the NAP merchant entity hierarchy (parent entities, child entities, merchants, and the relationships between them), an Access Control List (ACL) consumed by downstream components, and it acts as an orchestration proxy for all user lifecycle operations (create, update, activate, deactivate, suspend, reset password) against one of two external SunGard Identity Provider instances. No user credentials are stored in UAMS itself.
+2. **Reference-data CRUD for the NAP merchant entity hierarchy.** Owns and manages parent entities, child entities, merchants (MIDs), and the merchant-to-entity relationships that underpin the runtime authorization check. CRUD is exposed through the `/entity`, `/merchant`, and `/{parentEntityId}/child` endpoint families. Internal callers can manage the full hierarchy; external callers are scoped to their own `napParentEntity` claim.
 
-For bulk entity onboarding, UAMS accepts a file upload via a dedicated endpoint, validates the file type and optional email address, and writes the file directly to AWS S3. No content parsing or downstream processing is performed by UAMS itself — the file lands in S3 for a downstream consumer to process.
+3. **User-lifecycle proxy to SunGard IdP.** Every user-management action — create, update, reset password, activate, suspend — is forwarded to one of two SunGard IdP instances. The instance is selected at runtime by the caller's firm: `Merchant_Fraud_Disputes` traffic goes to the MFD IdP, all other firm values go to the standard `US_Merchant` IdP. UAMS stores no user credentials, no passwords, and no IdP tokens — it is a stateless pass-through for user data.
+
+4. **Bulk entity onboarding via S3.** A single multipart endpoint (`POST /entity/bulk/onboard`) writes the uploaded CSV/XLSX file to `RECEIVED/{ENV}/{filename}` in an S3 bucket fixed to the `eu-west-2` region. UAMS does not parse, validate, or process the file content — downstream processing is handled outside this component, and the response carries no job ID, no presigned URL, and no acknowledgement of downstream pickup.
+
+UAMS additionally maintains an **Access Control List (ACL)** in `wdp.acl` through `/acl`, `/acl/search`, and `PUT /acl`. The ACL is maintained as a service to downstream consumers — UAMS does **not** consult its own ACL when deciding `/authorize`. Whoever consumes the ACL is not identified anywhere in this repository.
 
 **What it does NOT do**
 
-- Does not issue or mint JWT tokens
-- Does not store user credentials or passwords
-- Does not enforce authorization for PIN, CORE, VAP, or LATAM platforms — those platforms return HTTP 400 stub responses in production
-- Does not process or parse the content of bulk onboarding files — S3 write only
-- Does not use the ACL data for its own authorization decisions — ACL is maintained purely as a service to downstream consumers
-- Does not produce or consume Kafka messages
-- Does not use the transactional outbox pattern
-- Does not handle any payment card data, PAN, or PCI-scoped fields
-- Does not implement queue or skill-based routing (suspected to reside in COMP-30 UserQueueSkillService — open question)
+- Issue, mint, or refresh JWT tokens — Spring Security acts as a resource server only.
+- Store user credentials, passwords, or IdP refresh tokens.
+- Process financial transactions or dispute cases — this component does not touch chargebacks, evidence, or case actions.
+- Handle PIN, CORE, VAP, or LATAM platform authorization. `POST /authorize` returns HTTP 400 "Implementation is in progress" for any non-NAP platform value. PIN authorization is owned by COMP-03 CHAS.
+- Process bulk-onboarding file content — only the upload to S3. Downstream parsing happens elsewhere.
+- Use the ACL it owns for its own authorization decisions — ACL is purely a downstream-consumer artefact.
+- Produce to or consume from any Kafka topic. UAMS is Kafka-free (zero `KafkaTemplate`, zero `@KafkaListener`, zero `kafka.*` config). The `KAFKA_SERVICE_ERROR` enum constant in source is vestigial.
+- Run any scheduled job, batch, or cron. REST is the sole entry mechanism — no `@Scheduled`, no `CronJob`, no webhook.
+- Apply circuit breakers, REST timeouts, or retries on any outbound call. Resilience4j is absent.
+- Enforce method-level RBAC via Spring Security annotations. No `@PreAuthorize`, no `@Secured`. All authorization is programmatic in controller and utility code.
+- Connect to IBM DB2. The `com.ibm.db2:jcc` JDBC driver is on the build path but no datasource references it — vestigial.
 
 ---
 
 ## Internal Processing Flow
 
-*This component has two fully independent entry paths. They share no processing steps and are documented separately.*
+UAMS exposes **four functionally independent processing paths** that share only the JWT validation entry filter. Each is documented as a separate flow.
 
----
-
-### Path A — POST /authorize (NAP Case-Level Authorization)
+### Flow A — POST /authorize (NAP runtime authorization)
 
 ```mermaid
 flowchart TD
-    A1([POST /authorize received\nfrom API Gateway]) --> A2
+    A_IN[/"POST /merchant/gcp/access-management/authorize<br/>AuthorizationRequest:<br/>platform, caseNumber?, merchantId?"/]
+    A_JWT{{"Spring Security<br/>Bearer JWT valid?<br/>issuer in trusted list"}}
+    A_401["401 Unauthorized<br/>Spring Security framework"]
+    A_VAL{{"RequestValidator<br/>platform present AND<br/>(caseNumber OR merchantId)?"}}
+    A_400_VAL["400 BadRequestException<br/>missing required field"]
+    A_TOKEN{{"JWT claims non-null?"}}
+    A_400_TOKEN["400 BadRequestException<br/>'Token is blank'"]
+    A_INTERNAL{{"jwt.iss contains<br/>'us_worldpay_fis_int'?"}}
+    A_BYPASS["Bypass entity scope<br/>return authorized"]
+    A_PLAT{{"platform = 'nap'<br/>(case-insensitive)?"}}
+    A_400_STUB["400 BadRequestException<br/>'Implementation is in progress'<br/>field: platform : CORE/VAP/LATAM/PIN<br/>⚠️ Active production stub"]
+    A_CLAIMS{{"napParentEntity OR<br/>napChildEntities<br/>non-blank?"}}
+    A_403_CLAIMS["403 UnauthorizedException<br/>'Entity details not found'"]
+    A_RESOLVE{{"caseNumber<br/>provided?"}}
+    A_CASE_LOOKUP["Read nap.case<br/>NapCaseRepository.findByCaseNumber"]
+    A_CASE_FAIL["403 UnauthorizedException<br/>'Case number not found' /<br/>'Merchant id not found'"]
+    A_USE_MID["Use request.merchantId<br/>directly"]
+    A_BRANCH{{"both claims present<br/>AND napChildEntities<br/>set size ≤ 4?"}}
+    A_NATIVE["Optimized path:<br/>nap.nap_entity_rel<br/>native query<br/>searchMerchantRelationship"]
+    A_FALLBACK["Fallback path:<br/>nap.nap_entity_rel<br/>findByMerchantId<br/>application-side match"]
+    A_MATCH{{"relationship<br/>matches JWT<br/>parent / child?"}}
+    A_403_NOMATCH["403 UnauthorizedException<br/>'Entity details not found'"]
+    A_DB_FAIL["500 — bare<br/>JPA exception<br/>(no retry, no CB)"]
+    A_200["200 OK<br/>empty body — Void"]
 
-    A2{Validate AuthorizationRequest\nplatform is a known enum value?\nIf NAP: caseNumber or merchantId present?}
-    A2 -->|Invalid or missing| A2F[/"HTTP 400\nBadRequestException"/]
-    A2 -->|Valid| A3
-
-    A3{JWT 'iss' claim\ncontains 'us_worldpay_fis_int'?\ncase-insensitive check}
-    A3 -->|Yes — internal firm| A3Y[/"HTTP 200 empty body\nNo DB lookups performed"/]
-    A3 -->|No — external caller| A4
-
-    A4{platform == 'nap'\ncase-insensitive?}
-    A4 -->|No — CORE, VAP,\nLATAM, or PIN| A4F[/"HTTP 400\n'Implementation is in progress'\nHardcoded stub — not implemented"/]
-    A4 -->|Yes — NAP path| A5
-
-    A5{Extract JWT claims:\nnapParentEntity + napChildEntities\nBoth blank or null?}
-    A5 -->|Both blank/null| A5F[/"HTTP 403\nUnauthorizedException"/]
-    A5 -->|At least one present| A6
-
-    A6{caseNumber provided\nin request body?}
-    A6 -->|Yes| A7["Query nap.case\nWHERE caseNumber = :caseNumber\nExtract C_LEVEL1_ENTITY as merchantId"]
-    A6 -->|No| A8
-    A7 -->|Case not found\nor no merchantId| A7F[/"HTTP 403\nUnauthorizedException"\nNote: uncaught exception\npropagates as HTTP 500/]
-    A7 -->|merchantId resolved| A8
-
-    A8{Optimised query path?\nnapChildEntitiesSet.size ≤ 4\nAND napChildEntities non-empty\nAND napParentEntity non-blank?}
-    A8 -->|Yes — optimised| A9["MerchantRelationshipSearchRepository\nNative SQL against nap.nap_entity_rel\nWHERE mid=? AND parent_entity=? AND child_entity=?"]
-    A8 -->|No — fallback| A10["MerchantRelationshipEntityRepository\nfindByMerchantId\nnap.nap_entity_rel — fetch all rows\nfor this merchantId"]
-
-    A9 -->|DB exception| A9F[/"HTTP 500\nUncaught — propagates to\nGlobalExceptionHandler"/]
-    A9 -->|Non-empty result| A9Y[/"HTTP 200 empty body\nAuthorized"/]
-    A9 -->|Empty result| A9E[/"HTTP 403\nUnauthorizedException"/]
-
-    A10 -->|DB exception| A10F[/"HTTP 500\nUncaught — propagates to\nGlobalExceptionHandler"/]
-    A10 -->|Empty result| A10E[/"HTTP 403\nUnauthorizedException"/]
-    A10 -->|Rows returned| A11
-
-    A11{napChildEntitiesSet empty?\nParent-only token?}
-    A11 -->|Yes — parent-only| A12{Any row's parentEntityId\nmatches napParentEntity claim?}
-    A11 -->|No — child entities in token| A13{Intersection between\ntoken's child entities\nand rows' child entities?}
-
-    A12 -->|No match| A12F[/"HTTP 403\nUnauthorizedException"/]
-    A12 -->|Match found| A12Y[/"HTTP 200 empty body\nAuthorized"/]
-
-    A13 -->|Empty intersection| A13F[/"HTTP 403\nUnauthorizedException"/]
-    A13 -->|Non-empty intersection| A13Y[/"HTTP 200 empty body\nAuthorized"/]
+    A_IN --> A_JWT
+    A_JWT -->|"no"| A_401
+    A_JWT -->|"yes"| A_VAL
+    A_VAL -->|"no"| A_400_VAL
+    A_VAL -->|"yes"| A_TOKEN
+    A_TOKEN -->|"no"| A_400_TOKEN
+    A_TOKEN -->|"yes"| A_INTERNAL
+    A_INTERNAL -->|"yes (internal)"| A_BYPASS
+    A_INTERNAL -->|"no (external)"| A_PLAT
+    A_PLAT -->|"non-NAP"| A_400_STUB
+    A_PLAT -->|"NAP"| A_CLAIMS
+    A_CLAIMS -->|"both blank"| A_403_CLAIMS
+    A_CLAIMS -->|"at least one set"| A_RESOLVE
+    A_RESOLVE -->|"yes"| A_CASE_LOOKUP
+    A_RESOLVE -->|"no"| A_USE_MID
+    A_CASE_LOOKUP -->|"row found"| A_BRANCH
+    A_CASE_LOOKUP -->|"row missing /<br/>merchantId null"| A_CASE_FAIL
+    A_CASE_LOOKUP -.->|"DB error"| A_DB_FAIL
+    A_USE_MID --> A_BRANCH
+    A_BRANCH -->|"yes"| A_NATIVE
+    A_BRANCH -->|"no"| A_FALLBACK
+    A_NATIVE --> A_MATCH
+    A_FALLBACK --> A_MATCH
+    A_NATIVE -.->|"DB error"| A_DB_FAIL
+    A_FALLBACK -.->|"DB error"| A_DB_FAIL
+    A_MATCH -->|"yes"| A_200
+    A_MATCH -->|"no"| A_403_NOMATCH
+    A_BYPASS --> A_200
 ```
 
----
-
-### Path B — Management Operations
-
-*Path B covers four categories of management endpoint, each with its own sub-flow. All require a valid Bearer JWT. Internal callers (JWT `iss` URL contains `us_worldpay_fis_int` — case-sensitive `.contains()`) bypass entity-scoping and ownership validation. External callers are scoped to their JWT `napParentEntity` and `napChildEntities` claims.*
+### Flow B — Reference-data CRUD (Entity / Child / Merchant)
 
 ```mermaid
 flowchart TD
-    B1([Management request received]) --> B2
+    B_IN[/"POST/PUT/DELETE/GET<br/>/entity, /v2/merchant,<br/>/{parentEntityId}/child,<br/>/merchant"/]
+    B_JWT{{"Bearer JWT valid?"}}
+    B_401["401 Unauthorized"]
+    B_OP{{"Operation type?"}}
+    B_INT_GUARD{{"create / update / delete:<br/>jwt.iss contains<br/>'us_worldpay_fis_int'?"}}
+    B_403_EXT["403 Forbidden<br/>external user blocked<br/>on internal-only writes"]
+    B_VALIDATE["RequestValidator<br/>field-presence checks"]
+    B_400_REQ["400 BadRequestException"]
+    B_DUP{{"create: duplicate<br/>name / relationship<br/>via app-level SELECT?"}}
+    B_400_DUP["400 BadRequestException<br/>'Parent name matches' /<br/>'Child name matches' /<br/>'Merchant already linked'"]
+    B_NPE{{"updateEntity:<br/>entity present?"}}
+    B_500_NPE["500 NoSuchElementException<br/>⚠️ inverted guard —<br/>.get() before .isPresent()<br/>should return 400"]
+    B_TX["@Transactional<br/>(no TM specified)<br/>⚠️ wdpTransactionManager<br/>(@Primary default)"]
+    B_NAP_WRITE["Write nap.* tables<br/>via napEntityManagerFactory<br/>⚠️ DEC-021 — schema/TM<br/>mismatch on 7 methods"]
+    B_NAP_AUTOCOMMIT["⚠️ nap writes execute in<br/>per-save implicit transactions<br/>NOT covered by service<br/>@Transactional rollback"]
+    B_DB_FAIL["500 — exception bubbles<br/>partial wdp rollback only<br/>nap state may persist"]
+    B_201["201 Created /<br/>200 OK / empty body"]
+    B_GET_SCOPE{{"GET path:<br/>internal firm?"}}
+    B_GET_SCOPED["Apply napParentEntity<br/>filter from JWT"]
+    B_GET_FULL["No scope filter<br/>(internal — full read)"]
+    B_AGG{{"GET parent details<br/>with sorting?"}}
+    B_AGG_PAGED["Paginated DB query<br/>(bounded by pageSize)"]
+    B_AGG_UNBOUNDED["⚠️ @Async parallel fetch<br/>searchChildEntitiesByParentEntityIds<br/>+ searchMerchantEntitiesByParentEntityIds<br/>NO pagination — heap risk"]
+    B_GET_200["200 OK + DTO"]
 
-    B2{JWT iss URL\ncontains 'us_worldpay_fis_int'?\ncase-sensitive check}
-    B2 -->|Yes — internal caller| B3[Bypass entity-scoping\nand ownership validation\nProceed directly to operation]
-    B2 -->|No — external caller| B4[Extract napParentEntity\nand napChildEntities from JWT\nApply entity-scoping rules]
+    B_IN --> B_JWT
+    B_JWT -->|"no"| B_401
+    B_JWT -->|"yes"| B_OP
+    B_OP -->|"GET"| B_GET_SCOPE
+    B_OP -->|"create / update / delete"| B_INT_GUARD
+    B_INT_GUARD -->|"no"| B_403_EXT
+    B_INT_GUARD -->|"yes"| B_VALIDATE
+    B_VALIDATE -->|"fail"| B_400_REQ
+    B_VALIDATE -->|"pass"| B_DUP
+    B_DUP -->|"duplicate found"| B_400_DUP
+    B_DUP -->|"unique"| B_NPE
+    B_NPE -->|"missing on update"| B_500_NPE
+    B_NPE -->|"present or create path"| B_TX
+    B_TX --> B_NAP_WRITE
+    B_NAP_WRITE --> B_NAP_AUTOCOMMIT
+    B_NAP_AUTOCOMMIT -->|"all writes succeed"| B_201
+    B_NAP_AUTOCOMMIT -.->|"mid-sequence failure"| B_DB_FAIL
+    B_GET_SCOPE -->|"internal"| B_GET_FULL
+    B_GET_SCOPE -->|"external"| B_GET_SCOPED
+    B_GET_FULL --> B_AGG
+    B_GET_SCOPED --> B_AGG
+    B_AGG -->|"by-merchant-count<br/>by-child-count"| B_AGG_PAGED
+    B_AGG -->|"with @Async fan-out"| B_AGG_UNBOUNDED
+    B_AGG_PAGED --> B_GET_200
+    B_AGG_UNBOUNDED --> B_GET_200
+```
 
-    B3 --> B5
-    B4 --> B5
+### Flow C — User-lifecycle proxy to SunGard IdP
 
-    B5{Operation category?}
+```mermaid
+flowchart TD
+    C_IN[/"POST/PUT /v2/user/*<br/>(create, update,<br/>reset-password,<br/>activate/suspend)"/]
+    C_JWT{{"Bearer JWT valid?"}}
+    C_401["401 Unauthorized"]
+    C_RBAC{{"AuthorizationList claim<br/>contains WDP_NAP_ADMIN<br/>or WDP_PIN_ADMIN?"}}
+    C_403_RBAC["403 UnauthorizedException"]
+    C_SELF{{"target loginName /<br/>userId == caller's<br/>token loginName?"}}
+    C_403_SELF["403 — cannot act<br/>on own account"]
+    C_EXT_SCOPE{{"external user?<br/>napParentEntity matches?"}}
+    C_403_SCOPE["403 — external scope<br/>mismatch"]
+    C_FIRM_ROUTE{{"firmName ==<br/>'Merchant_Fraud_Disputes'?"}}
+    C_IDP_MFD["MFD IdP instance<br/>idp.mfd-user-api-base-url<br/>+ mfd-auth-token<br/>+ mfd-sungard-key"]
+    C_IDP_STD["Standard IdP instance<br/>idp.user-api-base-url<br/>+ auth-token<br/>+ sungard-key"]
+    C_MAP["Map WDP request →<br/>IdpUserRequest /<br/>IdpUpdateUserRequest"]
+    C_CALL["RestTemplate call<br/>⚠️ no connect timeout<br/>⚠️ no read timeout<br/>⚠️ no retry<br/>⚠️ no circuit breaker"]
+    C_CALL_FAIL{{"RestClientException?"}}
+    C_500_IDP["500 WebServiceException /<br/>AccessManagementServiceException<br/>thread blocks until<br/>TCP gives up"]
+    C_200_OK["200 OK / 201 Created<br/>(no IdP response body returned)"]
 
-    %% Entity CRUD
-    B5 -->|Entity CRUD\nPOST/PUT/DELETE /entity\nGET /entity\nchild entity endpoints| B6["Validate entity ownership\nfor external callers\nparentEntityId must match JWT napParentEntity"]
-    B6 -->|Ownership check fails| B6F[/"HTTP 403"/]
-    B6 -->|Passes| B7
+    C_IN --> C_JWT
+    C_JWT -->|"no"| C_401
+    C_JWT -->|"yes"| C_RBAC
+    C_RBAC -->|"no admin role"| C_403_RBAC
+    C_RBAC -->|"admin"| C_SELF
+    C_SELF -->|"yes (self)"| C_403_SELF
+    C_SELF -->|"no (target ≠ self)"| C_EXT_SCOPE
+    C_EXT_SCOPE -->|"external + mismatch"| C_403_SCOPE
+    C_EXT_SCOPE -->|"internal OR matched"| C_FIRM_ROUTE
+    C_FIRM_ROUTE -->|"yes"| C_IDP_MFD
+    C_FIRM_ROUTE -->|"no"| C_IDP_STD
+    C_IDP_MFD --> C_MAP
+    C_IDP_STD --> C_MAP
+    C_MAP --> C_CALL
+    C_CALL --> C_CALL_FAIL
+    C_CALL_FAIL -->|"yes"| C_500_IDP
+    C_CALL_FAIL -->|"no"| C_200_OK
+```
 
-    B7{Operation type?}
-    B7 -->|CREATE parent entity| B7A["Duplicate name check\nnap.nap_parent_entity\nGenerate IDs via sequence\nWrite parent + child entity\nin single @Transactional\nnap schema"]
-    B7 -->|CREATE/UPDATE child\nand merchant relationship| B7B["createOrUpdateChildEntity\n@Transactional napTransactionManager\nChild entity save + merchant\nrelationship update in one tx"]
-    B7 -->|saveChildWithMerchant| B7C["⚠️ @Transactional without\nexplicit napTransactionManager\nUses @Primary wdpTransactionManager\nfor NAP tables — POTENTIAL BUG"]
-    B7 -->|READ entity or child listing| B7D[/"HTTP 200 + entity data\nScoped to caller's JWT claims"/]
-    B7 -->|DELETE entity| B7E["Validate CHILD type only\nfor external callers\nValidate parent ownership"]
+### Flow D — Bulk entity onboarding upload
 
-    B7A -->|Duplicate name| B7AF[/"HTTP 400\nDuplicate check or DB constraint"/]
-    B7A -->|Success| B7AY[/"HTTP 200"/]
-    B7C -->|DB exception| B7CF[/"HTTP 500\nPartial commit risk\nif later step fails"/]
+```mermaid
+flowchart TD
+    D_IN[/"POST /entity/bulk/onboard<br/>multipart: file + notifyEmailId"/]
+    D_JWT{{"Bearer JWT valid?"}}
+    D_401["401 Unauthorized"]
+    D_FILE{{"RequestValidator<br/>file present, CSV or XLSX,<br/>email valid?"}}
+    D_400["400 BadRequestException"]
+    D_CLAIMS["Extract LoginName,<br/>EmailAddress from JWT"]
+    D_S3_KEY["Build S3 key:<br/>RECEIVED/{ENV}/{filename}<br/>add metadata headers"]
+    D_S3_PUT["S3Client.putObject<br/>region=eu-west-2 (hardcoded)<br/>bucket=${wdp_entity_file}<br/>⚠️ no timeouts<br/>⚠️ no retry<br/>⚠️ no circuit breaker"]
+    D_S3_FAIL["500 AccessManagementServiceException<br/>'S3 upload failed'"]
+    D_200["200 OK<br/>empty body<br/>(no job ID, no presigned URL,<br/>no downstream ACK)"]
+    D_DOWNSTREAM["⚠️ Downstream parser<br/>not in this repo<br/>processing fate<br/>opaque to caller"]
 
-    %% User Lifecycle (IdP proxy)
-    B5 -->|User lifecycle\n/v2/user endpoints\n/v2/users| B8["Determine SunGard IdP instance\nvia firmName routing\nAll /v2/user* endpoints:\nfirmName = 'Merchant_Fraud_Disputes'\nRoutes to MFD IdP instance"]
-    B8 --> B9["Call SunGard IdP via REST\nIdpRestInvoker\nNo timeout — thread blocks indefinitely\nNo retry — single attempt\nNo circuit breaker"]
-    B9 -->|IdP returns HTTP 400| B9A[/"HTTP 400\nIdP error body parsed\nand returned to caller"/]
-    B9 -->|IdP returns HTTP 500\nor IO failure| B9B[/"HTTP 500\nWebServiceException SYSTEM_ERROR"/]
-    B9 -->|IdP success| B9Y[/"HTTP 200 + user data\nor HTTP 200 empty body"/]
-
-    %% ACL Management
-    B5 -->|ACL management\nPOST /acl\nPUT /acl\nPOST /acl/search| B10["Duplicate check for POST\nWrite to wdp.acl\nwdpTransactionManager\nStatus and timestamps managed\nby mapAclUpdateRequest"]
-    B10 -->|Duplicate found| B10F[/"HTTP 400\nDuplicateEntityValidationException"/]
-    B10 -->|Success| B10Y[/"HTTP 200"/]
-
-    %% Bulk Onboard
-    B5 -->|Bulk entity onboard\nPOST /entity/bulk/onboard| B11["Validate file type\n.csv, .xlsx, .xls only\nValidate email if provided\n@worldpay.com only"]
-    B11 -->|Validation fails| B11F[/"HTTP 500\nAccessManagementServiceException\nNote: should be 400 — arch gap"/]
-    B11 -->|Valid| B12["Stream file directly to S3\nbucket: wdp_entity_file\nkey: RECEIVED/{ENV}/{filename}\nregion: EU_WEST_2 hardcoded\nNo content parsing"]
-    B12 -->|S3 upload fails| B12F[/"HTTP 500\nAccessManagementServiceException\nS3_UPLOAD_FAILED"/]
-    B12 -->|S3 upload succeeds| B12Y[/"HTTP 200 empty body\nDownstream processor\nconsumes from S3 — not UAMS"/]
+    D_IN --> D_JWT
+    D_JWT -->|"no"| D_401
+    D_JWT -->|"yes"| D_FILE
+    D_FILE -->|"fail"| D_400
+    D_FILE -->|"pass"| D_CLAIMS
+    D_CLAIMS --> D_S3_KEY
+    D_S3_KEY --> D_S3_PUT
+    D_S3_PUT -->|"success"| D_200
+    D_S3_PUT -->|"any Exception"| D_S3_FAIL
+    D_200 -.->|"file picked up<br/>asynchronously"| D_DOWNSTREAM
 ```
 
 ---
@@ -171,22 +248,157 @@ flowchart TD
 
 ### Inbound Interfaces
 
-| Source | Protocol | Endpoint | Payload / Description |
-|---|---|---|---|
-| API Gateway (COMP-01) | REST — Bearer JWT | `POST /authorize` | AuthorizationRequest: platform, caseNumber (optional), merchantId (optional) |
-| Merchant Portal (external NAP users) | REST — Bearer JWT | Entity, child, merchant, ACL, user, bulk onboard endpoints | Scoped to caller's JWT entity claims |
-| Merchant Fraud/Disputes Portal users | REST — Bearer JWT | User lifecycle endpoints | Scoped to caller's napParentEntity claim |
-| Internal Worldpay systems | REST — Bearer JWT (internal issuer) | All endpoints | All entity-scoping bypassed via internal issuer claim |
+| Source | Protocol | Endpoint / Trigger | Payload / Description |
+|--------|----------|--------------------|-----------------------|
+| API Gateway (COMP-01) | REST | `POST /merchant/gcp/access-management/authorize` | NAP case-level entity authorization. Caller's JWT forwarded as Bearer; `void.class` response on success. |
+| WDP Merchant Portal (COMP-49) | REST | Entity / merchant / user / ACL CRUD | External-user paths scoped to `napParentEntity` from JWT. |
+| WDP Ops Portal (COMP-50) | REST | Entity / merchant / user / ACL CRUD | Internal-firm callers; full hierarchy access. |
+| Internal Worldpay systems | REST | All endpoint families | `iss` contains `us_worldpay_fis_int` — bypasses all entity scoping. |
+| K8s liveness/readiness probes | REST | `GET /merchant/gcp/access-management/livez`, `/readyz` | Operational health. |
 
 ### Outbound Interfaces
 
 | Target | Protocol | Endpoint / Resource | Purpose | On failure |
-|---|---|---|---|---|
-| SunGard IdP — US/Default instance | REST — API Key + Bearer token | `${idp_user_api_base_url}` | User lifecycle operations for non-MFD callers | HTTP 500 — no retry, no circuit breaker, no timeout |
-| SunGard IdP — Merchant Fraud Disputes instance | REST — API Key + Bearer token | `${idp_mfd_user_api_base_url}` | User lifecycle operations for all `/v2/user*` and `/user/entity/*` endpoints (hardcoded to MFD instance) | HTTP 500 — no retry, no circuit breaker, no timeout |
-| AWS S3 (eu-west-2) | S3 SDK — `putObject()` | `RECEIVED/{ENV}/{originalFilename}` in bucket `${wdp_entity_file}` | Bulk entity onboarding file storage | HTTP 500 AccessManagementServiceException |
-| nap schema — Aurora PostgreSQL | JPA / PostgreSQL | `nap.nap_parent_entity`, `nap.nap_child_entity`, `nap.nap_merchant`, `nap.nap_entity_rel`, `nap.case` | Entity hierarchy CRUD and case-number resolution | Uncaught exception → HTTP 500 |
-| wdp schema — Aurora PostgreSQL | JPA / PostgreSQL | `wdp.acl` | ACL management | Uncaught exception → HTTP 500 |
+|--------|----------|---------------------|---------|------------|
+| SunGard IdP — US_Merchant instance | REST (blocking) | `${idp.user-api-base-url}/...` | All non-MFD user-lifecycle ops | 500 — thread blocks until TCP gives up; no retry, no CB, no timeout |
+| SunGard IdP — MFD instance | REST (blocking) | `${idp.mfd-user-api-base-url}/...` | Merchant_Fraud_Disputes user ops | 500 — same pattern as standard IdP |
+| AWS S3 (eu-west-2) | AWS SDK v2 | `${wdp_entity_file}` bucket, key `RECEIVED/{ENV}/{filename}` | Bulk-onboarding file upload — UAMS does not parse content | 500 "S3 upload failed"; SDK default retry only |
+| PostgreSQL `nap` schema | JDBC (HikariCP) | `nap.nap_parent_entity`, `nap.nap_child_entity`, `nap.nap_merchant`, `nap.nap_entity_rel`, `nap.case` (read) | Entity hierarchy + authorization lookup | JPA exception → 500; transaction-manager mismatch (DEC-021) means partial-write hazard |
+| PostgreSQL `wdp` schema | JDBC (HikariCP) | `wdp.acl` | ACL maintenance for downstream consumers | JPA exception → 500 |
+
+---
+
+## ━━━ TYPE BLOCK A — REST API CONTRACTS ━━━━━━━━━━━━━━━━━━━
+
+---
+
+## REST API Contracts
+
+**Framework:** Spring Boot 3.5 / Java 17, Spring Web MVC.
+**Authentication:** Spring Security OAuth2 Resource Server. Issuer trust list configured via `${jwt_trusted_issuer_urls}` (issuer URLs not in repo).
+**Base URL pattern:** `https://<host>/merchant/gcp/access-management`
+**RBAC mechanism:** **Programmatic only** — every authorization check is in controller or `AuthorizationUtil` code. No `@PreAuthorize`, no `@Secured`, no method-level Spring Security annotations anywhere.
+**Whitelisted paths (no JWT required):** `/actuator/health`, `/livez`, `/readyz`. In non-prod profiles only: `/access-management-service-api-docs`, `/access-management-service-api-docs/swagger-config`, `/swagger-ui/**`.
+**Correlation header:** `v-correlation-id` (note: `v-` not `x-`). Read by request interceptor, written to MDC, written to response. **Not propagated** on outbound IdP or S3 calls.
+**Error body:** Structured JSON via `GlobalExceptionHandler` with `message` and field-reference fields. Empty body on 200/201 unless otherwise noted.
+
+UAMS exposes **22 application endpoints** across 5 controller families plus 5 health/observability endpoints. The full inventory below is at architecture level — request and response field-by-field schemas live in source.
+
+### Endpoint family 1 — Authorization
+
+| Method | Path | Caller | Auth model | Success | Failure modes |
+|--------|------|--------|-----------|---------|---------------|
+| `POST` | `/authorize` | API Gateway (COMP-01) | JWT + internal-firm bypass + entity-scope check | 200 OK, empty body | 400 (token blank, non-NAP platform, missing merchantId+caseNumber); 403 (case not found, merchant not found, no entity match); 500 (DB error) |
+
+**Notes:**
+- The 200 status code is the authorization signal — **no body returned** on success.
+- The internal-firm short-circuit is `iss` contains `us_worldpay_fis_int` (substring match). Same string as COMP-03 CHAS.
+- For NAP, an **optimization branch** runs a native `searchMerchantRelationship` query on `nap.nap_entity_rel` when both claims are present and `napChildEntities.size() ≤ 4`. Otherwise the fallback path uses `findByMerchantId` and matches in application code.
+- Unlike CHAS, UAMS does **not** apply chain-first / merchant-fallback; the lookup is direct against `nap.nap_entity_rel`.
+
+### Endpoint family 2 — Entity Management
+
+| Method | Path | Internal-only | Notes |
+|--------|------|---------------|-------|
+| `POST` | `/entity` | Yes (create) | Creates parent entity (and matching child) or child entity. App-level uniqueness check by name. |
+| `GET` | `/entity` | No | Paginated parent entity list with optional name / column / order filters. External callers scoped to `napParentEntity`. |
+| `PUT` | `/entity/{entityId}` | Yes | ⚠️ Inverted-guard NPE: missing entity returns 500 instead of 400. |
+| `DELETE` | `/entity` | Yes (parent), scoped (child) | Deletes parent or child entity by `DeleteEntityRequest`. |
+| `POST` | `/entity/bulk/onboard` | No | Multipart upload to S3 — fire-and-forget. |
+| `GET` | `/v2/entity/{parentEntityId}/child` | No | Paginated child list within parent scope. |
+| `POST` | `/{parentEntityId}/child` | No (validated user) | Create child under parent. |
+| `PUT` | `/{parentEntityId}/child/{childEntityId}` | No (validated user) | Update child. |
+
+### Endpoint family 3 — Merchant Management
+
+| Method | Path | Internal-only | Notes |
+|--------|------|---------------|-------|
+| `POST` | `/v2/merchant` | Yes | `saveChildWithMerchant` — creates child + merchants + relationships. **DEC-021 occurrence #1** (root-cause method). |
+| `GET` | `/merchant` | No | Paginated merchant list with filters. External callers scoped. |
+| `PUT` | `/merchant/{merchantId}` | Yes | Update merchant attributes. |
+| `DELETE` | `/v2/merchant` | Yes | Bulk delete by request body. |
+
+### Endpoint family 4 — User Lifecycle (proxy to SunGard IdP)
+
+| Method | Path | RBAC | Notes |
+|--------|------|------|-------|
+| `GET` | `/user/entity` | Entity scope | Paginated parent/child entity list for user. |
+| `POST` | `/v2/user` | Admin role | Create user → IdP. |
+| `PUT` | `/v2/user/{loginName}` | Admin role + not-self | Update user → IdP. |
+| `PUT` | `/v2/user/reset-password/{userId}` | Admin role + not-self | Reset password → IdP. |
+| `PUT` | `/v2/user/{userId}/{status}` | Admin role + not-self | Activate / suspend → IdP. |
+| `GET` | `/v2/users` | Entity scope | Paginated IDP user list. |
+| `GET` | `/user/entity/{loginName}/child` | Entity scope | User-scoped child entity list. |
+
+**IdP routing:** `firmName == "Merchant_Fraud_Disputes"` selects the MFD instance; all other firms select the standard `US_Merchant` instance. `firmName` is parsed from the JWT `iss` claim (substring after the last `/`). The user controller hardcodes the `MERCHANT_DISPUTES_FIRM` constant for several endpoints — whether traffic for the standard `US_Merchant` IdP reaches UAMS through a separate deployment or routing layer is **not determinable from this repository alone**.
+
+### Endpoint family 5 — ACL
+
+| Method | Path | RBAC | Notes |
+|--------|------|------|-------|
+| `POST` | `/acl` | Any authenticated | Bulk-create ACL records via `List<CreateAclRequest>`. App-level duplicate check on composite key `(consumerName, sourceSystem, entityType, entityValue)`. |
+| `PUT` | `/acl` | Any authenticated | Update ACL record. ACTIVE / INACTIVE status transitions tracked by activated/deactivated timestamps. |
+| `POST` | `/acl/search` | Any authenticated | Search ACL records by `SearchAclRequest`. |
+
+### Health and observability
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/livez` | K8s liveness probe |
+| `GET` | `/readyz` | K8s readiness probe |
+| `GET` | `/actuator/health` | Spring Actuator health |
+| `GET` | `/actuator/info` | Spring Actuator info |
+| `GET` | `/actuator/prometheus` | Prometheus scrape endpoint |
+
+---
+
+## Functional Behaviour
+
+### Classification and routing logic
+
+| Decision | Field examined | Outcomes |
+|----------|----------------|----------|
+| Platform on `/authorize` | `request.platform` (case-insensitive) | `nap` → NAP authorization flow; anything else → 400 stub |
+| Internal vs external caller | `jwt.iss` substring | contains `us_worldpay_fis_int` → bypass entity scope; else → external scope filter |
+| IdP instance selection | `firmName` parsed from JWT `iss` | `Merchant_Fraud_Disputes` → MFD IdP; else → US_Merchant IdP |
+| Entity create branch | `request.type` | `PARENT` → parent + matching child; `CHILD` → child under parent |
+| Authorization lookup branch | `napChildEntitiesSet.size()` | `≤ 4` AND both claims present → native query; else → fallback `findByMerchantId` |
+| Resolution path | `request.caseNumber` | present → `nap.case` lookup; absent → use `request.merchantId` directly |
+
+### Business rules applied locally
+
+- **JWT presence**: `jwt == null` OR `jwt.getClaims() == null` → 400 "Token is blank".
+- **Platform restriction**: only `nap` is implemented; CORE / VAP / LATAM / PIN return 400 "Implementation is in progress" — **active production stub**.
+- **Resolution validity**: `caseNumber` must resolve to a non-null `merchantId` from `nap.case`, or `request.merchantId` must be non-blank — failure is 403.
+- **Entity-scope match**: at least one JWT-supplied parent or child entity must match a row in `nap.nap_entity_rel` for the resolved merchant — failure is 403.
+- **Internal-only writes**: external callers cannot create / update / delete parent entities or saveChildWithMerchant — failure is 403.
+- **Name uniqueness**: parent name (case-insensitive) and child name within parent must be unique — failure is 400. Application-level only (no DB unique constraint visible in source).
+- **Merchant relationship uniqueness**: a merchant cannot be linked to two different parents — failure is 400.
+- **Admin role**: user-lifecycle endpoints require `WDP_NAP_ADMIN` or `WDP_PIN_ADMIN` in the `AuthorizationList` JWT claim — failure is 403.
+- **Self-exclusion**: an admin cannot perform user-lifecycle ops on their own account — failure is 403.
+- **File contract**: bulk-upload accepts CSV / XLSX only — failure is 400. No file-size cap in code (Spring Boot defaults apply).
+
+### Data transformations
+
+- `EntityRequest` → `ParentEntity` / `ChildEntity`: name uppercased unconditionally, sequence ID generated.
+- `UserRequest` → `IdpUserRequest`: department fields and custom fields mapped per IdP contract.
+- `UpdateUserRequest` → `IdpUpdateUserRequest`: caller's user ID is the `updatedBy` source.
+- `CreateAclRequest` → `MerchantDisputeAcl`: created/updated/activated timestamps populated from system clock.
+
+### Idempotency
+
+UAMS implements **no formal idempotency**. No `idempotency-key` header is read at any write site. Per write endpoint:
+
+| Endpoint | Detection | Gap |
+|----------|-----------|-----|
+| `POST /entity` (PARENT) | Application-level SELECT by name | No DB unique constraint visible — replica race window |
+| `POST /entity` (CHILD) | Application-level SELECT by parent + name | Same gap |
+| `POST /v2/merchant` | `existsRelationshipForInsert()` SELECT | Same gap. SQL state `23505` constant defined but not used here |
+| `POST /v2/user` | Delegated to SunGard IdP | UAMS-side: no record kept |
+| `POST /acl` | Composite-key SELECT | Same gap |
+| `PUT /acl` | ACL ID + composite-key SELECT | Same gap |
+
+This component **DEVIATES from DEC-020**.
 
 ---
 
@@ -194,303 +406,237 @@ flowchart TD
 
 ### Tables Owned (written by this component)
 
-| Schema.Table | Purpose | Key Columns | Notes |
-|---|---|---|---|
-| `nap.nap_parent_entity` | Top-level NAP merchant groupings | `id` (PK seq), `i_entity_id` (business key), `c_name`, `x_insrt`, `z_insrt`, `x_updt`, `z_updt`, `X_INSRT_DISPLAY`, `X_UPDT_DISPLAY` | Written in same `@Transactional` as child entity on createEntity |
-| `nap.nap_child_entity` | Sub-groupings beneath a NAP parent entity | `id` (PK seq), `i_entity_id`, `i_parent_entity_id` (FK), `c_name`, `x_insrt`, `z_insrt`, `x_updt`, `z_updt`, `X_INSRT_DISPLAY`, `X_UPDT_DISPLAY` | Written in same tx as parent on createEntity; also written by createOrUpdateChildEntity (napTransactionManager) and saveChildWithMerchant (⚠️ wrong TM — see risks) |
-| `nap.nap_merchant` | Individual merchant IDs | `id` (PK seq), `i_merchant_id` (MID), `c_merchant_name`, `c_mcc`, `c_wpg_id`, `x_insrt`, `z_insrt`, `x_updt`, `z_updt`, `X_INSRT_DISPLAY`, `X_UPDT_DISPLAY` | Written by saveNewMerchant() and updateMerchant() |
-| `nap.nap_entity_rel` | Merchant-to-entity relationships — primary authorization lookup table | `id` (PK seq), `i_mid` (merchant ID), `i_parent_entity_id`, `i_child_entity_id` | Written by saveChildWithMerchant(), createOrUpdateChildEntity(), deleteMerchantByParent(). Also the table queried on every /authorize call. |
-| `wdp.acl` | Access control list for downstream consumers | `i_acl_id` (PK, seq `ACL_I_ACL_ID_SEQUENCE`), `c_consumer_name`, `c_source_system`, `c_entity_class`, `c_entity_type`, `c_entity_value`, `c_status`, `c_created_by`, `t_created_timestamp`, `c_updated_by`, `t_updated_timestamp`, `c_activated_by`, `c_activated_timestamp`, `c_deactivated_by`, `t_deactivated_timestamp` | Index: `acl_search_index` on `(c_consumer_name, c_status)`. Written on POST /acl and PUT /acl. Not used by UAMS itself for authorization. |
+| Schema.Table | Purpose | Key columns | Notes |
+|--------------|---------|-------------|-------|
+| `nap.nap_parent_entity` | Top-level NAP entity hierarchy | `i_entity_id`, `c_name` | Created with name uppercased; no DB UNIQUE on name visible. |
+| `nap.nap_child_entity` | Child entities under a parent | `i_entity_id`, `c_name`, `i_parent_entity_id` | Created with name uppercased; no DB UNIQUE visible. **🔴 DEC-021 — written under wrong TM** (Risk Register). |
+| `nap.nap_merchant` | Merchant master (MID, MCC, WPG ID) | `i_mid`, `c_name`, `c_mcc`, `c_wpg_id` | Created via `saveChildWithMerchant`. **🔴 DEC-021 — written under wrong TM**. |
+| `nap.nap_entity_rel` | Merchant ↔ parent ↔ child relationships — primary NAP authorization lookup | `i_parent_entity_id`, `i_child_entity_id`, `i_mid` | Read on every `/authorize`. **🔴 DEC-021 — written under wrong TM**. |
+| `wdp.acl` | Access Control List for downstream consumers | `i_acl_id`, `c_consumer_name`, `c_source_system`, `c_entity_type`, `c_entity_value`, `c_status`, `c_created_by`, `t_created_timestamp`, `c_updated_by`, `t_updated_timestamp`, `c_activated_by`, `t_activated_timestamp`, `c_deactivated_by`, `t_deactivated_timestamp` | Status transitions ACTIVE / INACTIVE tracked by paired audit columns. **Downstream consumers not identifiable from source.** |
 
 ### Tables Read (not owned by this component)
 
 | Schema.Table | Owned by | Why accessed |
-|---|---|---|
-| `nap.case` | Core WDP case management (write path unconfirmed) | Read-only. Resolves `caseNumber` → `merchantId` via `C_LEVEL1_ENTITY` during /authorize processing. UAMS never writes to this table. |
+|--------------|----------|--------------|
+| `nap.case` | COMP-23 CaseManagementService | Case-number → `merchantId` resolution on `/authorize` when `caseNumber` is provided. Confirmed read-only — UAMS never writes `nap.case`. |
 
-### Transaction Boundaries
+### DEC-021 occurrences within UAMS
 
-| Operation | Transaction manager | Tables in scope | Notes |
-|---|---|---|---|
-| `createEntity` (PARENT type) | `napTransactionManager` — explicit | `nap.nap_parent_entity`, `nap.nap_child_entity` | Single `@Transactional` — both inserts rolled back together on any failure |
-| `createOrUpdateChildEntity` | `napTransactionManager` — explicit | `nap.nap_child_entity`, `nap.nap_entity_rel` | Child entity save and merchant relationship updates in one transaction |
-| `saveChildWithMerchant` | ⚠️ `wdpTransactionManager` (`@Primary`) — NOT napTransactionManager | `nap.nap_child_entity`, `nap.nap_merchant`, `nap.nap_entity_rel` | **Bug confirmed by Copilot**: `@Transactional` without explicit TM name uses the `@Primary` wdpTransactionManager. All writes target NAP schema tables — managed by napTransactionManager. Rollback on late-step failure may not occur. |
-| ACL writes | `wdpTransactionManager` — explicit (primary schema) | `wdp.acl` | Correct — wdp schema uses wdpTransactionManager |
+Seven service / DAO methods write `nap.*` tables under `@Transactional` with no transaction-manager qualifier — the default is `@Primary` `wdpTransactionManager`. Because `nap.*` repositories are bound to a separate `napEntityManagerFactory`, the nap writes execute in their own per-save implicit transactions and are **not covered by the service-method `@Transactional` rollback boundary**.
 
-### Caching
+| # | Method | Schema written | Severity |
+|---|--------|----------------|----------|
+| 1 | `MerchantServiceImpl.saveChildWithMerchant` | nap_child_entity, nap_merchant, nap_entity_rel | 🔴 Cross-table — root-cause method recorded in DEC-021 |
+| 2 | `AccessManagementServiceImpl.createEntity` | nap_parent_entity, nap_child_entity | 🔴 Cross-table |
+| 3 | `AccessManagementServiceImpl.updateEntity` | nap_parent_entity, nap_child_entity | 🔴 Cross-table |
+| 4 | `MerchantDaoImpl.updateMerchantRelationships` | nap_entity_rel | 🟠 Single-table |
+| 5 | `MerchantDaoImpl.deleteMerchantByParent` | nap_entity_rel, nap_merchant | 🔴 Cross-table |
+| 6 | `AccessManagementDaoImpl.deleteChildEntity` | nap_entity_rel, nap_merchant, nap_child_entity | 🔴 Cross-table |
+| 7 | `AccessManagementDaoImpl.deleteParentEntity` | nap_entity_rel, nap_merchant, nap_child_entity, nap_parent_entity | 🔴 Cross-table |
 
-No caching of any database reads. No Spring Cache annotations, no EhCache, no Redis, no in-memory maps for entity or relationship data.
+Only one method correctly specifies `napTransactionManager`: `AccessManagementServiceImpl.createOrUpdateChildEntity`.
 
----
+**Implication:** any multi-table NAP-side write that fails part-way through leaves the NAP schema in an inconsistent state. The wdp transaction (which carries no nap writes) rolls back cleanly, but no nap state is rolled back. **This is broader than the v2.0 DEC-021 record indicated** — the issue is a pattern across UAMS, not a single method defect.
 
-## Architecture Decisions
+### Locking
 
-| Decision | Detail |
-|---|---|
-| Single deployable — dual responsibility | UAMS combines the runtime authorization check service (stateless lookup) with the reference data management surface (stateful CRUD). These are architecturally distinct concerns served by the same pod. |
-| NAP-only authorization | /authorize implements NAP platform only. CORE, VAP, LATAM, PIN return HTTP 400 stub. PIN authorization is owned by CHAS (COMP-03). |
-| Internal caller bypass via JWT issuer | Internal Worldpay systems bypass all entity-scoping via a JWT `iss` claim check. The bypass check on /authorize uses case-insensitive `containsAnyIgnoreCase`; the bypass check on management endpoints uses case-sensitive `.contains()`. These are different implementations of the same logical check — a consistency gap. |
-| Firm-based IdP routing in code | The SunGard IdP instance selection is determined by a `firmName` parameter passed internally. All `/v2/user*` and `/user/entity/*` endpoints hardcode `firmName = 'Merchant_Fraud_Disputes'`, routing to the MFD IdP instance. Routing is static in code via `ApplicationConstants` — not runtime-configurable. |
-| S3 write — no content processing | Bulk entity onboarding files are streamed directly to S3. UAMS performs no content parsing, validation, or transformation. Downstream processing is delegated to an unidentified consumer of the S3 bucket. |
-| Dual PostgreSQL datasources | Two separate Aurora PostgreSQL datasources within the same pod — `nap` schema and `wdp` schema — each with their own transaction manager and HikariCP connection pool. |
-| ACL as a downstream service | UAMS maintains the ACL table as a service to downstream consumers. UAMS does not use ACL data for its own authorization decisions. |
-| No credential storage | No user passwords or credentials are stored. All credential lifecycle is delegated to SunGard IdP. |
-| Planned consolidation | Case-level authorization is planned to be consolidated into a single service, replacing the current NAP/PIN split between UAMS and CHAS. No timeline confirmed. |
-
----
-
-## Platform Standard Deviations
-
-| Standard | Status | Detail |
-|---|---|---|
-| DEC-001 Transactional Outbox | ✅ COMPLIANT (N/A) | No Kafka producer. No outbox table. The only Kafka reference in the codebase is a dead-code error code constant — no Kafka dependency in pom.xml. |
-| DEC-003 Kafka Partition Key = merchantId | ✅ COMPLIANT (N/A) | No Kafka producer. |
-| DEC-004 PAN Encryption | ✅ COMPLIANT | No payment card data, PAN, or PCI-scoped fields exist anywhere in the data model or API contracts. The service handles merchant IDs, entity hierarchy identifiers, and case numbers only. |
-| DEC-005 Manual Kafka Offset Commit | ✅ COMPLIANT (N/A) | No Kafka consumer. |
-| DEC-014 Resilience4j | ⛔ DEVIANT — HIGH SEVERITY | No Resilience4j dependency in pom.xml. No circuit breakers, bulkheads, or rate limiters on any outbound call. Combined with no timeout on the RestTemplate used for IdP calls, a hung SunGard IdP will block servlet threads indefinitely with no recovery path. Three outbound surfaces are unprotected: SunGard IdP (REST, blocking, no timeout), AWS S3, and PostgreSQL JPA. |
-
----
-
-## Risks & Constraints
-
-| Risk | Severity | Detail |
-|---|---|---|
-| No timeout on IdP RestTemplate | HIGH | `CommonConfig` creates RestTemplate as `new RestTemplate()` with no `ClientHttpRequestFactory` customisation. `SimpleClientHttpRequestFactory` default has no connection or read timeout. A hung SunGard IdP call blocks a servlet thread indefinitely. No circuit breaker or retry exists. Under IdP degradation, thread pool exhaustion is a realistic failure mode. |
-| saveChildWithMerchant uses wrong transaction manager | HIGH | Confirmed bug: `@Transactional` without specifying `napTransactionManager` falls through to the `@Primary` `wdpTransactionManager`. All tables written by this method (`nap.nap_child_entity`, `nap.nap_merchant`, `nap.nap_entity_rel`) are in the NAP schema — managed by `napTransactionManager`. If a late step in this method fails, rollback may not be issued to the NAP datasource, leaving the hierarchy in a partially committed state. |
-| NPE bug in updateEntity — PARENT type | HIGH | Confirmed bug: `entity.get().getParentName()` is called unconditionally before `entity.isPresent()` is checked. If the parent entity does not exist, this throws `NoSuchElementException` → HTTP 500. Intended behaviour is HTTP 400 (`PARENT_NOT_EXISTS`). No ticket or comment references this bug in source. CHILD type branch correctly checks presence before `.get()`. |
-| IdP auth token logged at INFO level | HIGH | `IdpRestInvoker` logs the auth token value at INFO level on every outbound call. The auth token (`authCode`) is a credential — logging at INFO means it appears in standard operational log streams and is shipped to Logstash. Security risk — credentials exposed in logs. |
-| Topology spread constraint inoperative | MEDIUM | Pod template label: `app: user-access-management-service${BRANCH_NAME_PLACEHOLDER}`. Topology spread `labelSelector.matchLabels.app`: `gcp-user-access-management-service${BRANCH_NAME_PLACEHOLDER}` (prefixed with `gcp-`). Labels do not match. Kubernetes never evaluates the spread constraint. All pods may schedule to the same node with no warning. |
-| @Async methods — implicit pool resolution | MEDIUM | Two `@Async` methods in `AccessManagementDaoImpl` do not specify the configured `asyncExecutor` bean name. Spring resolves the pool implicitly because it is the only `TaskExecutor` bean defined. This is behaviourally correct today but breaks if a second `TaskExecutor` bean is added. Explicit pool name reference would be safer. |
-| No HPA — static replica count | MEDIUM | Replica count is a fixed XL Deploy variable (`{{ replicas-user-access-management-service }}`). No automated scaling under load. Under IdP latency events, thread exhaustion can occur without any scaling response. |
-| No CPU limits configured | MEDIUM | No `cpu:` entries in `resources.limits` or `resources.requests`. CPU is unconstrained. Risk of node CPU starvation affecting co-scheduled pods. |
-| No PodDisruptionBudget | MEDIUM | No PDB resource in `resources.yaml`. During node maintenance or rolling updates, all pods could be evicted simultaneously. |
-| S3 region hardcoded to eu-west-2 | LOW | `S3ClientConfig.java` hardcodes `Region.EU_WEST_2`. Cross-region latency or access failure if the target bucket is in a different region for a non-eu-west-2 deployment. |
-| Unused IBM DB2 JDBC dependency | LOW | `com.ibm.db2:jcc` declared in pom.xml. No DB2 datasource, dialect, or schema exists anywhere in the codebase. Likely a leftover from a prior configuration. Adds to the dependency surface unnecessarily. |
-| Dead config — mfdDepartmentName | LOW | `application.yaml` property `idp.mfd-department-name` is injected into `UserServiceImpl` but never referenced in any method — `getFirmDetails()` hardcodes `ApplicationConstants.MERCHANT_FRAUD_DISPUTES_DEPARTMENT_NAME` instead. Dead injection with no effect. |
-| Dead code in UserController | LOW | A null/blank check block assigns `loginName` to itself on both branches — a no-op. Leftover from a refactor. No functional impact but reduces code clarity. |
-| Commented-out Logstash destination IPs in logback-spring.xml | INFO | Two destinations pointing to an internal development IP (`10.43.145.125:5044`) are commented out. Residual from development configuration — no production impact. |
-
----
-
-## ━━━ TYPE BLOCK A — REST API CONTRACTS ━━━━━━━━━━━━━━━━━━━
-*Block A applies — UAMS is a REST API service.*
-
----
-
-## REST API Contracts
-
-**Framework:** Spring MVC (blocking servlet)
-**Authentication:** Bearer JWT required on all endpoints
-**Context path:** `/merchant/gcp/access-management`
-
----
-
-### Authorization Endpoint
-
-#### POST /authorize
-
-**Controller:** `AuthorizationController`
-**Caller:** API Gateway (COMP-01) — NAP platform case-level authorization
-**Internal callers:** Bypass all DB lookups — HTTP 200 returned immediately on internal `iss` claim
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `platform` | String | Yes | Must be one of: CORE, NAP, VAP, LATAM, PIN. Only NAP is implemented. |
-| `caseNumber` | String | Conditional | At least one of caseNumber / merchantId required when platform = NAP |
-| `merchantId` | String | Conditional | At least one of caseNumber / merchantId required when platform = NAP |
-
-| Status | Condition | Response body |
-|---|---|---|
-| 200 | Authorized — entity in scope | Empty body (`ResponseEntity<Void>`) |
-| 400 | Invalid/missing platform; missing both caseNumber and merchantId for NAP; case not found; merchant not found in case | `BadRequestException` message |
-| 403 | JWT entity claims absent; entity not in scope | `StandardErrorResponse` JSON: `errors[{message, target}]` |
-| 500 | Unhandled DB exception | No structured body |
-
-**Notes:** HTTP 200 itself is the authorization signal — no body is returned on success. 403 returns a JSON error body. The API Gateway COMP-01 treats any non-200 as a deny. CORE, VAP, LATAM, PIN return HTTP 400 with "Implementation is in progress" — these are live stubs in production.
-
----
-
-### Entity Management Endpoints
-
-**Controller:** `AccessManagementController`
-**Auth model:** Bearer JWT. External callers are scoped to their `napParentEntity` JWT claim. Internal callers bypass scoping.
-
-| Method | Path | Callers | Internal only? | Notes |
-|---|---|---|---|---|
-| POST | `/entity` | Internal systems | Yes — 403 for external | Creates parent entity + child entity in single transaction |
-| GET | `/entity` | Portals, internal | No — scoped for external | Lists parent entities scoped to caller's entity claims |
-| PUT | `/entity/{entityId}` | Internal systems | Yes — 403 for external | Updates parent entity. ⚠️ Known NPE bug — entity-not-found returns HTTP 500 instead of HTTP 400 (PARENT type only) |
-| DELETE | `/entity` | Portals (restricted), internal | Partial — CHILD type only for external, with parent ownership check | Full delete for internal callers |
-| POST | `/entity/bulk/onboard` | Portals, internal | Not enforced at controller | Validates file type + email, then writes to S3. No content processing. |
-| GET | `/v2/entity/{parentEntityId}/child` | Portals, internal | No — external scoped to JWT napParentEntity | parentEntityId in path must match JWT napParentEntity for external callers |
-| POST | `/{parentEntityId}/child` | Portals, internal | No — external with MID scope check | |
-| PUT | `/{parentEntityId}/child/{childEntityId}` | Portals, internal | No — scoped for external | childEntityId must be in token's napChildEntities list |
-
-**POST /entity/bulk/onboard — detail:**
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `file` | MultipartFile | Yes | Must be `.csv`, `.xlsx`, or `.xls`. Content-type validated. |
-| `notifyEmailId` | String | No | Must be a `@worldpay.com` address if provided |
-
-| Status | Condition |
-|---|---|
-| 200 | File successfully written to S3 |
-| 500 | S3 upload failure (`AccessManagementServiceException S3_UPLOAD_FAILED`) |
-
----
-
-### User Lifecycle Endpoints
-
-**Controller:** `UserController`
-**Auth model:** Bearer JWT. External callers require admin role for write operations. Scoped to `napParentEntity` claim for reads. All `/v2/user*` endpoints route to the **Merchant Fraud Disputes** SunGard IdP instance (hardcoded).
-
-| Method | Path | IdP call? | Notes |
-|---|---|---|---|
-| POST | `/v2/user` | Yes — `createUserIdp()` | External: admin role + entity check required |
-| PUT | `/v2/user/{loginName}` | Yes — `updateUser()` | External: admin role check |
-| PUT | `/v2/user/reset-password/{userId}` | Yes — `resetUserPassword()` + pre-flight `getIdpUser()` | |
-| PUT | `/v2/user/{userId}/{status}` | Yes — `updateUserAccess()` (activate/deactivate/suspend/resume) + pre-flight `getIdpUser()` for external | status values: ACTIVATE, DEACTIVATE, SUSPEND, RESUME |
-| GET | `/v2/users` | Yes — `getUsersDetails()` | Returns all users scoped to entity |
-| GET | `/user/entity/{loginName}/child` | Yes — `getUsersByLoginName()` then DB query | Scoped for external |
-| GET | `/user/entity` | No — DB only | Scoped for external |
-
-**Failure behaviour on IdP calls:**
-
-| IdP response | UAMS behaviour |
-|---|---|
-| HTTP 400 from IdP | Parsed into error response → HTTP 400 to caller |
-| HTTP 500 from IdP | `WebServiceException(SYSTEM_ERROR)` → HTTP 500 to caller |
-| IO / connection failure | `WebServiceException(SYSTEM_ERROR)` → HTTP 500 to caller |
-| No response (thread blocked) | Thread blocks indefinitely — no timeout, no circuit breaker |
-
-Some methods (`resetUserPassword`, `updateUserAccess`, `getUsersByLoginName`) bypass the standard IdP error handling and throw `AccessManagementServiceException(SYSTEM_ERROR)` directly → HTTP 500.
-
----
-
-### Merchant Management Endpoints
-
-**Controller:** `MerchantController`
-**Auth model:** Bearer JWT. Write operations restricted to internal callers.
-
-| Method | Path | Internal only? | Notes |
-|---|---|---|---|
-| POST | `/v2/merchant` | Yes — UnauthorizedException for external | |
-| GET | `/merchant` | No — scoped for external | |
-| PUT | `/merchant/{merchantId}` | Yes — 403 for external | |
-| DELETE | `/v2/merchant` | Yes — 403 for external | |
-
----
-
-### ACL Management Endpoints
-
-**Controller:** `AccessManagementController`
-**Auth model:** Bearer JWT. No internal-only check — accessible to all authenticated callers.
-
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/acl` | Duplicate check before insert. Throws `DuplicateEntityValidationException` → HTTP 400 on duplicate. |
-| PUT | `/acl` | Status and timestamps managed by `mapAclUpdateRequest` |
-| POST | `/acl/search` | Queries `wdp.acl` filtered by `c_consumer_name` and `c_status` index |
+No `SELECT FOR UPDATE`, no row locks, no advisory locks anywhere in source.
 
 ---
 
 ## Dependencies
 
-| Dependency | Protocol | Auth | Purpose | Timeout | Retry | Circuit Breaker |
-|---|---|---|---|---|---|---|
-| SunGard IdP — US/Default | REST (RestTemplate, blocking) | API Key (`X-SunGard-IdP-API-Key`) + Bearer token (`Authorization`) | User lifecycle operations | **None** — `new RestTemplate()` with no timeout config. Thread blocks indefinitely on hang. | **None** — single attempt. Exception thrown on failure. | **None** — no Resilience4j dependency. |
-| SunGard IdP — Merchant Fraud Disputes | REST (RestTemplate, blocking) | API Key + Bearer token (MFD-specific keys) | User lifecycle operations for all `/v2/user*` endpoints | **None** | **None** | **None** |
-| AWS S3 (eu-west-2) | S3 SDK | IAM role / injected credentials | Bulk entity onboarding file storage | Not explicitly configured | **None** | **None** |
-| nap schema — Aurora PostgreSQL | JPA / JDBC | K8s secret injection | Entity hierarchy CRUD + case number resolution | HikariCP defaults | JPA retry: none | None |
-| wdp schema — Aurora PostgreSQL | JPA / JDBC | K8s secret injection | ACL management | HikariCP defaults | JPA retry: none | None |
+### SunGard IdP (two instances, firm-routed)
 
-**Connection pools:** Both datasources use HikariCP with default pool size of 10 connections per pod. Not explicitly configured — platform defaults apply.
+| Property | Standard (US_Merchant) | MFD |
+|----------|------------------------|-----|
+| Base URL config | `${idp_user_api_base_url}` | `${idp_mfd_user_api_base_url}` |
+| Auth scheme | `Bearer ${idp_auth_token}` + `X-SunGard-IdP-API-Key: ${idp_sungard_key}` | `Bearer ${idp_mfd_auth_token}` + `X-SunGard-IdP-API-Key: ${idp_mfd_sungard_key}` |
+| Selection rule | `firmName != "Merchant_Fraud_Disputes"` | `firmName == "Merchant_Fraud_Disputes"` |
+| Connect timeout | **Not configured** | **Not configured** |
+| Read timeout | **Not configured** | **Not configured** |
+| Retry | **Not configured** | **Not configured** |
+| Circuit breaker | **Not configured** | **Not configured** |
+| Behaviour if unavailable | Thread blocks indefinitely until TCP timeout; `RestClientException` → 500 | Same |
 
-**Security concern:** IdP authentication tokens (`authCode`) are logged at INFO level in `IdpRestInvoker` on every outbound call. Credentials are present in operational log streams and shipped to Logstash.
+The auth pattern (`Bearer + X-SunGard-IdP-API-Key`) matches COMP-30 UserQueueSkillService.
 
----
+### AWS S3 (eu-west-2)
 
-## Scaling and Deployment
+| Property | Value |
+|----------|-------|
+| Bucket | `${wdp_entity_file}` (env-resolved, not in repo) |
+| Region | `eu-west-2` **hardcoded** in source — does not honour environment |
+| Key prefix | `RECEIVED/{ENV}/` |
+| Credential chain | AWS SDK v2 default chain (no explicit override) |
+| Connect / read timeout | **Not configured** (SDK defaults apply) |
+| Retry | **Not configured** (SDK default retry only) |
+| Circuit breaker | **Not configured** |
+| Behaviour if unavailable | Generic `Exception` → 500 "S3 upload failed" |
 
-| Parameter | Value | Source |
-|---|---|---|
-| Kubernetes resource type | Deployment | `resources.yaml` |
-| Replica count | `{{ replicas-user-access-management-service }}` — XL Deploy/Helm variable. Actual environment values not in source. | `resources.yaml` |
-| Memory limit | `2048Mi` | `resources.yaml` |
-| Memory request | `1024Mi` | `resources.yaml` |
-| CPU limit | **Not configured** — CPU unconstrained | `resources.yaml` |
-| CPU request | **Not configured** | `resources.yaml` |
-| HPA | **Absent** — no HorizontalPodAutoscaler resource | `resources.yaml` |
-| Rolling update | `type: RollingUpdate`, `maxSurge: 1`, `maxUnavailable: 0` | `resources.yaml` |
-| PodDisruptionBudget | **Absent** — no PDB resource | `resources.yaml` |
-| Topology spread | **Configured but inoperative** — label mismatch between pod label (`app: user-access-management-service${BRANCH_NAME_PLACEHOLDER}`) and spread constraint selector (`app: gcp-user-access-management-service${BRANCH_NAME_PLACEHOLDER}`). Kubernetes never evaluates the constraint. | `resources.yaml` lines 20 and 29–31 |
-| OTel agent | ✅ Present — `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default` annotation on pod template | `resources.yaml` |
-| Spring Actuator | ✅ Enabled — `spring-boot-starter-actuator`. Endpoints: `info`, `health`, `prometheus`. Actuator runs on same port as application (`8082`) — no management port separation. | `application.yaml` |
-| Liveness probe | `GET /merchant/gcp/access-management/livez` on port 8082 | `resources.yaml` |
-| Readiness probe | `GET /merchant/gcp/access-management/readyz` on port 8082 | `resources.yaml` |
-| Logstash | ✅ Configured — `logstash-logback-encoder` via `LogstashTcpSocketAppender`. Ships to `${logstash_server_host_port}`. | `logback-spring.xml` |
-| Async thread pool | Bean name: `asyncExecutor`. Core pool size: `${gcp_async_corepoolsize}` (env var). Max pool size: `${gcp_async_maxpoolsize}`. Queue capacity: `${gcp_async_queuecapacity}`. Thread name prefix: `AsyncThread-`. | `AsyncConfiguration.java` |
+### PostgreSQL — `nap` schema
 
-**Async pool note:** The two `@Async` methods (`searchChildEntitiesByParentEntityIds`, `searchMerchantEntitiesByParentEntityIds`) do not specify `asyncExecutor` by name. Spring resolves to this bean implicitly because it is the only `TaskExecutor` bean defined. Behaviourally correct today but fragile if a second `TaskExecutor` is added.
+| Property | Value |
+|----------|-------|
+| JDBC URL | `${nap_datasource_jdbc_url}` |
+| Pool | HikariCP — Spring Boot defaults (max 10 connections) |
+| Transaction manager | `napTransactionManager` (explicitly bound) |
+| Behaviour if unavailable | Pool exhaustion → request blocks; JPA exception → 500 |
 
----
+### PostgreSQL — `wdp` schema
 
-## Planned Work and Incomplete Items
+| Property | Value |
+|----------|-------|
+| JDBC URL | `${wdp_datasource_jdbc_url}` |
+| Pool | HikariCP — Spring Boot defaults (max 10 connections) |
+| Transaction manager | `wdpTransactionManager` (`@Primary` — used as default for unqualified `@Transactional`) |
+| Behaviour if unavailable | Same as `nap` |
 
-### Stub Implementations — Live in Production
+### Vestigial / unused dependencies
 
-| Platform | Endpoint | Behaviour |
-|---|---|---|
-| CORE | POST /authorize | HTTP 400 "Implementation is in progress" |
-| VAP | POST /authorize | HTTP 400 "Implementation is in progress" |
-| LATAM | POST /authorize | HTTP 400 "Implementation is in progress" |
-| PIN | POST /authorize | HTTP 400 "Implementation is in progress" |
-
-Note: All four platforms pass the `SourceSystemName` enum validation in `RequestValidator` but are rejected by a hardcoded `BadRequestException` in `AuthorizationServiceImpl`. Callers on these platforms receive a misleading HTTP 400 rather than a meaningful error indicating the platform is unsupported.
-
-### Planned Changes
-
-Case-level authorization consolidation: the current NAP/PIN split between UAMS (/authorize for NAP) and CHAS (COMP-03, /authorize for PIN/CORE/VAP/LATAM) is planned to be replaced by a single consolidated service. No timeline or design confirmed.
-
-### Unused Dependencies
-
-`com.ibm.db2:jcc` (IBM DB2 JDBC driver) is declared in pom.xml. No DB2 datasource configuration, dialect, or schema exists in the codebase. Likely a leftover from a prior integration design.
-
-### Dead Configuration
-
-`application.yaml` property `idp.mfd-department-name` is injected but never used. The field is populated but not referenced in any method — `getFirmDetails()` hardcodes the department name constant directly.
-
-### Dead Code
-
-In `UserController`, a null/blank check block for `loginName` assigns the variable to itself on both branches — a no-op. No functional impact.
-
-### Commented-out Code
-
-Two Logstash destination lines in `logback-spring.xml` point to a development internal IP address (`10.43.145.125:5044`) and are commented out. Residual from development configuration.
-
-### No Feature Flags
-
-No feature flags or migration flags found in source or `application.yaml`.
-
-### No TODO / FIXME References
-
-No `TODO`, `FIXME`, or user-story ticket references (`US-`, `WDF-`) found in any source file.
+- **IBM DB2 JDBC driver** (`com.ibm.db2:jcc`) is on the build path but no DB2 datasource or query exists in source. Likely inherited from a parent / shared template.
 
 ---
 
-## Idempotency
+## Configuration and Scaling
 
-No explicit idempotency mechanism is implemented. No idempotency keys or request deduplication. Duplicate prevention is handled by:
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Replica count | `{{ replicas-user-access-management-service }}` (XL Deploy placeholder) | Production value not in repo |
+| HPA | None | No `HorizontalPodAutoscaler` resource present |
+| Memory request | 1024Mi | |
+| Memory limit | 2048Mi | |
+| CPU request | **Not configured** | Best-effort QoS class |
+| CPU limit | **Not configured** | |
+| Deployment type | Kubernetes Deployment | |
+| Rollout strategy | RollingUpdate — `maxSurge: 1`, `maxUnavailable: 0` | One extra pod created before old pod removed |
+| `minReadySeconds` | Present in manifest but **mis-indented** | Whether it takes effect at runtime is not determinable from repo |
+| PodDisruptionBudget | None | No PDB resource present |
+| Topology spread | **Non-functional — `gcp-` prefix label drift** | Constraint selector uses `app: gcp-user-access-management-service<branch>`; pod label uses `app: user-access-management-service<branch>`. All pods can schedule to the same node. Same class of defect as COMP-03 CHAS. |
+| Liveness probe | HTTP `GET /merchant/gcp/access-management/livez` on port 8082; `initialDelay=30s`, `timeout=5s`, `period=10s`, `failureThreshold=3` | |
+| Readiness probe | HTTP `GET /merchant/gcp/access-management/readyz` on port 8082; `initialDelay=20s`, `timeout=5s`, `period=10s`, `failureThreshold=3` | |
+| Startup probe | **Not configured** | |
+| Container port | 8082 | |
+| Image pull policy | `Always` | |
+| Database connection pool | HikariCP defaults (10 per datasource, 2 datasources = up to 20 per pod) | Not tuned in source; runtime tuning via env vars cannot be confirmed from repo |
+| Async thread pool | `asyncExecutor` bean defined (`AsyncConfiguration`) with env-driven core/max/queue sizes | ⚠️ `@Async` methods do **not** specify the executor by name — fall-through is **non-deterministic**: Spring picks up the sole `Executor` bean only when no qualifier is needed; bean is named `asyncExecutor`, not `taskExecutor`, so behaviour depends on Spring's auto-detection rules |
+| OpenTelemetry | Pod annotation `instrumentation.opentelemetry.io/inject-java` — agent injected at runtime | Memory/CPU overhead unaccounted in resource limits |
+| Spring Actuator | `/actuator/health`, `/actuator/info`, `/actuator/prometheus` exposed | |
+| Prometheus | Enabled via Actuator | Scraped by cluster Prometheus |
+| Logstash appender | `LogstashTcpSocketAppender` configured — destination `${logstash_server_host_port}` | Console fallback active alongside Logstash; if env var empty, Logstash side fails to connect, console continues |
+| Correlation ID | `v-correlation-id` header read by request interceptor, written to MDC and response | **Not propagated** on outbound IdP / S3 calls |
+| Secrets | `user-access-management-service`, `wdp-common-secrets`, `{{ ingressTLSsecretName }}` | XL-Deploy template syntax |
+| Ingress | NGINX with CORS, 4 host rules (external, internal, wdp-internal, reverse-proxy) | |
+| Context path | `/merchant/gcp/access-management` | |
 
-1. Application-level pre-insert checks (name match, relationship exists, ACL duplicate) — throw HTTP 400 on detection
-2. Database unique constraints (`nap_parent_entity_c_name_key`, `nap_child_entity_c_name_key`) — `ConstraintViolationException` is caught and translated to HTTP 400
+**Helm chart / `values.yaml` are not in the repo** — manifest uses XL Deploy `{{ }}` template syntax. **No Dockerfile in repo** — image build is external.
 
-**Gap:** A race condition between two concurrent create requests can bypass the application-level check before either reaches the DB constraint. In this scenario the DB constraint catches the second insert and returns HTTP 400, not HTTP 500. The window is small but present.
+---
+
+## Key Architectural Decisions
+
+| Decision | Reference | Notes |
+|----------|-----------|-------|
+| Single deployable serves runtime authorization AND reference-data ownership | Local | Tightly couples UAMS uptime to gateway authorization. Planned consolidation under a single platform-wide authorization service (joint with COMP-03 CHAS) |
+| Authorization for NAP only — non-NAP returns 400 stub | Local | CORE / VAP / LATAM / PIN authorization is owned by COMP-03 CHAS via the API Gateway routing |
+| Authorization model is **3-layer** (corrects v1.0 "2-layer") | Local | (1) Spring Security JWT issuer validation; (2) internal-firm bypass on `iss` containing `us_worldpay_fis_int`; (3) entity-scope check against `nap.nap_entity_rel` using `napParentEntity` / `napChildEntities` claims |
+| Internal-firm bypass uses substring match `us_worldpay_fis_int` on JWT `iss` | Local | Same constant as COMP-03 CHAS — platform pattern |
+| User credentials fully delegated to SunGard IdP | Local | Zero credential, password, or refresh-token persistence in UAMS |
+| Two SunGard IdP instances routed by firm | Local | `Merchant_Fraud_Disputes` → MFD; everything else → standard |
+| ACL (`wdp.acl`) maintained for downstream consumers — not consulted by UAMS | Local | Architecturally separate concern from `/authorize` |
+| Bulk onboarding fire-and-forget to S3 | Local | UAMS does not parse the file; downstream parsing is opaque to caller |
+| ⚠️ DEC-021 — wrong transaction manager scope expanded to 7 methods | DEC-021 (was scoped to 1 method in v2.0) | **Pattern across UAMS**, not a single defect. Cross-schema partial-write hazard on every multi-table NAP write. |
+| ⚠️ DEC-014 deviation — Resilience4j absent | DEC-014 VOID | Confirmed: no circuit breaker, no REST timeout, no retry on any outbound call. Same as platform-wide pattern |
+| ⚠️ DEC-020 deviation — no idempotency at any write endpoint | DEC-020 PARTIAL | Application-level duplicate checks only; no idempotency keys, no DB unique constraints visible |
+| ⚠️ Programmatic-only RBAC — no `@PreAuthorize` / `@Secured` | Local | Same RBAC posture as COMP-24 (DEC-018) and COMP-27. No central enforcement layer |
+
+---
+
+## Platform Standard Deviations
+
+| ADR | Standard | Status | Detail |
+|-----|----------|--------|--------|
+| **DEC-001** | Transactional Outbox for Event Delivery | ✅ NOT APPLICABLE | UAMS is Kafka-free. No outbox table, no event publish |
+| **DEC-003** | Kafka Partition Key = merchantId | ✅ NOT APPLICABLE | No Kafka producer or consumer present |
+| **DEC-004** | PAN Encryption Before Persistence | ✅ NOT APPLICABLE | UAMS handles no PAN data — merchant data is MID, name, MCC, WPG ID only |
+| **DEC-005** | Manual Kafka Offset Commit | ✅ NOT APPLICABLE | No Kafka consumer present |
+| **DEC-014** | Resilience4j Circuit Breakers | ⛔ DEVIATES (platform VOID) | No circuit breaker, no REST timeout, no retry on IdP or S3 calls. Bare `RestTemplate` bean. Severity 🔴 HIGH |
+| **DEC-019** | No Clear PAN in Persistent Store | ✅ NOT APPLICABLE | No PAN handled |
+| **DEC-020** | Full At-Least-Once Idempotency | ⛔ DEVIATES | No idempotency keys at any write endpoint. Application-level duplicate checks only — race window between SELECT and INSERT on replica concurrency. Severity 🟠 MEDIUM-HIGH |
+| **DEC-021** | UAMS saveChildWithMerchant — Wrong Transaction Manager | ⛔ DEVIATES — **scope expanded** | v2.0 record scoped DEC-021 to one method. Source verification confirms **7 methods** write `nap.*` tables under the `@Primary` `wdpTransactionManager`. Effectively all multi-table NAP-side writes are uncoordinated. Severity 🔴 HIGH |
+| **DEC-023** | Polling Batch Replica Count Fixed at 1 | ✅ NOT APPLICABLE | UAMS has no polling batch — REST API only |
+
+---
+
+## Risks and Constraints
+
+**Severity scale:**
+- 🔴 HIGH — data loss, security breach, complete processing halt
+- 🟠 MEDIUM-HIGH — partial-failure hazard, cross-component contract gap
+- 🟡 MEDIUM — degraded throughput, incorrect behaviour under load, latent defect
+- 🟢 LOW — observability gap, dead code, vestigial dependency
+
+| Severity | Risk | Consequence |
+|----------|------|-------------|
+| 🔴 | **DEC-021 scope expansion — 7 methods write `nap.*` tables under `wdpTransactionManager`.** Because nap repositories are bound to `napEntityManagerFactory`, nap writes execute in per-save implicit transactions and are NOT rolled back when the service method's `@Transactional` rolls back. | Mid-sequence failure on any multi-table NAP-side write (createEntity, updateEntity, saveChildWithMerchant, deleteParentEntity, deleteChildEntity, deleteMerchantByParent, updateMerchantRelationships) leaves NAP schema in an inconsistent state. No automatic recovery. |
+| 🔴 | **No timeouts on outbound RestTemplate** — IdP calls can block threads indefinitely. Same RestTemplate bean used for all IdP traffic. | A slow or hung SunGard IdP saturates the application thread pool. Compounds with absence of `@Async` qualifier — runaway thread creation possible. |
+| 🟠 | **Authorization fail-mode on DB outage** — `nap.case` lookup, `nap.nap_entity_rel` fallback, and `nap.nap_entity_rel` native query all surface raw JPA exceptions as 500. No circuit breaker, no fallback, no degraded mode. | A nap-database disruption blocks the entire NAP authorization plane platform-wide. API Gateway returns 403 (fail-closed) on UAMS 500, but every NAP request path is broken. |
+| 🟠 | **No idempotency at any write endpoint.** Application-level SELECT-then-INSERT pattern. No DB unique constraints visible in source. | Two replicas racing on the same entity create can both pass the duplicate check and both INSERT. No DB-level protection. |
+| 🟠 | **`updateEntity` NPE — inverted entity-existence guard.** `.get()` is called before `.isPresent()`. | Caller updating a non-existent entity receives a 500 (mapped from `NoSuchElementException`) instead of a 400. Misleading error class; alerting on 500 rate cannot distinguish from genuine server faults. |
+| 🟠 | **Cross-schema atomicity is broken.** No XA, no `ChainedTransactionManager`. Every endpoint that writes both `nap` and `wdp` schemas has a partial-failure window. | Partial state on any failure path. Recovery is manual. |
+| 🟡 | **Topology spread non-functional — `gcp-` prefix label drift.** Constraint label vs pod template label do not match. | All pods can schedule to the same node. No availability protection from node failure. Same class as COMP-03 CHAS. |
+| 🟡 | **`@Async` executor binding is non-deterministic.** Methods don't qualify the executor; the bean is named `asyncExecutor` (not `taskExecutor`). | Behaviour depends on Spring's sole-Executor-bean auto-detection. If a future change adds another Executor bean, fall-through to unbounded `SimpleAsyncTaskExecutor` becomes the runtime reality. |
+| 🟡 | **Unbounded fan-out in entity aggregation.** `searchChildEntitiesByParentEntityIds` and `searchMerchantEntitiesByParentEntityIds` use `@Async` parallel fetch over a parent-ID list with no pagination. | Heap pressure proportional to entity-hierarchy depth. JVM OOM possible under large-tenant query. |
+| 🟡 | **S3 region hardcoded to `eu-west-2`.** | Bulk-onboarding upload is cross-region from non-EU clusters. Latency and egress cost. |
+| 🟡 | **No HPA, no PDB, no startup probe.** | Pod count is static; no automated response to load. Voluntary disruptions can take all replicas down. Slow-starting pods may be killed by liveness probe before they're ready. |
+| 🟡 | **No formal RBAC annotations.** Authorization is programmatic in controller / utility code. | Any future endpoint can be added without going through a central RBAC enforcement point — high regression risk. Same pattern as COMP-24 (DEC-018) and COMP-27. |
+| 🟢 | **`v-correlation-id` not propagated on outbound IdP / S3 calls.** | Distributed-trace correlation breaks at the IdP and S3 boundary. OTel agent provides trace context, but business-key correlation is lost. |
+| 🟢 | **`minReadySeconds` is mis-indented in `resources.yaml`.** | Whether it takes effect at runtime cannot be confirmed from source. Rolling-update protection may be silently absent. |
+| 🟢 | **`logstash_server_host_port` empty-secret risk.** | If the env-injected secret is empty in production, the Logstash appender fails to connect. Console fallback continues — log aggregation degraded silently. Same class as COMP-21 RISK-050. |
+| 🟢 | **DB2 JDBC driver vestigial in build path.** | Increases artifact size; presents an attack surface for a database the service does not use. |
+| 🟢 | **Active production stub on non-NAP `/authorize` path.** Returns 400 "Implementation is in progress". | Misleading error code if any non-NAP traffic ever reaches UAMS — should be a 404 / 405 / 501 architecturally. The API Gateway is supposed to route non-NAP `/authorize` to CHAS instead, so this code path is operationally unreachable, but remains as latent risk. |
+
+---
+
+## Planned Changes
+
+- **Case-level authorization consolidation** — joint with COMP-01 API Gateway and COMP-03 CHAS, the NAP / non-NAP split is to be replaced by a single platform-wide authorization service. Timing not committed in this repository. UAMS' `/authorize` endpoint and CHAS' `/authorize` endpoint converge under that programme.
+- **DEC-021 remediation** — pending. Two architecturally valid options: (a) qualify all 7 methods with `@Transactional("napTransactionManager")`; (b) introduce `ChainedTransactionManager` on the affected service methods. **Architect decision required**.
+- **No active migration in repo.** No feature flags. No commented-out future paths beyond a single Logstash destination line.
+
+---
+
+## Open Questions
+
+- ⚠️ **OQ-COMP-02-1** — Production replica count for UAMS. XL Deploy placeholder; runtime value not in repo. (Environment config / team confirmation.)
+- ⚠️ **OQ-COMP-02-2** — `${jwt_trusted_issuer_urls}` actual issuer list. Env-resolved. (Environment config / team confirmation.)
+- ⚠️ **OQ-COMP-02-3** — `${idp_user_api_base_url}` and `${idp_mfd_user_api_base_url}` runtime values. (Environment config / team confirmation.)
+- ⚠️ **OQ-COMP-02-4** — `${wdp_entity_file}` actual S3 bucket name and region of bucket vs hardcoded client region. (Environment config / team confirmation.)
+- ⚠️ **OQ-COMP-02-5** — Downstream consumers of `wdp.acl`. Source has no comments, no Swagger tags, no test fixtures identifying them. (Cross-component review.)
+- ⚠️ **OQ-COMP-02-6** — Downstream parser of bulk-onboarding S3 files. Not in this repo. UAMS gives no caller-visible signal of pickup or completion. (Cross-component review.)
+- ⚠️ **OQ-COMP-02-7** — Whether HikariCP pool size is tuned at runtime via `spring.datasource.nap.*` / `spring.datasource.wdp.*` env vars. (Environment config / team confirmation.)
+- ⚠️ **OQ-COMP-02-8** — Whether `logstash_server_host_port` is populated with a non-empty value in production. (Runtime observation — log inspection.)
+- ⚠️ **OQ-COMP-02-9** — Whether the user-controller hardcoded `MERCHANT_DISPUTES_FIRM` reflects a routing reality where standard-IdP traffic reaches a separate UAMS deployment, or whether the standard-IdP code path is unreachable in production. (Architect decision / routing inspection.)
+- ⚠️ **OQ-COMP-02-10** — Whether `minReadySeconds` mis-indentation in `resources.yaml` is honoured by the K8s manifest engine. (Runtime observation / XL Deploy team.)
+- ⚠️ **OQ-COMP-02-11** — DEC-021 remediation strategy: per-method `@Transactional("napTransactionManager")` or `ChainedTransactionManager`. (Architect decision.)
+- ⚠️ **OQ-COMP-02-12** — DB-level UNIQUE constraints on `nap.nap_parent_entity.c_name`, `(nap.nap_child_entity.i_parent_entity_id, c_name)`, and `(nap.nap_entity_rel.i_parent_entity_id, i_child_entity_id, i_mid)`. No DDL in repo. (DBA confirmation.)
+
+---
+
+## Items Not Verifiable From Source
+
+These claims could not be cross-checked against code or config and require follow-up beyond a Copilot CLI re-run:
+
+- All env-injected secrets and configuration values (production replica count, JWT issuer list, IdP base URLs / tokens / API keys, S3 bucket name, JDBC URLs, `logstash_server_host_port`, async pool sizing).
+- DB-level UNIQUE constraints on owned tables (no DDL / Flyway / Liquibase scripts in repo).
+- Whether HikariCP pool tuning is applied via env vars.
+- The `MERCHANT_DISPUTES_FIRM` hardcoding implication for whether standard-IdP user endpoints are reachable in production.
+- Whether `minReadySeconds` mis-indentation is honoured at deploy time.
+- Downstream consumers of `wdp.acl`.
+- Downstream processor of bulk-onboarding S3 files.
 
 ---
 
 *End of WDP-COMP-02-UAMS.md*
-*Status: 📝 DRAFT — architect confirmation PENDING*
-*Next: Update WDP-COMP-INDEX.md doc status from 📋 PENDING to 📝 MIGRATING*
-*Update WDP-DB.md with confirmed table details below*
+*File status: 📝 DRAFT v1.0 — source-verified 2026-04-29, architect confirmation pending.*
+*First source-verified pass; supersedes WDP-COMPONENTS.md § 1.2 as the authoritative component reference.*

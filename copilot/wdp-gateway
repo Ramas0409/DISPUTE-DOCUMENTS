@@ -1,0 +1,285 @@
+You are auditing the WDP component API Gateway in the repository wdp-gateway.
+A prior pass using a separate tool already produced an updated DRAFT architecture
+document. Your job is to CONFIRM OR CORRECT the items listed under 'ALREADY
+DOCUMENTED' from source, and to CLOSE the items listed under 'GAPS TO FILL' by
+reading the code and config directly.
+
+Produce a single structured research report organised under the section headings
+below, in the order given. For every claim, cite the file path and line range you
+read it from. Format citations as: relative/path/to/file.ext:Lstart-Lend.
+Where source does not show the answer, state that explicitly and label it
+'not determinable from source'. Do NOT guess. Do NOT summarise without evidence.
+Do NOT use the existing document as a substitute for source — treat it as a
+hypothesis to verify.
+
+---
+
+REFERENCE DOCUMENT INSTRUCTION
+
+The existing component document WDP-COMP-01-API-GATEWAY.md is provided alongside
+this prompt. Treat every claim in it as a HYPOTHESIS to verify — not ground truth.
+
+For each documented claim in the ALREADY DOCUMENTED list below, you must either:
+  (a) Write: "Still accurate — <file>:<lines>"
+  (b) Write a CORRECTION block in this format:
+        CORRECTION
+        Document states: <what the document says>
+        Source shows: <what the code actually shows, with file:lines>
+        Section to update: <which section of the component doc is affected>
+
+At the end of the report, in Section 10, list every documented claim you could
+NOT cross-check from source — neither confirmed nor contradicted. These are
+items that require team confirmation, runtime observation, or database access.
+
+Do NOT restate anything from the reference document verbatim unless you are
+writing a CORRECTION block. If a section confirms the document, write
+"Document accurate — <file>:<lines>" and move on.
+
+---
+
+ALREADY DOCUMENTED — confirm or correct each item
+
+AD-01  Spring Cloud Gateway 2024.0.0, Spring Boot 3.4.1, Java 17, WebFlux/Netty
+       stack. Confirm exact version strings from pom.xml.
+
+AD-02  server.port declared as 9082 in application.yml. K8s containerPort and
+       all health probes target port 8082. This discrepancy is unresolved.
+
+AD-03  Route configuration loaded from wdp.api_route PostgreSQL table at startup
+       via R2DBC. Cached by CachingRouteLocator. Route changes require pod restart.
+
+AD-04  DB is queried TWICE at startup: (1) blocking collectList().block() in
+       AuthenticationFilter.createWhiteList() for the JWT whitelist; (2) reactive
+       query in ApiPathRouteLocatorImpl for route predicates.
+
+AD-05  authExceptions column: comma-delimited string, split on literal comma,
+       no trim on split results, resulting entries matched via Spring Security
+       pathMatchers() using Ant-style matching.
+
+AD-06  Four filters execute in this order: (1) Spring Security JWT authentication,
+       (2) LoggingGlobalFilter at order = -1, (3) AuthorizationFilter at order = 0,
+       (4) CaseNumberFilter at order = 0. Steps 3 and 4 share order = 0 with no
+       secondary ordering mechanism — execution is non-deterministic.
+
+AD-07  LoggingGlobalFilter: inbound pass logs request path and matched route ID.
+       Outbound pass (after chain returns) logs the same inbound path and HTTP
+       response status code. Does not log response time. Does not inspect body.
+       NPE thrown if route attribute is null on inbound pass.
+
+AD-08  AuthorizationFilter: region detected by case-insensitive substring match
+       on exactly four constants /US/, /UK/, /PIN/, /NAP/. Firm type via iss
+       claim substring check for us_worldpay_fis_int. Missing AuthorizationList
+       JWT claim causes NPE producing 500. Empty role intersection returns 403
+       with empty body.
+
+AD-09  CaseNumberFilter: case ID detection requires path segment of exactly 12
+       characters, first character alphabetic, exactly 2 alphabetic characters
+       total across all 12. NAP platform calls UAMS /authorize. PIN platform
+       calls CHAS /authorize. Internal firm (iss contains us_worldpay_fis_int)
+       is auto-authorized with no external call. If platform resolves to null
+       or is not NAP or PIN, isAuthorized remains null and the method returns
+       true — implicit auto-authorization without any external call.
+
+AD-10  /entity-authorize endpoint is never called. entityHierarchy parameter
+       is always null. The routing capability exists in RestInvoker but has no
+       active call path from any filter.
+
+AD-11  Both UAMS and CHAS outbound calls: blocking RestTemplate with no
+       ClientHttpRequestFactory, no connection timeout configured, no read timeout
+       configured, no retry, no circuit breaker. Original caller JWT forwarded
+       as-is in Authorization header. Response type is void — pass/fail via
+       HTTP status code only. Non-2xx or exception returns 403 empty body.
+
+AD-12  CORE, VAP, and LATAM are not present anywhere in the gateway source as
+       region segment constants or filter conditions. Requests with only these
+       platform path segments pass through Steps 3 and 4 without any platform
+       or case-level authorization.
+
+AD-13  JWK Set cache: no custom configuration in gateway source. Nimbus library
+       default applies — key-ID-miss eviction only, no TTL, no scheduled refresh.
+
+AD-14  oauth2-client dead configuration: property path uses wrong Spring Boot
+       namespace (spring.security.oauth2.resourceserver.client instead of
+       spring.security.oauth2.client). No OAuth2AuthorizedClientManager or
+       equivalent in any Java file. Token never fetched or used.
+
+AD-15  wdp.api_route columns mapped in ApiRoute.java: id, path,
+       original_path_regex, replacement_path, uri, auth_exceptions.
+       No custom query — findAll() only. No routes defined in source — entirely
+       database-driven.
+
+AD-16  K8s Deployment. Replicas: {{ replicas-wdp-gateway }} placeholder.
+       Memory limit 2048Mi, request 256Mi. No CPU limit. No CPU request.
+       No HPA. No PodDisruptionBudget. Rolling update maxSurge=1,
+       maxUnavailable=0. minReadySeconds: 30 placed under spec.template.spec
+       (PodSpec) — not a valid PodSpec field, silently ignored by Kubernetes.
+       Should be at spec.minReadySeconds. Topology spread present with
+       topologyKey: kubernetes.io/hostname, maxSkew: 1,
+       whenUnsatisfiable: ScheduleAnyway. Label selector matches pod labels.
+
+AD-17  Ingress: 7 XL Deploy hostname placeholder entries. All route to port 8082.
+
+AD-18  OTel: injected by Kubernetes OpenTelemetry Operator via pod annotation
+       instrumentation.opentelemetry.io/inject-java. Not in container image.
+
+AD-19  Actuator: spring-boot-starter-actuator present. Endpoints exposed: health
+       and gateway only. Same port as application.
+
+AD-20  No structured logging: no logback-spring.xml, no logstash-logback-encoder
+       dependency, no JSON log appender. Spring Boot default Logback plain-text
+       output.
+
+AD-21  No Kafka dependency in pom.xml. Not a producer or consumer.
+
+AD-22  No Resilience4j on classpath. Not in pom.xml.
+
+AD-23  No database writes anywhere. Read-only startup query only.
+
+AD-24  Dead dependencies in pom.xml: spring-boot-starter-web (listed twice, no
+       servlet controller exists, suppressed by reactive mode), postgresql JDBC
+       driver (no JDBC usage, R2DBC only), spring-boot-starter-oauth2-client
+       (no OAuth2 client usage).
+
+AD-25  Dead K8s env var: SERVER_SERVLET_CONTEXT_PATH — Servlet/Tomcat-specific,
+       no effect in WebFlux/Netty application.
+
+AD-26  reactor-netty version pin in pom.xml: temporary fix for Swagger UI
+       forwarding bug, references GitHub issue reactor/reactor-netty#3559.
+       Comment says to remove when Spring Cloud Gateway is upgraded.
+
+AD-27  Dead code: extractCaseIdFromRequestParameters() in CommonExtractors is
+       never called anywhere in the codebase. CaseNumberFilter calls only
+       extractCaseIdFromPath().
+
+---
+
+GAPS TO FILL — answer these from source
+
+GAP-01  Port override mechanism
+        Search the entire repository for any file that sets SERVER_PORT, server.port,
+        or app_port as an environment variable or property override. Check:
+          - All YAML files in src/main/resources/ and src/test/resources/
+          - Any secrets.yml, gcp-wdp-gateway-secrets.yml, or similar secrets manifest
+          - Any Helm values.yaml or values-*.yaml
+          - The resources.yml env: section in its entirety — list every environment
+            variable defined
+        If no override exists in the repo, state explicitly: "No SERVER_PORT override
+        found in repository. The port discrepancy between application.yml:9082 and
+        K8s containerPort:8082 cannot be resolved from source alone."
+
+GAP-02  Ingress host placeholder names
+        List every host entry in the Ingress manifest with its exact placeholder
+        name and the port it routes to. Confirm whether any Ingress rules apply
+        path-based routing or whether all hosts route all paths to port 8082.
+
+GAP-03  wdp-common-secrets app_port key
+        If secrets.yml is present in the repo, find the app_port key. State
+        what type of value it holds and whether any Spring Boot property binding
+        or env var injection maps it to server.port or SERVER_PORT. If secrets.yml
+        is not present, state that explicitly.
+
+GAP-04  AuthorizationServiceImpl — other callers
+        The null-platform auto-authorize bypass (isAuthorized = null → return true)
+        was found in AuthorizationServiceImpl. Search the entire codebase for any
+        call site that invokes this service method other than from CaseNumberFilter.
+        If CaseNumberFilter is the only caller, confirm that explicitly.
+
+GAP-05  Additional TODO, FIXME, commented-out code, or stub implementations
+        Search the entire codebase for:
+          - TODO and FIXME comments (cite file:line and verbatim text for each)
+          - Any method that returns a hardcoded stub value with no real implementation
+          - Any block of commented-out Java code not yet captured in the document
+        The prior audit found zero TODOs/FIXMEs and no commented-out code blocks.
+        Confirm this is still accurate, or report any findings.
+
+GAP-06  reactor-netty pin — any other temporary pins
+        Besides the reactor-netty version pin, search pom.xml for any other
+        version overrides or exclusions accompanied by explanatory comments.
+        List each with the comment text and line range.
+
+GAP-07  Environment YAML files — full list and property coverage
+        List all application-*.yml files present in src/main/resources/. For
+        each, state the Spring profile it activates and whether it contains
+        any properties not present in application.yml. Focus on any properties
+        that differ across environments and that are not already captured in
+        the documented configuration.
+
+GAP-08  Confirm wdp-internal-auth namespace error
+        In each application-*.yml file, find the oauth2 client configuration
+        block. Confirm the exact property path used (state the full YAML key
+        path) and compare it against the correct Spring Boot OAuth2 client
+        path spring.security.oauth2.client. Confirm that no environment YAML
+        uses the correct namespace.
+
+---
+
+REPORT STRUCTURE — use these exact section headings in order
+
+Section 1 — Processing Flow
+  1a. Steps in Order
+  1b. Decision Points
+  1c. Skip and Bypass Conditions
+  1d. Failure Path Per Step
+  1e. Multiple Entry Paths
+  1f. State at Each Step (if applicable)
+
+Section 2 — Functional Behaviour
+  2a. Classification and Routing Logic
+  2b. Business Rules Applied
+  2c. Data Transformations
+  2d. Idempotency Mechanism
+
+Section 3 — Contracts
+  REST API section: gateway-level response contract and outbound auth calls.
+  Kafka: not present — confirm explicitly.
+  Batch/Scheduler: not present — confirm explicitly.
+
+Section 4 — Dependencies
+  For UAMS and CHAS calls: confirm all timeout, retry, circuit breaker, and
+  auth parameters as documented. State any corrections.
+
+Section 5 — Database
+  Confirm wdp.api_route columns and access pattern. Confirm no other tables
+  touched. State transaction semantics of startup read.
+
+Section 6 — Platform Standard Deviations
+  DEC-001, DEC-003, DEC-004, DEC-005, DEC-019, DEC-020.
+  For each: COMPLIES / DEVIATES / NOT APPLICABLE with file:lines.
+
+Section 7 — Scaling and Deployment
+  Address AD-16, AD-17, AD-18, AD-19, AD-20, and GAP-01, GAP-02, GAP-03.
+  If any manifest file is not present in the repo, state "not in repo"
+  and list what IS present instead.
+
+Section 8 — Planned and Incomplete Work
+  Address AD-24, AD-25, AD-26, AD-27, and GAP-05, GAP-06, GAP-07, GAP-08.
+
+Section 9 — Confidence Assessment
+  For each of Sections 1 through 8, state:
+    Confidence: High / Medium / Low
+    Basis: direct source / inferred / not determinable from source alone
+
+Section 10 — Items Not Verifiable From Source
+  List every documented claim you could not cross-check from source — neither
+  confirmed nor contradicted. These will require team confirmation, database
+  access, or runtime observation. For each item state which type of follow-up
+  is needed.
+
+---
+
+OUTPUT RULES
+
+- Cite file paths and line ranges for every concrete claim.
+  Format: relative/path/to/file.ext:Lstart-Lend
+- State "not determinable from source" for any item the code does not reveal.
+  Do not guess.
+- Use plain Markdown. No code blocks except when quoting a short annotation,
+  config value, or DDL fragment (maximum 4 lines).
+- No narrative preamble. Start directly at Section 1.
+- Target correctness over completeness. If a section confirms the existing
+  document, write "Document accurate — <file>:<lines>" and move on.
+- If you would restate something the reference document already states verbatim,
+  replace that prose with "Document accurate — <file>:<lines>". Do not restate.
+- Do not invent file paths. If a file is referenced in the existing document but
+  you cannot locate it in the repository, list it under "REFERENCED BUT NOT FOUND
+  IN REPO" at the end of Section 10.
