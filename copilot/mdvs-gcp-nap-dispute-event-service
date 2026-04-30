@@ -1,0 +1,393 @@
+BEGIN PROMPT ─────────────────────────────────────────────────
+
+You are auditing the WDP component NAPDisputeEventService in the
+repository mdvs-gcp-nap-dispute-event-service. A prior pass already
+produced a DRAFT architecture document. Your job is to CONFIRM OR
+CORRECT the items listed under "ALREADY DOCUMENTED" from source, and
+to CLOSE the items listed under "GAPS TO FILL" by reading the code and
+config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that
+explicitly and label it "not determinable from source". Do NOT guess.
+Do NOT summarise without evidence. Do NOT use the existing document as
+a substitute for source — treat it as a hypothesis to verify.
+
+─── REFERENCE DOCUMENT ───────────────────────────────────────
+
+The existing component file WDP-COMP-04-NAP-DISPUTE-EVENT-SERVICE.md is
+provided alongside this prompt. It is HYPOTHESES to verify, not ground
+truth.
+
+For each documented claim:
+  (a) confirm "Still accurate — <file>:<lines>", OR
+  (b) write a CORRECTION block:
+       Document says: <quoted claim>
+       Source shows: <actual value, file:lines>
+       Section to update: <Identity / Boundaries / Flow / Kafka /
+                           Risks / Decisions / etc.>
+
+At the end of the report, under Section 10, list every documented claim
+that could NOT be verified from source.
+
+NOTE: The reference document references DEC-014 as a deviation. Treat
+DEC-014 as VOIDED at the platform level. Confirm circuit-breaker
+absence as a fact, not as a deviation. The Section 6 sweep below uses
+the live decision IDs only.
+
+─── ALREADY DOCUMENTED — confirm or correct (do NOT re-document) ───
+
+Identity & deployment surface
+  1. Component is REST API + Kafka Producer. Stateless. No Kafka
+     consumer. No DB.
+  2. Maven artifact: nap-event-service v1.4.4.
+  3. Listens on port 8082, context path /merchant/gcp/nap.
+  4. Three Ingress hostnames (external, internal WPS, NAP-specific).
+     TLS terminated at Ingress.
+  5. Memory request 1024Mi, limit 3072Mi. CPU request and limit NOT
+     set. No HPA. Replica count is an XL Deploy placeholder.
+
+Endpoints (4)
+  6. POST /event — new chargeback (SRV-116), caller NAP-DPS.
+  7. POST /{caseId}/{uniqueId} — case update, caller WDP OPS Portal.
+  8. POST /outcome/{caseId}/{uniqueId} — win/loss outcome, caller WDP
+     OPS Portal.
+  9. POST /response/document — base64 evidence document, caller WDP
+     OPS Portal. Direct proxy to DocumentManagementService. No Kafka,
+     no enrichment, no retry.
+ 10. All endpoints unauthenticated at app level; SecurityConfig
+     whitelists /**. OAuth2 client registration gcp-ops-portal-dev is
+     present but not enforced.
+ 11. Correlation ID via v-correlation-id header; UUID generated if
+     absent; propagated via MDC.
+
+Processing flow — Path 1 (Kafka path)
+ 12. Per inbound request: fetch IDP Bearer token, then branch by event
+     type.
+ 13. New-dispute enrichment chain (serial):
+       CaseManagementService → FraudSwitch → DisplayCodeService.
+ 14. Case-update enrichment chain (serial):
+       CaseActionService → CaseManagementService →
+       ChargebackResponseRulesService.
+ 15. Outcome enrichment chain (serial):
+       CaseActionService → CaseManagementService.
+ 16. Bypass condition: enrichment_failure=true OR function_code=603 →
+     validation skipped, event still published with
+     enrichmentFailure=true.
+ 17. Mapping via BeanUtils.copyProperties (silent field-drop risk).
+
+Processing flow — Path 2 (document upload)
+ 18. Direct REST proxy to DocumentManagementService. No Kafka. No
+     enrichment. No retry.
+
+Kafka producer
+ 19. Topic: nap-dispute-events, configured via kafka.nap-topic.
+ 20. ENABLE_IDEMPOTENCE_CONFIG=true.
+ 21. MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION=1.
+ 22. Publish is synchronous: kafkaTemplate.send(...).get(). No
+     timeout bound on .get().
+ 23. @Retryable on the publish call.
+ 24. Partition key: merchantId for case-update and outcome events;
+     cardAcceptorCodeId for new dispute events (POST /event) —
+     partial DEC-003 deviation.
+ 25. CVV is present in NapEvent.toString() and logged at INFO before
+     publish.
+
+Outbound REST dependencies
+ 26. IDPTokenService — endpoint not documented.
+ 27. CaseManagementService, CaseActionService, FraudSwitch,
+     DisplayCodeService, ChargebackResponseRulesService — all called
+     with @Retryable.
+ 28. DocumentManagementService — no retry, fail-fast.
+ 29. RestTemplate is instantiated with default constructor — no
+     connection or read timeout configured.
+ 30. No Resilience4j, no Hystrix, no circuit breaker library.
+ 31. RestServiceInvoker bean is autowired but never called.
+
+Database
+ 32. Component owns no tables. Reads no tables. No JPA, JDBC, or
+     datasource bean.
+
+Mapping quirks
+ 33. GUARPAY1–GUARPAY5 → TIER1–TIER5; GUARPAY7 also maps to TIER5
+     (same as GUARPAY5).
+
+For each item above, output one of:
+  (a) "Still accurate — <file>:<lines>"
+  (b) Correction block as defined above.
+Do NOT re-document items marked accurate.
+
+─── GAPS TO FILL — answer from source ───────────────────────────
+
+  G1. REST request bodies. For each of the 4 endpoints, list every
+      field on the inbound DTO: name, type, required/optional,
+      validation annotations.
+  G2. REST responses. For each of the 4 endpoints: every HTTP status
+      code returned, the condition that triggers it, the response body
+      shape (success and error).
+  G3. @Retryable configuration on each outbound REST dependency AND on
+      the Kafka publish:
+         - max attempts
+         - backoff / delay
+         - multiplier
+         - exception types caught (include / exclude lists)
+         - what happens after retries are exhausted
+  G4. RestTemplate construction. Confirm the default-constructor claim
+      for every RestTemplate bean / instance. Note any RestTemplate
+      configured differently for any specific dependency.
+  G5. IDPTokenService — exact URL or path. Confirm whether the token
+      is fetched per-request or cached (annotation, manual cache,
+      Spring Cache abstraction).
+  G6. NapEvent payload schema. Full field list as serialised to Kafka.
+      Mark each field as ENRICHED or COPIED-FROM-DTO.
+      Confirm CVV is in toString() output. Cite the exact log statement
+      file:line that emits NapEvent before publish.
+  G7. BeanUtils.copyProperties — every call site in the request → NapEvent
+      path. Identify any field-name mismatches that could cause silent
+      drops.
+  G8. Bypass predicate. Show exactly where enrichment_failure and
+      function_code are evaluated. Confirm which endpoints honour the
+      bypass and which do not. Show where enrichmentFailure=true is
+      set on the outbound NapEvent.
+  G9. Kafka publish failure path. After @Retryable exhausts on
+      kafkaTemplate.send().get(): what is thrown, what is caught at
+      the controller layer, what HTTP status returns to the caller, and
+      whether ANY persistent record of the event exists anywhere.
+ G10. Inbound idempotency. Is there any application-level deduplication
+      on inbound POSTs (e.g. by caseId+uniqueId, by SRV-116 message id,
+      by Idempotency-Key header)? If not, state explicitly: duplicate
+      POSTs result in duplicate enrichment and duplicate Kafka
+      publishes.
+ G11. Document-upload failure behaviour. What does POST
+      /response/document return when DocumentManagementService fails?
+      Is the request body or document payload ever logged?
+ G12. SecurityConfig. Confirm whitelist scope. List every filter that
+      runs on inbound traffic. Confirm OAuth2 client registration is
+      unused for endpoint protection. Identify any auth-related code
+      that IS active.
+ G13. Kubernetes deployment. Search for resources.yaml, values.yaml,
+      Helm chart, deployment.yaml, manifests/ directory, k8s/, deploy/,
+      xldeploy/, .xldeploy. For each found:
+         - replica count (placeholder name and resolution mechanism)
+         - HPA presence/absence
+         - rolling update strategy (maxSurge, maxUnavailable)
+         - PodDisruptionBudget
+         - topology spread constraints
+         - liveness / readiness / startup probes (path, port, period)
+         - ports exposed
+      If NONE of these are present in the repo, state "K8s manifests
+      not in repo" for the entire Section 7 and list which config files
+      ARE present (Dockerfile, application.yaml, application-*.yaml,
+      logback-spring.xml, etc).
+ G14. Observability. OpenTelemetry Java agent — present in Dockerfile
+      ENTRYPOINT or javaagent flag? Spring Boot Actuator endpoints
+      exposed (which ones). Logstash appender — is logstash-logback-
+      encoder on the classpath and configured?
+ G15. Kafka topic config. Search application*.yaml and any spring
+      kafka config for partition count or retention for
+      nap-dispute-events. Mark "not in repo" if absent.
+ G16. GUARPAY7 → TIER5 mapping. Locate the mapping code. Quote any
+      comment, annotation, or commit message hint at intent. Likely
+      "not determinable from source alone".
+ G17. Planned / incomplete work:
+         - TODO / FIXME markers (file:line, verbatim text)
+         - Commented-out code blocks of architectural significance
+         - Unused imports
+         - Dependencies in pom.xml not referenced anywhere
+         - @Value or yaml keys configured but never injected
+         - Feature flags (toggleable behaviour) and their default values
+         - Stub implementations returning fixed responses
+ G18. Decommission scope. Any @Deprecated, deprecation comments,
+      migration markers, or "to be removed" notes in source confirming
+      decommission status?
+
+─── REPORT STRUCTURE — use these section headings, in order ─────
+
+SECTION 1 — PROCESSING FLOW
+
+  a) STEPS IN ORDER
+     Every processing step from inbound HTTP receipt to final response.
+     For each step: what happens, which service or component is called,
+     what the output of that step is. Cite file:lines.
+
+  b) DECISION POINTS
+     Every branch in the flow — endpoint dispatch, event-type
+     dispatch, bypass predicate, enrichment-success vs failure. State
+     the condition and every possible outcome with the path it leads
+     to. Cite file:lines.
+
+  c) SKIP AND BYPASS CONDITIONS
+     The enrichment_failure / function_code=603 bypass — what is
+     checked, what value triggers the skip, where control goes after
+     the skip, what flag is set on the outbound event.
+
+  d) FAILURE PATH PER STEP
+     For each step that calls an external dependency (IDP, CMS, CAS,
+     FraudSwitch, DisplayCode, ChargebackResponseRules,
+     DocumentManagement, Kafka publish) — what happens if that call
+     fails. Retry / skip / halt / fail-fast. Per step, not globally.
+     State exception type caught, number of retries, post-exhaustion
+     behaviour, whether the inbound HTTP request fails.
+
+  e) MULTIPLE ENTRY PATHS
+     Four REST endpoints. Describe each separately. State where they
+     converge (token fetch? mapping?) or confirm they are fully
+     independent. Confirm explicitly: no Kafka listener, no scheduler,
+     no webhook, no other entry types.
+
+  f) STATE AT EACH STEP
+     Component is stateless — confirm explicitly. State that no record
+     status transitions occur because no records are persisted. The
+     only persistent side-effect is the Kafka publish.
+
+SECTION 2 — FUNCTIONAL BEHAVIOUR
+
+  a) CLASSIFICATION AND ROUTING LOGIC
+     How endpoint is dispatched to handler. How event type is
+     determined. How partition key is selected (cardAcceptorCodeId vs
+     merchantId).
+
+  b) BUSINESS RULES APPLIED
+     Validation applied inside this component (not delegated). What is
+     checked, expected value, failure outcome. Include
+     ChargebackResponseRulesService validation only if applied locally
+     vs delegated.
+
+  c) DATA TRANSFORMATIONS
+     Inbound DTO → NapEvent field map. Conditional fields. Enrichment
+     field provenance (which downstream service supplies which field).
+     BeanUtils.copyProperties call sites.
+
+  d) IDEMPOTENCY MECHANISM
+     Kafka producer-level idempotence (broker-side). Application-level
+     inbound idempotency: present or absent. If absent, state the
+     scenario explicitly: duplicate POST → duplicate enrichment →
+     duplicate Kafka publish (broker idempotence does not help across
+     separate producer sessions).
+
+SECTION 3 — CONTRACTS
+
+  REST API — for each of the 4 endpoints:
+     Method, path, request fields with types and required flags,
+     response fields, every HTTP status code returned and its trigger,
+     auth model, known callers, error body structure.
+
+  Kafka Producer — for nap-dispute-events:
+     Exact topic name and config key, message key field per event
+     type, sync vs async, idempotence setting, max-in-flight,
+     publish trigger (which controller methods publish), failure
+     behaviour after retries exhausted.
+
+  Kafka Consumer — STATE "not present".
+  Batch / Scheduler — STATE "not present".
+
+SECTION 4 — DEPENDENCIES
+
+  For every outbound call (IDP, CMS, CAS, FraudSwitch, DisplayCode,
+  ChargebackResponseRules, DocumentManagement):
+     Service name / logical target
+     Protocol and auth method
+     Purpose — at which step in the flow
+     Connection timeout (state "not configured" if absent)
+     Read timeout (state "not configured" if absent)
+     Retry: count, delay, backoff type
+     Circuit breaker: Resilience4j configured? — expected NO,
+       confirm "not configured"
+     Behaviour if unavailable: halt / skip / degrade / item lost
+
+SECTION 5 — DATABASE
+
+  Confirm explicitly: no schema config, no datasource bean, no JPA
+  entity, no @Repository, no JDBC code, no flyway/liquibase migrations,
+  no nap.* or wdp.* table reference. State "no database access of any
+  kind".
+
+SECTION 6 — PLATFORM STANDARD DEVIATIONS
+
+  For each standard, output: COMPLIES / DEVIATES / NOT APPLICABLE,
+  with evidence cited file:lines.
+
+     DEC-001 (Transactional outbox): used? Which table? Is outbox
+       write in same transaction as business write? Expected: NO —
+       confirm.
+     DEC-003 (Kafka partition key = merchantId): for each event type
+       confirm key. Expected partial deviation on POST /event.
+     DEC-004 (PAN encryption at ingestion boundary): is full PAN ever
+       present in the inbound payload or NapEvent? Is EncryptionService
+       called? Expected: NA — payload carries no full PAN. CVV is a
+       separate concern, document under PCI risk.
+     DEC-005 (Manual Kafka offset commit): not applicable —
+       producer-only component. State "NOT APPLICABLE".
+     DEC-019 (Clear PAN exception accepted risk): does this component
+       write clear PAN to any persistent store? Expected: no
+       persistent store at all. State "NOT APPLICABLE".
+     DEC-020 (Idempotency / at-least-once): full at-least-once
+       implemented? Expected NO — direct publish without outbox is a
+       gap. State the gap clearly.
+
+SECTION 7 — SCALING AND DEPLOYMENT
+
+  Kubernetes resource type
+  Replica count — exact value or placeholder, state which and which
+    variable
+  Memory and CPU limits and requests
+  HPA — present or absent (cite the manifest)
+  Rolling update strategy
+  PodDisruptionBudget — present or absent
+  Topology spread — functional or label mismatch
+  Liveness / readiness / startup probes
+  Ports exposed
+  Observability — OTel agent, Actuator, Logstash
+
+  IF the K8s manifest, Helm chart, values.yaml, or xldeploy templates
+  are NOT in the repo, state "not in repo" for this entire section
+  and explicitly list what IS in the repo (Dockerfile,
+  application.yaml, logback config, etc.) so the gap is visible.
+
+SECTION 8 — PLANNED AND INCOMPLETE WORK
+
+  Commented-out code — what it did and why
+  Unused dependencies in pom.xml
+  Feature flags active in production — exact flag names and behaviour,
+    plus default value if env var unset
+  TODO / FIXME references — file:line and verbatim text
+  Stub implementations returning fixed responses
+  Properties configured but never read
+  RestServiceInvoker (autowired-but-unused) — confirm and identify
+    declaration site
+
+SECTION 9 — CONFIDENCE ASSESSMENT
+
+  For EACH of sections 1 through 8:
+     Confidence: High / Medium / Low
+     Basis: direct source reading / inferred from pattern / not
+       determinable from source alone
+
+SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE
+
+  List every claim from the existing component document that could
+  NOT be cross-checked against code or config — neither confirmed nor
+  contradicted. These will need follow-up from the team or from
+  runtime observation.
+
+─── OUTPUT RULES ────────────────────────────────────────────────
+
+- Cite file paths and line ranges for every concrete claim.
+  Format: <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does
+  not reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms
+  existing documentation, a one-paragraph "still accurate —
+  file:lines" is acceptable.
+- If you would restate something the reference document already
+  states verbatim, replace that prose with "Document accurate —
+  <file>:<lines>". Do not restate.
+- Do not invent file paths. If a file is referenced in the existing
+  doc but you cannot locate it, list it under "REFERENCED BUT NOT
+  FOUND IN REPO" at the end.
+
+END PROMPT ───────────────────────────────────────────────────

@@ -1,0 +1,349 @@
+You are auditing the WDP component NAPDisputeDeclineBatch in the
+repository gcp-visa-issuer-decline-batch. A prior pass already
+produced a DRAFT architecture document. Your job is to CONFIRM OR
+CORRECT the items listed under 'ALREADY DOCUMENTED' from source, and
+to CLOSE the items listed under 'GAPS TO FILL' by reading the code
+and config directly.
+
+Produce a single structured research report organised under the
+section headings below. For every claim, cite the file path and line
+range you read it from. Where source does not show the answer, state
+that explicitly and label it 'not determinable from source'. Do NOT
+guess. Do NOT summarise without evidence. Do NOT use the existing
+document as a substitute for source — treat it as a hypothesis to
+verify.
+
+══════════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT
+══════════════════════════════════════════════════════════════════
+The existing component file (WDP-COMP-06-NAP-DISPUTE-DECLINE-BATCH.md)
+is provided alongside this prompt. Treat it as HYPOTHESES to verify,
+not ground truth.
+
+For each claim listed under ALREADY DOCUMENTED you must either:
+  (a) confirm: "Still accurate — <relative/path>:Lstart-Lend"
+  (b) correct: write a CORRECTION block stating
+        - what the doc says
+        - what the source actually shows (cited)
+        - which section of the doc needs updating
+
+At the end of the report (Section 10) list every documented claim
+that could NOT be verified from source.
+
+Do NOT re-document the items in the ALREADY DOCUMENTED block from
+scratch. Confirm or correct only.
+
+══════════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — CONFIRM OR CORRECT
+══════════════════════════════════════════════════════════════════
+D1.  Repo gcp-visa-issuer-decline-batch, artifact
+     visa-issuer-decline-batch v1.1.1
+D2.  Java 17, Spring Boot 3.5.7, Spring Batch
+D3.  Visa-only, NAP-only scope — non-Visa records skipped after
+     Case Management GET
+D4.  Polls nap.action on NAP PostgreSQL datasource
+D5.  Filter: C_CASE_STAGE='PAB' AND C_ACTION_TYPE='OPAB' AND
+     C_ACTION_STA='OPEN' AND C_MIGRATION_STA='Y' AND
+     Z_INSRT > (now - ${past_days})
+D6.  Cursor-based pagination, page size ${number_of_records}
+D7.  Look-back window from ${past_days}
+D8.  Trigger is internal Spring @Scheduled cron — NOT a K8s CronJob
+D9.  Step 1: IDP Token Service GET, ONCE per job run
+D10. Step 2: Case Management GET — verify cardNetwork=VISA
+D11. Step 3: Visa Adapter HyperSearch POST returns stageStateDesc,
+     disputePreArbResponseId, deadlines, amounts
+D12. Step 4: only "Fraud Dispute - Pre-Arb Declined" or
+     "Authorization Dispute - Pre-Arb Declined" proceed; all other
+     states skipped
+D13. Step 5: disputePreArbResponseId must be present; skip if absent
+D14. Step 6: Case Actions GET — retrieve existing action financial
+     details
+D15. Step 7: Case Actions POST creates IDCL draft action —
+     stageCode=PAB, actionStatus=DRAFT, userId=NPRBDECLB,
+     financial amounts copied
+D16. Visa network access is mediated by Visa Adapter only — NO
+     direct Visa API call from this component
+D17. nap.action rows are NOT updated by this component after
+     processing
+D18. Up to 4 serial REST calls per qualifying record; no parallelism
+     within the per-record loop
+D19. Two PostgreSQL datasources: NAP (read), WDP (Spring Batch meta)
+D20. Spring Batch metadata: BATCH_JOB_INSTANCE,
+     BATCH_JOB_EXECUTION, BATCH_STEP_EXECUTION
+D21. Logstash / ELK TCP appender for structured logs
+D22. No Kafka surface anywhere
+D23. DEC-001 DEVIATION — direct REST POST to Case Actions, no
+     outbox
+D24. DEC-003 NOT APPLICABLE — no Kafka
+D25. DEC-004 DEVIATION on the claim that NAP data carries no full
+     PAN; EncryptionService never called
+D26. DEC-005 NOT APPLICABLE — no Kafka consumer
+D27. DEC-014 DEVIATION — Resilience4j not active in this component
+D28. Caller of Case Management GET /nap/case (per COMP-23 doc)
+D29. Caller of Case Actions POST /{platform}/case/{caseNumber}/actions
+     (per COMP-24 doc)
+
+══════════════════════════════════════════════════════════════════
+GAPS TO FILL — ANSWER FROM SOURCE
+══════════════════════════════════════════════════════════════════
+1.  Cron expression and property/annotation that holds it; timezone
+2.  Concrete value or env-var name for ${past_days} and
+    ${number_of_records}; default values if any
+3.  Spring Batch JobParameters construction — timestamp, run-id, or
+    other. Is there a distributed lock (@SchedulerLock, advisory
+    lock, Redis lock) preventing concurrent runs across replicas?
+4.  For EACH of the four outbound REST calls (IDP Token, Case
+    Management GET, Visa Adapter HyperSearch POST, Case Actions GET,
+    Case Actions POST):
+      - connection timeout (or 'not configured')
+      - read timeout (or 'not configured')
+      - retry count / delay / backoff
+      - exception caught
+      - behaviour on exhaustion: skip record / fail step / fail
+        job / halt
+5.  Idempotency — is there any guard preventing a duplicate IDCL
+    draft on re-run before nap.action propagation? Client-side and
+    server-side considerations.
+6.  Spring Batch internals — chunk size; tasklet vs chunk step;
+    checkpointing and resume behaviour on mid-job failure.
+7.  Cross-datasource transaction behaviour — which TransactionManager
+    bean is used; what happens if Case Actions POST succeeds but
+    the Spring Batch step-completion write fails.
+8.  Replica count, memory/CPU requests and limits, HPA, rolling
+    update strategy, PodDisruptionBudget, topology spread,
+    liveness/readiness/startup probes, container ports.
+9.  OTel agent presence; Actuator endpoints; Logstash endpoint
+    property; Spring Batch metrics emission; Prometheus endpoint.
+10. Resilience4j — confirm not on classpath; no @CircuitBreaker,
+    @Retry, @TimeLimiter annotations anywhere.
+11. PAN handling — confirm no PAN field on any DTO; no call to
+    EncryptionService or TokenService for PAN; no clear PAN
+    reaches any persistent store.
+12. Confirm no Kafka client, no SQS client, no Kafka listener, no
+    webhook receiver, no REST controller, no secondary scheduler —
+    only entry path is the single @Scheduled cron.
+13. Manual reprocessing — any operator-facing trigger (REST,
+    JobLauncher, Actuator) to re-run for a specific date range?
+14. Auth — how is the JWT bootstrap call cached, when is it
+    refreshed, how is it propagated; mTLS or JWT-only for downstream
+    WDP services; secret names for credentials.
+15. DEC-023 applicability — is this component intended to run as
+    replicas=1? Any concurrency guard if not?
+16. Commented-out code; TODO/FIXME (file:line and verbatim text);
+    dead Kafka/outbox imports; properties declared but never read;
+    unused dependencies in pom.xml; feature flags.
+17. File presence — confirm Dockerfile, application.yaml, pom.xml
+    are in the repo. State whether values.yaml / Helm chart /
+    resources.yaml is in the repo; if not, Section 7 must be
+    marked 'not in repo'.
+
+══════════════════════════════════════════════════════════════════
+REPORT STRUCTURE — USE THESE EXACT HEADINGS, IN THIS ORDER
+══════════════════════════════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ──────────────────────────────────
+
+a) STEPS IN ORDER
+   Every processing step from cron trigger to final job-completion
+   write. For each step: what happens, which service/table, output
+   of that step. Cite file:lines.
+
+b) DECISION POINTS
+   Every branch — condition evaluated and every outcome with the
+   path taken. Cite file:lines.
+
+c) SKIP AND BYPASS CONDITIONS
+   Every condition that short-circuits a record or the whole job.
+   What is checked, what value triggers the skip, where control
+   goes after.
+
+d) FAILURE PATH PER STEP
+   For each step that calls an external dependency: what happens
+   if that call fails. Per step, not globally. Exception type
+   caught, retry count, post-exhaustion behaviour. Cover IDP
+   Token, Case Management GET, Visa Adapter HyperSearch POST,
+   Case Actions GET, Case Actions POST, NAP DB read,
+   Spring Batch metadata write.
+
+e) MULTIPLE ENTRY PATHS
+   Confirm explicitly: only one entry path (internal @Scheduled
+   cron) — no REST controller, no Kafka listener, no SQS listener,
+   no webhook receiver, no secondary scheduler. Cite file:lines.
+
+f) STATE AT EACH STEP
+   For stateful processing — the status of the action record at
+   each step and any state transition this component triggers
+   (note: existing doc claims nap.action rows are NOT updated —
+   confirm).
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ─────────────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   How the job decides which action records to act on (nap.action
+   filter predicate), which to skip after Case Management GET
+   (cardNetwork), which to skip after HyperSearch (state filter
+   + response ID check). Every condition and outcome.
+
+b) BUSINESS RULES APPLIED
+   Validation, eligibility, or rule applied inside this component
+   (not delegated). What is checked, expected value, failure
+   outcome. Include the financial-amount copy logic from existing
+   action to new IDCL draft.
+
+c) DATA TRANSFORMATIONS
+   Inbound (nap.action row + HyperSearch response + existing
+   action) to outbound (IDCL ActionRequest) field map. Any
+   conditional fields. Source field → target field, with cite.
+
+d) IDEMPOTENCY MECHANISM
+   Detection key fields. Duplicate behaviour. Gaps — re-run
+   windows, replica races, no-DB-constraint reliance, server-side
+   vs client-side dedup.
+
+── SECTION 3 — CONTRACTS ────────────────────────────────────────
+
+For REST API components: state 'not present — this component
+exposes no REST endpoints' if confirmed.
+
+For Kafka Consumer components: state 'not present — no Kafka
+consumer' if confirmed.
+
+For Kafka Producer components: state 'not present — no Kafka
+producer' if confirmed.
+
+For Batch/Scheduler components: this is the relevant sub-section.
+Document:
+  - Trigger mechanism (annotation, scheduler bean)
+  - Cron expression / config key / env-var name
+  - Input source query and exact filter predicate
+  - Chunk size (or tasklet)
+  - Pagination strategy and page-size config key
+  - Job uniqueness — JobParameters construction, distributed lock
+    if any
+  - Restart behaviour — checkpoint resume vs full restart
+  - Manual re-trigger path if any
+
+── SECTION 4 — DEPENDENCIES ─────────────────────────────────────
+
+For every outbound call (IDP Token Service, Case Management
+Service, Visa Adapter HyperSearch, Case Actions Service GET,
+Case Actions Service POST, NAP PostgreSQL, WDP PostgreSQL,
+Logstash):
+  - Service name / logical target
+  - Protocol and auth method
+  - Purpose — at which step in the flow
+  - Connection timeout (state 'not configured' if absent)
+  - Read timeout (state 'not configured' if absent)
+  - Retry: count, delay, backoff type
+  - Circuit breaker: Resilience4j configured?
+      If yes — failure rate threshold, wait duration, half-open
+      permitted calls.
+      If no — state explicitly 'not configured'.
+  - Behaviour if unavailable: halt / skip / degrade / item lost
+
+── SECTION 5 — DATABASE ─────────────────────────────────────────
+
+For every table read or written:
+  - Schema and exact table name
+  - Read or write — state clearly
+  - Purpose — at which step in the flow
+  - Key columns used in queries or writes
+  - Whether writes are in the same transaction as other writes
+    at that step
+  - Transaction manager bean used
+  - Whether SELECT FOR UPDATE / row locks used
+
+Cover: nap.action (read), Spring Batch metadata tables
+(BATCH_JOB_INSTANCE, BATCH_JOB_EXECUTION, BATCH_STEP_EXECUTION)
+on the WDP datasource — confirm the schema name they live in.
+
+Confirm explicitly: nap.action is NOT written by this component
+(existing doc claim D17). Confirm explicitly: nap.case is NOT
+read directly — accessed only via Case Management Service.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ─────────────────────
+
+For each standard, output COMPLIES / DEVIATES / NOT APPLICABLE
+with evidence cited to file:lines.
+
+  DEC-001: Transactional outbox — used? Which table? Outbox
+    write in same transaction as business write?
+    (Existing claim: DEVIATES — direct REST POST, no outbox.)
+  DEC-003: Kafka partition key = merchantId? If not, what is it?
+    (Existing claim: NOT APPLICABLE — no Kafka.)
+  DEC-004: PAN encryption — encrypted before any persistent write?
+    Clear PAN ever written? Which service handles encryption?
+    (Existing claim: DEVIATES — NAP data carries no full PAN, so
+    no encryption happens. Verify by confirming there is no PAN
+    field on any DTO and no EncryptionService client wired in.)
+  DEC-005: Kafka offset — committed manually after all processing?
+    (Existing claim: NOT APPLICABLE — no Kafka.)
+  DEC-019: Clear PAN — does this component write clear PAN to any
+    persistent store? (Verify by inspecting all writes —
+    Spring Batch metadata only — and all DTOs for PAN fields.)
+  DEC-020: Idempotency — full at-least-once implemented? If not,
+    what gap exists? (Likely DEVIATES — no nap.action update,
+    no client-side dedup; flag exact gaps.)
+
+── SECTION 7 — SCALING AND DEPLOYMENT ───────────────────────────
+
+  Kubernetes resource type
+  Replica count — exact value or placeholder, state which and which
+  variable
+  Memory and CPU limits and requests
+  HPA — present or absent (cite manifest)
+  Rolling update strategy
+  PodDisruptionBudget — present or absent
+  Topology spread — functional or label mismatch
+  Liveness / readiness / startup probes
+  Ports exposed
+  Observability — OTel agent, Actuator, Logstash
+
+If the K8s manifest, Helm chart, or values.yaml is NOT in the
+repo, state 'not in repo' for this entire section and explicitly
+list what IS in the repo (Dockerfile, application.yaml, etc.).
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ──────────────────────
+
+  Commented-out code — what it did and why
+  Unused dependencies in pom.xml
+  Feature flags active in production — exact flag names and
+    behaviour, plus default if env var unset
+  TODO / FIXME references — file:line and verbatim text
+  Stub implementations returning fixed responses
+  Properties configured but never read — search for @Value or yaml
+    keys with no injection point
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ────────────────────────────
+
+For EACH of sections 1 through 8, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+    determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ────────────────
+
+List every claim from the existing component document that you
+could NOT cross-check against code or config — neither confirmed
+nor contradicted. These will need follow-up from the team or
+runtime observation.
+
+══════════════════════════════════════════════════════════════════
+OUTPUT RULES
+══════════════════════════════════════════════════════════════════
+- Cite file paths and line ranges for every concrete claim.
+  Format: <relative/path>:Lstart-Lend
+- State 'not determinable from source' for any item the code does
+  not reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms
+  existing documentation, a one-paragraph
+  'still accurate — <file>:<lines>' is acceptable.
+- If you would restate something the reference document already
+  states verbatim, replace that prose with
+  'Document accurate — <file>:<lines>'. Do not restate.
+- Do not invent file paths. If a file is referenced in the
+  existing doc but you cannot locate it, list it under
+  'REFERENCED BUT NOT FOUND IN REPO' at the end.
