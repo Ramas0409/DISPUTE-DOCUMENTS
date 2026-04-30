@@ -1,0 +1,534 @@
+You are auditing the WDP component BENConsumer in the repository wdp-ben-consumer.
+A prior pass already produced a DRAFT architecture document. Your job is to
+CONFIRM OR CORRECT the items listed under 'ALREADY DOCUMENTED' from source, and
+to CLOSE the items listed under 'GAPS TO FILL' by reading the code and config
+directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you read
+it from. Where source does not show the answer, state that explicitly and
+label it 'not determinable from source'. Do NOT guess. Do NOT summarise
+without evidence. Do NOT use the existing document as a substitute for source
+— treat it as a hypothesis to verify.
+
+═══════════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT
+═══════════════════════════════════════════════════════════════════
+
+The existing component file WDP-COMP-42-BEN-CONSUMER.md (v1.0 DRAFT) is
+provided alongside this prompt. It is HYPOTHESES TO VERIFY, not ground truth.
+
+For each documented claim:
+  - If source confirms the claim, write: "Still accurate — <file>:<lines>"
+  - If source contradicts the claim, write a CORRECTION block:
+        DOC SAYS: <verbatim claim>
+        SOURCE SHOWS: <actual finding> — <file>:<lines>
+        SECTION TO UPDATE: <which section of the existing doc>
+  - Do NOT re-document confirmed claims from scratch. Replace prose with
+    "Document accurate — <file>:<lines>".
+
+At the end of the report (Section 10), list every documented claim that
+could NOT be verified from source — neither confirmed nor contradicted.
+
+═══════════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — confirm or correct, do NOT re-document
+═══════════════════════════════════════════════════════════════════
+
+For each of the following, output one line: confirmation with file:lines,
+or a CORRECTION block.
+
+INBOUND CONSUMER
+  D-1  Topic per env: external-request-events / -stg / -dev
+  D-2  Consumer group per env: external-request-ben-events / -stg / -dev
+  D-3  AckMode = MANUAL_IMMEDIATE, syncCommits = true
+  D-4  Concurrency = 1 (default — no setConcurrency() configured anywhere)
+  D-5  auto.offset.reset = latest
+  D-6  allow.auto.create.topics = false
+  D-7  enable.auto.commit = false
+  D-8  Security = SASL_SSL + AWS_MSK_IAM + IAMClientCallbackHandler
+  D-9  Value deserializer = ErrorHandlingDeserializer<BusinessRuleEvent>
+       wrapping JsonDeserializer<BusinessRuleEvent>
+  D-10 Key deserializer = StringDeserializer (assumed — confirm)
+  D-11 CommonErrorHandler is an empty anonymous class — no overrides
+
+LAYER-1 FILTER
+  D-12 eventType ∈ {CASE_CREATED, ACTION_CREATED}
+  D-13 platform  ∈ {PIN, CORE}
+  D-14 channelType ∈ {blank, BEN_EVENTS}
+  D-15 Filter-skip path writes NO outbox row — only acks offset and returns
+
+IDEMPOTENCY
+  D-16 Composite key = idempotencyId (header 'idempotency-key') +
+       constant channel_type='BEN_EVENTS' + eventTimestamp
+       (header 'event-timestamp')
+  D-17 Repository method:
+       findByIdempotencyIdAndChannelTypeAndEventTimestamp()
+  D-18 PUBLISHED row → re-process path (re-use entity ID)
+  D-19 Non-PUBLISHED row → silent drop (ack offset, return)
+  D-20 Missing 'idempotency-key' OR 'event-timestamp' → ERROR row written;
+       offset acked; return
+
+PRE-ACK POSITION
+  D-21 Offset committed at Step 4 — after idempotency INSERT, BEFORE all of:
+       Step 6 CMS REST, Step 7 BEN Product REST, Step 10 CAS REST,
+       Step 12 BEN Kafka publish, Step 13 outbox status UPDATE
+
+PREDECESSOR HANDLING (handlePreviousEventStatus)
+  D-22 Looks up prior outbox row for same caseNumber with id < currentId
+  D-23 Prior status = ERROR → current.status = ERROR; write outbox; return
+  D-24 Prior status = non-null AND non-SUCCESS → current.status =
+       PENDING_DEFERRED; nextRetryAt set; write outbox; return
+  D-25 Prior is SUCCESS or absent → continue to Step 6
+
+OUTBOUND REST DEPENDENCIES
+  D-26 mdvs-gcp-case-management-service GET /{platform}/case?caseNumber=
+       (Step 6)
+  D-27 BEN Product API GET ${ben_product_url} with ${ben_product_license}
+       static license-key auth (Step 7)
+  D-28 mdvs-gcp-case-actions-service GET
+       /{platform}/case/{caseNumber}/actions?actionSequence=  (Step 10)
+  D-29 mdvs-gcp-display-code-service POST /merchant/gcp/display-code/search
+       — invoked at @PostConstruct startup ONLY, never per event
+  D-30 wdp-idp-token-service GET /merchant/gcp/idp-token/token
+       — unauthenticated, lazy per event via ThreadLocal
+
+  D-31 No connect or read timeout configured on any RestTemplate
+  D-32 No Resilience4j artifact in pom.xml; no @CircuitBreaker / @Bulkhead /
+       @RateLimiter / @TimeLimiter anywhere
+  D-33 Spring Retry @Retryable applied ONLY to BEN Product API call
+       (3 attempts, 1000ms fixed, no multiplier)
+
+OUTBOUND KAFKA PRODUCER (BEN MSK)
+  D-34 Bootstrap servers = ${ben_bootstrap_servers} (separate from WDP MSK)
+  D-35 SASL config = ${ben_sasl_config} (separate JAAS from WDP MSK)
+  D-36 Topic name = ${ben_topic} (K8s secret — value not in source)
+  D-37 enable.idempotence = true, acks = all,
+       max.in.flight.requests.per.connection = 1
+  D-38 retries = 3, retry.backoff.ms = 1000ms
+  D-39 Synchronous publish via .get() on ListenableFuture
+  D-40 Producer message key = merchantId (from CaseSearchResponse)
+  D-41 No Resilience4j on producer
+
+EVENT CLASSIFICATION (Layer 3 — identifyEvent)
+  D-42 CASE_CREATED + actionSequence == "01" → NEW
+       eventType = "transaction.disputecases.created"
+  D-43 ACTION_CREATED + any → UPDATE
+       eventType = "transaction.disputecases.status.updated"
+  D-44 Any other combination → empty string eventType (still published)
+  D-45 actionSequence comparison semantics — exact ("01" only) or normalised?
+       Confirm string-equality method used.
+
+BEN ENTITLEMENT (Layer 2)
+  D-46 BEN product list cached after first fetch
+  D-47 level4Entity (chainCode) OR level5Entity (superChainCode) match
+       against BEN product list
+  D-48 No match → Status.SUCCESS written to outbox; no BEN publish
+
+PAN HANDLING
+  D-49 BusinessRuleEvent (inbound) has no PAN field
+  D-50 CaseSearchResponse.cardNumberLast4 is the only card field forwarded
+       to BEN
+  D-51 Full PAN never written to wdp.outgoing_event_outbox or any other
+       store
+
+OUTBOX
+  D-52 Table = wdp.outgoing_event_outbox
+  D-53 created_by / updated_by constant = "WBENC" at every write site
+  D-54 channel_type constant = "BEN_EVENTS" at every write site
+  D-55 Status enum values: PUBLISHED, SUCCESS, FAILED, ERROR,
+       PENDING_DEFERRED, SKIPPED. SKIPPED is in the enum but is NEVER
+       written by any code path.
+  D-56 hbm2ddl.auto = none — DDL not managed by this service
+  D-57 All outbox writes are auto-commit (no @Transactional spanning
+       multiple writes; no spanning offset commit + outbox INSERT)
+
+TOKEN HANDLING
+  D-58 IDP token stored in ThreadLocal (KafkaTokenHolder pattern)
+  D-59 Token fetched lazily on first WDP REST call per event
+  D-60 ThreadLocal cleared in finally block at Step 14
+  D-61 IDP service called UNAUTHENTICATED (plain GET — no Bearer)
+
+DISPLAY CODES
+  D-62 Loaded ONCE at @PostConstruct application startup
+  D-63 Held in in-memory HashMap; lookup is in-process per event
+  D-64 No display-code REST call per event
+  D-65 Display Code Service failure at startup → @PostConstruct re-throws
+       → application fails to start
+
+DEPLOYMENT
+  D-66 Kubernetes resource type = Deployment
+  D-67 Replica count = {{ replicas-wdp-ben-consumer }} (XL Deploy templated)
+  D-68 Memory limit = 2048Mi; memory request = 512Mi
+  D-69 No CPU limit, no CPU request configured
+  D-70 No HorizontalPodAutoscaler manifest
+  D-71 No PodDisruptionBudget manifest
+  D-72 Rolling update: maxSurge=1, maxUnavailable=0, minReadySeconds=30
+  D-73 TopologySpread: maxSkew=1, whenUnsatisfiable=ScheduleAnyway,
+       topologyKey=kubernetes.io/hostname
+  D-74 ServiceAccount = ben-msk-access
+  D-75 OTel pod annotation: instrumentation.opentelemetry.io/inject-java
+  D-76 spring-boot-starter-actuator present
+  D-77 LogstashTcpSocketAppender configured to ${logstash_server_host_port}
+
+KNOWN RISKS / TODOs
+  D-78 TODO at BenConsumerUtils.java:59 — monetary exponent hardcoded to
+       2dp (correct only for PIN/CORE)
+  D-79 spring-retry not declared as direct dependency in pom.xml
+       (transitive of spring-kafka)
+  D-80 spring-boot-starter-oauth2-resource-server present but unused
+  D-81 spring-boot-starter-oauth2-client present but unused
+
+═══════════════════════════════════════════════════════════════════
+GAPS TO FILL — answer these from source
+═══════════════════════════════════════════════════════════════════
+
+G-1  PROBES — Enumerate every container probe wired in the deployment
+     manifest: livenessProbe, readinessProbe, startupProbe. For each
+     wired probe, cite the manifest path, the probe type (httpGet /
+     exec / tcpSocket), the path/port, initialDelaySeconds, periodSeconds,
+     failureThreshold. For each probe NOT wired, state "absent" with the
+     manifest cited.
+
+G-2  ACK CALL SITE — Locate the exact line where
+     acknowledgment.acknowledge() is invoked. Cite file:line. Confirm
+     it is reached BEFORE every one of: CMS REST call, BEN Product
+     REST call, CAS REST call, BEN Kafka send, final outbox UPDATE.
+     Confirm no second acknowledge() call exists later in the success
+     path.
+
+G-3  OUTBOX TRANSACTIONAL BOUNDARIES — List every call site that
+     writes to wdp.outgoing_event_outbox. For each: the calling method,
+     whether the method (or any enclosing method up the call chain)
+     carries @Transactional, and the transaction-manager bean if
+     specified. Confirm or correct the claim that all outbox writes
+     are bare auto-commit.
+
+G-4  IDEMPOTENCY DB-LEVEL PROTECTION — State whether any DB UNIQUE
+     constraint on (idempotency_id, channel_type, event_timestamp) is
+     declared in source (Liquibase / Flyway / JPA @UniqueConstraint /
+     DDL fragment). If absent, state "no DB-level UNIQUE constraint
+     visible in repo". State whether the SELECT (idempotency check)
+     and INSERT run inside the same JPA transaction or as separate
+     short transactions.
+
+G-5  setConcurrency CONFIRMATION — Grep for setConcurrency,
+     concurrency: in YAML, ConcurrentKafkaListenerContainerFactory
+     property `concurrency`. Confirm that none is set (or report what
+     IS set). Cite the listener-factory bean construction.
+
+G-6  RESILIENCE4J ARTEFACT ABSENCE — Grep pom.xml for "resilience4j".
+     Grep all source for @CircuitBreaker, @Bulkhead, @RateLimiter,
+     @TimeLimiter. Report exact match counts and cite any positives.
+
+G-7  OAUTH2 DEAD-CODE CONFIRMATION — Grep for @EnableResourceServer,
+     SecurityFilterChain, oauth2ResourceServer(), oauth2Client(),
+     OAuth2RestTemplate, JwtAuthenticationToken. Report exact match
+     counts. If zero, the OAuth2 starters are confirmed dead.
+
+G-8  SPRING-RETRY TRANSITIVE STATUS — Confirm spring-retry is NOT a
+     direct dependency in pom.xml. Confirm @EnableRetry and @Retryable
+     usage points. If spring-retry is present as a managed BOM
+     transitive (e.g., from spring-kafka), state where.
+
+G-9  EXTERNAL RETRY SCHEDULER — IN-REPO ABSENCE — Grep for @Scheduled,
+     @EnableScheduling, repository methods reading status IN ('FAILED',
+     'PENDING_DEFERRED'), and any background poller or batch class.
+     Confirm zero such code exists in wdp-ben-consumer. Recovery is
+     owned externally (COMP-12 InboundDisputeEventScheduler / Scheduler3)
+     — confirm wdp-ben-consumer contains no such logic.
+
+G-10 KEY MAPPING ON @KafkaListener — Cite the @Header annotation that
+     reads the inbound Kafka key. State the variable name and type.
+     (This is the consumer-side observation only — actual partition
+     key is producer-side and tracked separately as a COMP-18 OQ.)
+
+G-11 actionSequence COMPARISON SEMANTICS — Cite the exact line where
+     CASE_CREATED + "01" classification is decided. State the string-
+     equality method used (equals / equalsIgnoreCase / startsWith /
+     pattern). Note whether leading-zero normalisation occurs. (This
+     mirrors a defect class found in COMP-43 — actionSequence "1" vs
+     "01" treated differently.)
+
+G-12 PROCESSING-FLOW STEP VERIFICATION — Walk the listener method from
+     entry through the success path and through every failure branch.
+     For each numbered step (1 through 14 in the existing doc):
+        - Cite file:lines for the step
+        - State the action it performs in one short sentence
+        - State any state mutation (outbox status set, ThreadLocal set,
+          CMS response cached, etc.)
+     If any step in the existing doc does not exist in source, mark
+     it "NOT IN SOURCE". If any step exists in source but is not in
+     the doc, mark it "NEW STEP".
+
+G-13 CommonErrorHandler EMPTINESS — Cite the file:line of the
+     CommonErrorHandler bean. List every method override on the bean.
+     Confirm zero overrides (truly empty anonymous class).
+
+G-14 DEC-019 / DEC-020 RATING
+        DEC-019 (clear PAN written to a persistent store) — state
+          COMPLIES / DEVIATES with evidence.
+        DEC-020 (full at-least-once delivery implemented end-to-end) —
+          state COMPLIES / DEVIATES with evidence. The pre-ACK at Step 4
+          and reliance on an external retry scheduler likely make this
+          DEVIATES.
+     This is in addition to DEC-001, 003, 004, 005 already covered.
+
+G-15 DEVELOPER ADVISORY COMMENTS — Cite file:line and verbatim text of
+     the two "comment out for local testing" advisory comments in
+     KafkaConsumerConfig and KafkaBenProducerConfig.
+
+G-16 BEN PRODUCT API CACHE — How is the BEN product list cached? In a
+     bean-scoped Map? @Cacheable? With what TTL or eviction trigger?
+     Confirm caching is functional (i.e., @EnableCaching is present if
+     @Cacheable is used — mirroring the COMP-41 silent-no-op defect).
+
+G-17 BEN_EVENTS-SCOPED PREDECESSOR QUERY — In handlePreviousEventStatus,
+     does the predecessor query restrict on channel_type='BEN_EVENTS' or
+     does it scan ALL channel_types for that caseNumber? Cite the
+     repository method and JPQL/SQL. (COMP-17 was found to scan beyond
+     i_action_seq scope — establish whether COMP-42 has the analogous
+     issue.)
+
+G-18 OUTBOX NEVER-WRITTEN COLUMNS — Which columns of wdp.outgoing_
+     event_outbox does COMP-42 NEVER populate? (e.g. SKIPPED status,
+     any JSONB envelope sub-fields, kafka_topic/kafka_partition/
+     kafka_offset write-back if present in entity.) This matters
+     because the table is shared with COMP-17, COMP-41, COMP-43.
+
+G-19 MERCHANTID SOURCE ON OUTBOUND PRODUCE — Confirm that the BEN
+     producer message key is sourced from CaseSearchResponse.merchantId
+     (CMS-fetched at Step 6) and NOT from the inbound BusinessRuleEvent
+     payload. Cite the producer template call and key argument.
+
+G-20 BAD-PAYLOAD OBSERVABILITY — When ErrorHandlingDeserializer
+     converts a parse failure to null, what (if anything) happens?
+     Confirm: no log line, no metric increment, no DLT publish, no
+     audit row insert. Cite the listener entry to demonstrate that
+     null payload is not explicitly handled.
+
+═══════════════════════════════════════════════════════════════════
+REPORT STRUCTURE — use these exact section headings, in this order
+═══════════════════════════════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ─────────────────────────────────────
+
+a) STEPS IN ORDER
+   Every processing step from Kafka poll through final outbox UPDATE
+   and ThreadLocal clear. For each step: what happens, which service
+   or table is called, what the output of that step is. Cite
+   file:lines.
+
+b) DECISION POINTS
+   Every branch in the flow — the condition evaluated and every
+   possible outcome with the path it leads to. Cover at minimum:
+     - Layer-1 filter (eventType / platform / channelType)
+     - Mandatory header check (idempotencyId / eventTimestamp)
+     - Idempotency lookup (none / PUBLISHED / non-PUBLISHED)
+     - Predecessor status (none / SUCCESS / ERROR / non-SUCCESS)
+     - CMS response (OK / 4xx / 5xx / null body)
+     - BEN Product API response (OK / empty / failure / retries
+       exhausted)
+     - Layer-2 entitlement (match / no match)
+     - Layer-3 classification (NEW / UPDATE / unmatched)
+     - CAS response (OK / empty / 4xx / 5xx)
+     - BEN Kafka publish (success / BenServiceException)
+
+c) SKIP AND BYPASS CONDITIONS
+   Every condition that short-circuits processing. Specifically:
+     - Layer-1 filter-skip (no outbox row written)
+     - Non-PUBLISHED duplicate (silent drop)
+     - PUBLISHED re-process (eventId pre-set path if any)
+     - Layer-2 no-entitlement (Status.SUCCESS, no BEN publish)
+   For each: what is checked, what value triggers the skip, where
+   control goes after the skip.
+
+d) FAILURE PATH PER STEP
+   For each step that calls an external dependency, what happens if
+   that call fails. Per step:
+     - exception type caught
+     - retry count
+     - status written to outbox
+     - whether offset is already committed at that point
+     - post-exhaustion behaviour (ERROR vs FAILED)
+
+e) MULTIPLE ENTRY PATHS
+   Confirm there is exactly ONE @KafkaListener entry. Confirm zero
+   REST controllers, zero @Scheduled, zero @KafkaListener on any
+   other topic. State each absence explicitly.
+
+f) STATE AT EACH STEP
+   For each step, the row status in wdp.outgoing_event_outbox at
+   that point. PUBLISHED at Step 3, ERROR at Step 5 if predecessor
+   ERROR, etc. Show every status transition.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ────────────────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   Layer-1 filter — fields, values, branches.
+   Layer-2 entitlement — fields, comparison, outcome.
+   Layer-3 event classification — fields, comparison, outcome.
+
+b) BUSINESS RULES APPLIED
+   Validation (mandatory headers), eligibility (entitlement),
+   predecessor ordering rule. State each rule, expected value, and
+   failure outcome.
+
+c) DATA TRANSFORMATIONS
+   Inbound BusinessRuleEvent → outbound BENNotificationEvent field
+   map. Conditional fields (createdDate, result). Display-code
+   lookup transformations. Currency exponent scaling. Card-number-
+   last-4 derivation.
+
+d) IDEMPOTENCY MECHANISM
+   Detection key fields. Duplicate behaviour by status. Crash
+   windows (offset committed but no notification sent; INSERT
+   committed but offset not committed). At-most-once vs at-least-
+   once classification. DB-level constraint presence/absence.
+
+── SECTION 3 — CONTRACTS ───────────────────────────────────────────
+
+NOT PRESENT: REST API endpoints, Batch/Scheduler.
+
+KAFKA CONSUMER (external-request-events):
+   Topic per env, consumer group per env, AckMode, offset commit
+   timing relative to every write, concurrency, max-poll-records,
+   max-poll-interval, deserialiser, bad-payload behaviour, security.
+
+KAFKA PRODUCER (BEN MSK ${ben_topic}):
+   Topic, message key field, sync/async, idempotence setting,
+   publish trigger step, failure behaviour.
+
+── SECTION 4 — DEPENDENCIES ────────────────────────────────────────
+
+For each of: IDP Token Service, Case Management Service, BEN
+Product API, Case Actions Service, Display Code Service, BEN MSK
+Producer, wdp.outgoing_event_outbox.
+
+For each:
+  Service name / logical target
+  Protocol and auth method
+  Purpose — at which step in the flow
+  Connection timeout (state "not configured" if absent)
+  Read timeout (state "not configured" if absent)
+  Retry: count, delay, backoff type
+  Circuit breaker: Resilience4j configured? If not, state
+    "not configured".
+  Behaviour if unavailable: halt / skip / degrade / item lost
+
+── SECTION 5 — DATABASE ────────────────────────────────────────────
+
+For wdp.outgoing_event_outbox (read AND written):
+  Schema and exact table name
+  Read or write — state both with separate purposes
+  Purpose — at which step in the flow
+  Key columns used in queries (idempotency check, predecessor)
+  Key columns written (every status transition)
+  Whether writes are in the same transaction as other writes at
+    that step
+  Transaction manager bean used
+  Whether SELECT FOR UPDATE / row locks used
+
+Confirm explicitly: NO other tables touched. No coredata datasource.
+Single primary datasource only.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ────────────────────────
+
+For each, output: COMPLIES / DEVIATES / NOT APPLICABLE with
+file:line evidence.
+
+  DEC-001: Transactional outbox — used? Which table? Outbox write
+           in same transaction as business write? Relay/poller in
+           this codebase?
+  DEC-003: Outbound Kafka partition key on BEN MSK = merchantId?
+           Inbound consumer-side key observation (variable name).
+  DEC-004: PAN encryption — encrypted before any persistent write?
+           Clear PAN ever written? Any encryption-service call?
+  DEC-005: Kafka offset — committed manually after all processing?
+           Or auto / pre-ACK? Exact timing relative to each write
+           and each REST call.
+  DEC-019: Clear PAN — does this component write clear PAN to any
+           persistent store? Cite the writer and the column.
+  DEC-020: Idempotency — full at-least-once implemented end-to-end?
+           If not, state the gap (pre-ACK + external retry scheduler
+           dependency).
+
+DO NOT flag DEC-014 (it is VOID). Instead, list Resilience4j
+absence under "Risks / Constraints" with a note that it
+strengthens DEC-014-VOID evidence.
+
+── SECTION 7 — SCALING AND DEPLOYMENT ──────────────────────────────
+
+  Kubernetes resource type
+  Replica count — exact value or templated placeholder; state
+    which and which variable
+  Memory and CPU limits and requests
+  HPA — present or absent (cite the manifest)
+  Rolling update strategy
+  PodDisruptionBudget — present or absent
+  Topology spread — keys and label match
+  Liveness / readiness / startup probes (each individually)
+  Ports exposed
+  Observability — OTel agent, Actuator, Logstash
+  ServiceAccount
+
+If any K8s manifest, Helm chart, or values.yaml is NOT in the
+repo, state "not in repo" for that file and explicitly list what
+IS in the repo (Dockerfile, application.yaml, resources.yaml,
+chart/, k8s/, etc.) so the architect knows what is missing vs
+absent.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ─────────────────────────
+
+  Commented-out code — what it did and why
+  Unused dependencies in pom.xml — verify spring-boot-starter-
+    oauth2-resource-server, spring-boot-starter-oauth2-client are
+    truly dead, plus any others
+  Feature flags active in production — exact flag names and default
+    values if env var unset
+  TODO / FIXME references — file:line and verbatim text
+  Stub implementations returning fixed responses
+  Properties configured but never read — search for @Value and
+    yaml keys with no matching @Value injection point
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ───────────────────────────────
+
+For each of Sections 1 through 8, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+    determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ───────────────────
+
+List every claim from the existing component document that you
+could NOT cross-check against code or config — neither confirmed
+nor contradicted. These will need follow-up from the team or from
+runtime observation. Expected items include: production replica
+count, production ${ben_topic}, production ${ben_bootstrap_servers},
+production ${ben_product_url}, production ${max_poll_records} and
+${max_poll_interval}, BEN platform's idempotency handling.
+
+── REFERENCED BUT NOT FOUND IN REPO ────────────────────────────────
+
+Any file the existing doc cites by name (e.g. resources.yaml line
+numbers, BenConsumerUtils.java:59) that you could not locate.
+List path, the doc's claim, and what you searched for.
+
+═══════════════════════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════════════════════
+
+- Cite file paths and line ranges for every concrete claim.
+  Format: <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does
+  not reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms
+  existing documentation, "Document accurate — <file>:<lines>" is
+  acceptable. Do not restate.
+- Do not invent file paths. If a file is referenced in the
+  existing doc but you cannot locate it, list it under
+  "REFERENCED BUT NOT FOUND IN REPO" at the end.
+- Do not flag DEC-014 — it is VOID. Resilience4j absence goes in
+  Risks instead.

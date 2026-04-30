@@ -1,0 +1,470 @@
+You are auditing the WDP component VisaResponseQuestionnaire in the
+repository gcp-visa-respond-questionnaire-consumer. A prior pass already
+produced a DRAFT architecture document. Your job is to CONFIRM OR CORRECT
+the items listed under 'ALREADY DOCUMENTED' from source, and to CLOSE the
+items listed under 'GAPS TO FILL' by reading the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that explicitly
+and label it 'not determinable from source'. Do NOT guess. Do NOT summarise
+without evidence. Do NOT use the existing document as a substitute for
+source — treat it as a hypothesis to verify.
+
+═══════════════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT
+═══════════════════════════════════════════════════════════════════════
+
+The existing component file
+WDP-COMP-40-VISA-RESPONSE-QUESTIONNAIRE.md is provided alongside this
+prompt. Treat it as HYPOTHESES to verify, NOT as ground truth.
+
+For each documented claim:
+  - Confirm with file:line — write "Still accurate — <file>:<lines>"
+  - OR write a CORRECTION block in this exact form:
+      DOC SAYS:    <quoted from existing doc>
+      SOURCE SHOWS: <what you read, with file:line>
+      DOC SECTION TO UPDATE: <which heading in the existing doc>
+
+At the end of your report, in Section 10, list every documented claim
+that you could NOT verify from source — neither confirmed nor contradicted.
+
+═══════════════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — confirm or correct, do NOT redocument from scratch
+═══════════════════════════════════════════════════════════════════════
+
+Identity & runtime
+  D01. Repository name `gcp-visa-respond-questionnaire-consumer`; Maven
+       artefact `com.wp.gcp:gcp-visa-respond-questionnaire-consumer:0.0.1-SNAPSHOT`;
+       Spring Boot 3.5.7; Java 17.
+  D02. Sole entry path is the Kafka consumer. No REST controller
+       (`@RestController`, `@RequestMapping`), no `@Scheduled`, no
+       `@SqsListener`.
+
+Kafka consumer config
+  D03. Topic name (prod) `internal-integration-events`; per-env suffixes
+       `-dev`, `-uat`, `-stg`, `-cers`, `-test`.
+  D04. Consumer group (prod) `internal-integration-events-ques-group`.
+  D05. AckMode `MANUAL_IMMEDIATE`; `syncCommits=true`;
+       `enable.auto.commit=false`; `auto.offset.reset=latest` —
+       hardcoded in `KafkaConsumerConfig`.
+  D06. Concurrency = 1 (default; no `factory.setConcurrency()`).
+  D07. `max.poll.records = 500`; `max.poll.interval = 600000 ms`.
+  D08. Key deserialiser `StringDeserializer`; value deserialiser
+       `ErrorHandlingDeserializer` wrapping `JsonDeserializer<ContestEvent>`
+       with `setRemoveTypeHeaders(false)`.
+  D09. `SASL_SSL` + `AWS_MSK_IAM`
+       (`software.amazon.msk.auth.iam.IAMLoginModule`).
+  D10. Log label `key-MerchantId` is mismatched with the bound
+       `caseNumber` variable.
+
+Pre-ACK pattern
+  D11. `acknowledgement.acknowledge()` precedes `processContestEvent()`
+       inside `KafkaConsumer.java` (existing doc cites lines 30 and 32 —
+       re-verify these line numbers).
+  D12. `CommonErrorHandler` is registered as an empty no-op.
+
+Filter & routing logic
+  D13. Decision A — accept iff `visaResponseIds` non-null AND non-empty
+       AND `responseType` non-blank. Else silent discard.
+  D14. Decision B — `responseType` case-insensitive match against five
+       constants:
+         allocprearb  → getDisputePreArbDetails
+         allocarb     → getDisputeFilingDetails (loops all IDs)
+         representment → getDisputeResponseDetails
+         prearbresp   → getDisputePreArbResponseDetails
+         precomresp   → getDisputePreCompResponseDetails
+       Any other value silently falls through.
+  D15. Decision C — `platform == "nap"` (case-insensitive) → Visa
+       Adapter `mdvs-gcp-visa-adapter` with Bearer IDP token; else →
+       DataPower with `vantiveLicense` raw header (not Bearer-prefixed).
+
+Outbound dependencies
+  D16. Five outbound REST targets in this order through the flow:
+       Step 4  IDP Token Service (no auth, no retry, no CB)
+       Step 7  Visa RTSI via DataPower (non-NAP) OR Visa Adapter (NAP)
+       Step 10 DocumentManagementService — multipart/form-data, RESPQDOC
+       Step 11 NotesService — error path only
+  D17. Spring Retry `@Retryable(retryFor = ServiceException.class,
+       maxAttemptsExpression = "${app.retrycount}",
+       backoff = @Backoff(delayExpression = "${app.retrydelay}"))`
+       on `VisaRTSIService` and `DisputeService` interfaces only.
+  D18. No `@Retryable` on the IDP token call.
+  D19. No `@Retryable` on `addCaseNote()`.
+  D20. `CommonConfig.java` instantiates `new RestTemplate()` with no
+       `ClientHttpRequestFactory` customisation — no connect or read
+       timeout on any outbound call.
+  D21. No `io.github.resilience4j` dependency on classpath.
+
+Failure paths
+  D22. Deserialisation failure → null/default ContestEvent → silent
+       discard at Decision A; offset already committed.
+  D23. IDP token failure → ServiceException propagates to outer
+       `KafkaConsumer.listener()` catch → logged + swallowed; no SNOTE
+       written (the case-note path is inside `processContestEvent`'s
+       try-catch, which is never reached).
+  D24. RTSI failure after Spring Retry exhaustion → ServiceException
+       caught in `EventConsumerServiceImpl` → `addCaseNote()` called.
+  D25. Document upload failure after Spring Retry exhaustion or
+       null response → ServiceException caught → `addCaseNote()` called.
+  D26. NotesService unavailable on the error path → exception caught
+       inside `addCaseNote()`, logged ERROR, not re-thrown.
+
+Data transformations
+  D27. `disputeAsImageResponseDescriptor.imageData` →
+       `quesImageBase64Encoded`; `contentType` → `quesImageContentType`.
+  D28. Upload file name = `RESPQDOC` + `currentActionSequence[0]` +
+       `.` + extension (tiff/pdf/jpeg mapped from contentType).
+  D29. Hardcoded upload query params:
+       `documentType=RESPQDOC`, `uploadedBy=WVRQCONSUM`.
+  D30. SNOTE `userId=WVRQCONSUM` (hardcoded, NOT from event's `userId`).
+  D31. `additionalImagesList` is extracted from
+       `disputeImageAttachment.attachment[]` but never uploaded —
+       no TODO comment, no issue reference.
+
+State
+  D32. No JPA / JDBC / Hibernate / DynamoDB SDK on classpath. No
+       `@Entity`, no `@Repository`, no `DataSource` bean. No DB reads
+       or writes.
+
+Deviation flags asserted
+  D33. DEC-001 Outbox — NON-COMPLIANT, HIGH (no outbox table; pass-through).
+  D34. DEC-003 Partition Key — N/A (consumer only).
+  D35. DEC-004 PAN — N/A (no PAN data).
+  D36. DEC-005 Offset Commit — NON-COMPLIANT, HIGH (pre-ACK).
+  D37. DEC-014 Resilience4j — NON-COMPLIANT, LOW (Spring Retry only).
+
+Scaling / deployment
+  D38. K8s Deployment; replica count templated
+       `{{ replicas-gcp-visa-respond-questionnaire-consumer }}`.
+  D39. Memory limit 2048Mi, request 1024Mi; no CPU limit, no CPU
+       request.
+  D40. No HPA, no PodDisruptionBudget, no topology spread constraints.
+  D41. Rolling update `maxSurge: 1, maxUnavailable: 0`;
+       `minReadySeconds: 30`.
+  D42. OTel Java agent injected via pod annotation
+       `instrumentation.opentelemetry.io/inject-java:
+        opentelemetry-operator-system/default`.
+  D43. Spring Actuator exposes `info, health, prometheus`.
+  D44. Logstash via `LogstashTcpSocketAppender`; destination
+       `${logstash_server_host_port}` (two previous hardcoded IPs
+       commented out).
+  D45. Liveness path `/merchant/gcp/respond-questionnaire/livez`
+       port 8082; readiness path `/merchant/gcp/respond-questionnaire/readyz`
+       port 8082.
+
+Planned & incomplete
+  D46. `DisputeFilingInfo` field commented out at `ResponseData.java`
+       around lines 44–45. Re-verify line numbers.
+  D47. `testUploadDocument_valid` test commented out at
+       `DisputeServiceTest.java` around line 75. Re-verify.
+  D48. `pom.xml` declares `spring-boot-devtools`,
+       `springdoc-openapi-starter-webmvc-ui`, `httpclient` 4.5.14 —
+       confirm they are not actively wired at runtime.
+  D49. No feature flags / migration flags. No stub implementations.
+
+═══════════════════════════════════════════════════════════════════════
+GAPS TO FILL — answer from source
+═══════════════════════════════════════════════════════════════════════
+
+G1.  Probe completeness. State for both liveness and readiness probes:
+     `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`,
+     `failureThreshold`. State whether a startup probe is present or
+     absent. State whether probe paths are backed by Spring Boot
+     Actuator health-group `additional-path` config (look in
+     `application*.yml` under `management.endpoint.health.group.*`),
+     or by a custom controller. Confirm container port 8082.
+
+G2.  `minReadySeconds: 30` placement. Cross-component audit (COMP-25,
+     COMP-28, COMP-34, COMP-08) found `minReadySeconds` misplaced
+     inside `spec.template.spec` where Kubernetes silently ignores it
+     at runtime. Cite the exact YAML path of the `minReadySeconds`
+     key in `resources.yaml` and state whether it is at
+     `spec.minReadySeconds` (correct) or `spec.template.spec.minReadySeconds`
+     (silently ignored).
+
+G3.  Topology spread re-verify. Existing doc says "not configured".
+     Search `resources.yaml` for `topologySpreadConstraints`. If
+     present, cite it and check whether the `labelSelector.matchLabels.app`
+     value matches the pod template label exactly — the
+     `BRANCH_NAME_PLACEHOLDER` mismatch class is a known platform pattern.
+
+G4.  Actuator exposure, MDC, custom metrics.
+     - Cite the line in `application*.yml` where
+       `management.endpoints.web.exposure.include` is set, and the
+       value.
+     - State whether `micrometer-registry-prometheus` appears in
+       `pom.xml` as a runtime dependency.
+     - Grep for any custom `Counter`, `Timer`, `Gauge`, `@Timed`
+       declaration in `src/main/java`. State present or absent.
+     - Grep for any `MDC.put` / `MDC.clear` / `HttpInterceptor` /
+       `ThreadLocal` correlation-ID enrichment. State present or absent.
+
+G5.  Add explicit deviation rows for DEC-019 and DEC-020 to the
+     'PLATFORM STANDARD DEVIATIONS' section.
+     - DEC-019 (no clear PAN in persistent store): expected COMPLIES —
+       cite full-codebase scan result for `pan` / `cardNumber` /
+       `accountNumber` / `acctNum` in entity classes and the absence
+       of any persistent write.
+     - DEC-020 (full at-least-once idempotency): expected DEVIATES —
+       given pre-ACK at-most-once. Cite reasoning from source: no
+       idempotency-key check, no application-level dedup table, no DB
+       UNIQUE (no DB at all). Severity: HIGH if DEC-005 deviation is
+       HIGH. Confirm.
+
+G6.  DEC-023 (replica = 1 hard constraint) applicability. State
+     explicitly: APPLIES, NOT APPLICABLE, or OPERATIONAL ONLY. Concurrency
+     = 1 with multiple replicas would distribute partitions across
+     replicas (no duplication under at-most-once). Cite any
+     `@SchedulerLock`, ShedLock, advisory-lock annotation — expected
+     absent. State explicitly absent if so.
+
+G7.  `getDisputeFilingDetails` loop semantics. Locate the `allocarb`
+     branch in `EventConsumerServiceImpl` (or equivalent) and confirm:
+     (a) iteration over ALL elements of `visaResponseIds` rather than
+     `get(0)`;
+     (b) upload behaviour per iteration — does each iteration upload
+     a separate document, or does each call overwrite the prior
+     `quesImageBase64Encoded` field on a shared result object so only
+     the last one is uploaded?
+     Cite file:lines.
+
+G8.  DataPower URL — single config key for all non-NAP platforms.
+     Confirm there is one `${dispute_rtsi_url}` / `app.rtsiService.disputeRtsiUrl`
+     value used regardless of platform value (CORE, VAP, LATAM, PIN).
+     No per-platform variant. Cite from source.
+
+G9.  Re-verify cited line numbers (line drift since v1.0 capture):
+     - `KafkaConsumer.java:30` — `acknowledgement.acknowledge()`
+     - `KafkaConsumer.java:32` — `processContestEvent()` invocation
+     - `ResponseData.java:44–45` — `DisputeFilingInfo` field commented
+     - `DisputeServiceTest.java:75` — `testUploadDocument_valid` commented
+     If any line number has drifted, give the current file:lines
+     under the CORRECTION format above.
+
+G10. IDP token caching. Locate the IDP token client class. State
+     explicitly:
+     - Is the token fetched per message, or cached?
+     - If cached: where is the cache (Redis, Caffeine, Spring
+       `@Cacheable`, in-memory ConcurrentHashMap, OAuth2AuthorizedClient)?
+     - If a `Cached*` class name exists but the cache is not actually
+       populated, flag this — same anti-pattern was found in COMP-21.
+
+G11. Listener container factory bean name. Confirm
+     `notificationListener` (or whatever it is) and that no second
+     `@KafkaListener` exists anywhere in the codebase.
+
+G12. Confirm pure consumer. State explicitly that no `KafkaTemplate`,
+     no `@KafkaProducer`, no `outgoing-events` reference, no producer
+     config exists.
+
+G13. Environment-config gaps. State explicitly that the following
+     values are NOT in repo and must come from env config / K8s
+     secrets:
+     - `replicas-gcp-visa-respond-questionnaire-consumer`
+     - `api_retrycount`
+     - `api_retrydelay`
+     - `dispute_rtsi_url`
+     - `vantive_license`
+     - `logstash_server_host_port`
+     - any other env-only value you find.
+
+G14. REFERENCED BUT NOT FOUND. List any of the following file paths
+     cited in the existing v1.0 DRAFT that you cannot locate in the
+     repo. Do NOT guess at relocated paths.
+     - KafkaConsumer.java
+     - KafkaConsumerConfig
+     - EventConsumerServiceImpl
+     - VisaRTSIServiceImpl
+     - DisputeServiceImpl
+     - IdpTokenService
+     - CommonConfig.java
+     - ApplicationConstants.java
+     - ResponseData.java
+     - DisputesRTSIResult
+     - TestDataUtil
+     - DisputeServiceTest.java
+     - application-prod.yaml
+     - resources.yaml
+     - logback-spring.xml
+     - pom.xml
+
+═══════════════════════════════════════════════════════════════════════
+REPORT STRUCTURE — use these section headings, in this order
+═══════════════════════════════════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ────────────────────────────────────────
+
+a) STEPS IN ORDER
+   Every processing step from Kafka receive to final outcome. For each
+   step: what happens, which service or method is called, what the
+   output is. Cite file:lines.
+
+b) DECISION POINTS
+   Decisions A through F as documented (filter, responseType match,
+   platform routing, RTSI status check, document-response null check,
+   ServiceException catch). For each: condition evaluated, every
+   possible outcome, the path each outcome leads to. Cite file:lines.
+
+c) SKIP AND BYPASS CONDITIONS
+   Decision A short-circuit, Decision B unknown-responseType silent
+   fall-through, deserialisation no-op handler. For each: what is
+   checked, what value triggers skip, where control goes after.
+
+d) FAILURE PATH PER STEP
+   For each of: IDP token call, RTSI DataPower call, RTSI Visa Adapter
+   call, DocumentManagementService upload, NotesService SNOTE — state
+   what happens on failure. Retry count, retry delay (placeholder
+   names, not values), exception type caught, post-exhaustion
+   behaviour. Per step, not globally.
+
+e) MULTIPLE ENTRY PATHS
+   State explicitly that this component has only one entry path
+   (Kafka @KafkaListener on `internal-integration-events`) and confirm
+   the negatives:
+     - no REST controller
+     - no @Scheduled / cron
+     - no @SqsListener / SQS consumer
+     - no webhook / ServerEndpoint
+   Cite the absence (no matches found in `src/main/java`).
+
+f) STATE AT EACH STEP
+   This component is stateless. No status field, no DB write, no
+   in-memory state across messages. Confirm explicitly.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ───────────────────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   Decision A filter, Decision B responseType → method mapping,
+   Decision C platform → URL/auth mapping. Field, value, branch.
+
+b) BUSINESS RULES APPLIED
+   None internal — this component does not validate or enforce dispute
+   rules. State explicitly.
+
+c) DATA TRANSFORMATIONS
+   ContestEvent → RTSI request (visaCaseNumber, response ID,
+   includeDisputeAsImageInd hardcoded "true").
+   RTSI response → DocumentManagementService upload (file name pattern,
+   query params, multipart body).
+
+d) IDEMPOTENCY MECHANISM
+   None. State explicitly: no `idempotency-key` header read, no
+   duplicate check, no DB constraint (no DB), no in-memory dedup.
+   Under at-most-once semantics duplicates are unlikely; under any
+   replay scenario duplicate RTSI calls and duplicate uploads would
+   occur.
+
+── SECTION 3 — CONTRACTS ──────────────────────────────────────────────
+
+For Kafka Consumer:
+  Topic name (config key + prod value), consumer group (config key +
+  prod value), AckMode, offset commit timing relative to processing,
+  concurrency, max poll records, max poll interval, deserialisers,
+  bad payload behaviour. Cite all from `KafkaConsumerConfig` and
+  `application-prod.yaml`.
+
+State explicitly NOT PRESENT for:
+  - REST API contracts
+  - Kafka Producer contracts
+  - Batch / Scheduler contracts
+
+── SECTION 4 — DEPENDENCIES ───────────────────────────────────────────
+
+For each of the five outbound calls (IDP Token, RTSI DataPower, Visa
+Adapter, DocumentManagementService, NotesService):
+  Service name / logical target
+  Protocol and auth method
+  Purpose — at which step in the flow
+  Connection timeout (state "not configured" if absent)
+  Read timeout (state "not configured" if absent)
+  Retry: count, delay, backoff type
+  Circuit breaker: Resilience4j configured? Expected absent — state
+    explicitly "not configured".
+  Behaviour if unavailable: halt / skip / degrade / item lost
+
+── SECTION 5 — DATABASE ───────────────────────────────────────────────
+
+Confirm explicitly:
+  - No JPA / JDBC / Hibernate / DynamoDB SDK on classpath.
+  - No @Entity, @Repository, DataSource bean.
+  - No DB reads, no DB writes.
+  - No tables touched.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ───────────────────────────
+
+For each, output COMPLIES / DEVIATES / NOT APPLICABLE with file:line
+evidence:
+  DEC-001 Transactional Outbox — used? (expected DEVIATES — pass-through)
+  DEC-003 Kafka partition key = merchantId — (expected N/A consumer-only)
+  DEC-004 PAN encryption before persist — (expected N/A — no PAN)
+  DEC-005 Offset commit after all processing — (expected DEVIATES pre-ACK)
+  DEC-019 No clear PAN in persistent store — (expected COMPLIES — no writes)
+  DEC-020 Full at-least-once idempotency — (expected DEVIATES — pre-ACK
+    + no idempotency-key check)
+
+── SECTION 7 — SCALING AND DEPLOYMENT ─────────────────────────────────
+
+Kubernetes resource type
+Replica count — placeholder string + secret name (production value not
+  in repo)
+Memory and CPU limits and requests
+HPA — present or absent (cite the manifest)
+Rolling update strategy — including minReadySeconds placement check (G2)
+PodDisruptionBudget — present or absent
+Topology spread — present / absent / functional / label mismatch (G3)
+Liveness / readiness / startup probes — full sub-parameters (G1)
+Container port
+Observability — OTel agent (annotation), Actuator endpoints, Prometheus,
+Logstash, MDC, custom Micrometer metrics (G4)
+
+If `resources.yaml` is the ONLY K8s file in the repo, state that
+explicitly. If a Helm chart, `values.yaml`, Kustomize, or PDB manifest
+is missing, state "not in repo" and list what IS in the repo so we
+know what is missing vs absent.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ────────────────────────────
+
+Commented-out code — file:lines and what it does.
+Unused dependencies in `pom.xml` (devtools, springdoc, httpclient) —
+  confirm or correct.
+Feature flags — expected none. Confirm.
+TODO / FIXME references — file:lines and verbatim text.
+Stub implementations — expected none. Confirm.
+Properties configured but never read (search for @Value or yaml keys
+  with no injection point).
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ──────────────────────────────────
+
+For EACH of sections 1 through 8 above, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+  determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ──────────────────────
+
+List every claim from the existing component document or from the
+GAPS list above that you could NOT cross-check against code or config —
+neither confirmed nor contradicted. These will need follow-up from the
+team or from runtime observation (logs, infra, K8s secrets).
+
+═══════════════════════════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════════════════════════
+
+- Cite file paths and line ranges for every concrete claim. Format:
+  <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does not
+  reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms existing
+  documentation, a one-paragraph "Document accurate — <file>:<lines>"
+  is acceptable.
+- If you would restate something the reference document already states
+  verbatim, replace that prose with "Document accurate —
+  <file>:<lines>". Do not restate.
+- Do not invent file paths. If a file is referenced in the existing doc
+  but you cannot locate it, list it under "REFERENCED BUT NOT FOUND IN
+  REPO" at the end of the report.

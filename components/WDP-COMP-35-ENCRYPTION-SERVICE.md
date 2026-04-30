@@ -1,7 +1,8 @@
 # WDP-COMP-35-ENCRYPTION-SERVICE
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: wdp-encryption-service (CORE-SERVICES) using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 1.1 DRAFT | April 2026*
+*Source-verified: 2026-04-29 via Copilot CLI on `wdp-encryption-service` | Architect-confirmed: PENDING*
+*Supersedes v1.0 DRAFT (April 2026).*
 
 ---
 
@@ -19,7 +20,7 @@
 | **Status** | `✅ Production` |
 | **Doc status** | `📝 DRAFT` |
 | **Sections present** | `Core \| Block A — REST` |
-| **Runtime** | `Spring Boot 3.5 / Java 17` |
+| **Runtime** | `Spring Boot 3.5.6 / Java 17` |
 | **Port** | `8082` |
 | **Context path** | `/merchant/gcp/encryption` |
 
@@ -29,29 +30,30 @@
 
 **What it does**
 
-EncryptionService is the sole component in WDP authorised to handle plaintext PAN (Primary Account Number) data. It acts as the PCI-DSS cryptographic boundary for the entire platform. No other service stores, processes, or transmits clear PAN in any form.
+EncryptionService is the sole component in WDP authorised to handle plaintext PAN (Primary Account Number). It is the PCI-DSS cryptographic boundary for the entire platform — no other service stores, processes, or transmits clear PAN in any form.
 
-The service implements a two-token PAN strategy (DEC-007). On every encrypt call, it produces two artefacts from the plaintext PAN: an HPAN (Hashed PAN) — a 64-character lowercase hex string generated via HMAC-SHA256 with a fixed secret key — and a pan_ct (ciphertext) — an AES-256-GCM encrypted representation stored internally alongside the HPAN. The HPAN is returned to callers and used platform-wide for case lookups and matching. The ciphertext (pan_ct) is never returned to any caller — it is held exclusively in this service's database table (`wdp.hash_key_store`) and recovered only by this service when a decrypt is requested.
+The service implements the two-token PAN strategy (DEC-007). On every encrypt call it produces two artefacts from the input PAN: an HPAN — a 64-character lowercase hex string generated via HMAC-SHA256 with a fixed key — and a `pan_ct` (ciphertext) — an AES-256-GCM-encrypted representation stored internally alongside the HPAN. The HPAN is returned to callers and used platform-wide for case lookups and matching. The ciphertext is never returned to any caller — it is held exclusively in this service's database and recovered only by this service when a decrypt is requested.
 
-On decrypt, the service accepts an HPAN, locates the corresponding ciphertext and DEK reference in its own table, decrypts the Data Encryption Key (DEK) from AWS KMS, performs AES-256-GCM decryption in memory, and returns the cleartext PAN to the caller transiently. The cleartext PAN is never written to any persistent store at any point.
+On decrypt, the service accepts an HPAN, locates the corresponding ciphertext and DEK reference in its own table, decrypts the wrapped DEK from AWS KMS, performs in-memory AES-256-GCM decryption, and returns the cleartext PAN to the caller transiently. Cleartext PAN is never written to any persistent store at any point.
 
-The DEK is managed via an envelope encryption model (DEC-008). AWS KMS holds the Customer Master Key (CMK). The service generates a plaintext DEK + a KMS-wrapped ciphertext of that DEK. Only the KMS-wrapped ciphertext is persisted (`wdp.data_enc_key`). The plaintext DEK is held in memory and used for all encrypt operations until the rotation interval elapses. The HMAC key is loaded once at startup from AWS Secrets Manager and held in memory for the JVM lifetime.
+The DEK is managed via an envelope-encryption model (DEC-008). AWS KMS holds the Customer Master Key (CMK). The service generates a plaintext DEK plus a KMS-wrapped ciphertext of that DEK; only the KMS-wrapped ciphertext is persisted (`wdp.data_enc_key`). The plaintext DEK is held in memory and used for all encrypt operations until the rotation interval elapses. The HMAC key is loaded once at startup from AWS Secrets Manager and held in memory for the JVM lifetime.
 
-⚠️ **Design document correction — DEK rotation interval is DAYS, not hours.** The design premise stated a 6-hour DEK cache. Source analysis confirms the rotation interval is configured in days via `${dek_rotation_interval_days}`. The "6-hour" assumption in WDP-ARCHITECTURE.md, WDP-DECISIONS.md, WDP-COMPONENTS.md, and WDP-COMP-INDEX.md is incorrect and must be corrected in all documents.
+⚠️ **Design-document correction confirmed at source — DEK rotation interval is DAYS, not hours.** The platform-index document and DEC-008 narrative still describe a "6-hour DEK cache". Source confirms the unit is days, configured via `${dek_rotation_interval_days}`. No hardcoded default exists in any committed configuration profile.
 
 **What it does NOT do**
 
-- Does **not** return the AES ciphertext (pan_ct) to any caller. Only HPAN is ever returned on the encrypt path. Callers that need the actual PAN must call the decrypt endpoint with the HPAN.
-- Does **not** handle JWT PAN tokenisation or any form of network token. It is purely a PAN encrypt/decrypt service. (TokenService, COMP-36, handles JWT management — a separate concern.)
-- Does **not** produce to or consume from any Kafka topic. No Kafka dependency exists anywhere in the codebase.
-- Does **not** use the transactional outbox pattern. It is a synchronous REST API with no asynchronous messaging.
-- Does **not** technically enforce which callers may call the decrypt endpoint. The design intent that only CaseCreationConsumer (COMP-14) may decrypt is a **policy convention only** — there is no JWT claim inspection or allowlist in code. Any caller with a valid JWT from a trusted issuer can call `/v1/pan/decrypt`.
-- Does **not** cache the DEK on the decrypt path. Every decrypt request makes a live KMS call to decrypt the wrapped DEK from the database record.
-- Does **not** apply Resilience4j circuit breakers, rate limiters, or bulkheads on any outbound call. No Resilience4j dependency is present in `pom.xml`.
+- Does **not** return the AES ciphertext (`pan_ct`) to any caller. Only HPAN is ever returned on the encrypt path. Callers needing the actual PAN must call the decrypt endpoint with the HPAN.
+- Does **not** handle JWT or network token tokenisation. PAN encrypt/decrypt only. JWT issuance and caching is COMP-36 TokenService.
+- Does **not** produce to or consume from any Kafka topic. Confirmed absent — no Kafka client dependency, no listener, no template.
+- Does **not** use the transactional outbox pattern. Synchronous REST API only.
+- Does **not** technically restrict which callers may invoke the decrypt endpoint. The intent that only COMP-14 CaseCreationConsumer may decrypt is a **policy convention only** — there is no method-level authorization, no JWT scope/audience/role check, and no allowlist. Any caller bearing a valid JWT from a trusted issuer may call `/v1/pan/decrypt`.
+- Does **not** cache the DEK on the decrypt path. KMS is called on every decrypt request to unwrap the stored DEK.
+- Does **not** apply Resilience4j circuit breakers, rate limiters, bulkheads, or retry annotations on any outbound call. (DEC-014 is platform-VOID; absence here is consistent with platform posture.)
 - Does **not** configure explicit REST connection or read timeouts on any outbound call (AWS KMS, AWS Secrets Manager, PostgreSQL).
-- Does **not** enforce a UNIQUE constraint on `hpan` at the JPA entity level — whether a DB-level unique index exists cannot be determined from source alone (migration scripts not in repository).
-- Does **not** refresh the HMAC key after startup. Once loaded from Secrets Manager, the key is held in memory for the lifetime of the JVM process.
-- Does **not** include a HPA, PodDisruptionBudget, or Topology Spread configuration.
+- Does **not** enforce a UNIQUE constraint at the JPA entity level on `hpan`. Whether a DB-level unique index exists cannot be determined from this repository — no Liquibase / Flyway / `schema.sql` is present.
+- Does **not** refresh the HMAC key after startup. Loaded once and held for the JVM lifetime.
+- Does **not** include HPA, PodDisruptionBudget, or TopologySpread configuration.
+- Does **not** enforce caller-identity restrictions on `/actuator/prometheus` or `/actuator/info` — these endpoints are exposed by the management server but are NOT in the security-config permit-all list, so they require JWT. (Corrected at v1.1 from v1.0 which incorrectly listed them as auth-whitelisted.)
 
 ---
 
@@ -60,67 +62,61 @@ The DEK is managed via an envelope encryption model (DEC-008). AWS KMS holds the
 ```mermaid
 flowchart TD
 
-    %% ── ENTRY POINTS ──────────────────────────────────────────
-    IN_ENC["POST /v1/pan/encrypt\n(Nginx Ingress → pod port 8082)"]
-    IN_DEC["POST /v1/pan/decrypt\n(Nginx Ingress → pod port 8082)"]
+    %% ── ENTRY POINTS ─────────────────────────────────────────
+    IN_ENC["POST /v1/pan/encrypt<br/>(Nginx Ingress → pod 8082)"]
+    IN_DEC["POST /v1/pan/decrypt<br/>(Nginx Ingress → pod 8082)"]
 
-    %% ── SHARED AUTH ───────────────────────────────────────────
-    JWT_ENC{{"JWT valid?\n(Spring Security OAuth2 RS\nlocal JWKS validation)"}}
-    JWT_DEC{{"JWT valid?\n(Spring Security OAuth2 RS\nlocal JWKS validation)"}}
-    HTTP401_ENC["HTTP 401\n(missing or invalid token)"]
-    HTTP401_DEC["HTTP 401\n(missing or invalid token)"]
+    %% ── SHARED AUTH ──────────────────────────────────────────
+    JWT_ENC{{"JWT valid?<br/>Spring Security OAuth2 RS<br/>local JWKS validation"}}
+    JWT_DEC{{"JWT valid?<br/>Spring Security OAuth2 RS<br/>local JWKS validation"}}
+    HTTP401_ENC["HTTP 401"]
+    HTTP401_DEC["HTTP 401"]
 
     %% ══════════════════════════════════════════════════════════
     %% PATH 1 — ENCRYPT
     %% ══════════════════════════════════════════════════════════
-    VAL_ENC{{"@Valid EncryptionRequest\npan @NotEmpty, numeric only\n13–19 digits?"}}
-    HTTP400_ENC["HTTP 400\nStandardErrorResponse\n(validation failure)"]
+    VAL_ENC{{"@Valid EncryptionRequest<br/>pan @NotEmpty, numeric only,<br/>13–19 digits?"}}
+    HTTP400_ENC["HTTP 400<br/>StandardErrorResponse"]
 
-    DEK_FRESH{{"DEK fresh?\n!initialized OR\nage > dek_rotation_interval_days?"}}
+    subgraph TX_ENC["@Transactional — encryptPAN (rollbackOn=Exception)"]
+        DEK_FRESH{{"DEK fresh?<br/>!initialized OR<br/>age &gt; rotation interval days?"}}
+        ROTATE["rotateDEK() — synchronous, blocks request thread<br/>① SELECT data_enc_key ORDER BY inserted_at DESC<br/>② Recent row → decryptAndStore (⚠️ Base64 bug)<br/>③ Else → KMS generateDataKey(AES_256)<br/>persist KMS-wrapped ciphertext to data_enc_key<br/>store plaintext DEK in memory"]
+        ROTATE_FAIL["⚠️ KMS or DB failure<br/>SWALLOWED in rotateDEK()<br/>old (expired) DEK kept<br/>processing continues"]
+        HMAC["HMAC-SHA256 with in-memory key<br/>→ 64-char hex HPAN"]
+        HMAC_FAIL["PANEncryptionException<br/>→ HTTP 404<br/>⚠️ semantic error"]
+        IDEM{{"findByHpan<br/>row exists in<br/>wdp.hash_key_store?"}}
+        IDEM_HIT["UPDATE last_seen_at<br/>return existing HPAN"]
+        AES_ENC["AES-256-GCM encryption<br/>12-byte random IV (SecureRandom)<br/>IV‖ciphertext‖GCM-tag → Base64<br/>→ HashKeyStoreEntity"]
+        AES_ENC_FAIL["PANEncryptionException<br/>→ HTTP 404"]
+        PERSIST_ENC["INSERT INTO wdp.hash_key_store<br/>(hpan, pan_ct, dek_id,<br/>inserted_at, last_seen_at)"]
+        PERSIST_FAIL["JPA exception<br/>→ rollback → HTTP 500"]
+    end
 
-    ROTATE["rotateDEK()\n(synchronous — blocks request thread)\n① Query data_enc_key ORDER BY inserted_at DESC\n② If recent row found → decryptAndStore()\n   (⚠️ Base64 bug on this path)\n③ Else → kmsClient.generateDataKey(AES_256)\n   persist KMS-wrapped ciphertext to data_enc_key\n   store plaintext DEK in memory"]
-    ROTATE_FAIL["⚠️ KMS/DB failure on rotate\nException SWALLOWED in rotateDEK()\nOld (expired) DEK kept in memory\nProcessing continues"]
-
-    HMAC["HMACManager.hashPAN(clearPAN)\nHMAC-SHA256 with in-memory 256-bit key\nOutput: 64-char lowercase hex HPAN"]
-    HMAC_FAIL["PANEncryptionException\n→ GlobalExceptionHandler\n→ HTTP 404\n⚠️ Semantic error: crypto failure\nmapped to NOT_FOUND"]
-
-    IDEM{{"findByHpan(hpan)\nRecord exists in\nwdp.hash_key_store?"}}
-    IDEM_HIT["updateLastSeenAtByHpan()\nReturn existing HPAN\n(no new ciphertext created)\nHTTP 200"]
-    IDEM_HIT_FAIL["@Transactional rollback\nHTTP 500"]
-
-    AES_ENC["AES-256-GCM encryption\n① 12-byte random IV via SecureRandom\n② Encrypt clearPAN.getBytes(UTF-8)\n③ Prepend IV to ciphertext\n④ Base64-encode combined array\n⑤ Build HashKeyStoreEntity\n   (hpan, pan_ct, dekId, timestamps)"]
-    AES_ENC_FAIL["PANEncryptionException\n→ HTTP 404\n⚠️ Semantic error"]
-
-    PERSIST_ENC["@Transactional\nsave(entity)\nINSERT INTO wdp.hash_key_store\n(hpan, pan_ct, dek_id,\ninserted_at, last_seen_at)"]
-    PERSIST_FAIL["JPA exception\n@Transactional rollback\n→ HTTP 500"]
-
-    RESP_ENC["HTTP 200\nEncryptionResponse { hpan }\npan_ct NEVER returned to caller"]
+    RESP_ENC["HTTP 200<br/>EncryptionResponse { hpan }<br/>pan_ct NEVER returned"]
 
     %% ══════════════════════════════════════════════════════════
     %% PATH 2 — DECRYPT
     %% ══════════════════════════════════════════════════════════
-    VAL_DEC{{"@Valid DecryptionRequest\nhpan @NotEmpty?"}}
-    HTTP400_DEC["HTTP 400\n(hpan blank/missing)"]
+    VAL_DEC{{"@Valid DecryptionRequest<br/>hpan @NotEmpty?<br/>(reason field accepted, unused)"}}
+    HTTP400_DEC["HTTP 400"]
 
-    LOOKUP_HPAN["findByHpan(hpan)\nSELECT * FROM wdp.hash_key_store\nWHERE hpan = ?"]
-    LOOKUP_HPAN_MISS["PANNotFoundException\n→ re-thrown as PANDecryptionException\n→ HTTP 404"]
-    LOOKUP_HPAN_DBFAIL["DB exception\n→ PANDecryptionException\n→ HTTP 404"]
+    subgraph TX_DEC["@Transactional — decryptPAN (rollbackOn=Exception) — DB connection held during KMS call"]
+        LOOKUP_HPAN["findByHpan<br/>SELECT * FROM wdp.hash_key_store"]
+        LOOKUP_HPAN_MISS["PANNotFoundException<br/>→ PANDecryptionException<br/>→ HTTP 404"]
+        LOOKUP_HPAN_DBFAIL["DB exception<br/>→ PANDecryptionException<br/>→ HTTP 404"]
+        LOOKUP_DEK["findById(dek_id)<br/>⚠️ Called TWICE per request<br/>(isPresent() then get())"]
+        LOOKUP_DEK_MISS["DEKNotFoundException<br/>→ PANDecryptionException<br/>→ HTTP 404"]
+        KMS_DEC["KMS decrypt<br/>Base64-decode dek_enc<br/>call KMS with wrapped DEK + CMK<br/>⚠️ NO in-memory cache on decrypt path<br/>KMS called every request<br/>⚠️ executed inside @Transactional<br/>(DB connection held)"]
+        KMS_DEC_FAIL["SDK exception<br/>→ PANDecryptionException<br/>→ HTTP 404"]
+        AES_DEC["AES-256-GCM decryption<br/>extract 12-byte IV<br/>cipher.doFinal authenticates + decrypts"]
+        AES_DEC_FAIL["PANDecryptionException<br/>→ HTTP 404"]
+        TOUCH["UPDATE wdp.hash_key_store<br/>SET last_seen_at = NOW()"]
+        TOUCH_FAIL["DB exception<br/>(KMS + AES already executed —<br/>not rollback-able)<br/>→ HTTP 500"]
+    end
 
-    LOOKUP_DEK["findById(dek_id)\nSELECT * FROM wdp.data_enc_key\nWHERE dek_id = ?\n⚠️ Called TWICE (bug — double query)"]
-    LOOKUP_DEK_MISS["DEKNotFoundException\n→ PANDecryptionException\n→ HTTP 404"]
+    RESP_DEC["HTTP 200<br/>DecryptionResponse { pan }<br/>@ToString(exclude='pan')"]
 
-    KMS_DEC["kmsClient.decrypt()\nBase64-decode dek_enc\nCall KMS with encrypted DEK bytes + CMK ARN\nOutput: plaintext DEK bytes\n⚠️ NO in-memory cache used on decrypt path\nKMS called on EVERY decrypt request"]
-    KMS_DEC_FAIL["SDK exception\n→ PANDecryptionException\n→ HTTP 404"]
-
-    AES_DEC["AES-256-GCM decryption\n① Base64-decode pan_ct\n② Extract first 12 bytes as IV\n③ Remaining = ciphertext + 16-byte GCM tag\n④ cipher.doFinal() — authenticates + decrypts\nOutput: cleartext PAN bytes"]
-    AES_DEC_FAIL["PANDecryptionException\n→ HTTP 404"]
-
-    TOUCH["@Transactional\nupdateLastSeenAtByHpan(hpan)\nUPDATE wdp.hash_key_store\nSET last_seen_at = NOW()\nWHERE hpan = ?"]
-    TOUCH_FAIL["@Transactional rollback\n(KMS + AES already executed\n— cannot be rolled back)\nHTTP 500"]
-
-    RESP_DEC["HTTP 200\nDecryptionResponse { pan }\n@ToString(exclude='pan')\nprevents PAN appearing in logs"]
-
-    %% ── CONNECTIONS: ENCRYPT PATH ─────────────────────────────
+    %% ── CONNECTIONS: ENCRYPT ─────────────────────────────────
     IN_ENC --> JWT_ENC
     JWT_ENC -->|"invalid"| HTTP401_ENC
     JWT_ENC -->|"valid"| VAL_ENC
@@ -134,15 +130,14 @@ flowchart TD
     HMAC -->|"failure"| HMAC_FAIL
     HMAC -->|"success"| IDEM
     IDEM -->|"found"| IDEM_HIT
-    IDEM_HIT -->|"DB failure"| IDEM_HIT_FAIL
-    IDEM_HIT -->|"success"| RESP_ENC
+    IDEM_HIT --> RESP_ENC
     IDEM -->|"not found"| AES_ENC
     AES_ENC -->|"failure"| AES_ENC_FAIL
     AES_ENC -->|"success"| PERSIST_ENC
     PERSIST_ENC -->|"JPA exception"| PERSIST_FAIL
     PERSIST_ENC -->|"success"| RESP_ENC
 
-    %% ── CONNECTIONS: DECRYPT PATH ─────────────────────────────
+    %% ── CONNECTIONS: DECRYPT ─────────────────────────────────
     IN_DEC --> JWT_DEC
     JWT_DEC -->|"invalid"| HTTP401_DEC
     JWT_DEC -->|"valid"| VAL_DEC
@@ -169,23 +164,25 @@ flowchart TD
 
 | Source | Protocol | Endpoint | Payload / Description |
 |---|---|---|---|
-| COMP-11 FileProcessor | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/encrypt` | Plaintext PAN from inbound dispute file |
 | COMP-07 VisaDisputeBatch | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/encrypt` | Plaintext PAN from Visa dispute record |
 | COMP-08 FirstChargebackBatch | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/encrypt` | Plaintext PAN from MC chargeback record |
 | COMP-09 CaseFillingBatch | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/encrypt` | Plaintext PAN from case filling record |
-| COMP-14 CaseCreationConsumer | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/decrypt` | HPAN — decrypt for transient acquiring platform API call |
-| COMP-27 CaseSearchService | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/encrypt` | Raw PAN supplied by search caller — converts to HPAN for DB query filter (v2 search path only) |
-| Kubernetes liveness probe | HTTP | `GET /merchant/gcp/encryption/livez` | No auth — liveness check |
-| Kubernetes readiness probe | HTTP | `GET /merchant/gcp/encryption/readyz` | No auth — readiness check |
-| Prometheus scraper | HTTP | `GET /actuator/prometheus` | No auth — metrics scrape |
+| COMP-11 FileProcessor | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/encrypt` | Plaintext PAN from inbound dispute file |
+| COMP-27 CaseSearchService (v2 search) | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/encrypt` | Raw PAN supplied by search caller — converts to HPAN for query filter |
+| COMP-14 CaseCreationConsumer | REST (in-cluster) | `POST /merchant/gcp/encryption/v1/pan/decrypt` | HPAN — decrypt for transient acquiring-platform API call |
+| Kubernetes liveness probe | HTTP | `GET /merchant/gcp/encryption/livez` | No auth |
+| Kubernetes readiness probe | HTTP | `GET /merchant/gcp/encryption/readyz` | No auth |
+| Prometheus scraper | HTTP + JWT | `GET /actuator/prometheus` | ⚠️ JWT-required (corrected at v1.1) |
+
+> **Caller list is design-asserted only.** No artefact in the EncryptionService repository names these upstream callers. Cross-component verification is required to confirm each caller is present.
 
 ### Outbound Interfaces
 
 | Target | Protocol | Resource | Purpose | On failure |
 |---|---|---|---|---|
-| AWS KMS | HTTPS (AWS SDK v2) | CMK ARN — region-only config, no explicit timeout | DEK generation (startup + rotation) and DEK decryption (every decrypt request) | Startup: silently swallowed, service starts degraded. Rotation: silently swallowed, old DEK kept. Decrypt: exception re-thrown → HTTP 404 |
-| AWS Secrets Manager | HTTPS (AWS SDK v2) | HMAC key secret — region-only config, no explicit timeout | Load HMAC key once at startup | Startup: RuntimeException propagates from @PostConstruct → Spring context fails → pod crash-loops |
-| PostgreSQL (`wdp` schema) | JDBC (HikariCP defaults) | `wdp.hash_key_store`, `wdp.data_enc_key` | HPAN idempotency check, ciphertext storage, DEK record management, last-seen-at audit | Startup: swallowed, service degraded. Requests: JPA exception → @Transactional rollback → HTTP 500 |
+| AWS KMS | HTTPS (AWS SDK v2) | CMK ARN — region-only config, no explicit timeout | DEK generation (startup + rotation); DEK decryption on every decrypt request | Startup: silently swallowed → service starts degraded. Rotation: silently swallowed → old DEK retained. Decrypt: re-thrown → HTTP 404 |
+| AWS Secrets Manager | HTTPS (AWS SDK v2) | HMAC key secret — region-only config, no explicit timeout | Load HMAC key once at startup | Startup: RuntimeException re-thrown from `@PostConstruct` → Spring context fails → pod crash-loops |
+| PostgreSQL (`wdp` schema) | JDBC (HikariCP defaults) | `wdp.hash_key_store`, `wdp.data_enc_key` | HPAN idempotency, ciphertext storage, DEK record management, last-seen-at audit | Startup: swallowed → degraded. Encrypt: JPA exception → rollback → HTTP 500. Decrypt: caught and re-mapped → HTTP 404 |
 
 ---
 
@@ -195,12 +192,16 @@ flowchart TD
 
 | Schema.Table | Purpose | Key columns | Notes |
 |---|---|---|---|
-| `wdp.hash_key_store` | Maps HPAN → AES-256-GCM ciphertext (pan_ct) + DEK reference. Primary lookup table for both encrypt idempotency and decrypt recovery. | `id` (BIGINT PK, sequence), `hpan` (VARCHAR 64-char hex), `pan_ct` (VARCHAR — Base64 IV‖ciphertext), `dek_id` (BIGINT FK), `inserted_at` (TIMESTAMP), `last_seen_at` (TIMESTAMP) | ⚠️ No UNIQUE constraint declared in JPA entity on `hpan`. DB-level unique index existence not determinable from source — migration scripts not in repository. `pan_ct` is never returned to any caller. |
-| `wdp.data_enc_key` | Stores KMS-wrapped (encrypted) DEK ciphertext per rotation cycle. Plaintext DEK is never persisted. | `dek_id` (BIGINT PK, sequence), `dek_enc` (VARCHAR — Base64-encoded KMS-wrapped DEK), `inserted_at` (TIMESTAMP) | Written by this service on first startup and on each rotation. Read by DEKManager at startup/rotation and by PANDecryptionServiceImpl on every decrypt. |
+| `wdp.hash_key_store` | Maps HPAN → AES-256-GCM ciphertext (`pan_ct`) + DEK reference. Primary lookup table for both encrypt idempotency and decrypt recovery. | `id` (PK, sequence), `hpan` (64-char hex), `pan_ct` (Base64 IV‖ciphertext‖tag), `dek_id` (FK), `inserted_at`, `last_seen_at` | ⚠️ No `unique=true` on `hpan` at JPA level. DB-level unique index existence not determinable from repository. `pan_ct` never returned to any caller. |
+| `wdp.data_enc_key` | KMS-wrapped (encrypted) DEK ciphertext per rotation cycle. Plaintext DEK is never persisted. | `dek_id` (PK, sequence `wdp.hash_key_store_dek_id_seq`), `dek_enc` (Base64 KMS-wrapped DEK), `inserted_at` | Written on first startup and on each rotation. `insertEncryptedDEK` runs in a Spring-Data default short transaction — separate from the surrounding `rotateDEK()` orchestration. |
 
 ### Tables Read (not owned)
 
 None. Both tables accessed by this service are owned by this service.
+
+**Transaction manager:** `wdpTransactionManager` (single PostgreSQL datasource, JPA-managed).
+
+**Locking:** No `SELECT FOR UPDATE`, no PostgreSQL advisory locks, no ShedLock, no Redisson — confirmed absent across the codebase.
 
 ---
 
@@ -208,70 +209,74 @@ None. Both tables accessed by this service are owned by this service.
 
 | Decision | ADR reference | Notes |
 |---|---|---|
-| Two-token PAN strategy — HPAN for lookup, pan_ct for recovery | DEC-007 ✅ Compliant | HPAN returned to callers. pan_ct held internally only. Callers never receive AES ciphertext. |
-| Encrypt PAN at ingestion boundary | DEC-004 ✅ Compliant | This service is the DEC-004 enforcement point. PAN never written to any persistent store. @ToString excludes `pan` fields. Log statements mask all but last 4 digits. |
-| AWS KMS for key management | DEC-008 ✅ Compliant — with correction | CMK in AWS KMS (FIPS 140-2 Level 3). HMAC key in AWS Secrets Manager. DEK rotation interval is DAYS (configurable via `${dek_rotation_interval_days}`), not hours as stated in design documents. |
-| No transactional outbox | DEC-001 — Not applicable | Synchronous REST API. No Kafka, no outbox table. |
-| No Kafka producer or consumer | DEC-003, DEC-005 — Not applicable | No `spring-kafka` dependency. No `KafkaTemplate` or `@KafkaListener`. Confirmed. |
-| No Resilience4j | DEC-014 — **DEVIATION** | No Resilience4j dependency in `pom.xml`. No circuit breaker, rate limiter, bulkhead, or retry annotation on any outbound call (KMS, Secrets Manager, PostgreSQL). AWS SDK v2 default retry policy applies to KMS and Secrets Manager (legacy mode, 3 attempts) but is not explicitly configured. No timeout configured on any outbound call. |
-| Decrypt caller not technically enforced | Local decision | Design intent: COMP-14 CaseCreationConsumer only. Actual enforcement: none. Any caller with a valid JWT from a trusted issuer may call the decrypt endpoint. JWT principal is injected by controller but ignored by service implementation. |
-| Synchronous DEK rotation on request thread | Local decision | When DEK freshness check fails, `rotateDEK()` is called synchronously on the request thread that triggered it. The encrypt request is blocked until KMS responds and the new DEK is stored. No background/async refresh. |
-| KMS called on every decrypt request | Local decision | The decrypt path does NOT use the in-memory DEK cache. `kmsClient.decrypt()` is called on every decrypt request. This adds KMS latency (~25–75ms) to every decrypt. |
-| DEK rotation failure is silently swallowed | Local decision — **RISK** | If KMS fails during DEK rotation, the exception is caught and logged but not re-thrown. The service continues using the expired DEK indefinitely with no hard failure, no alerting, and no circuit breaker. |
-| DEK startup failure is silently swallowed | Local decision — **RISK** | If KMS or PostgreSQL is unavailable at startup, `initializeDEK()` catches and swallows the exception. The service starts in a degraded state (`initialized = false`). First encrypt request will attempt rotation and fail with HTTP 500. |
+| Two-token PAN strategy — HPAN for lookup, ciphertext for recovery | DEC-007 ✅ Compliant | HPAN returned to callers; `pan_ct` held internally only. |
+| Encrypt PAN at ingestion boundary | DEC-004 ✅ Compliant — with 🟢 LOW caveat | This service IS the DEC-004 enforcement point. PAN never persisted. `@ToString(exclude='pan')` on both request and response. ⚠️ **Caveat (new at v1.1):** `PANHashingServiceImpl` logs the last 4 PAN digits at DEBUG level. Production log level must remain INFO or above; DEBUG logging would expose partial PAN. |
+| AWS KMS for key management | DEC-008 ✅ Compliant — with correction | CMK in AWS KMS. HMAC key in AWS Secrets Manager. **DEK rotation interval is DAYS** (configurable via `${dek_rotation_interval_days}`), not hours as stated in design documents. Correction must propagate to WDP-DECISIONS.md DEC-008 narrative and WDP-COMP-INDEX.md COMP-35 description. |
+| No transactional outbox | DEC-001 — Not applicable | Synchronous REST API. No Kafka, no outbox. |
+| No Kafka producer or consumer | DEC-003, DEC-005 — Not applicable | Confirmed absent at source. |
+| No Resilience4j | DEC-014 — Platform-VOID | Recorded as factual context, not as a deviation. AWS SDK v2 default legacy retry (3 attempts) applies implicitly to KMS and Secrets Manager. |
+| Decrypt caller not technically enforced | Local decision | Design intent: COMP-14 only. Actual enforcement: none. No method-level `@PreAuthorize`, no scope/role/audience check, no allowlist. Any valid JWT from a trusted issuer may call decrypt. |
+| Synchronous DEK rotation on request thread | Local decision | When DEK freshness check fails, `rotateDEK()` runs synchronously on the encrypt request thread. The request blocks until KMS responds and the new DEK is stored. No background/async refresh. |
+| KMS called on every decrypt request | Local decision | Decrypt path does NOT use the in-memory DEK cache. KMS is invoked per request, adding KMS latency to every decrypt. |
+| Decrypt @Transactional spans the KMS call | Local decision — **NEW finding at v1.1** | The `@Transactional` boundary on `decryptPAN()` brackets the entire method, including the KMS network round-trip. A DB connection from the Hikari pool is held for the duration of the KMS call. Under sustained decrypt load with KMS slowdown, pool exhaustion risk is non-trivial. |
+| DEK rotation failure silently swallowed | Local decision — **RISK** | KMS or DB failure during rotation is caught and logged but not re-thrown. Service continues with the expired DEK indefinitely — no hard failure, no alert path, no circuit breaker. |
+| DEK startup failure silently swallowed | Local decision — **RISK** | KMS or PostgreSQL unavailability at startup leaves `initialized = false`. Probes do not check this flag. First encrypt attempt will trigger rotation and likely fail with HTTP 500. |
+| HMAC startup failure crash-loops the pod | Local decision | Secrets Manager unavailability at `@PostConstruct` propagates a RuntimeException. Spring context fails. Pod crash-loops until Secrets Manager recovers. |
 
 ---
 
 ## Startup Behaviour
 
-| Key | Behaviour at startup | Failure outcome |
+| Resource | Behaviour at startup | Failure outcome |
 |---|---|---|
-| HMAC key (Secrets Manager) | `@PostConstruct loadHMACKey()` — fetched once, held as `byte[] hmacKey`. Key must be exactly 32 bytes. | If Secrets Manager unreachable: RuntimeException propagates from @PostConstruct → Spring context fails → pod crash-loops immediately. Not swallowed. |
-| DEK (KMS + PostgreSQL) | `@PostConstruct initializeDEK()` — queries `data_enc_key` for most recent row. If found: decrypt via KMS and cache. If not found: generate new DEK via KMS, persist wrapped ciphertext, cache plaintext. | If KMS or DB unreachable: exception **silently swallowed**. `initialized` remains false. Service starts in broken state. All subsequent encrypt requests attempt rotation and fail with HTTP 500. |
-| Memory safety on shutdown | `@PreDestroy cleanup()` zeros out `currentDEK` byte array (`Arrays.fill(currentDEK, (byte) 0)`). | Prevents plaintext DEK from remaining in heap memory after JVM shutdown. |
+| HMAC key (Secrets Manager) | `@PostConstruct loadHMACKey()` — fetched once, held as in-memory bytes. Must be exactly 32 bytes; `IllegalStateException` thrown otherwise. | Secrets Manager unreachable: RuntimeException re-thrown → Spring context fails → pod crash-loops. |
+| DEK (KMS + PostgreSQL) | `@PostConstruct initializeDEK()` — checks for an existing DEK row; if recent enough, decrypts via KMS; otherwise generates a new DEK and persists the wrapped ciphertext. | KMS or PostgreSQL unreachable: exception caught and swallowed. Service starts with `initialized = false`. Liveness/readiness probes pass. First encrypt request triggers rotation and likely fails with HTTP 500. |
 
 ---
 
-## Risks and Constraints
+## Risks
 
-🔴 **HIGH — No technical enforcement of decrypt caller identity (PCI-DSS risk)**
-The decrypt endpoint is intended for CaseCreationConsumer (COMP-14) only. There is no allowlist, no JWT claim inspection (`sub`, `client_id`, `azp`), and no technical control. Any service with a valid JWT from a trusted issuer can decrypt any HPAN. The `reason` field accepted by the request is ignored entirely. This is a PCI-DSS boundary gap — decryption of stored PANs is not access-controlled beyond network authentication. Candidate for a formal ADR when WDP-DECISIONS.md is rebuilt.
+🔴 **HIGH — Single global dependency for all PAN ingestion paths**
+Every dispute ingest path (COMP-07/08/09/11) depends on this service to encrypt PAN before any further processing. Unavailability of EncryptionService halts all inbound dispute processing platform-wide. There is no fallback, no degraded-mode persistence, and no client-side queue. Capacity, availability, and rolling-deploy posture for this service are platform-critical.
 
-🔴 **HIGH — KMS called on every decrypt request — no DEK cache on decrypt path**
-Unlike the encrypt path (which uses the in-memory DEK), the decrypt path calls `kmsClient.decrypt()` on every request. No timeout is configured on the KMS client. A single hung KMS call blocks the request thread indefinitely. Under concurrent decrypt load, this can exhaust the Tomcat thread pool. Compounded by the absence of Resilience4j (DEC-014 deviation).
+🔴 **HIGH — `rotateDEK()` Base64 bug on reuse path**
+The branch in `rotateDEK()` that handles "recent existing DEK row found" passes the raw UTF-8 bytes of the Base64-encoded `dek_enc` string to KMS, instead of the Base64-decoded ciphertext bytes. This will cause KMS to reject the unwrap with `InvalidCiphertextException`. Active risk: a pod restart that occurs within the rotation interval — and finds a recent-enough row to reuse — will fail to unwrap that row and (because rotation failures are silently swallowed) start with `initialized = false`. Operations should be aware that pod restart hygiene during the rotation window is fragile.
 
-🔴 **HIGH — No Resilience4j on any outbound call (DEC-014 deviation)**
-No circuit breaker, rate limiter, bulkhead, or retry annotation exists anywhere in the service. AWS KMS, AWS Secrets Manager, and PostgreSQL are all called with no explicit timeout, no Resilience4j protection, and no fallback path beyond error logging. Platform-wide pattern confirmed absent — consistent with COMP-04, COMP-05, COMP-11, COMP-14 findings.
-
-🔴 **HIGH — Base64 bug in `decryptAndStore()` during DEK reuse**
-When `rotateDEK()` detects that another pod has already generated a new DEK (the reuse path), it passes the raw UTF-8 bytes of the Base64 string to `kmsClient.decrypt()` instead of Base64-decoding first. This will cause KMS to reject the request with an exception. The DEK reuse path fails silently (exception swallowed in `rotateDEK()`), and the pod continues using its old in-memory DEK. In a multi-pod deployment, this means pods that are not the first to rotate will be unable to adopt the new DEK via the reuse path and will either generate a redundant new DEK (multi-pod race) or continue with stale DEK.
-
-🔴 **HIGH — DEK rotation failure silently swallowed — service uses expired DEK indefinitely**
-If KMS is unavailable at the moment of DEK rotation, the exception is caught and logged but not propagated. The service continues using the expired DEK with no alerting, no circuit breaker, and no forced failure. Records encrypted with an expired DEK can still be decrypted (the DEK ID is stored per record), but this creates an indefinite window of non-compliance with the configured rotation policy.
+🟡 **MEDIUM — Decrypt @Transactional holds DB connection during KMS call (NEW at v1.1)**
+The `@Transactional` boundary on `decryptPAN()` brackets the entire method body, including the synchronous KMS network call. Each in-flight decrypt request holds a Hikari pool connection for the duration of the KMS round-trip (typically tens of milliseconds, but vulnerable to KMS slowdown). Under sustained decrypt load combined with KMS latency degradation, pool exhaustion can manifest before KMS itself begins to fail. Consider narrowing the transaction to the UPDATE only.
 
 🟡 **MEDIUM — Multi-pod DEK rotation race condition**
-No distributed lock (no Redis advisory lock, no `SELECT FOR UPDATE`, no DB advisory lock) guards the `rotateDEK()` path. Multiple pods can simultaneously call `kmsClient.generateDataKey()` and insert separate rows into `wdp.data_enc_key`. Each pod then uses its own independently generated in-memory DEK. Records encrypted by different pods with different DEK IDs coexist in `wdp.hash_key_store` — this is handled correctly on decrypt (each record carries its `dek_id`), but the proliferation of DEK rows is uncontrolled. Operations teams should be aware.
+No distributed lock guards the `rotateDEK()` path. Multiple pods may simultaneously call KMS `generateDataKey` and insert separate rows into `wdp.data_enc_key`. Each pod uses its own DEK. Records encrypted by different pods coexist correctly on decrypt (each `hash_key_store` row carries its own `dek_id`), but DEK row proliferation is uncontrolled. Source code carries an explicit comment acknowledging the race.
 
-🟡 **MEDIUM — No UNIQUE constraint on `hpan` column (concurrent duplicate risk)**
-The `HashKeyStoreEntity` JPA entity declares no `unique=true` on the `hpan` column. Whether a DB-level unique index exists cannot be determined from source alone (migration scripts not in repository). Without this constraint, two concurrent encrypt requests for the same PAN that both pass the `findByHpan` idempotency check before either commits could insert two rows for the same HPAN with different `pan_ct` values. Subsequent `findByHpan` would return a single result — one of the duplicates — non-deterministically. Architect should confirm DB schema state.
+🟡 **MEDIUM — No UNIQUE constraint on `hpan` (concurrent duplicate INSERT race)**
+The JPA entity declares no `unique=true` on `hpan`. Whether a DB-level unique index exists cannot be determined from this repository. Without it, two concurrent encrypt requests for the same PAN can both pass the `findByHpan` idempotency check before either commits and produce two rows for the same HPAN with different `pan_ct` values. Subsequent `findByHpan` is non-deterministic. The encrypt method is `@Transactional` but the transaction does not protect across pods.
 
 🟡 **MEDIUM — HTTP 404 returned for crypto failures (semantic error)**
-`GlobalExceptionHandler` maps both `PANEncryptionException` and `PANDecryptionException` to HTTP 404 NOT_FOUND. A crypto or processing failure is not a "resource not found" condition and should return HTTP 500. Callers that inspect HTTP status to detect "HPAN not in database" vs "crypto failed" cannot distinguish the two. Confirmed known deviation from REST conventions.
+`GlobalExceptionHandler` maps both `PANEncryptionException` and `PANDecryptionException` to HTTP 404. A crypto failure is not "resource not found". Callers cannot distinguish "HPAN not in database" from "AES failed" from "KMS unavailable" via HTTP status alone — all four conditions on decrypt collapse to 404.
 
-🟡 **MEDIUM — `DEKServiceImpl.findById()` double query bug**
-On the decrypt path, `dekRepository.findById(id)` is called twice in succession — once for `isPresent()` and once for `get()`. This causes two identical `SELECT` queries against `wdp.data_enc_key` per decrypt request. Performance impact under decrypt load.
+🟡 **MEDIUM — `DEKServiceImpl.findById()` double query**
+On the decrypt path, `findById(id)` is called twice — once for `isPresent()` and once for `get()`. Two identical SELECTs against `wdp.data_enc_key` per decrypt request. Performance impact under decrypt load.
 
 🟡 **MEDIUM — DEK startup failure silently swallowed**
-If KMS or PostgreSQL is unavailable at pod startup, `initializeDEK()` catches and swallows the exception. The service starts with `initialized = false`. All subsequent encrypt requests will attempt DEK rotation (and likely fail with HTTP 500) until KMS and PostgreSQL are available. Kubernetes liveness/readiness probes do not check DEK initialisation state — the pod appears healthy to Kubernetes while in a broken operational state.
+KMS or PostgreSQL unavailability at pod startup leaves the service in a broken-but-Healthy state. Kubernetes probes pass; first encrypt request fails. Probe contracts do not include a DEK initialisation check.
 
-🟡 **MEDIUM — Unused OAuth2 client dependency (`spring-boot-starter-oauth2-client`)**
-An `OAuthAuthorizationClientManager` bean is configured (registered as `wdp-internal-auth`) but no outbound HTTP calls use this client anywhere in the visible service code. This appears to be dead code or scaffolding for a future outbound call integration. The dependency is present in `pom.xml` and increases the classpath and attack surface without current operational benefit.
+🟡 **MEDIUM — DEK rotation failure silently swallowed**
+Rotation failure leaves the service running with an expired DEK and no alert. The rotation interval is days — silent expiry is a long-window operational risk.
+
+🟡 **MEDIUM — Unused OAuth2 client dependency**
+`spring-boot-starter-oauth2-client` is present and a client manager bean is registered as `wdp-internal-auth`, but no outbound HTTP client uses it. Dead code or unbuilt scaffolding. Increases classpath and attack surface.
 
 🟢 **LOW — `EncryptionKeys.java` dead code**
-A `@Component` class with fields `hmac`, `dek`, `decEnc` — none populated via `@Value` or `@ConfigurationProperties` — is present but never injected anywhere. Dead code that should be removed.
+A `@Component` with three String fields, never populated, never injected. Should be removed.
 
-🟢 **LOW — GlobalExceptionHandler TODO comment**
-One `// TODO` comment exists in `GlobalExceptionHandler.java` referencing `METHOD_NOT_ALLOWED` error target string. No functional impact confirmed, but the error response body for that path may be incomplete.
+🟢 **LOW — `PANHashingServiceImpl` last-4 PAN at DEBUG**
+Last-4 digits of clear PAN are written to log at DEBUG level. Production log level must remain INFO or above. Risk is operational (log-level governance), not architectural.
+
+🟢 **LOW — `GlobalExceptionHandler` TODO**
+A `// TODO` comment in the `METHOD_NOT_ALLOWED` handler indicates an incomplete error-target string. No functional impact confirmed.
+
+🟢 **LOW — Dead configuration keys**
+`logger.level` and `logstash.server.host.port` are declared in `application.yaml` but no bean injects them and no `logback.xml` / `logback-spring.xml` consumes them. The structured-log Logstash route therefore depends entirely on whatever Logback defaults the Spring Boot starter provides.
 
 ---
 
@@ -281,19 +286,29 @@ One `// TODO` comment exists in `GlobalExceptionHandler.java` referencing `METHO
 
 ## REST API Contracts
 
-**Framework:** Spring Boot 3.5 (Spring MVC)
+**Framework:** Spring Boot 3.5.6 (Spring MVC)
 **Port:** 8082
-**Context path prefix:** `/merchant/gcp/encryption`
-**Auth model:** Bearer JWT validated by Spring Security OAuth2 Resource Server (`JwtIssuerAuthenticationManagerResolver`). Service validates tokens itself against configured JWKS URI (`${jwt_trusted_issuer_urls}` — prod: `https://login8.fiscloudservices.com/...`). No gateway delegation.
-**Auth whitelist (no token required):** `/merchant/gcp/encryption/readyz`, `/merchant/gcp/encryption/livez`, `/actuator/health`, `/actuator/prometheus`, `/actuator/info`, `/encryptionservice-api-docs/**`, `/swagger-ui/**`
+**Context path:** `/merchant/gcp/encryption`
+**Auth model:** Bearer JWT validated by Spring Security OAuth2 Resource Server (`JwtIssuerAuthenticationManagerResolver`). Service validates tokens itself against the configured JWKS URI (`${jwt_trusted_issuer_urls}` — production issuer `https://login8.fiscloudservices.com/...`). No gateway delegation. No method-level authorization — any valid token from a trusted issuer is accepted on every authenticated endpoint.
+
+**Auth whitelist (no token required):**
+- `/merchant/gcp/encryption/health`
+- `/merchant/gcp/encryption/actuator/health`
+- `/merchant/gcp/encryption/readyz`
+- `/merchant/gcp/encryption/livez`
+- `/encryptionservice-api-docs`
+- `/encryptionservice-api-docs/swagger-config`
+- `/swagger-ui/**`
+
+> ⚠️ **v1.1 correction:** `/actuator/prometheus` and `/actuator/info` are exposed by the management server but are NOT on the permit-all list. They require a valid JWT. Prometheus scrape configuration must include a token, or the path must be added to the whitelist.
 
 ---
 
-### Endpoint 1: POST /v1/pan/encrypt
+### Endpoint 1: `POST /v1/pan/encrypt`
 
 **Full path:** `POST /merchant/gcp/encryption/v1/pan/encrypt`
 
-**Auth:** Bearer JWT — validated by Spring Security before controller is invoked. No per-caller identity enforcement.
+**Auth:** Bearer JWT — validated before controller invocation. No per-caller identity enforcement.
 
 **Request body:**
 
@@ -311,43 +326,35 @@ One `// TODO` comment exists in `GlobalExceptionHandler.java` referencing `METHO
 
 | Status | Trigger |
 |---|---|
-| 200 | PAN encrypted successfully (new PAN) or HPAN already exists — returns existing HPAN |
-| 400 | Bean validation failure: `pan` missing, non-numeric, or wrong length |
+| 200 | New PAN encrypted, OR HPAN already exists (idempotent return of existing HPAN) |
+| 400 | Bean-validation failure: `pan` missing, non-numeric, or out of length range |
 | 401 | Missing or invalid JWT |
-| 404 | `PANEncryptionException` thrown during AES encryption — ⚠️ semantic error, crypto failure mapped to NOT_FOUND |
-| 500 | KMS failure, DEK rotation failure, DB failure, or any other RuntimeException |
+| 404 | `PANEncryptionException` thrown during AES encryption — ⚠️ semantic error |
+| 500 | KMS rotation failure surfaced to caller, DB failure, or any other RuntimeException |
 
-**Error response body structure (all non-200):**
-
+**Error response body:**
 ```
-{
-  "errors": [
-    {
-      "errorMessage": "<description>",
-      "target": "<field:value>"
-    }
-  ]
-}
+{ "errors": [ { "errorMessage": "<message>", "target": "<field>" } ] }
 ```
 
-**Idempotency:** Same PAN submitted multiple times always returns the same HPAN. If a record exists in `wdp.hash_key_store` for the computed HPAN, `last_seen_at` is updated and the existing HPAN is returned immediately. No new AES ciphertext is generated.
+**Idempotency:** Same PAN submitted multiple times always returns the same HPAN. If a row exists for the computed HPAN, `last_seen_at` is updated and the existing HPAN is returned. No new ciphertext is generated. The idempotency check + write are wrapped in a single `@Transactional` boundary, which protects within a pod but not across pods (no DB-level UNIQUE on `hpan` at the JPA level; DB-level constraint not verifiable from repo).
 
-**Known callers:** COMP-11 FileProcessor, COMP-07 VisaDisputeBatch, COMP-08 FirstChargebackBatch, COMP-09 CaseFillingBatch, COMP-27 CaseSearchService (v2 search path)
+**Known callers (design-asserted):** COMP-07 VisaDisputeBatch, COMP-08 FirstChargebackBatch, COMP-09 CaseFillingBatch, COMP-11 FileProcessor, COMP-27 CaseSearchService (v2 search path).
 
 ---
 
-### Endpoint 2: POST /v1/pan/decrypt
+### Endpoint 2: `POST /v1/pan/decrypt`
 
 **Full path:** `POST /merchant/gcp/encryption/v1/pan/decrypt`
 
-**Auth:** Bearer JWT — same validation as encrypt. **No per-caller identity enforcement.** Design intent: COMP-14 CaseCreationConsumer only. Technical enforcement: none. Any valid JWT from a trusted issuer may call this endpoint.
+**Auth:** Bearer JWT — same validation as encrypt. **No per-caller identity enforcement.** Design intent: COMP-14 only. Technical enforcement: none.
 
 **Request body:**
 
 | Field | Type | Constraints |
 |---|---|---|
 | `hpan` | String | Required (`@NotEmpty`) |
-| `reason` | String | Optional — accepted but not validated, not used for authorisation or audit |
+| `reason` | String | Optional — accepted but never read; not used for authorization, audit, or routing |
 
 **Response body — HTTP 200:**
 
@@ -360,42 +367,51 @@ One `// TODO` comment exists in `GlobalExceptionHandler.java` referencing `METHO
 | Status | Trigger |
 |---|---|
 | 200 | PAN decrypted successfully |
-| 400 | `hpan` is blank or missing |
+| 400 | `hpan` blank or missing |
 | 401 | Missing or invalid JWT |
-| 404 | HPAN not found in DB; DEK not found in DB; KMS decrypt failed; AES decrypt failed — all four conditions map to `PANDecryptionException` → 404. ⚠️ Caller cannot distinguish "HPAN not found" from "crypto failure" via HTTP status alone. |
-| 500 | `last_seen_at` timestamp update fails, or any other RuntimeException |
+| 404 | HPAN not found in DB; DEK not found in DB; KMS decrypt failed; AES decrypt failed — all four collapse to `PANDecryptionException` → 404. ⚠️ Caller cannot distinguish via HTTP status alone. |
+| 500 | `last_seen_at` UPDATE failure, or any other RuntimeException |
 
-**Error response body structure:** Same `{ "errors": [...] }` structure as encrypt endpoint.
+**Error response body:** Same `{ "errors": [...] }` structure as encrypt.
 
-**Idempotency:** The same HPAN may be decrypted an unlimited number of times. No one-time-use flag, rate limit, session constraint, or consume-on-read mechanism. Each call updates `last_seen_at` and returns the same cleartext PAN.
+**Idempotency:** None. Same HPAN may be decrypted unlimited times. No one-time-use, no rate limit, no consume-on-read. Each call updates `last_seen_at` and returns the same PAN.
 
-**Known callers (design intent):** COMP-14 CaseCreationConsumer. Not technically enforced.
+**Transaction boundary:** ⚠️ The method is `@Transactional`, and the boundary covers the KMS network call. A Hikari connection is held for the duration of the KMS round-trip on every decrypt request.
+
+**Known callers (design-asserted):** COMP-14 CaseCreationConsumer only.
 
 ---
 
-### Endpoints 3–7: Actuator / Health / Observability (no auth)
+### Endpoints 3–5: Kubernetes probes / Actuator (no auth)
 
 | Path | Method | Description |
 |---|---|---|
-| `GET /merchant/gcp/encryption/readyz` | GET | Spring readiness probe — Kubernetes readiness check |
-| `GET /merchant/gcp/encryption/livez` | GET | Spring liveness probe — Kubernetes liveness check |
-| `GET /actuator/health` | GET | Full Spring Actuator health (show-details: never) |
-| `GET /actuator/prometheus` | GET | Prometheus metrics scrape endpoint |
-| `GET /actuator/info` | GET | Application info |
+| `GET /merchant/gcp/encryption/livez` | GET | Liveness probe — Spring Boot health group |
+| `GET /merchant/gcp/encryption/readyz` | GET | Readiness probe — Spring Boot health group |
+| `GET /merchant/gcp/encryption/health` (and `/actuator/health`) | GET | Spring Actuator health |
 
-**Kubernetes probe configuration:**
-- Readiness: `GET /merchant/gcp/encryption/readyz` — initial delay 20 s, period 10 s, timeout 5 s, failure threshold 3
-- Liveness: `GET /merchant/gcp/encryption/livez` — initial delay 30 s, period 10 s, timeout 5 s, failure threshold 3
+**Probe configuration:**
+- Liveness: initial 30 s, period 10 s, timeout 5 s, failure threshold 3
+- Readiness: initial 20 s, period 10 s, timeout 5 s, failure threshold 3
 
-⚠️ Neither probe checks DEK initialisation state. A pod that started with `initialized = false` (DEK not loaded) will pass both probes and receive traffic while unable to process encrypt requests.
+⚠️ Neither probe inspects the DEK initialisation flag. A pod that started with `initialized = false` (KMS or PostgreSQL unavailable at boot) passes both probes and receives traffic while unable to process encrypt requests.
 
 ---
 
-### Endpoint 8–10: Swagger / OpenAPI (no auth)
+### Endpoints 6–8: Actuator metrics & info (JWT required — corrected at v1.1)
+
+| Path | Method | Description |
+|---|---|---|
+| `GET /actuator/prometheus` | GET | Prometheus scrape — ⚠️ JWT required |
+| `GET /actuator/info` | GET | Application info — ⚠️ JWT required |
+
+---
+
+### Endpoints 9–11: OpenAPI / Swagger (no auth)
 
 | Path | Description |
 |---|---|
-| `GET /encryptionservice-api-docs` | OpenAPI JSON specification |
+| `GET /encryptionservice-api-docs` | OpenAPI JSON spec |
 | `GET /encryptionservice-api-docs/swagger-config` | Swagger UI configuration |
 | `GET /swagger-ui/**` | Swagger UI |
 
@@ -406,73 +422,85 @@ One `// TODO` comment exists in `GlobalExceptionHandler.java` referencing `METHO
 | Attribute | Value | Source |
 |---|---|---|
 | Kubernetes resource type | `Deployment` | `resources.yaml` |
-| Replica count | `{{ replicas-wdp-encryption-service }}` (templated — exact value in external deployment config system, not in this repository) | `resources.yaml` |
+| Replica count | `{{ replicas-wdp-encryption-service }}` — templated; no default in repo | `resources.yaml` |
 | Memory limit | `2048Mi` | `resources.yaml` |
 | Memory request | `1024Mi` | `resources.yaml` |
 | CPU limit | Not configured | `resources.yaml` |
 | CPU request | Not configured | `resources.yaml` |
-| HPA | Not configured — no HPA manifest in `resources.yaml` | `resources.yaml` |
+| HPA | Not configured | absent from manifests |
 | Rolling update — maxSurge | `1` | `resources.yaml` |
 | Rolling update — maxUnavailable | `0` | `resources.yaml` |
-| PodDisruptionBudget | Not configured | `resources.yaml` |
-| Topology spread | Not configured | `resources.yaml` |
-| minReadySeconds | `30` | `resources.yaml` |
-| Service type | `ClusterIP` — exposed via Nginx Ingress on `/merchant/gcp/encryption` with TLS | `resources.yaml` |
-| OpenTelemetry | OTel Java agent injected via pod annotation `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default` | `resources.yaml` |
-| Spring Actuator | Present (`spring-boot-starter-actuator` in `pom.xml`) — `info`, `health`, `prometheus` exposed | `pom.xml`, `application.yaml` |
-| Liveness probe | `GET /merchant/gcp/encryption/livez` — port 8082, initial delay 30 s, period 10 s, timeout 5 s, failure threshold 3 | `resources.yaml` |
-| Readiness probe | `GET /merchant/gcp/encryption/readyz` — port 8082, initial delay 20 s, period 10 s, timeout 5 s, failure threshold 3 | `resources.yaml` |
+| `minReadySeconds` | `30` | `resources.yaml` |
+| PodDisruptionBudget | Not configured | absent |
+| Topology spread | Not configured | absent |
+| Service type | `ClusterIP` exposed via Nginx Ingress with TLS | `resources.yaml` |
+| mTLS / backend re-encryption | Not configured (TLS terminates at Ingress) | `resources.yaml` |
+| Liveness probe | `GET /merchant/gcp/encryption/livez` — initial 30 s, period 10 s, timeout 5 s, threshold 3 | `resources.yaml` |
+| Readiness probe | `GET /merchant/gcp/encryption/readyz` — initial 20 s, period 10 s, timeout 5 s, threshold 3 | `resources.yaml` |
+| Startup probe | Not configured | `resources.yaml` |
+| OpenTelemetry | OTel Java agent injected via pod annotation `instrumentation.opentelemetry.io/inject-java` | `resources.yaml` |
+| Spring Actuator | `info`, `health`, `prometheus` exposed (`info` and `prometheus` JWT-required) | `application.yaml` |
+| Logback | No `logback.xml` / `logback-spring.xml` in repo. Logstash encoder dependency present in `pom.xml`. Structured-log routing depends on starter defaults plus injected configuration; not verifiable from repository alone. | `pom.xml` |
+
+**Files present in repo:** `resources.yaml` (Deployment + Service + Ingress), `Jenkinsfile`, `deployit-manifest.xml`, `pom.xml`, `application.yaml` + profile YAMLs.
+**Files NOT in repo:** Helm chart, `values.yaml`, Dockerfile, HPA manifest, PDB manifest, `logback.xml`, DB migration scripts (Liquibase / Flyway / `schema.sql`).
 
 ---
 
 ## Planned and Incomplete Work
 
 ### Commented-out code
-None found. No commented-out business logic blocks in source.
+None found in Java sources.
 
 ### TODOs and FIXMEs
-One `// TODO` in `GlobalExceptionHandler.java` (line 138):
-```
-StandardDisplayError error = new StandardDisplayError(e.getMessage(), ApplicationConstants.METHOD_NOT_ALLOWED); // TODO
-```
-No further context. The error target string for the METHOD_NOT_ALLOWED handler appears intended to be improved.
+One `// TODO` in `GlobalExceptionHandler` referencing the `METHOD_NOT_ALLOWED` error target string. No further context.
 
 ### Feature flags / migration flags
-None. No feature flag framework present (`LaunchDarkly`, `FF4j`, Unleash, etc.).
+None. No feature-flag framework present.
 
 ### Stub implementations
 None. All service implementations are functional.
 
 ### Unused dependencies / dead code
-- `spring-boot-starter-oauth2-client` — OAuth2 client configured as `wdp-internal-auth` but no visible outbound HTTP calls use it. Dead code or scaffolding for a future outbound integration.
-- `EncryptionKeys.java` — `@Component` with fields `hmac`, `dek`, `decEnc` — none populated, never injected. Dead code.
+- `spring-boot-starter-oauth2-client` — client manager registered as `wdp-internal-auth`. No outbound HTTP client (`RestTemplate`, `WebClient`, `FeignClient`) uses it. Dead code or scaffolding for a future integration.
+- `EncryptionKeys` `@Component` — three String fields, never populated, never injected. Dead code.
+- `logger.level` and `logstash.server.host.port` config keys — declared in YAML, no consumer in repo.
 
 ---
 
 ## Deviation Flags
 
-| Decision | Deviation | Severity |
-|---|---|---|
-| DEC-014 Resilience4j | No circuit breaker, rate limiter, bulkhead, or Resilience4j dependency on any outbound call. AWS KMS, Secrets Manager, and PostgreSQL all called with no timeout and no Resilience4j protection. | 🔴 HIGH — consistent with platform-wide pattern but especially dangerous here: this is a global dependency; its unavailability halts all inbound processing. |
-| DEC-008 (design doc) | DEK rotation interval is **days**, not hours. All prior documentation stating "6-hour DEK cache" is incorrect. The unit is configured via `${dek_rotation_interval_days}` in days. | 🟡 MEDIUM — design correction, not a runtime risk, but all documentation must be updated. |
-| REST convention | `PANEncryptionException` and `PANDecryptionException` both mapped to HTTP 404 by `GlobalExceptionHandler`. Crypto failures are not "resource not found" conditions. Should be HTTP 500. Callers cannot distinguish "HPAN not in database" (legitimate 404) from "crypto processing failed" (incorrectly 404). | 🟡 MEDIUM — semantic error; impacts caller error-handling logic. |
-| DEC-004 (caveat) | PAN is excluded from Lombok `toString()` and from log statements. However, full assurance that PAN does not appear in structured log output (Logstash serialisation of HTTP request bodies) requires confirming no HTTP request body logging filter is active. None found in source — but cannot be determined from source alone without confirming log pipeline config. | 🟢 LOW — source evidence is strong; caveat is operational. |
+| Decision | Status | Severity | Notes |
+|---|---|---|---|
+| **DEC-001** Transactional outbox | ✅ NOT APPLICABLE | — | No Kafka, no async publish, no outbox table. |
+| **DEC-003** Kafka partition key = merchantId | ✅ NOT APPLICABLE | — | No Kafka. |
+| **DEC-004** PAN encryption boundary | ✅ COMPLIES — 🟢 LOW caveat | 🟢 LOW | Service IS the DEC-004 boundary. ⚠️ Caveat: `PANHashingServiceImpl` logs last-4 PAN at DEBUG. Production log level must remain INFO or higher. |
+| **DEC-005** Kafka offset | ✅ NOT APPLICABLE | — | No Kafka. |
+| **DEC-019** Clear PAN written | ✅ COMPLIES | — | No clear PAN persisted. Only `hpan` and `pan_ct` stored. |
+| **DEC-020** Idempotency | ⚠️ PARTIAL | 🟡 MEDIUM | In-memory `findByHpan` check inside `@Transactional`, but no DB-level UNIQUE on `hpan` verifiable from repo. Multi-replica concurrent-INSERT race exists. |
+| **DEC-008** AWS KMS — design narrative | ⚠️ DOC CORRECTION | 🟡 MEDIUM | DEK rotation interval is **days**, not hours. Correction must propagate to DEC-008 narrative, COMP-INDEX, and ARCHITECTURE. |
+| REST convention — crypto failure → 404 | ⛔ DEVIATES | 🟡 MEDIUM | `PANEncryptionException` and `PANDecryptionException` mapped to HTTP 404. Should be HTTP 500 (or distinct 404 for "HPAN not in DB" and 500 for crypto failure). Callers cannot distinguish. |
+
+(DEC-014 Resilience4j — platform-VOID. Absence is recorded as factual context, not as a deviation, per WDP-DECISIONS.md v2.1.)
 
 ---
 
 ## Remaining Gaps
 
-| Gap | What is missing | Resolution needed |
+| Gap | What is missing | Resolution path |
 |---|---|---|
-| UNIQUE index on `wdp.hash_key_store.hpan` | JPA entity has no `unique=true`. Whether a DB-level unique index exists cannot be determined from source — migration scripts not in repository. | **Architect + DBA confirmation required.** Ask DBA to confirm: `SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'hash_key_store' AND schemaname = 'wdp';` |
-| Replica count exact value | `{{ replicas-wdp-encryption-service }}` is a deployment system template variable. Actual replica count not in repository. | **Confirm from XL Deploy or deployment config with ops team.** |
-| DB-level unique constraint on `data_enc_key` | Whether `dek_id` has additional constraints or whether there is any protection against duplicate DEK rows from the multi-pod race is unknown. | **DBA confirmation or follow-up Copilot question on DB migration scripts.** |
-| Log pipeline PAN assurance | Logstash structured logging could serialise HTTP request objects — `@ToString` exclusion covers Lombok but not all serialisation paths. | **Confirm no HTTP request body logging filter active — ask ops/platform team.** |
-| DEK rotation interval in production | `${dek_rotation_interval_days}` — exact production value unknown. | **Confirm from Kubernetes secret or environment config with ops team.** |
+| UNIQUE index on `wdp.hash_key_store.hpan` | No JPA `unique=true`. No migration scripts in repo. DB-level state unknown. | DBA confirmation. |
+| UNIQUE / additional indexes on `wdp.data_enc_key` | JPA declares `dek_id` PK only. No migration scripts in repo. | DBA confirmation. |
+| Production replica count | Template variable only; no default in repo. | Confirm from XL Deploy with ops team. |
+| DEK rotation interval — production value | No hardcoded default in any committed YAML. | Confirm from K8s secret / env config with ops team. |
+| Log pipeline PAN assurance | No HTTP request-body logging filter, MDC writer, or `spring.mvc.log-request-details` setting found in repo. External log pipeline (Logstash target) PAN scrubbing posture not visible from this repo. | Ops / platform team confirmation. |
+| Production JWKS issuer URL | `application-prod.yaml` carries `jwk-set-uri` for resource server; `jwt.trustedIssuers` list is still env-injected. | Ops confirmation of injected value. |
+| AWS region, KMS CMK ARN, HMAC secret name | All env-injected. | Ops confirmation. |
+| HikariCP pool size in production | All settings at defaults; runtime overrides via env not visible. | Ops confirmation. |
+| Decrypt caller verification | Caller list is design-asserted. No artefact in this repo names callers. | Cross-component verification (audit COMP-14 source for the decrypt call). |
 
 ---
 
-*End of WDP-COMP-35-ENCRYPTION-SERVICE.md*
-*File status: 📝 DRAFT — awaiting architect confirmation*
-*Update WDP-COMP-INDEX.md doc status from PENDING to DRAFT after upload.*
-*See WDP-KAFKA.md update, WDP-DB.md update, and WDP-DECISIONS.md correction notes below.*
+*End of WDP-COMP-35-ENCRYPTION-SERVICE.md v1.1 DRAFT.*
+*Architect confirmation: PENDING.*
+*Update WDP-COMP-INDEX.md COMP-35 description to remove "6-hour DEK cache" claim after this revision is accepted.*

@@ -1,7 +1,22 @@
 # WDP-COMP-30-USER-QUEUE-SKILL-SERVICE
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: gcp-user-queue-skill-service using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 1.1 DRAFT | April 2026*
+*Source: v1.0 DRAFT (Copilot CLI extraction) + 2026-04-28 source-verification pass via GitHub Copilot CLI against `gcp-user-queue-skill-service`*
+*Architect-confirmed: PENDING*
+
+> **v1.1 reconciliation scope:** ten corrections applied to the v1.0 DRAFT, the most material being:
+> 1. **Maven artifactId is `user-queue-skill-service`**, not `gcp-user-queue-skill-service` (the latter is the Kubernetes deployment name).
+> 2. **Queue create/update `@Transactional` uses `jakarta.transaction.Transactional`** which selects the `@Primary` US transaction manager. UK queue operations are therefore **NOT covered** by the service-level transaction boundary — atomicity for UK queue + criterion + user_queue writes is not guaranteed. New 🔴 HIGH risk.
+> 3. **POST /user has no `@Transactional` at all.** The user upsert and the auto-enrol side effect run in separate implicit transactions — auto-enrol failure does not roll back the user upsert. New 🔴 HIGH risk.
+> 4. **V1 external-user orgId mismatch maps to HTTP 403**, not 401 (`UnauthorizedException` is rewritten by `GlobalExceptionHandler`).
+> 5. **CHAS endpoints clarified**: `/entity-authorize` when `entityHierarchy` is present, `/authorize` otherwise. The `/hierarchy-authorization` portion is the base path, not the verb endpoint.
+> 6. **Auto-enrol scope expanded**: triggers for existing internal users too (not only on first insert) and enrols into queues of type `SKILLS_INTERNAL` **OR** `DEFAULT_QUEUE` (v1.0 said `SKILLS_INTERNAL` only).
+> 7. **Logstash integration is incomplete**: `logback-spring.xml` is **not in the repo**. The `logstash-logback-encoder` dependency and the `logstash.server.host.port` property are both present but no appender wires them — the integration is non-functional unless a logback config is mounted at runtime via ConfigMap. v1.0 reported Logstash as "configured".
+> 8. **No `@UniqueConstraint` on any owned table** — idempotency for POST /user, POST /lft-report, POST /user-view, POST /{region}/queue is application-level only. POST /{region}/queue has a confirmed race-condition window between duplicate-name check and insert.
+> 9. **Async configuration confirmed dead**: `AsyncConfiguration` is `@EnableAsync` and the executor bean is created at startup, but no `@Async` annotation exists anywhere — the executor is never invoked.
+> 10. **Whitelist endpoints are two specific paths**, not a wildcard: `/user-queue-skill-service-api-docs` and `/user-queue-skill-service-api-docs/swagger-config`.
+>
+> All v1.0 statements about Kafka-free posture, no PAN handling, dual-datasource design, and DEC-014 deviation remain accurate.
 
 ---
 
@@ -15,14 +30,16 @@
 | Field             | Value                                                        |
 |-------------------|--------------------------------------------------------------|
 | **Name**          | `UserQueueSkillService`                                      |
-| **Artifact**      | `gcp-user-queue-skill-service`                               |
 | **Type**          | REST API                                                     |
 | **Repository**    | `gcp-user-queue-skill-service`                               |
+| **Maven artifactId** | `user-queue-skill-service` *(corrected from `gcp-user-queue-skill-service`)* |
 | **Runtime**       | Java 17 / Spring Boot 3.5.5 / PostgreSQL                     |
-| **Version**       | 1.1.7                                                        |
+| **Service version** | 1.1.7                                                      |
+| **Context path**  | `/merchant/gcp/user-queue-skill`                             |
+| **Port**          | 8082                                                         |
 | **Status**        | ✅ Production                                                 |
-| **Doc status**    | 📝 DRAFT                                                     |
-| **Sections present** | Core \| Block A (REST API)                              |
+| **Doc status**    | 📝 DRAFT v1.1 — source-verified 2026-04-28, architect confirmation pending |
+| **Sections present** | `Core \| Block A — REST API`                              |
 
 ---
 
@@ -30,342 +47,317 @@
 
 **What it does**
 
-`UserQueueSkillService` is the **data management and light-eligibility service** for user, queue, and skill relationships on the Worldpay Dispute Platform. It owns the user registry, queue definitions, queue-criterion (skill filter) rules, user-to-queue assignments, user column-view preferences, and async large-file-transfer (LFT) export request lifecycle. It is the authoritative store for *which queues exist*, *what criteria those queues define*, and *which users are assigned to which queues*.
+`UserQueueSkillService` is the **data management and light-eligibility service** for user, queue, and skill relationships on the Worldpay Dispute Platform. It owns the user registry, queue definitions, queue-criterion (skill filter) rules, user-to-queue assignments, user column-view preferences, and the async large-file-transfer (LFT) export-request lifecycle. It is the authoritative store for *which queues exist*, *what criteria those queues define*, and *which users are assigned to which queues*.
 
-The service operates across two regions served from the same deployed pod. UK operations use the `nap` PostgreSQL schema (via a dedicated UK datasource). US operations use the `wdp` PostgreSQL schema (via a separate US datasource). The two datasources are entirely independent — no XA or distributed transaction spans them.
+The service operates across two regions served from the same deployed pod. UK operations use the `nap` PostgreSQL schema via a dedicated UK datasource and `ukTransactionManager`. US operations use the `wdp` PostgreSQL schema via a separate US datasource and `usTransactionManager` (marked `@Primary`). The two datasources are entirely independent — no XA or distributed transaction spans them.
 
 On first encounter with a user (V1 GET by login name), the service calls an upstream Identity Provider (IDP) to retrieve user details and persists them locally. Subsequent lookups are served from the local database. A V2 endpoint performs DB-only lookup with no IDP fallback.
 
-When a new internal user is registered via `POST /user` and holds a recognised WDP NAP queue role, the service auto-enrols that user into all queues of type `SKILLS_INTERNAL` as an atomic side-effect of the upsert.
+When a user is upserted via `POST /user` and holds a recognised WDP NAP queue role (`WDP_NAP_REGULAR`, `WDP_NAP_ADVANCED`, `WDP_NAP_SUPERVISOR`, `WDP_NAP_ADMIN`, or `vantiv-iq-merchant-chargebacks`) and has no existing queue assignments, the service auto-enrols that user into all UK queues of type `SKILLS_INTERNAL` **or** `DEFAULT_QUEUE`. The auto-enrol step runs as a follow-on operation after the user upsert — there is no enclosing transaction.
 
-The service additionally manages an async LFT report request lifecycle: users submit export requests, the service validates counts and persists a `PENDING` row in `wdp.lft_report`, and report files (once generated externally) are made available for download via 15-minute AWS S3 presigned URLs.
+The service additionally manages an async LFT report-request lifecycle: users submit export requests, the service validates count caps and entity authorization, persists a `PENDING` row in `wdp.lft_report`, and (once the file is generated externally and `s3_key_path` is populated by a downstream component) makes the file available for download via 15-minute AWS S3 presigned URLs.
 
 **What it does NOT do**
 
-- Does **not** make real-time eligibility routing decisions on live cases. It stores the criteria and assignments; the matching of a live case against those criteria is performed by a downstream component (not determinable from source alone).
-- Does **not** publish to any Kafka topic.
-- Does **not** consume from any Kafka topic.
-- Does **not** use a transactional outbox pattern — all writes are direct table mutations.
-- Does **not** handle PAN (Primary Account Number) data in any form.
-- Does **not** generate LFT report files — it only tracks request status and provides presigned download URLs once files are available in S3.
-- Does **not** configure Resilience4j circuit breakers on any outbound call.
+- Does **not** make real-time eligibility routing decisions on live cases. It stores the criteria and assignments; the matching of a live case against those criteria is performed by a downstream component — not determinable from source.
+- Does **not** publish to or consume from any Kafka topic. No `spring-kafka` dependency.
+- Does **not** use a transactional outbox pattern. All writes are direct table mutations; no event publication accompanies any write.
+- Does **not** handle PAN data in any form. No PAN columns on any owned entity, no encryption configuration.
+- Does **not** generate LFT report files. It only tracks request status and produces presigned download URLs once a downstream component populates `s3_key_path`.
+- Does **not** transition `wdp.lft_report.status` after the initial `PENDING` insert. It only writes `PENDING` and reads `INPROGRESS` for count-cap checks. The status state-machine owner is unknown.
+- Does **not** configure Resilience4j circuit breakers, REST timeouts, or retries on any outbound call.
+- Does **not** atomically coordinate UK and US writes — there is no XA transaction.
+- Does **not** atomically wrap UK queue create/update — see Risks below.
 
 ---
 
 ## Internal Processing Flow
 
-*The service exposes four logical endpoint groups. Each is shown as a separate flow below.*
+The service exposes four logical endpoint groups. Each is documented as a separate flow. All four groups share `AuthorizationServiceImpl` for JWT-claim extraction; otherwise the service-layer code paths are independent.
+
+There is **no Kafka listener**, **no scheduler**, **no webhook endpoint**. REST is the only entry mechanism.
+
+---
 
 ### Flow A — User Lookup and Registration
 
 ```mermaid
 flowchart TD
-    A_IN["HTTP Request\nGET /users/{loginName} (V1)\nGET /v2/users/{loginName} (V2)\nPOST /user\nGET /users/search"]
+    A_IN[/"HTTP Request"/]
+    A_IN --> A_JWT["JWT decoded by Spring Security<br/>OAuth2 resource server filter"]
+    A_JWT --> A_CTX["AuthorizationServiceImpl extracts:<br/>isInternalFirm · orgId · userFirm<br/>from JWT claims"]
+    A_CTX --> A_VER{"Version / Method?"}
 
-    A1["JWT decoded by Spring Security\nOAuth2 resource server filter"]
-    A2["AuthorizationService extracts:\nisInternalFirm · orgId · userFirm\nfrom JWT claims"]
+    A_VER -->|"GET /users/{loginName} (V1)"| A_V1_UP["loginName uppercased"]
+    A_V1_UP --> A_V1_DB{"User found<br/>in nap.users?"}
+    A_V1_DB -->|"yes"| A_V1_OK["Map entity → UserResponse<br/>HTTP 200"]
+    A_V1_DB -->|"no"| A_V1_IDP["Call IDP REST API<br/>(internal or external<br/>by userFirm)"]
+    A_V1_IDP -->|"RestClientException"| A_V1_IDP_FAIL["WebServiceException<br/>HTTP 500"]
+    A_V1_IDP -->|"returns null"| A_V1_400["BadRequestException<br/>HTTP 400"]
+    A_V1_IDP -->|"returns user"| A_V1_EXT{"External user<br/>and orgId mismatch?"}
+    A_V1_EXT -->|"yes"| A_V1_403["UnauthorizedException<br/>→ HTTP 403"]
+    A_V1_EXT -->|"no"| A_V1_ROLE["Filter IDP roles against<br/>user.roles.internal /<br/>user.roles.external"]
+    A_V1_ROLE --> A_V1_INS["INSERT into nap.users<br/>(no @Transactional)"]
+    A_V1_INS --> A_V1_OK
 
-    A_VER{{"Version / Method?"}}
+    A_VER -->|"GET /v2/users/{loginName}"| A_V2_DB{"User found<br/>in nap.users?"}
+    A_V2_DB -->|"none"| A_V2_404["NotFoundException<br/>HTTP 404"]
+    A_V2_DB -->|"multiple"| A_V2_400["BadRequestException<br/>HTTP 400"]
+    A_V2_DB -->|"single"| A_V2_OK["Map entity → UserResponse<br/>HTTP 200"]
 
-    %% V1 path
-    A_V1["loginName uppercased"]
-    A_DB1{{"User found\nin nap.users?"}}
-    A_MAP["Map entity → UserResponse\nReturn 200"]
-    A_IDP["Call IDP REST API\n(IdpRestInvoker)"]
-    A_IDP_NULL{{"IDP returns\nnull?"}}
-    A_400["Throw BadRequestException\nUser not found → 400"]
-    A_EXT{{"External user?\n(org mismatch check)"}}
-    A_401["OrgId mismatch → 401"]
-    A_ROLES["Extract & filter roles\nfrom AuthorizationList\nagainst configured role sets"]
-    A_PERSIST["Insert UKUsersEntity\ninto nap.users"]
-    A_V1_OUT["Return 200 UserResponse"]
-    A_IDP_FAIL["RestClientException →\nUserSkillsServiceException → 500"]
+    A_VER -->|"POST /user"| A_POST_EX["Extract LoginName · FirstName · LastName ·<br/>EmailAddress · ExternalID · AuthorizationList<br/>from JWT claims"]
+    A_POST_EX --> A_POST_DB{"User exists<br/>in nap.users?"}
+    A_POST_DB -->|"yes"| A_POST_UP["Copy non-null props<br/>save() → nap.users<br/>(implicit TX)"]
+    A_POST_DB -->|"no"| A_POST_NEW["Build new entity<br/>isActive=true<br/>save() → nap.users<br/>(implicit TX)"]
+    A_POST_UP --> A_POST_ROLE{"Internal user<br/>with valid<br/>NAP queue role?"}
+    A_POST_NEW --> A_POST_ROLE
+    A_POST_ROLE -->|"no"| A_POST_OK["Return 200<br/>CreateUserResponse"]
+    A_POST_ROLE -->|"yes"| A_POST_HAS{"User has any<br/>existing<br/>nap.user_queue rows?"}
+    A_POST_HAS -->|"yes"| A_POST_OK
+    A_POST_HAS -->|"no"| A_POST_LOAD["Load all UK queues of type<br/>SKILLS_INTERNAL or DEFAULT_QUEUE"]
+    A_POST_LOAD --> A_POST_ENROL["saveAll() to nap.user_queue<br/>SEPARATE implicit TX"]
+    A_POST_ENROL -->|"any failure"| A_POST_ORPHAN["User row already committed<br/>NO ROLLBACK<br/>HTTP 500"]
+    A_POST_ENROL -->|"success"| A_POST_OK
 
-    %% V2 path
-    A_V2_DB{{"User found\nin nap.users?"}}
-    A_V2_MULTI{{"Multiple records\nfound?"}}
-    A_V2_404["Return 404"]
-    A_V2_400["Return 400"]
-    A_V2_OUT["Return 200 UserResponse"]
-
-    %% POST /user path
-    A_POST["Extract LoginName · FirstName\nLastName · EmailAddress\nExternalID · AuthorizationList\nfrom JWT claims"]
-    A_POST_DB{{"User exists\nin nap.users?"}}
-    A_POST_UPD["Update non-null fields\nvia BeanUtils.copyProperties\nSet updated_by / updated_at · Save"]
-    A_POST_INS["Insert new row\nSet is_active=true\ncreated_by · timestamps"]
-    A_POST_ROLE{{"Has WDP NAP queue role\nAND no existing user_queue rows?\n(internal users only)"}}
-    A_AUTO_ENROL["Auto-enrol into ALL\nSKILLS_INTERNAL queues\nInsert into nap.user_queue"]
-    A_POST_OUT["Return CreateUserResponse\n{ loginName } 200"]
-
-    %% Search path
-    A_SEARCH["LIKE query on nap.users\nExternal: filter by orgId\nInternal: filter by userType only"]
-    A_SEARCH_OUT["Return List<UserResponse> 200"]
-
-    A_IN --> A1 --> A2 --> A_VER
-
-    A_VER -->|"GET V1"| A_V1
-    A_V1 --> A_DB1
-    A_DB1 -->|"Found"| A_MAP --> A_V1_OUT
-    A_DB1 -->|"Not found"| A_IDP
-    A_IDP -->|"Success"| A_IDP_NULL
-    A_IDP -->|"RestClientException"| A_IDP_FAIL
-    A_IDP_NULL -->|"null"| A_400
-    A_IDP_NULL -->|"Returned"| A_EXT
-    A_EXT -->|"External + org mismatch"| A_401
-    A_EXT -->|"Valid"| A_ROLES --> A_PERSIST --> A_V1_OUT
-
-    A_VER -->|"GET V2"| A_V2_DB
-    A_V2_DB -->|"Not found"| A_V2_404
-    A_V2_DB -->|"Multiple found"| A_V2_400
-    A_V2_DB -->|"Single found"| A_V2_OUT
-
-    A_VER -->|"POST /user"| A_POST --> A_POST_DB
-    A_POST_DB -->|"Exists"| A_POST_UPD
-    A_POST_DB -->|"New"| A_POST_INS
-    A_POST_UPD --> A_POST_ROLE
-    A_POST_INS --> A_POST_ROLE
-    A_POST_ROLE -->|"Yes"| A_AUTO_ENROL --> A_POST_OUT
-    A_POST_ROLE -->|"No"| A_POST_OUT
-
-    A_VER -->|"GET /users/search"| A_SEARCH --> A_SEARCH_OUT
+    A_VER -->|"GET /users/search"| A_SR_DB["Internal: findByLoginNameAndUserType<br/>External: findByLoginNameAndUserTypeAndOrgId"]
+    A_SR_DB --> A_SR_OK["List of UserResponse<br/>HTTP 200 (always)"]
 ```
+
+**Critical structural finding (Flow A):** The auto-enrol step on POST /user is **not** in the same transaction as the user upsert. v1.0 implied atomicity. Source confirms `userUpdate()` has no `@Transactional`. Failure of the SKILLS_INTERNAL / DEFAULT_QUEUE enrolment leaves the user row persisted with no queue assignments — recovery requires either a re-POST or manual intervention.
 
 ---
 
-### Flow B — Queue Create and Update
+### Flow B — Queue Management
 
 ```mermaid
 flowchart TD
-    B_IN["HTTP Request\nPOST /{region}/queue\nPUT /{region}/queue"]
+    B_IN[/"POST or PUT<br/>/{region}/queue"/]
+    B_IN --> B_JWT["JWT decode<br/>+ AuthorizationServiceImpl context"]
+    B_JWT --> B_VAL_R{"Region valid?<br/>(Region enum: UK or US)"}
+    B_VAL_R -->|"no"| B_400_R["BadRequestException<br/>HTTP 400"]
+    B_VAL_R -->|"yes"| B_VAL_ROLE["validateRole(jwt, region, queueType)<br/>against user.roles.internal /<br/>user.roles.external"]
+    B_VAL_ROLE -->|"queueType not recognised"| B_400_QT["BadRequestException<br/>HTTP 400"]
+    B_VAL_ROLE -->|"role intersection empty"| B_403["UnauthorizedException<br/>→ HTTP 403"]
+    B_VAL_ROLE -->|"ok"| B_VAL_Q["RequestValidator.queueRequestValidate()<br/>· assigned users required for<br/>  non-LOGICAL_INTERNAL queues<br/>· criterion name/category checks"]
+    B_VAL_Q -->|"validation fail"| B_400_V["BadRequestException<br/>HTTP 400"]
 
-    B1["JWT decoded"]
-    B2["AuthorizationService.validateRole\nCheck AuthorizationList claim\nvs configured roles for queueType"]
-    B_ROLE{{"Role valid?"}}
-    B_401["Return 401"]
+    B_VAL_Q -->|"ok"| B_TX["Service-level @Transactional<br/>(jakarta.transaction.Transactional)<br/>→ binds to @Primary usTransactionManager"]
 
-    B3["RequestValidator.queueRequestValidate\nValidate region (UK/US)\nValidate assignedUsers set\nValidate criterion category+name pairs"]
-    B_VAL{{"Validation passes?"}}
-    B_400V["Return 400\n(region / users / criteria)"]
+    B_TX --> B_REGION{"Region?"}
+    B_REGION -->|"US"| B_US_DUP["Duplicate-name check via<br/>queueDAO.findNameByQueueTypeInUS()"]
+    B_REGION -->|"UK"| B_UK_DUP["Duplicate-name check via<br/>queueDAO.findNameByQueueTypeInUK()"]
 
-    B4["Extract orgId from JWT\nSet on request"]
-    B_TX["@Transactional begins\n(rollbackOn=Exception.class)"]
+    B_US_DUP -->|"name in use"| B_400_DUP["BadRequestException<br/>HTTP 400"]
+    B_UK_DUP -->|"name in use"| B_400_DUP
 
-    B_DUP{{"Queue name already exists\nfor same type in region?"}}
-    B_400D["Throw BadRequestException\nDuplicate name → 400\nRollback"]
+    B_US_DUP -->|"unique"| B_US_TYPE{"queueType?"}
+    B_UK_DUP -->|"unique"| B_UK_TYPE{"queueType?"}
 
-    B_METHOD{{"POST (create) or\nPUT (update)?"}}
+    B_US_TYPE -->|"LOGICAL_INTERNAL"| B_DCS_US["Call DisplayCodeService<br/>POST /merchant/gcp/display-code/search"]
+    B_UK_TYPE -->|"LOGICAL_INTERNAL"| B_DCS_UK["Call DisplayCodeService<br/>POST /merchant/gcp/display-code/search"]
 
-    %% Create path
-    B_QTYPE{{"Queue type?"}}
-    B_EXT_Q["LOGICAL_EXTERNAL\nSKILLS_INTERNAL\nDEFAULT_QUEUE:\nResolve assignedUsers login names\nvia nap.users lookup\nSave queue\nSave user-queue join rows"]
-    B_INT_Q["LOGICAL_INTERNAL:\nValidate name not a physical queue\n(call Display Code Service)\nSave queue only — no user assignments"]
-    B_DC_FAIL["Display Code Service unavailable:\nRestClientException →\nUserSkillsServiceException → 500\nRollback"]
-    B_201["Return 201"]
+    B_DCS_US -->|"name is physical"| B_400_PHY["BadRequestException<br/>HTTP 400"]
+    B_DCS_UK -->|"name is physical"| B_400_PHY
+    B_DCS_US -->|"RestClientException"| B_500_DCS["UserSkillsServiceException<br/>HTTP 500"]
+    B_DCS_UK -->|"RestClientException"| B_500_DCS
 
-    %% Update path
-    B_FIND{{"Queue found\nby name+type?"}}
-    B_400NF["Return 400 Not Found\nRollback"]
-    B_ASSIGN{{"User-assignable\nqueue type?"}}
-    B_DELTA_U["Compute user delta:\nDelete removed users from user_queue\nInsert new users into user_queue"]
-    B_DELTA_C["Compute criteria delta:\nDelete criteria absent from request\nValidate new criterion IDs exist in DB\nInsert new criteria"]
-    B_SAVE_Q["Update queue entity · Save"]
-    B_200["Return 200"]
+    B_DCS_US -->|"name available"| B_US_INS["INSERT wdp.queues<br/>+ wdp.queue_criterion<br/>(NO user assignments)"]
+    B_DCS_UK -->|"name available"| B_UK_INS_PHY["INSERT nap.queues<br/>+ nap.queue_criterion<br/>(NO user assignments)"]
 
-    B_IN --> B1 --> B2 --> B_ROLE
-    B_ROLE -->|"Invalid"| B_401
-    B_ROLE -->|"Valid"| B3 --> B_VAL
-    B_VAL -->|"Fails"| B_400V
-    B_VAL -->|"Passes"| B4 --> B_TX --> B_DUP
-    B_DUP -->|"Duplicate"| B_400D
-    B_DUP -->|"Unique"| B_METHOD
+    B_US_TYPE -->|"LOGICAL_EXTERNAL /<br/>SKILLS_INTERNAL /<br/>DEFAULT_QUEUE"| B_US_INS_FULL["Resolve user IDs from login names<br/>INSERT wdp.queues<br/>+ wdp.queue_criterion<br/>+ wdp.user_queue mappings"]
+    B_UK_TYPE -->|"LOGICAL_EXTERNAL /<br/>SKILLS_INTERNAL /<br/>DEFAULT_QUEUE"| B_UK_INS_FULL["Resolve user IDs from login names<br/>INSERT nap.queues<br/>+ nap.queue_criterion<br/>+ nap.user_queue mappings"]
 
-    B_METHOD -->|"POST"| B_QTYPE
-    B_QTYPE -->|"LOGICAL_EXTERNAL\nSKILLS_INTERNAL\nDEFAULT_QUEUE"| B_EXT_Q --> B_201
-    B_QTYPE -->|"LOGICAL_INTERNAL"| B_INT_Q
-    B_INT_Q -->|"DC call fails"| B_DC_FAIL
-    B_INT_Q -->|"Name valid"| B_201
+    B_US_INS --> B_OK["HTTP 201"]
+    B_US_INS_FULL --> B_OK
+    B_UK_INS_PHY --> B_UK_GAP["⚠️ UK writes use ukTransactionManager<br/>but service-level TX is on usTransactionManager<br/>→ UK writes NOT covered by outer TX"]
+    B_UK_INS_FULL --> B_UK_GAP
+    B_UK_GAP --> B_OK
 
-    B_METHOD -->|"PUT"| B_FIND
-    B_FIND -->|"Not found"| B_400NF
-    B_FIND -->|"Found"| B_ASSIGN
-    B_ASSIGN -->|"Yes"| B_DELTA_U --> B_DELTA_C --> B_SAVE_Q --> B_200
-    B_ASSIGN -->|"No"| B_DELTA_C
+    B_OK -->|"persistence error<br/>during US path"| B_RB["usTransactionManager rollback<br/>HTTP 500"]
+    B_OK -->|"persistence error<br/>during UK path"| B_PARTIAL["⚠️ Partial commit possible<br/>HTTP 500"]
 ```
+
+**Critical structural finding (Flow B):** The `@Transactional` annotation on `QueueServiceImpl.createQueue()` and `updateQueue()` uses `jakarta.transaction.Transactional`, which without an explicit qualifier picks the bean marked `@Primary` — the **US transaction manager**. UK queue operations execute against `nap` repositories which use `ukTransactionManager`. The service-level transaction therefore does **not** cover UK writes. The v1.0 claim of "one transaction per datasource" was technically achieved by within-repository propagation only — it is not guaranteed by the service-level annotation and a partial-write window exists.
 
 ---
 
-### Flow C — User View (Column Preferences)
+### Flow C — LFT Report Lifecycle
 
 ```mermaid
 flowchart TD
-    C_IN["HTTP Request\nPOST /user-view\nGET /user-view?gridName=<name>"]
+    C_IN[/"POST /lft-report"/]
+    C_IN --> C_JWT["JWT extract: isInternal · userId ·<br/>userFirm · userEntity"]
+    C_JWT --> C_INT{"Internal user?"}
+    C_INT -->|"yes"| C_PERSIST_GATE["Skip entity-auth checks"]
+    C_INT -->|"no"| C_GRID{"gridName?"}
 
-    C1["JWT decoded\nExtract userId · userType"]
-    C_METHOD{{"POST or GET?"}}
+    C_GRID -->|"orgMgmtParentListGrid /<br/>orgMgmtChildListGrid"| C_PE["Validate parentEntityId<br/>matches JWT napParentEntity<br/>(reads nap.nap_parent_entity)"]
+    C_PE -->|"mismatch"| C_403_PE["UnauthorizedException<br/>→ HTTP 403"]
+    C_PE -->|"match"| C_PERSIST_GATE
 
-    %% POST path
-    C_VALIDATE["Validate mandatory fields\n(gridName, columnPrefs)\nBadRequestException if missing"]
-    C_LOOKUP{{"Row exists in\nnap.user_grid_preferences\n(userId + userType + gridName)?"}}
-    C_UPDATE["UPDATE column_config + z_updt timestamp"]
-    C_INSERT["INSERT new row"]
-    C_POST_OUT["Return 200 (empty body)"]
+    C_GRID -->|"disputesListGrid"| C_PLAT{"platform?"}
 
-    %% GET path
-    C_GET_DB{{"Row found in\nnap.user_grid_preferences?"}}
-    C_DESER["Deserialize column_config JSON\n→ List<ColumnPrefResponse>"]
-    C_200["Return 200 with columnPrefs"]
-    C_NULL["Return 200 with null body"]
+    C_PLAT -->|"NAP"| C_NAP["Check NAP entities<br/>present in JWT"]
+    C_NAP -->|"missing"| C_403_NAP["UnauthorizedException<br/>→ HTTP 403"]
+    C_NAP -->|"ok"| C_PERSIST_GATE
 
-    C_IN --> C1 --> C_METHOD
-    C_METHOD -->|"POST"| C_VALIDATE --> C_LOOKUP
-    C_LOOKUP -->|"Exists"| C_UPDATE --> C_POST_OUT
-    C_LOOKUP -->|"New"| C_INSERT --> C_POST_OUT
+    C_PLAT -->|"PIN"| C_PIN_VAL["validateSearchCriteriaOrEntityHierarchy()<br/>requires entityHierarchy or case identifiers"]
+    C_PIN_VAL -->|"missing"| C_400_PIN["BadRequestException<br/>HTTP 400"]
+    C_PIN_VAL -->|"hierarchy present"| C_CHAS_EH["Call CHAS<br/>POST /entity-authorize"]
+    C_PIN_VAL -->|"no hierarchy"| C_LOOKUP["Lookup merchant/chain ID<br/>from wdp.case<br/>(fallback wdp.action)"]
+    C_LOOKUP -->|"null"| C_403_NULL["ForbiddenException<br/>HTTP 403"]
+    C_LOOKUP -->|"found"| C_CHAS_M["Call CHAS<br/>POST /authorize"]
 
-    C_METHOD -->|"GET"| C_GET_DB
-    C_GET_DB -->|"Found"| C_DESER --> C_200
-    C_GET_DB -->|"Not found"| C_NULL
+    C_CHAS_EH -->|"RestClientException"| C_403_CHAS["ForbiddenException<br/>HTTP 403<br/>⚠️ misrepresents infra fault as auth denial"]
+    C_CHAS_M -->|"RestClientException"| C_403_CHAS
+    C_CHAS_EH -->|"denied"| C_403_DENY["ForbiddenException<br/>HTTP 403"]
+    C_CHAS_M -->|"denied"| C_403_DENY
+    C_CHAS_EH -->|"granted"| C_PERSIST_GATE
+    C_CHAS_M -->|"granted"| C_PERSIST_GATE
+
+    C_PERSIST_GATE --> C_VAL_INPUT{"Input validation<br/>· merchantId numeric<br/>· merchantName ≥ 4 chars"}
+    C_VAL_INPUT -->|"fail"| C_400_INPUT["BadRequestException<br/>HTTP 400"]
+    C_VAL_INPUT -->|"ok"| C_COUNT_INPROG{"INPROGRESS count<br/>≥ max-inprogress-requests?"}
+    C_COUNT_INPROG -->|"yes"| C_400_INPROG["HTTP 400<br/>'Too Many Exports Inprogress'"]
+    C_COUNT_INPROG -->|"no"| C_COUNT_TOTAL{"Total count<br/>≥ max-total-requests?"}
+    C_COUNT_TOTAL -->|"yes"| C_400_TOTAL["HTTP 400<br/>'Download Area Full'"]
+    C_COUNT_TOTAL -->|"no"| C_INS["INSERT wdp.lft_report<br/>status=PENDING<br/>NO @Transactional"]
+    C_INS -->|"JSON serialise fail"| C_400_JSON["BadRequestException<br/>HTTP 400"]
+    C_INS -->|"DB error"| C_500_DB["HTTP 500<br/>orphan/partial row possible"]
+    C_INS -->|"ok"| C_201["HTTP 201"]
+
+    C_DOWNLOAD[/"GET /lft-report/download/{reportName}"/]
+    C_DOWNLOAD --> C_LOAD["Load row by userId+userFirm+reportName"]
+    C_LOAD --> C_S3{"s3_key_path null?"}
+    C_S3 -->|"yes"| C_404_DL["NotFoundException<br/>HTTP 404"]
+    C_S3 -->|"no"| C_PRES["AWS S3 presigner<br/>region us-east-2 (hardcoded)<br/>TTL 15 min (hardcoded)"]
+    C_PRES -->|"SdkException"| C_500_S3["RuntimeException<br/>HTTP 500"]
+    C_PRES -->|"ok"| C_302["HTTP 302<br/>Location: presigned URL"]
 ```
+
+**Critical structural finding (Flow C):**
+- `wdp.lft_report` insert is **non-transactional**. v1.0 already flagged this; v1.1 confirms.
+- CHAS `RestClientException` is mapped to `ForbiddenException` → HTTP 403. From the caller's perspective an infrastructure outage (CHAS down, network blip) is indistinguishable from a legitimate authorization denial. This is a 🔴 HIGH operational concern.
+- The `wdp.case` / `wdp.action` lookup query in `USCaseSearchDaoImpl` catches and silently logs DB exceptions, returning `null`. A swallowed exception cascades to a misleading 403 rather than surfacing an upstream fault.
 
 ---
 
-### Flow D — LFT Report Lifecycle
+### Flow D — User View (Column Preferences)
 
 ```mermaid
 flowchart TD
-    D_IN["HTTP Request\nPOST /lft-report\nGET /lft-report\nDELETE /lft-report\nDELETE /lft-report/{reportName}\nGET /lft-report/download/{reportName}"]
+    D_IN_P[/"POST /user-view"/]
+    D_IN_G[/"GET /user-view?gridName="/]
 
-    D1["JWT decoded\nExtract isInternal · userId\nuserFirm · userEntity hierarchy"]
-    D_METHOD{{"Method / Path?"}}
+    D_IN_P --> D_JWT_P["JWT extract: isInternal · userId"]
+    D_IN_G --> D_JWT_G["JWT extract: isInternal · userId"]
 
-    %% POST path
-    D_AUTH{{"External user?\n(conditional authorization)"}}
-    D_AUTH_GRID{{"gridName type?"}}
-    D_AUTH_PARENT["Validate parentEntityId\nvs JWT napParentEntity"]
-    D_AUTH_NAP["Require non-empty\nNAP entity in JWT"]
-    D_AUTH_PIN["Call core-hierarchy-\nauthorization-service\n→ authorize entity access"]
-    D_AUTH_MID["Lookup parentEntityId by name\nfrom nap.nap_parent_entity\nValidate vs token entities"]
-    D_AUTH_FAIL["ForbiddenException → 403"]
-    D_PIN_FAIL["CHAS unavailable:\nRestClientException → 403"]
+    D_JWT_P --> D_VAL{"Mandatory fields present?<br/>(gridName, columnPrefs)"}
+    D_VAL -->|"no"| D_400["BadRequestException<br/>HTTP 400"]
+    D_VAL -->|"yes"| D_LOAD_P["Load by userId + userType + gridName"]
+    D_LOAD_P --> D_EXISTS{"Row exists?"}
+    D_EXISTS -->|"yes"| D_UPD["UPDATE column_config JSON<br/>(implicit TX)"]
+    D_EXISTS -->|"no"| D_INS["INSERT nap.user_grid_preferences<br/>(implicit TX)"]
+    D_UPD --> D_201["HTTP 201"]
+    D_INS --> D_201
 
-    D_COUNT{{"INPROGRESS count ≥\nmax-inprogress-requests\nOR total count ≥\nmax-total-requests?"}}
-    D_400CAP["Return 400\n(soft error body — cap exceeded)"]
-    D_PERSIST["Persist USUserReportEntity\nstatus=PENDING\nto wdp.lft_report\n(non-transactional write)"]
-    D_201["Return 201"]
-
-    %% GET list path
-    D_GET_LIST["Query wdp.lft_report\nby userId + userFirm\nORDER BY updated_at DESC"]
-    D_GET_OUT{{"Records found?"}}
-    D_200["Return 200 UserReportResponse"]
-    D_404["Return 404"]
-
-    %% DELETE all path
-    D_DEL_ALL["Query IDs by userId + userFirm\nBulk-delete from wdp.lft_report"]
-    D_DEL_OUT["Return 200 or 404"]
-
-    %% DELETE named path
-    D_DEL_ONE["Query by reportName + userId + userFirm\nDelete row"]
-    D_DEL_ONE_OUT["Return 200 or 404"]
-
-    %% Download path
-    D_DL_LOOKUP["Lookup wdp.lft_report row\nRead s3_key_path column"]
-    D_DL_NULL{{"s3_key_path\nis null?"}}
-    D_DL_404["NotFoundException → 404"]
-    D_DL_S3["Build AWS S3 presigned GET URL\n15-min TTL\nbucket: wdp-lft-report\nregion: US_EAST_2 (hardcoded)"]
-    D_DL_S3_FAIL["SdkException → RuntimeException → 500"]
-    D_302["Return HTTP 302\nLocation: presigned URL"]
-
-    D_IN --> D1 --> D_METHOD
-
-    D_METHOD -->|"POST /lft-report"| D_AUTH
-    D_AUTH -->|"External user"| D_AUTH_GRID
-    D_AUTH -->|"Internal user — skip auth checks"| D_COUNT
-    D_AUTH_GRID -->|"orgMgmtParentListGrid\norgMgmtChildListGrid"| D_AUTH_PARENT --> D_COUNT
-    D_AUTH_GRID -->|"disputesListGrid (NAP)"| D_AUTH_NAP --> D_COUNT
-    D_AUTH_GRID -->|"PIN platform"| D_AUTH_PIN
-    D_AUTH_GRID -->|"orgMgmtMidListGrid"| D_AUTH_MID --> D_COUNT
-    D_AUTH_PARENT -->|"Mismatch"| D_AUTH_FAIL
-    D_AUTH_PIN -->|"Authorized"| D_COUNT
-    D_AUTH_PIN -->|"Denied / unavailable"| D_PIN_FAIL
-    D_COUNT -->|"Cap exceeded"| D_400CAP
-    D_COUNT -->|"Within limits"| D_PERSIST --> D_201
-
-    D_METHOD -->|"GET /lft-report"| D_GET_LIST --> D_GET_OUT
-    D_GET_OUT -->|"Found"| D_200
-    D_GET_OUT -->|"Empty"| D_404
-
-    D_METHOD -->|"DELETE /lft-report"| D_DEL_ALL --> D_DEL_OUT
-    D_METHOD -->|"DELETE /lft-report/{name}"| D_DEL_ONE --> D_DEL_ONE_OUT
-
-    D_METHOD -->|"GET /lft-report/download/{name}"| D_DL_LOOKUP --> D_DL_NULL
-    D_DL_NULL -->|"null"| D_DL_404
-    D_DL_NULL -->|"Present"| D_DL_S3
-    D_DL_S3 -->|"SDK failure"| D_DL_S3_FAIL
-    D_DL_S3 -->|"Success"| D_302
+    D_JWT_G --> D_LOAD_G["Load by userId + userType + gridName"]
+    D_LOAD_G --> D_FOUND{"Found?"}
+    D_FOUND -->|"yes"| D_200["HTTP 200<br/>UserViewResponse"]
+    D_FOUND -->|"no"| D_NULL["HTTP 200<br/>null body"]
 ```
 
 ---
 
-## Boundaries
+## Functional Behaviour
 
-### Inbound Interfaces
+**Classification & routing logic**
 
-| Source | Protocol | Endpoint / Trigger | Payload / Description |
-|--------|----------|--------------------|-----------------------|
-| WDP Ops Portal (COMP-50) | REST | All endpoints under `/merchant/gcp/user-queue-skill` | JWT-authenticated portal UI requests — user management, queue management, view preferences |
-| WDP Merchant Portal (COMP-49) | REST | All endpoints under `/merchant/gcp/user-queue-skill` | JWT-authenticated portal UI requests |
-| Unknown downstream callers | REST | `POST /user` | Likely invoked on login/session-start to register or sync user from IDP. Callers not determinable from source — no `@KnownCallers` annotation present |
-| Unknown export scheduler or portal | REST | `POST /lft-report` | Async export request submission |
+- **Region routing** for queue endpoints — the `{region}` path variable is validated against the `Region` enum (UK or US). The value drives a controller-level branch into the UK or US repository / datasource. Invalid region → HTTP 400.
+- **V1 vs V2 user lookup** — V1 falls back to IDP on DB miss and persists the user; V2 is DB-only with no IDP call and no insert.
+- **Internal vs external user** — determined by inspecting the JWT `iss` claim for the substring `us_worldpay_fis_int`. External users are subject to additional orgId validation, NAP/PIN entity-authorization gates on LFT, and a different role allowlist.
 
-### Outbound Interfaces
+**Business rules applied in this component**
 
-| Target | Protocol | Endpoint / Resource | Purpose | On failure |
-|--------|----------|---------------------|---------|------------|
-| IDP Internal (`idp.internal.user-api-base-url`) | HTTPS REST GET | IDP internal user API | Fetch user details on first V1 login (IDP fallback path only) | RestClientException → UserSkillsServiceException → 500 |
-| IDP External (`idp.external.user-api-base-url`, `idp.external.user-api-fraud-disputes-merchant-url`) | HTTPS REST GET | IDP external user API (two endpoints: standard and MFD) | Fetch external user details on first V1 login | RestClientException → 500 |
-| Display Code Service (`mdvs-gcp-display-code-service.wdp-micro:8082`) | HTTP POST (in-cluster) | `/merchant/gcp/display-code/search` | Validate LOGICAL_INTERNAL queue name is not already a physical queue name | RestClientException → UserSkillsServiceException → 500 |
-| Core Hierarchy Authorization Service (`core-hierarchy-authorization-service.wdp-micro:8082`) | HTTP POST (in-cluster) | `/merchant/gcp/hierarchy-authorization` or `/entity-authorize` | Authorize entity hierarchy access for PIN platform users submitting LFT reports | RestClientException → ForbiddenException → 403 |
-| AWS S3 (`wdp-lft-report` bucket, region `us-east-2`) | AWS SDK v2 | S3 presigned URL generation | Generate 15-minute presigned GET URL for report download | SdkException → RuntimeException → 500 |
-| PostgreSQL (`nap` schema — UK datasource) | JPA/JDBC | Multiple tables — see Database Ownership | All UK user/queue/criterion/assignment operations | Uncaught DB exception → 500 |
-| PostgreSQL (`wdp` schema — US datasource) | JPA/JDBC | Multiple tables — see Database Ownership | All US queue/LFT report operations | Uncaught DB exception → 500 |
+- V1 external-user orgId match against IDP `customInfos.napParentEntity` / `iqOrgId`.
+- Role filtering of JWT `AuthorizationList` against `user.roles.internal` / `user.roles.external` config sets, additionally filtered to a `WDP_` prefix.
+- LFT count caps: `max-inprogress-requests` and `max-total-requests` (env-resolved).
+- LFT input validation: `merchantId` numeric; `merchantName` length ≥ 4.
+- PIN authorization gate via CHAS for external PIN users on POST /lft-report.
+- Queue criterion-ID existence check on PUT /{region}/queue — unknown IDs → 400.
+- Display Code Service "name not in use as a physical queue" check on LOGICAL_INTERNAL queue creation.
+
+**Idempotency posture per write endpoint**
+
+| Endpoint | Dedup key | DB unique constraint | Concurrent duplicate behaviour |
+|----------|-----------|----------------------|--------------------------------|
+| POST /user | `loginName + userType + orgId + userFirm` (external) or `loginName + userType` (internal) | None | Last-write-wins via load-then-save upsert pattern; no constraint to surface a violation |
+| POST /lft-report | `reportName + userId + userFirm` | None | Duplicate rows insertable; only soft-limited by count caps |
+| POST /user-view | `userId + userType + gridName` | None | Last-write-wins via load-then-save |
+| POST /{region}/queue | `queueName + queueType` | None — checked in app code via `findNameByQueueType*` | **Confirmed race window** — two concurrent requests can both pass the duplicate check and both insert |
+
+No `idempotency-key` header is read or written by any endpoint.
+
+---
+
+## Dependencies
+
+The service has six external dependencies plus two PostgreSQL datasources. **All five REST integrations share a single `RestTemplate` bean** defined as a plain `new RestTemplate()` — no connection timeout, no read timeout, no retries, no Resilience4j. The same bean is injected into both `IdpRestInvoker` and `DisputeRestInvoker`.
+
+| Dependency | Protocol & auth | Purpose | Timeouts | Retry | Resilience4j | Failure behaviour |
+|-----------|----------------|---------|----------|-------|--------------|-------------------|
+| **IDP Internal** | HTTPS GET; static Bearer + `X-SunGard-IdP-API-Key` | V1 user-lookup IDP fallback | None | None | Absent | `WebServiceException` → HTTP 400 or 500 |
+| **IDP External (standard)** | HTTPS GET; Bearer + Sungard key; selected when `userFirm == us_merchant` | V1 external user lookup | None | None | Absent | HTTP 400 or 500 |
+| **IDP External (MFD)** | HTTPS GET; MFD-specific Bearer + Sungard key; selected when `userFirm != us_merchant` | V1 external user lookup (fraud-disputes-merchant variant) | None | None | Absent | HTTP 400 or 500 |
+| **Display Code Service** *(COMP-28)* | HTTP POST; OAuth2 `client_credentials` token from `us_worldpay_fis_int` IDP via `TokenServiceImpl` | Validate LOGICAL_INTERNAL queue name not already a physical queue | None | None | Absent | `UserSkillsServiceException` → HTTP 500 |
+| **CHAS** *(COMP-03 — Core Hierarchy Authorization Service)* | HTTP POST `/entity-authorize` (when `entityHierarchy` present) or `/authorize` (when not); caller's JWT forwarded as Bearer | PIN authorization on POST /lft-report | None | None | Absent | `ForbiddenException` → HTTP 403 — **infra fault indistinguishable from auth denial** |
+| **AWS S3** | AWS SDK v2 `S3Presigner`; default credential chain | Generate 15-min presigned GET URL for LFT download (`wdp-lft-report` bucket, region `us-east-2` hardcoded) | N/A | None | Absent | `SdkException` → HTTP 500 |
+| **PostgreSQL nap** | JDBC via HikariCP (Spring Boot defaults — no overrides) | UK schema operations | HikariCP defaults | N/A | N/A | JPA exception → HTTP 500 |
+| **PostgreSQL wdp** | JDBC via HikariCP (Spring Boot defaults — no overrides) | US schema operations | HikariCP defaults | N/A | N/A | JPA exception → HTTP 500 |
 
 ---
 
 ## Database Ownership
 
-### Tables Owned (written by this component)
+### Tables Owned (Read + Write)
 
-#### UK Datasource — `nap` schema
-
-| Schema.Table | Purpose | Key columns | Notes |
-|--------------|---------|-------------|-------|
-| `nap.users` | User registry — all WDP platform users | `id`, `login_name`, `user_type`, `orgid`, `is_active`, `c_usr_firm`, `role` (array) | Upserted on V1 GET (IDP fallback) and POST /user. Auto-enrol side-effect writes to `nap.user_queue`. |
-| `nap.queues` | Queue definitions (UK region) | `id`, `name`, `type`, `orgid`, `criteria_summary` | Written by POST and PUT /{region}/queue (UK path). @Transactional with queue_criterion and user_queue. |
-| `nap.queue_criterion` | Filter criteria per queue (UK region) | `id`, `queue_id` (FK), `type`, `category`, `name`, `value`, `operator_symbol` | One-to-many child of nap.queues. Cascade ALL. Same transaction as queue write. |
-| `nap.user_queue` | User-to-queue assignments (UK region) | `id`, `user_id` (FK→users), `queue_id` (FK→queues) | Join table. Written in same transaction as queue create/update. Also written on auto-enrol (POST /user). |
-| `nap.user_grid_preferences` | User column-view preferences (serialized JSON) | `id`, `user_id`, `user_type`, `grid_name`, `column_config` (JSON) | Upserted by POST /user-view. |
-
-#### US Datasource — `wdp` schema
+#### UK datasource — `nap` schema · `ukTransactionManager`
 
 | Schema.Table | Purpose | Key columns | Notes |
 |--------------|---------|-------------|-------|
-| `wdp.queues` | Queue definitions (US region) | `id`, `name`, `type`, `orgid` | Written by POST and PUT /{region}/queue (US path). Separate transaction manager from nap — no XA. |
-| `wdp.queue_criterion` | Filter criteria per queue (US region) | `id`, `queue_id` (FK), `type`, `category`, `name`, `value`, `operator_symbol` | Same transaction scope as wdp.queues. |
-| `wdp.user_queue` | User-to-queue assignments (US region) | `id`, `user_id`, `queue_id` | Same transaction scope as wdp.queues. |
-| `wdp.lft_report` | Async LFT export request tracking | `id`, `user_id`, `user_firm`, `grid_name`, `report_name`, `status`, `s3_key_path`, `criteria` (JSON), `user_entity` (JSON), `platform` | Written by POST /lft-report. Read by GET, DELETE, and download endpoints. Write is **not** transactional — no `@Transactional` on create path. |
+| `nap.users` | User registry — all WDP platform users | `id`, `login_name`, `user_type`, `orgid`, `is_active`, `c_usr_firm`, `role` (array) | Upserted on V1 GET (IDP fallback) and POST /user. **No `@UniqueConstraint`**. POST /user has no `@Transactional` — auto-enrol side effect runs in a separate implicit transaction. |
+| `nap.queues` | UK queue definitions | `id`, `name`, `type`, `orgid`, `criteria_summary` | Written by POST/PUT `/{region}/queue` (UK path). **Service-level `@Transactional` does not bind to `ukTransactionManager`** — see Risks. |
+| `nap.queue_criterion` | Filter criteria per UK queue | `id`, `queue_id` (FK), `type`, `category`, `name`, `value`, `operator_symbol` | Child of `nap.queues`. `@Modifying` delete on PUT path. Same caveat as parent table re service-level TX binding. |
+| `nap.user_queue` | UK user-to-queue assignments | `id`, `user_id` (FK→users), `queue_id` (FK→queues) | Written in queue create/update path AND on POST /user auto-enrol. The auto-enrol write runs **outside** the queue transaction context and outside the user-upsert implicit transaction. |
+| `nap.user_grid_preferences` | User column-view preferences (JSON) | `id`, `user_id`, `user_type`, `grid_name`, `column_config` (JSON) | Upserted by POST /user-view. No `@Transactional`. |
+
+#### US datasource — `wdp` schema · `usTransactionManager` (`@Primary`)
+
+| Schema.Table | Purpose | Key columns | Notes |
+|--------------|---------|-------------|-------|
+| `wdp.queues` | US queue definitions | `id`, `name`, `type`, `orgid` | Written by POST/PUT `/{region}/queue` (US path). Service-level `@Transactional` correctly binds here. |
+| `wdp.queue_criterion` | Filter criteria per US queue | `id`, `queue_id` (FK), `type`, `category`, `name`, `value`, `operator_symbol` | Same TX scope as `wdp.queues`. |
+| `wdp.user_queue` | US user-to-queue assignments | `id`, `user_id`, `queue_id` | Same TX scope as `wdp.queues`. |
+| `wdp.lft_report` | Async LFT export-request tracking | `id`, `user_id`, `user_firm`, `grid_name`, `report_name`, `status`, `s3_key_path`, `criteria` (JSON), `user_entity` (JSON), `platform` | **Non-transactional** insert — no `@Transactional` on `createUserReport`. Status state-machine owner unknown — this service only writes `PENDING` and reads `INPROGRESS` for count-cap checks. |
 
 ### Tables Read (not owned by this component)
 
 | Schema.Table | Owned by | Why accessed |
 |--------------|----------|--------------|
-| `nap.nap_parent_entity` | Unknown — read-only consumer | LFT report creation: lookup `parentEntityId` by name for `orgMgmtMidListGrid` validation |
-| `wdp.case` | CaseManagementService or DisputeService | LFT report creation: Merchant/chain ID lookup for PIN platform authorization |
-| `wdp.action` | CaseManagementService or DisputeService | LFT report creation: source case ID lookup (fallback join with wdp.case) |
+| `nap.nap_parent_entity` | ⚠️ Owner TBC — read-only in this repo (confirmed: no `@Modifying`, no `save()`, no native writes) | LFT validation: lookup `parentEntityId` by name for `orgMgmtMidListGrid` validation |
+| `wdp.case` | ⚠️ Owner TBC (candidates: CaseManagementService COMP-23 or DisputeService COMP-22) — read-only in this repo (confirmed) | LFT PIN authorization: merchant/chain ID lookup |
+| `wdp.action` | ⚠️ Owner TBC (candidates: CaseManagementService COMP-23 or CaseActionService COMP-24) — read-only in this repo (confirmed) | LFT PIN authorization: source case ID fallback join |
 
-### Transaction Scope Notes
+**Read-only confirmations from source-verification pass:** `ParentEntityRepository`, `USCaseSearchDaoImpl` for `wdp.case`, and the `wdp.action` JOIN query all contain SELECT-only operations. No `@Modifying`, no `save()`, no native UPDATE/INSERT/DELETE found.
 
-- `createQueue` and `updateQueue` are `@Transactional(rollbackOn = Exception.class)` — queue + criterion + user_queue inserts and deletes are all in **one transaction per datasource**.
-- The UK (`nap`) and US (`wdp`) datasources use **separate JPA EntityManagerFactory instances and separate transaction managers**. There is **no XA/distributed transaction** between them. A failure after committing one datasource but before committing the other cannot be automatically rolled back.
-- `lft_report` inserts are **not transactional** — no `@Transactional` annotation on the `createUserReport` path.
+### Transaction-scope summary
+
+- UK and US datasources have **independent `JpaTransactionManager` instances**: `ukTransactionManager` and `usTransactionManager` (`@Primary`). **No XA**.
+- **Queue create/update** declares `@Transactional(rollbackOn = Exception.class)` using `jakarta.transaction.Transactional`. This binds to the `@Primary` US transaction manager only. UK writes are NOT wrapped by the service-level transaction — they run under per-repository implicit transactions on `ukTransactionManager`.
+- **POST /user** has **no** `@Transactional`. The user upsert and the SKILLS_INTERNAL/DEFAULT_QUEUE auto-enrol are separate implicit transactions on `ukTransactionManager`.
+- **POST /lft-report** has **no** `@Transactional`.
+- **POST /user-view** has **no** `@Transactional`.
+- **No `SELECT FOR UPDATE` and no row locks** anywhere in source.
 
 ---
 
@@ -373,23 +365,27 @@ flowchart TD
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Replica count | `{{ replicas-gcp-user-queue-skill-service }}` | XL Deploy / Helm placeholder. Exact production value not determinable from source. |
-| HPA | None | No HorizontalPodAutoscaler manifest present |
-| Memory request | `1024Mi` | |
-| Memory limit | `2048Mi` | |
-| CPU request | Not set | Not specified in resources.yaml |
-| CPU limit | Not set | Not specified in resources.yaml |
-| Deployment type | Kubernetes Deployment | Standard stateless deployment |
-| Rollout strategy | RollingUpdate — maxSurge: 1, maxUnavailable: 0 | |
-| minReadySeconds | 30 | Set in resources.yaml |
-| PodDisruptionBudget | None | No PDB manifest present |
-| Topology spread | ScheduleAnyway — best-effort, not enforced | Label selector uses `${BRANCH_NAME_PLACEHOLDER}` suffix — functional limitation if branch name contains special characters |
-| Observability | OTel Java agent · Spring Actuator · Logstash · Prometheus | OTel: `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default`. Actuator: `/info`, `/health`, `/prometheus`. Liveness: `/livez`. Readiness: `/readyz`. |
-| Context path | `/merchant/gcp/user-queue-skill` | Set via `SERVER_SERVLET_CONTEXT_PATH` env var |
-| Async thread pool | `async.corePoolSize`, `async.maxPoolSize`, `async.queueCapacity` configured in application.yaml | AsyncConfiguration.java is present but async task execution is **not used** in any active endpoint — dead configuration |
-| S3 region | `us-east-2` (hardcoded — `Region.US_EAST_2`) | Not environment-configurable |
-| S3 presigned URL TTL | 15 minutes (hardcoded) | Not configurable |
-| Internal firm constant | `us_worldpay_fis_int` (hardcoded) | `ApplicationConstants.INTERNAL_FIRM` |
+| Replica count | `{{ replicas-gcp-user-queue-skill-service }}` | XL Deploy / Helm placeholder. **No default visible in repo** — environment-config-only. No `values.yaml` and no Helm chart present. |
+| HPA | Absent | No `HorizontalPodAutoscaler` resource. |
+| Memory request / limit | `1024Mi` / `2048Mi` | |
+| CPU request / limit | **Not configured** | Both absent from `resources.yaml`. Best-effort QoS — no cap, no scheduling guarantee. |
+| Deployment type | Kubernetes `Deployment` + `Service` (ClusterIP) + `Ingress` | nginx ingress with CORS enabled and TLS. |
+| Rollout strategy | `RollingUpdate` — `maxSurge: 1`, `maxUnavailable: 0` | |
+| `minReadySeconds` | 30 | Placed under `spec.template.spec` rather than `spec` — same misplacement pattern observed across other components; effective behaviour depends on the live K8s API server's tolerance. |
+| PodDisruptionBudget | Absent | Voluntary disruptions can take all replicas down simultaneously. |
+| Topology spread | `maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, `topologyKey: kubernetes.io/hostname` | Label selector uses `${BRANCH_NAME_PLACEHOLDER}` consistent across metadata, selector, and template labels — **no label mismatch**. `ScheduleAnyway` is advisory, not a hard guarantee. |
+| Liveness probe | `GET /merchant/gcp/user-queue-skill/livez` port 8082 | Actuator-backed via `management.endpoint.health.group.liveness.additional-path: server:/livez`. Initial delay 25s, period 10s, failure threshold 3. |
+| Readiness probe | `GET /merchant/gcp/user-queue-skill/readyz` port 8082 | Actuator-backed via `management.endpoint.health.group.readiness.additional-path: server:/readyz`. Initial delay 15s, period 10s, failure threshold 3. |
+| Startup probe | Absent | |
+| Container port | 8082 | |
+| Database connection pool | HikariCP (Spring Boot defaults) | **No** sizing or timeout overrides for either nap or wdp datasource. Only `username`, `password`, `jdbc-url`, `driverClassName` configured. |
+| OpenTelemetry | Java agent injected via `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default` annotation | |
+| Spring Actuator | `info`, `health`, `prometheus` endpoints exposed | |
+| Prometheus / Micrometer | Enabled | |
+| Logstash | ⚠️ **Incomplete** | `logstash-logback-encoder` dependency present and `logstash.server.host.port` property defined, but **no `logback-spring.xml` in the repo**. No appender wires the property. Integration is non-functional unless a logback config is mounted at runtime via ConfigMap — not visible in this repo. |
+| Spring profiles | `${gcp_env}` — selects `application-{local,dev,cert,stg,uat,prod,test}.yaml` | All seven profile files present in the repo. |
+| Hardcoded constants | S3 region `us-east-2`; presigned-URL TTL 15 minutes; internal-firm constant `us_worldpay_fis_int` | None environment-configurable. |
+| Async thread pool | `async.corepoolsize`, `async.maxpoolsize`, `async.queuecapacity` configured in `application.yaml`; `AsyncConfiguration` class is `@EnableAsync` and the executor bean is created at startup | ⚠️ **Confirmed dead config** — no `@Async` annotation exists anywhere in `src/main/java`, the executor is never invoked. |
 
 ---
 
@@ -397,75 +393,91 @@ flowchart TD
 
 | Decision | ADR reference | Notes |
 |----------|---------------|-------|
-| Service is a data provider only — routing decisions made externally | Local decision | Stores queue criteria and user assignments. Matching of live cases to queues is NOT performed here — downstream caller responsibility. |
-| Dual-datasource design: separate nap (UK) and wdp (US) schemas from same pod | Local decision | No XA transaction. UK and US writes cannot be atomically coordinated. |
-| No transactional outbox | DEC-001 — ABSENT | All writes are direct table mutations. No event publication accompanies any write. Confirmed explicitly from source. |
-| No Kafka involvement | DEC-003, DEC-005 — NOT APPLICABLE | No Kafka dependency in pom.xml. Neither producer nor consumer. |
-| No PAN data | DEC-004 — NOT APPLICABLE | Service stores dispute routing metadata only. No PAN fields in any entity. |
-| No Resilience4j on any outbound call | DEC-014 — DEVIATION | No `resilience4j` dependency in pom.xml. All four external dependencies (IDP internal, IDP external, Display Code Service, CHAS, AWS S3 SDK) have no circuit breaker, bulkhead, or rate-limiter. |
-| No REST timeouts on any outbound call | Local decision | All `RestTemplate` instances use `CommonConfig.getRestTemplate()` — plain `new RestTemplate()` with no connection or read timeout configured. |
-| SKILLS_INTERNAL queue type used as skill model | Local decision | No dedicated "skill" entity exists. Skills are represented by `SKILLS_INTERNAL` queue type. User skill assignment = user_queue join row to a SKILLS_INTERNAL queue. |
-| lft_report insert is non-transactional | Local decision | `@Transactional` is absent on the LFT report create path. A partial failure cannot be automatically rolled back. |
-| Region-specific UK/US role validation removed | Local decision | A commented-out `validateUserRole` method with separate UK/US role sets (`internalUKRoles`, `externalUKRoles`, `internalUSRoles`, `externalUSRoles`) was replaced by a single queue-type-based `validateRole`. The removed config properties no longer exist in application YAML. |
+| Service is a **data provider only** — does not perform live case-to-queue routing decisions | Local decision | Stores criteria and assignments. Live-case matching is a downstream component (unconfirmed). HANDOVER OQ resolved: COMP-30 is *not* the routing decision-maker. |
+| **Dual-datasource design** — separate `nap` (UK) and `wdp` (US) schemas served from the same pod, with separate `EntityManagerFactory` and `JpaTransactionManager` per datasource | Local decision | No XA. UK and US writes cannot be atomically coordinated. |
+| **No transactional outbox** | DEC-001 — ABSENT | All writes are direct table mutations. No event publication. Confirmed explicitly. |
+| **No Kafka involvement** | DEC-003, DEC-005 — N/A | No `spring-kafka` dependency. Neither producer nor consumer. |
+| **No PAN data path** | DEC-004, DEC-019 — N/A | No PAN columns or fields anywhere. Confirmed. |
+| **No Resilience4j** on any outbound call | DEC-014 — DEVIATION | Confirmed by absence of `resilience4j` dependency in `pom.xml`. |
+| **No REST timeouts** on any outbound call | Local decision | All five REST integrations share a single `new RestTemplate()` bean with no timeouts. |
+| **`@Transactional` binds to `@Primary` US TX manager** | Local — **defect-in-design** | Service-level `@Transactional` on queue create/update uses `jakarta.transaction.Transactional` and binds to `usTransactionManager` (`@Primary`). UK queue + criterion + user_queue writes are NOT covered by the service-level transaction. New 🔴 HIGH risk. |
+| **POST /user has no `@Transactional`** | Local — **defect-in-design** | User upsert and SKILLS_INTERNAL/DEFAULT_QUEUE auto-enrol run in separate implicit transactions. Auto-enrol failure leaves a user row with no queue assignments. New 🔴 HIGH risk. |
+| **POST /lft-report has no `@Transactional`** | Local decision | Insert is non-transactional — partial-write windows possible. |
+| **CHAS infra failure → HTTP 403** | Local decision | `RestClientException` from CHAS is caught and rethrown as `ForbiddenException`. Infra outage is indistinguishable from auth denial from the caller's view. |
+| **SKILLS_INTERNAL and DEFAULT_QUEUE queue types are the auto-enrol targets** | Local decision | No dedicated "skill" entity exists — skills are modelled as queues of these two types. Auto-enrol set expanded from v1.0 (`SKILLS_INTERNAL` only) to include `DEFAULT_QUEUE`. |
+| **Region-specific UK/US role validation removed** | Local decision | A commented-out `validateUserRole` method previously used separate `internalUKRoles` / `externalUKRoles` / `internalUSRoles` / `externalUSRoles` config sets. It was replaced by a single queue-type-based `validateRole`. The four removed config keys no longer exist in YAML. No ADR or ticket reference in source. |
+| **Application-level role enforcement** rather than Spring Security filter chain | Local decision | Spring Security only validates the JWT signature and issuer. All `AuthorizationList` claim intersection logic lives in `AuthorizationServiceImpl` — invoked per controller method. |
 
 ---
 
 ## Risks and Constraints
 
+**Severity scale:** 🔴 HIGH — data loss / security breach / processing halt · 🟡 MEDIUM — degraded throughput / partial failure · 🟢 LOW — latent bug / dead code
+
 | Severity | Risk | Consequence |
 |----------|------|-------------|
-| 🔴 HIGH | No Resilience4j circuit breaker on IDP calls. IDP unavailability causes all V1 GET /users/{loginName} calls for non-cached users to return 500, blocking user session establishment across all portals. | Complete portal access failure for users not yet in local DB during IDP outage. |
-| 🔴 HIGH | No Resilience4j circuit breaker on Core Hierarchy Authorization Service. CHAS unavailability causes all POST /lft-report requests from external PIN users to return 403, misrepresenting the error as an authorization failure rather than an infrastructure fault. | Silent service degradation — PIN external users unable to create LFT reports; error appears as authorization denial. |
-| 🔴 HIGH | No XA transaction between UK (nap) and US (wdp) datasources. A queue operation that writes to both schemas cannot be atomically coordinated. | Partial write inconsistency between UK and US data if one datasource fails mid-operation. |
-| 🟡 MEDIUM | No REST timeout on any outbound call (`RestTemplate` has no connect or read timeout). | Any slow response from IDP, Display Code Service, CHAS, or AWS S3 blocks the calling thread indefinitely. Thread pool exhaustion under sustained slowness. |
-| 🟡 MEDIUM | lft_report insert is non-transactional. If the write partially fails (e.g. mid-field), no rollback occurs. | Orphaned or corrupt rows in wdp.lft_report. |
-| 🟡 MEDIUM | S3 region hardcoded to `us-east-2`. | LFT download will silently fail if the report bucket is ever moved to a different region without a code change and redeployment. |
-| 🟡 MEDIUM | Topology spread constraint uses `whenUnsatisfiable: ScheduleAnyway` with a `${BRANCH_NAME_PLACEHOLDER}` label selector suffix. | Spread is best-effort only — not enforced. Label matching may fail if branch name contains special characters, reducing availability isolation. |
-| 🟡 MEDIUM | Replica count is an XL Deploy/Helm placeholder. Exact production replica count is not determinable from source. | Cannot validate HA posture from code alone. Confirm with deployment team. |
-| 🟢 LOW | `spring-boot-devtools` present in pom.xml without `<scope>runtime</scope>`. | Developer tooling deployed to production pod — increased memory footprint, potential class-reload interference. |
-| 🟢 LOW | `AsyncConfiguration.java` exists and async thread pool is configured (`async.corePoolSize`, `async.maxPoolSize`, `async.queueCapacity`) but async task execution is not used in any active endpoint. | Dead configuration — may create confusion during future development if async is added without checking the existing but dormant config. |
-| 🟢 LOW | No `// TODO` or `// FIXME` markers in source. Commented-out `validateUserRole` block has no accompanying ADR or ticket reference. | Technical debt with no tracking artifact — may be forgotten. |
-| 🟢 LOW | POST /lft-report has no deduplication constraint — multiple rows with same `reportName` for the same user are not prevented by DB constraint. Only soft rate-limited by count caps. | Duplicate report requests can accumulate in wdp.lft_report if a caller retries without checking existing records. |
+| 🔴 HIGH | **`@Transactional` on queue create/update binds to the `@Primary` `usTransactionManager` only.** UK queue + criterion + user_queue writes execute under per-repository implicit transactions on `ukTransactionManager`, not the service-level boundary. | Mid-operation failure on a UK queue write can leave queue + criterion + user_queue partially committed across repositories. v1.0 documentation of "one transaction per datasource" was misleading. |
+| 🔴 HIGH | **POST /user has no `@Transactional`.** The user upsert and the auto-enrol `saveAll()` to `nap.user_queue` are separate implicit transactions. | Auto-enrol failure leaves the user row persisted with no queue assignments. Recovery requires a manual re-POST or out-of-band fix. |
+| 🔴 HIGH | **No Resilience4j circuit breaker on IDP calls.** IDP unavailability causes V1 GET /users/{loginName} to return HTTP 500 for any user not yet in the local DB. | Users absent from `nap.users` cannot establish portal sessions during an IDP outage — full portal-access failure for that cohort. |
+| 🔴 HIGH | **CHAS `RestClientException` → HTTP 403.** Infrastructure failure of CHAS is indistinguishable from a legitimate authorization denial from the caller's perspective. | Silent service degradation. PIN external users see "authorization denied" error during a CHAS outage and cannot create LFT reports. Operations and merchant support cannot easily distinguish the two cases. |
+| 🔴 HIGH | **No XA between `nap` and `wdp` datasources.** Any logical operation that needs to write to both schemas cannot be atomically coordinated. | Currently no endpoint writes to both schemas in one request — but the service is one architectural change away from this becoming a real data-consistency problem. |
+| 🔴 HIGH | **`USCaseSearchDaoImpl` swallows DB exceptions and returns null** during PIN authorization lookup. | A DB outage on `wdp.case` / `wdp.action` reads is rewritten to "merchant not found" → HTTP 403, masking a real fault. |
+| 🟡 MEDIUM | **No REST timeouts on any outbound call.** All five REST integrations share a `new RestTemplate()` with no connect or read timeout. | Slow IDP / Display Code / CHAS / S3 response blocks the calling Tomcat thread indefinitely. Sustained slowness exhausts the request thread pool. |
+| 🟡 MEDIUM | **`POST /lft-report` insert is non-transactional.** | A partial-write failure cannot be auto-rolled-back. Orphaned or partially-populated rows can accumulate in `wdp.lft_report`. |
+| 🟡 MEDIUM | **No `@UniqueConstraint` on any owned table.** POST /{region}/queue has a confirmed race window between duplicate-name check and insert. POST /lft-report and POST /user-view rely on application-level dedup only. | Duplicate rows are insertable under concurrent traffic for queue creation. For LFT and user-view the load-then-save pattern produces last-write-wins without explicit detection. |
+| 🟡 MEDIUM | **S3 region hardcoded to `us-east-2`.** | Bucket relocation requires a code change + redeploy. LFT downloads silently fail until then. |
+| 🟡 MEDIUM | **Topology spread is `ScheduleAnyway`** — best-effort, not enforced. | Spread guarantees do not survive scheduler pressure. Two replicas can land on the same node. |
+| 🟡 MEDIUM | **Replica count is environment-injected** with no default visible in repo. | HA posture cannot be verified from source. Confirm with deployment team. |
+| 🟡 MEDIUM | **HikariCP runs on Spring Boot defaults** for both datasources. | No tuned pool size, no timeout overrides. Pool sizing for two datasources from one pod is implicit — not deliberate. |
+| 🟡 MEDIUM | **Logstash integration is non-functional** without an externally-mounted `logback-spring.xml`. | Structured JSON logging to Logstash is silently absent. Console output only — operational visibility relies on the K8s log pipeline rather than the configured Logstash sink. |
+| 🟢 LOW | **`spring-boot-devtools` present without `<scope>runtime</scope>` or `<optional>true</optional>`.** | Dev tooling included in the production artifact. The Spring Boot Maven plugin's `repackage` goal excludes devtools by default since 2.x, so runtime impact is likely nil — but explicit scope is best practice. |
+| 🟢 LOW | **`AsyncConfiguration` is dead config.** `@EnableAsync` and the `asyncExecutor` bean are created but no `@Async` annotation exists anywhere. | Resource cost is the executor pool. Risk is confusion during future development — adding `@Async` would activate dormant config without an explicit decision. |
+| 🟢 LOW | **`logger.level` and `logstash.server.host.port` properties are defined but never injected.** | Dead config. Removing them does not change behaviour. |
+| 🟢 LOW | **Removed `validateUserRole` method has no ADR or ticket reference.** Commented-out block remains in source. | Technical debt with no tracking artifact — risk of being forgotten or reverted. |
+| 🟢 LOW | **`DELETE /lft-report/{reportName}` has no scope check beyond `userId + userFirm`.** Multiple rows can share the same reportName for the same user. | Bulk-delete by name removes all matching rows, including any newer requests with the same name. |
 
 ---
 
 ## Planned Changes
 
-- ⚠️ OPEN QUESTION: Confirm production replica count — XL Deploy variable `{{ replicas-gcp-user-queue-skill-service }}` value not visible in source. Check deployment tooling.
-- ⚠️ OPEN QUESTION: Confirm identity of callers to `POST /user` — suspected to be called on portal session start but not verifiable from source alone. No `@KnownCallers` annotation present.
-- ⚠️ OPEN QUESTION: Confirm which downstream component performs the actual live-case-to-queue eligibility matching using the criteria stored in this service. This resolves the open question flagged in WDP-HANDOVER.md.
-- ⚠️ OPEN QUESTION: Confirm whether the absence of a CPU limit in `resources.yaml` is intentional or an oversight. No CPU limit or request is set.
-- Add Resilience4j circuit breakers to all four external dependencies (IDP internal, IDP external, Display Code Service, CHAS) as part of platform-wide DEC-014 remediation.
-- Add REST timeout configuration to all `RestTemplate` instances — currently all use `new RestTemplate()` with no connect or read timeout.
-- Remove `spring-boot-devtools` from production pom.xml scope.
-- Formally document or remove the dead async configuration (`AsyncConfiguration.java` and associated properties) — currently configured but never invoked.
+- ⚠️ **OPEN QUESTION:** Confirm production replica count — XL Deploy variable `{{ replicas-gcp-user-queue-skill-service }}` value not visible in source. Check deployment tooling.
+- ⚠️ **OPEN QUESTION:** Identify which component performs **live case-to-queue eligibility matching** using the criteria stored by COMP-30. The criteria are written here; the matcher reads them but lives elsewhere.
+- ⚠️ **OPEN QUESTION:** Identify the owner of `nap.nap_parent_entity` — read-only consumer in this repo.
+- ⚠️ **OPEN QUESTION:** Identify the owner of `wdp.case` and `wdp.action` — read-only consumers in this repo. Candidates: COMP-23 CaseManagementService, COMP-22 DisputeService, COMP-24 CaseActionService.
+- ⚠️ **OPEN QUESTION:** Identify the component that transitions `wdp.lft_report.status` from `PENDING` to `INPROGRESS` and on to a terminal state. COMP-30 only inserts `PENDING` and reads `INPROGRESS`.
+- ⚠️ **OPEN QUESTION:** Identify the runtime source of `logback-spring.xml` if present in deployment (ConfigMap mount, sidecar, base image). If absent, confirm whether structured Logstash logging is intended or whether console-only is acceptable.
+- ⚠️ **OPEN QUESTION:** Identify known callers of every endpoint. No `@KnownCallers` annotation, Swagger tag, comment header, or per-endpoint Spring Security restriction names callers in source.
+- ⚠️ **OPEN QUESTION:** Confirm whether the absence of CPU limits and requests is intentional, and whether the omission of a PodDisruptionBudget and HPA matches the load profile.
+- ⚠️ **ARCHITECT DECISION NEEDED:** Whether to remediate the queue `@Transactional` / `@Primary` mismatch — current pattern silently fails to wrap UK writes.
+- ⚠️ **ARCHITECT DECISION NEEDED:** Whether to add `@Transactional` to POST /user to atomically wrap user upsert + auto-enrol.
+- ⚠️ **ARCHITECT DECISION NEEDED:** Whether CHAS infra failure should surface as HTTP 503 (or 502) rather than HTTP 403, to distinguish it from genuine authorization denial.
 
 ---
 
 ---
 
 ## ━━━ TYPE BLOCK A — REST API CONTRACTS ━━━━━━━━━━━━━━━━━━━
-*This component exposes HTTP REST endpoints.*
 
 ---
 
 ## REST API Contracts
 
 **Authentication model:**
-All endpoints require a valid Bearer JWT validated by Spring Security's `JwtIssuerAuthenticationManagerResolver` with trusted issuers from config `jwt.trustedIssuers`. Scope/role enforcement is done in application code (not Spring Security filter chain) by reading the `AuthorizationList` JWT claim and intersecting with configured `user.roles.internal` / `user.roles.external` role sets.
+All endpoints require a valid Bearer JWT validated by Spring Security's `JwtIssuerAuthenticationManagerResolver` against trusted issuers defined in `jwt.trustedIssuers`. Spring Security only checks the JWT signature and issuer. **Scope/role enforcement is performed in application code** by `AuthorizationServiceImpl` reading the `AuthorizationList` JWT claim and intersecting it with configured `user.roles.internal` and `user.roles.external` allowlists.
 
-Whitelisted endpoints (no auth required): `/actuator/health`, `/readyz`, `/livez`, `/user-queue-skill-service-api-docs/**`, `/swagger-ui/**`
+Whitelisted endpoints (no auth required): `/actuator/health`, `/readyz`, `/livez`, `/user-queue-skill-service-api-docs`, `/user-queue-skill-service-api-docs/swagger-config`, `/swagger-ui/**`. *(v1.0 listed `/user-queue-skill-service-api-docs/**` as a wildcard; source defines two specific paths — corrected.)*
 
-Auth tokens for outbound calls:
-- IDP internal: Static Bearer token (`idp.internal.auth-token`) + `X-SunGard-IdP-API-Key` header
-- IDP external: Auth token + Sungard key selected based on `userFirm` (`us_merchant` vs others)
-- Display Code Service: OAuth2 client credentials token via `TokenServiceImpl` from `us_worldpay_fis_int` IDP
-- CHAS: Caller's JWT forwarded as Bearer token
+**Outbound auth tokens:**
+- IDP internal: static Bearer (`idp.internal.auth-token`) + `X-SunGard-IdP-API-Key` header
+- IDP external standard: Bearer + Sungard key — selected when `userFirm == us_merchant`
+- IDP external MFD: separate MFD-specific Bearer + Sungard key — selected when `userFirm != us_merchant`
+- Display Code Service: OAuth2 client_credentials token from `us_worldpay_fis_int` IDP via `TokenServiceImpl`
+- CHAS: caller's JWT forwarded as Bearer
 
 **Base URL pattern:** `https://<host>/merchant/gcp/user-queue-skill`
 
-**Error body format (all error responses):**
-```json
+**Common error body:**
+```
 {
   "errors": {
     "message": "<error message>",
@@ -474,374 +486,189 @@ Auth tokens for outbound calls:
 }
 ```
 
-**Common header:** `v-correlation-id` — optional correlation ID propagated on all endpoints for request tracing.
+**Common header:** `v-correlation-id` — optional correlation ID propagated for request tracing.
+
+**Known callers:** Not determinable from source for any endpoint. No `@KnownCallers` annotation, no Swagger `x-extensions` naming callers, no comment headers, no Spring Security per-endpoint caller restrictions. Likely callers (inference, not confirmed): WDP Merchant Portal (COMP-49), WDP Ops Portal (COMP-50), and an unidentified report-generation worker for the LFT lifecycle.
 
 ---
 
-### Endpoint Group: User Management
+### Endpoint group 1 — User Management
 
-#### `GET /users/{loginName}?userId=<id>` — Get User by Login Name (V1)
+#### `GET /users/{loginName}` (V1)
 
 **Purpose:** Retrieve a user by login name. Falls back to IDP if not found locally; persists on first encounter.
-**Caller(s):** Not determinable from source — no `@KnownCallers` annotation
-**Auth required:** Bearer JWT
-
-**Request**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `loginName` | String (path) | Yes | User's login name — uppercased internally |
-| `userId` | String (query) | Yes | User ID — used for correlation |
-| `v-correlation-id` | String (header) | No | Request tracing correlation ID |
+| `loginName` | path | Yes | User's login name — uppercased internally |
+| `userId` | query | Yes | User ID — used for correlation |
+| `v-correlation-id` | header | No | Request tracing |
 
-**Response — Success**
+| HTTP | Condition | Body |
+|------|-----------|------|
+| 200 | User found in DB or successfully fetched from IDP and persisted | `UserResponse` |
+| 400 | IDP returned null (user not found in IDP) | error body |
+| 403 | External user: `napParentEntity` / `iqOrgId` from IDP does not match caller's JWT `orgId` *(v1.0 said 401 — corrected: `UnauthorizedException` is mapped to 403 by `GlobalExceptionHandler`)* | error body |
+| 500 | IDP `RestClientException` | error body |
 
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 200 | User found in DB or successfully fetched from IDP and persisted | `UserResponse` JSON |
-
-**Response — Error**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 400 | IDP returned null — user not found in IDP | Error body |
-| 401 | External user: `napParentEntity`/`iqorgid` from IDP does not match caller's JWT `orgId` | Error body |
-| 500 | IDP call threw `RestClientException` | Error body |
-
----
-
-#### `GET /v2/users/{loginName}` — Get User by Login Name (V2)
+#### `GET /v2/users/{loginName}` (V2)
 
 **Purpose:** DB-only user lookup — no IDP fallback, no write-on-miss.
-**Caller(s):** Not determinable from source
-**Auth required:** Bearer JWT
 
-**Request**
+| HTTP | Condition |
+|------|-----------|
+| 200 | Single user found |
+| 400 | Multiple records found for loginName |
+| 404 | No user found |
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `loginName` | String (path) | Yes | User login name |
-| `v-correlation-id` | String (header) | No | Correlation ID |
+#### `POST /user`
 
-**Response — Success**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 200 | Single user found | `UserResponse` JSON |
-
-**Response — Error**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 400 | Multiple records found for loginName | Error body |
-| 404 | No user found | Empty |
-
----
-
-#### `POST /user` — Add or Update User
-
-**Purpose:** Upsert a user from JWT claims. Auto-enrols internal users with WDP NAP queue roles into all `SKILLS_INTERNAL` queues on first insert if no queue assignments exist.
-**Caller(s):** Not determinable — likely invoked on portal session start
-**Auth required:** Bearer JWT
+**Purpose:** Upsert a user from JWT claims. Auto-enrols internal users with valid NAP queue role into all UK queues of type `SKILLS_INTERNAL` or `DEFAULT_QUEUE` if no existing queue assignments. **Not atomic** — see Risks.
 
 **Request:** No body. All data sourced from JWT claims (`LoginName`, `FirstName`, `LastName`, `EmailAddress`, `ExternalID`, `AuthorizationList`).
 
-**Response — Success**
+| HTTP | Condition |
+|------|-----------|
+| 200 | User upserted (auto-enrol may or may not have completed — no signal in response body) |
+| 500 | DB write failure on user upsert |
 
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 200 | User upserted successfully | `CreateUserResponse { loginName }` |
+#### `GET /users/search?loginName=<partial>`
 
-**Response — Error**
+**Purpose:** Partial-match search by login name, scoped by firm/org. `LIKE '%value%'` semantics.
 
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 500 | DB write failure | Error body |
+| HTTP | Condition |
+|------|-----------|
+| 200 | Always — list may be empty |
 
 ---
 
-#### `GET /users/search?loginName=<partial>` — Search Users
+### Endpoint group 2 — Queue Management
 
-**Purpose:** Partial-match user search by login name, scoped by firm/org.
-**Caller(s):** Not determinable from source
-**Auth required:** Bearer JWT
+#### `POST /{region}/queue`
 
-**Request**
+**Purpose:** Create a queue with associated criterion rules and user assignments for a given region.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `loginName` | String (query) | Yes | Partial login name — LIKE '%value%' search |
-| `v-correlation-id` | String (header) | No | Correlation ID |
+| `region` | path | Yes | `UK` or `US` (case-insensitive). Other values → 400. |
+| body | `CreateQueueRequest` | Yes | `name`, `type`, `criteria[]`, `assignedUsers[]` |
 
-**Response — Success**
+| HTTP | Condition |
+|------|-----------|
+| 201 | Queue created |
+| 400 | Invalid region · invalid queueType · validation failure · duplicate name (app-check) · LOGICAL_INTERNAL name in physical queue list |
+| 403 | JWT role does not include any required queue role |
+| 500 | Display Code Service failure · DB persistence error |
 
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 200 | Always (even if empty result) | `List<UserResponse>` |
+#### `PUT /{region}/queue`
+
+**Purpose:** Update an existing queue. Same shape as POST plus criterion-ID existence check (unknown IDs → 400).
+
+| HTTP | Condition |
+|------|-----------|
+| 200 | Queue updated |
+| 400 | Region invalid · validation failure · unknown criterion ID |
+| 403 | JWT role insufficient |
+| 500 | Display Code Service failure · DB persistence error |
 
 ---
 
-### Endpoint Group: Queue Management
+### Endpoint group 3 — User View (Column Preferences)
 
-#### `POST /{region}/queue` — Create Queue
+#### `POST /user-view`
 
-**Purpose:** Create a new queue with associated criterion rules and user assignments for a given region.
-**Caller(s):** Portal UI (Ops Portal or Merchant Portal) — not determinable from source
-**Auth required:** Bearer JWT with WDP role matching queue type
+**Purpose:** Upsert the user's column-view configuration for a named grid. JSON-serialised column config.
 
-**Request**
+| HTTP | Condition |
+|------|-----------|
+| 201 | Upserted |
+| 400 | Missing mandatory fields |
+
+#### `GET /user-view?gridName=<name>`
+
+**Purpose:** Retrieve stored column preferences for a grid.
+
+| HTTP | Condition |
+|------|-----------|
+| 200 | Found (returns config) or not found (returns null body) |
+
+---
+
+### Endpoint group 4 — LFT Report (Large File Transfer)
+
+#### `POST /lft-report`
+
+**Purpose:** Submit an async export request. Validates entity authorization (external users), enforces count caps, persists a `PENDING` row.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `region` | String (path) | Yes | `UK` or `US` |
-| Body | `CreateQueueRequest` JSON | Yes | Queue name, type, assignedUsers, criteria |
-| `v-correlation-id` | String (header) | No | Correlation ID |
+| body | `UserReportRequest` | Yes | `gridName`, `reportName`, `searchCriteria`, `platform` |
+| `v-correlation-id` | header | No | Correlation ID |
 
-**Response — Success**
+| HTTP | Condition |
+|------|-----------|
+| 201 | Request accepted and persisted as PENDING |
+| 400 | INPROGRESS count ≥ `max-inprogress-requests` (`Too Many Exports Inprogress`) · total count ≥ `max-total-requests` (`Download Area Full`) · `merchantName` < 4 chars · `merchantId` non-numeric · JSON serialisation failure |
+| 403 | External NAP user with no NAP entities in JWT · external PIN user: CHAS denied · external PIN user: CHAS unavailable · external PIN user: merchant lookup returned null |
 
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 201 | Queue created successfully | Empty |
+#### `GET /lft-report`
 
-**Response — Error**
+**Purpose:** List the authenticated user's LFT report requests.
 
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 400 | Invalid region / duplicate name / invalid assigned user / invalid criterion / assignedUsers required but missing | Error body |
-| 401 | JWT role does not match queue type | Error body |
-| 500 | DB failure (rolled back) / Display Code Service unavailable | Error body |
+| HTTP | Condition |
+|------|-----------|
+| 200 | Reports found — `UserReportResponse { reportDetailsList: [{ reportName, status, creationDate, lastUpdateDate }] }` |
+| 404 | No reports found |
 
-**Notes:** `createQueue` is `@Transactional(rollbackOn=Exception.class)`. Queue + criterion + user_queue rows are all written in one transaction per datasource. For `LOGICAL_INTERNAL` queue type, Display Code Service is called to validate the name is not already a physical queue name — failure returns 500.
+#### `DELETE /lft-report`
 
----
+**Purpose:** Bulk-delete all the authenticated user's LFT report requests.
 
-#### `PUT /{region}/queue` — Update Queue
+| HTTP | Condition |
+|------|-----------|
+| 200 | Deleted |
+| 404 | None found |
 
-**Purpose:** Update an existing queue's assigned users and/or criterion rules.
-**Caller(s):** Portal UI — not determinable from source
-**Auth required:** Bearer JWT with WDP role matching queue type
-
-**Request**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `region` | String (path) | Yes | `UK` or `US` |
-| Body | `UpdateQueueRequest` JSON | Yes | Queue name, type, updated assignedUsers and criteria |
-| `v-correlation-id` | String (header) | No | Correlation ID |
-
-**Response — Success**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 200 | Queue updated | Empty |
-
-**Response — Error**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 400 | Queue not found / invalid criterion ID not in DB | Error body |
-| 401 | Role mismatch | Error body |
-| 500 | DB failure (rolled back) | Error body |
-
-**Notes:** `updateQueue` is `@Transactional(rollbackOn=Exception.class)`. Delta computation: removed users deleted from `user_queue`, new users inserted; removed criteria deleted, new criteria inserted. Criterion IDs in request must exist in DB — unknown IDs throw 400.
-
----
-
-### Endpoint Group: User View (Column Preferences)
-
-#### `POST /user-view` — Create / Upsert User View
-
-**Purpose:** Store or update the user's column-view configuration for a named grid.
-**Auth required:** Bearer JWT
-
-**Request**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| Body | `UserViewRequest { gridName, columnPrefs[] }` | Yes | Grid name and column preference array |
-
-**Response — Success**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 200 | Upserted | Empty |
-
-**Response — Error**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 400 | Missing mandatory fields | `StandardErrorResponse` |
-
----
-
-#### `GET /user-view?gridName=<name>` — Get User View
-
-**Purpose:** Retrieve stored column preferences for a named grid.
-**Auth required:** Bearer JWT
-
-**Response — Success**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 200 | Found or not found (null body if not found) | `UserViewResponse { gridName, columnPrefs[] }` or null body |
-
----
-
-### Endpoint Group: LFT Report (Large File Transfer)
-
-#### `POST /lft-report` — Create LFT Report Request
-
-**Purpose:** Submit an async export/report request. Validates entity authorization for external users, enforces count caps, persists a PENDING request row.
-**Auth required:** Bearer JWT
-
-**Request**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| Body | `UserReportRequest { gridName, reportName, searchCriteria, platform }` | Yes | Report parameters |
-| `v-correlation-id` | String (header) | No | Correlation ID |
-
-**Response — Success**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 201 | Request accepted and persisted as PENDING | Empty |
-
-**Response — Error**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 400 | INPROGRESS count ≥ max-inprogress-requests OR total count ≥ max-total-requests OR validation failure (merchantName < 4 chars, merchantId non-numeric) | `StandardErrorResponse` (soft error body) |
-| 403 | External PIN user: CHAS authorization denied or CHAS unavailable | `StandardErrorResponse` |
-
-**Notes:** Write to `wdp.lft_report` is non-transactional. No deduplication on `reportName` — multiple rows with same name are not blocked by DB constraint, only soft-limited by count caps.
-
----
-
-#### `GET /lft-report` — Get Report List
-
-**Purpose:** List all LFT report requests for the authenticated user.
-**Auth required:** Bearer JWT
-
-**Response**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 200 | Reports found | `UserReportResponse { reportDetailsList: [{ reportName, status, creationDate, lastUpdateDate }] }` |
-| 404 | No reports found | Empty |
-
----
-
-#### `DELETE /lft-report` — Delete All Reports
-
-**Purpose:** Bulk-delete all LFT report requests for the authenticated user.
-**Auth required:** Bearer JWT
-
-**Response:** 200 on success, 404 if no reports found.
-
----
-
-#### `DELETE /lft-report/{reportName}` — Delete Named Report
+#### `DELETE /lft-report/{reportName}`
 
 **Purpose:** Delete a specific LFT report request by name.
-**Auth required:** Bearer JWT
 
-**Response:** 200 on success, 404 if not found.
+| HTTP | Condition |
+|------|-----------|
+| 200 | Deleted |
+| 404 | Not found |
 
----
+#### `GET /lft-report/download/{reportName}`
 
-#### `GET /lft-report/download/{reportName}` — Download Report (Presigned URL)
+**Purpose:** Generate a 15-minute AWS S3 presigned URL for report download.
 
-**Purpose:** Generate and return a 15-minute AWS S3 presigned URL for report download.
-**Auth required:** Bearer JWT
-
-**Response**
-
-| HTTP Status | Condition | Body |
-|-------------|-----------|------|
-| 302 | Report file available in S3 | `Location: <presigned-url>` header |
-| 404 | `s3_key_path` is null in `wdp.lft_report` — file not yet generated | Empty |
-| 500 | AWS SDK exception during presigned URL generation | Error body |
+| HTTP | Condition |
+|------|-----------|
+| 302 | Report file available — `Location` header carries presigned URL |
+| 404 | `s3_key_path` is null in `wdp.lft_report` (file not yet generated) |
+| 500 | AWS SDK exception during presigned-URL generation |
 
 ---
 
-## Platform Standard Deviations
+## Items Not Verifiable From Source
 
-| Standard | Status | Detail |
-|----------|--------|--------|
-| DEC-001 (Transactional Outbox) | ⚠️ ABSENT | No outbox table. All writes are direct DB mutations. No event publication accompanies any write. Confirmed explicitly from source. |
-| DEC-003 (Kafka partition key = merchantId) | ✅ NOT APPLICABLE | No Kafka publishing. No Kafka dependency in pom.xml. |
-| DEC-004 (PAN encryption) | ✅ NOT APPLICABLE | No PAN data handled. No encryption configuration. Confirmed from full entity and schema review. |
-| DEC-005 (Kafka offset manual commit) | ✅ NOT APPLICABLE | No Kafka consumption. |
-| DEC-014 (Resilience4j circuit breaker) | 🔴 DEVIATION | No `resilience4j` dependency in pom.xml. No circuit breaker, bulkhead, or rate-limiter on any of the four external REST integrations or AWS S3 SDK. |
+These v1.0 / v1.1 statements could not be cross-checked against code or config and require team or runtime confirmation:
 
----
-
-## WDP-KAFKA.md Update Reference
-
-**No Kafka involvement.** This component neither produces to nor consumes from any Kafka topic. No rows to add to sections 3 or 4.
-
-Add the following row to Section 4 (Component Kafka Summary):
-
-| Component | Produces to | Consumes from | Notes |
-|-----------|-------------|---------------|-------|
-| COMP-30 UserQueueSkillService | None | None | No Kafka dependency in pom.xml. Confirmed explicitly. |
-
----
-
-## WDP-DB.md Update Reference
-
-Add or enrich the following rows:
-
-### nap schema
-
-| Schema.Table | Owner Component | R/W | Purpose |
-|--------------|----------------|-----|---------|
-| `nap.users` | COMP-30 UserQueueSkillService | Read + Write | User registry — upserted on V1 GET (IDP fallback) and POST /user |
-| `nap.queues` | COMP-30 UserQueueSkillService | Read + Write | UK queue definitions |
-| `nap.queue_criterion` | COMP-30 UserQueueSkillService | Read + Write | Filter criteria per UK queue — child of nap.queues |
-| `nap.user_queue` | COMP-30 UserQueueSkillService | Read + Write | UK user-to-queue assignments |
-| `nap.user_grid_preferences` | COMP-30 UserQueueSkillService | Read + Write | User column-view preferences (serialized JSON) |
-| `nap.nap_parent_entity` | Unknown — read-only consumer in COMP-30 | Read only | LFT report: lookup parentEntityId by name for orgMgmtMidListGrid validation |
-
-### wdp schema
-
-| Schema.Table | Owner Component | R/W | Purpose |
-|--------------|----------------|-----|---------|
-| `wdp.queues` | COMP-30 UserQueueSkillService | Read + Write | US queue definitions |
-| `wdp.queue_criterion` | COMP-30 UserQueueSkillService | Read + Write | Filter criteria per US queue |
-| `wdp.user_queue` | COMP-30 UserQueueSkillService | Read + Write | US user-to-queue assignments |
-| `wdp.lft_report` | COMP-30 UserQueueSkillService | Read + Write | Async LFT export request tracking |
-| `wdp.case` | Unknown — read-only consumer in COMP-30 | Read only | PIN authorization: merchant/chain ID lookup |
-| `wdp.action` | Unknown — read-only consumer in COMP-30 | Read only | PIN authorization: source case ID lookup |
-
----
-
-## Documents Requiring Update
-
-| Document | Update required |
-|----------|----------------|
-| **WDP-COMP-INDEX.md** | Update COMP-30 doc status from `📋 PENDING` to `📝 DRAFT` |
-| **WDP-KAFKA.md** | Add COMP-30 as Kafka-free row to Section 4 |
-| **WDP-DB.md** | Add all 10 table rows above; flag `nap.nap_parent_entity`, `wdp.case`, `wdp.action` as read-only consumers — ownership TBC |
-| **WDP-HANDOVER.md** | (1) Move COMP-30 from PENDING to DRAFT list. (2) RESOLVE open question: "Queue and skill-based routing logic owner — suspected COMP-30" — COMP-30 is confirmed as a **data provider only**, not a routing decision-maker. The actual case-to-queue matching component is still unconfirmed. (3) Add new open question: which component performs live-case-to-queue eligibility matching using criteria stored by COMP-30? |
-| **WDP-DECISIONS.md** (when rebuilt) | Record DEC-014 absence across COMP-30 (pattern consistent with rest of platform). Record no-timeout RestTemplate pattern as platform-wide concern. Record dual-datasource no-XA pattern. |
-
----
-
-## Remaining Gaps
-
-| Gap | Type | Action required |
-|-----|------|-----------------|
-| Known callers of `POST /user`, `GET /users/{loginName}` and queue endpoints | Follow-up Copilot question | Ask: *"Is there any annotation, comment, Swagger tag, or Spring Security configuration in gcp-user-queue-skill-service that identifies which services or portals are the intended callers of each controller endpoint?"* |
-| Which component performs live-case-to-queue eligibility matching | Architect decision | The criteria are stored here but matching is performed elsewhere. Identify the component that reads `queue_criterion` rows and applies them against live cases. |
-| Production replica count | Environment config | Check XL Deploy / Helm variable `{{ replicas-gcp-user-queue-skill-service }}` value for each environment |
-| Owner of `nap.nap_parent_entity` table | Team confirmation | Confirm which service owns this table — COMP-30 is a read-only consumer |
-| CPU limit absence | Architect decision | Confirm whether no CPU limit is intentional. No CPU limit or request is set in resources.yaml. |
-| `wdp.case` and `wdp.action` ownership | Team confirmation | Confirm which component owns these tables — candidates are DisputeService or CaseManagementService |
+1. **Production replica count** — XL Deploy variable, no default in repo.
+2. **`max-inprogress-requests` and `max-total-requests` actual values** — env-resolved.
+3. **`jwt.trustedIssuers` actual values** — env-resolved.
+4. **IDP base URL actual values across environments** — all env-resolved.
+5. **Downstream component that transitions `wdp.lft_report.status`** — only `PENDING` and `INPROGRESS` are touched here.
+6. **S3 bucket name in non-prod environments** — only prod has `wdp-lft-report` confirmed; others env-dependent.
+7. **AWS credentials mechanism for the S3 presigner** — `S3Presigner.builder().region(US_EAST_2).build()` uses default credential chain. Whether IRSA, env vars, or instance profile provides credentials is not in source.
+8. **Whether a `logback-spring.xml` is mounted at runtime** via ConfigMap or sidecar — if so, Logstash might be functional despite absence from repo.
+9. **`app.name` env var value** — referenced as `${app.name}` in `management.metrics.tags.application` but never defined in any YAML.
+10. **Owners of `nap.nap_parent_entity`, `wdp.case`, `wdp.action`** — confirmed read-only here, owner unknown.
+11. **Known callers per endpoint** — no naming convention, annotation, or Swagger tag identifies them.
+12. **Whether the `validateUserRole` removal has an associated ADR or ticket** — no reference in source.
 
 ---
 
 *End of WDP-COMP-30-USER-QUEUE-SKILL-SERVICE.md*
-*File status: 📝 DRAFT — content complete, architect confirmation pending.*
-*Remember to update WDP-COMP-INDEX.md, WDP-KAFKA.md, WDP-DB.md, and WDP-HANDOVER.md after confirmation.*
+*File status: 📝 DRAFT v1.1 — source-verified 2026-04-28, architect confirmation pending.*
+*Supersedes v1.0 DRAFT. See WDP-CHANGE-LOG.md entry for 2026-04-28 COMP-30 for the full correction set.*

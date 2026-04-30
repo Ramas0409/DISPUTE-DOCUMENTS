@@ -1,26 +1,27 @@
 # WDP-COMP-01-API-GATEWAY
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: `wdp-gateway` using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 2.0 DRAFT 🔍 | April 2026*
+*Extracted from: `wdp-gateway` (wp-mfd/wdp-gateway) — source-verified by Copilot CLI 2026-04-30*
+*Architect-confirmed: PENDING*
 
 ---
 
 ## ━━━ CORE SKELETON ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-*Mandatory for every component regardless of type.*
 
 ---
 
 ## Identity
 
-| Field             | Value                                                        |
-|-------------------|--------------------------------------------------------------|
-| **Name**          | `API Gateway`                                                |
-| **Type**          | `REST API — Reactive Reverse Proxy with Security Filter Pipeline` |
-| **Repository**    | `wdp-gateway`                                                |
-| **Technology**    | Spring Cloud Gateway 2024.0.0 · Spring Boot 3.4.1 · Java 17 · WebFlux / Netty |
-| **Status**        | `✅ Production`                                               |
-| **Doc status**    | `📝 DRAFT`                                                   |
-| **Sections present** | `Core · Block A`                                          |
+| Field                | Value                                                                               |
+|----------------------|-------------------------------------------------------------------------------------|
+| **Name**             | `API Gateway`                                                                       |
+| **Type**             | `REST API — Reactive Reverse Proxy with Security Filter Pipeline`                   |
+| **Repository**       | `wdp-gateway` (wp-mfd/wdp-gateway)                                                  |
+| **Technology**       | Spring Cloud Gateway 2024.0.0 · Spring Boot 3.4.1 · Java 17 · WebFlux / Netty     |
+| **Listen port**      | `8082` — confirmed in `application.yml` and K8s manifest. No discrepancy.          |
+| **Status**           | `✅ Production`                                                                     |
+| **Doc status**       | `📝 DRAFT 🔍` — source-verified 2026-04-30, architect confirmation pending         |
+| **Sections present** | `Core · Block A`                                                                    |
 
 ---
 
@@ -30,77 +31,101 @@
 
 The API Gateway is the single entry point for all WDP traffic regardless of origin —
 Merchant Portal (via Akamai), Ops Portal (direct), and external merchant systems
-(via Akamai → APIGEE). It runs on a reactive WebFlux/Netty stack and applies a
-4-layer security filter pipeline to every inbound request before proxying it to the
-appropriate backend microservice.
-
-The four filters execute in this order:
-
-**Step 1 — JWT Authentication** (Spring Security `SecurityWebFilterChain`). Validates
-the caller's Bearer token (or `?jwt` / `?access_token` query parameter) against trusted
-IDP issuers. Issuer URLs are injected from environment configuration at startup. Public
-keys are fetched from each issuer's `/.well-known/jwks.json` endpoint and cached — no
-per-request IDP call is made. Paths listed in the `authExceptions` column of
-`wdp.api_route` (loaded once at startup) bypass this step entirely. Failure returns 401
-with a Spring-default JSON error body and `WWW-Authenticate` header.
-
-**Step 2 — Request Logging (inbound)** (`LoggingGlobalFilter`, order = -1). Logs the
-inbound path and matched route identifier. Never short-circuits. If no route was matched
-and the route attribute is null, a `NullPointerException` is thrown (no null guard) and
-the request produces a 500.
-
-**Step 3 — Region-Based Role Authorization** (`AuthorizationFilter`, order = 0). Extracts
-region from the URL path by substring-matching `/US/`, `/UK/`, `/PIN/`, or `/NAP/`
-(case-insensitive). If no region segment is present, the filter is skipped and the request
-passes through. If a region is found, the JWT `AuthorizationList` claim is intersected
-against the configured allowed roles for that region and firm type. Absence of the
-`AuthorizationList` claim throws an uncaught `NullPointerException`, producing a 500.
-An empty intersection returns 403 (empty body).
-
-**Step 4 — Case-Level Entity Authorization** (`CaseNumberFilter`, order = 0). If both a
-platform identifier and a valid 12-character case ID are present in the URL path, an
-external authorization service is called. Platform is derived from the same region
-segments (`/US/` or `/PIN/` → PIN; `/UK/` or `/NAP/` → NAP). Case ID is detected by
-scanning path segments for exactly 12 characters, starting with an alphabetic character,
-with exactly 2 alphabetic characters total. Internal firms (JWT `iss` claim contains
-`us_worldpay_fis_int`) are auto-authorized without an external call. NAP requests go to
-UAMS `/authorize`; PIN requests go to CHAS `/authorize`. Any non-2xx response or network
-exception returns 403 (fail-closed). There is no timeout configured — a hung dependency
-blocks the calling thread indefinitely. Steps 3 and 4 are both at `Order = 0`; their
-relative execution order is non-deterministic.
-
-After all filters pass, the gateway applies a per-route path rewrite (regex substitution
-using `originalPathRegex` and `replacementPath` columns from `wdp.api_route`) and proxies
-the request to the backend URI (`uri` column). No other request or response transformation
-is applied. Body bytes are passed through as an opaque stream.
+(via Akamai → APIGEE). It runs on a reactive WebFlux/Netty stack at port 8082 and
+applies a 4-layer security filter pipeline to every inbound request before proxying
+it to the appropriate backend microservice.
 
 All routing configuration is stored in the `wdp.api_route` PostgreSQL table (26+ routes
-confirmed). Routes are loaded into memory at startup via R2DBC and cached by Spring Cloud
-Gateway's `CachingRouteLocator`. Route changes require a pod restart.
+confirmed in production — zero routes are defined in source code). Routes are loaded into
+memory at startup via two separate R2DBC operations: once by
+`AuthenticationFilter.createWhiteList()` (blocking `collectList().block()`) and once by
+`ApiPathRouteLocatorImpl` (reactive). Routes are cached by Spring Cloud Gateway's
+`CachingRouteLocator`. Route changes require a pod restart. The `auth_exceptions` column
+is a comma-delimited string of JWT-exempt paths; values are not trimmed on split, creating
+a silent whitelist-miss risk if the DB column contains spaces after commas.
+
+The four filters execute in this order (with a non-determinism caveat on steps 3 and 4):
+
+**Step 1 — JWT Authentication** (`AuthenticationFilter` / Spring Security
+`SecurityWebFilterChain`). Validates the caller's Bearer token against trusted IDP
+issuers. Issuer URLs are injected from environment configuration at startup. Public keys
+are fetched from each issuer's `/.well-known/jwks.json` endpoint and cached by the Nimbus
+library using its default key-ID-miss eviction policy — no per-request IDP call, no
+TTL-based cache expiry, no scheduled refresh. Paths listed in the `authExceptions` column
+of `wdp.api_route` (loaded at startup with Ant-style matching) bypass this step entirely.
+JWT validation failure returns 401 with a Spring Security default JSON error body and
+`WWW-Authenticate` header.
+
+**Step 2 — Request Logging** (`LoggingGlobalFilter`, order = -1). Logs the inbound path
+and matched route identifier on the inbound pass. On the outbound pass (after the chain
+returns), logs the same inbound path and the HTTP response status code. Does not log
+response time or inspect the response body. There is no null guard on the route attribute:
+if no route was matched and the route attribute is null, a `NullPointerException` is thrown
+and the request produces a 500.
+
+**Step 3 — Region-Based Role Authorization** (`AuthorizationFilter`, order = 0). Extracts
+the region from the URL path by case-insensitive substring match against exactly four
+constants: `/US/`, `/UK/`, `/PIN/`, `/NAP/`. CORE, VAP, and LATAM are not recognised
+region segments. If no region segment is present, the filter is skipped and the request
+passes through. If a region is found, firm type is determined by the same `iss`-claim
+substring check as Step 4 (match for `us_worldpay_fis_int`). Internal firms pass through
+directly. For external firms, the JWT `AuthorizationList` claim is intersected against the
+configured allowed roles for that region and firm type. Absence of the `AuthorizationList`
+claim throws an uncaught `NullPointerException`, producing a 500. An empty intersection
+returns 403 with an empty body.
+
+**Step 4 — Case-Level Entity Authorization** (`CaseNumberFilter`, order = 0). If both a
+recognised platform and a valid case ID are present in the URL path, an external
+authorization service is called. Platform is derived from the same four region constants:
+`/US/` or `/PIN/` → PIN; `/UK/` or `/NAP/` → NAP. The filter explicitly guards
+`platform != null && caseId != null` before calling the authorization service — if either
+is null, the filter passes through without any external call. Case ID is detected by
+scanning path segments for exactly 12 characters, starting with an alphabetic character,
+with exactly 2 alphabetic characters total. Internal firms (JWT `iss` claim contains
+`us_worldpay_fis_int`) are auto-authorized without an external call. NAP requests call
+UAMS `/authorize`; PIN requests call CHAS `/authorize`. Any non-2xx response or network
+exception returns 403 (fail-closed, empty body). There is no timeout configured on either
+call — a hung dependency blocks the calling Netty event-loop thread indefinitely.
+
+**⚠️ Both UAMS and CHAS calls use blocking `RestTemplate` executing directly on a Reactor
+Netty event-loop thread. There is no thread offloading. Under load, a slow or degraded
+authorization service will exhaust event-loop threads and stall the entire gateway.**
+
+**⚠️ Steps 3 and 4 both have `order = 0` with no secondary ordering mechanism.
+Their relative execution order is genuinely non-deterministic across JVM restarts.**
+
+After all filters pass, the gateway applies a per-route path rewrite (regex substitution
+using `originalPathRegex` and `replacementPath` from `wdp.api_route`) and proxies the
+request to the backend URI. No other request or response transformation is applied. Body
+bytes are passed through as an opaque stream.
 
 **What it does NOT do**
 
 - Does not write to any database table. The only database interaction is reading
-  `wdp.api_route` at startup. No INSERT, UPDATE, or DELETE operations exist anywhere
-  in the codebase.
-- Does not inspect, log, cache, or transform request or response bodies. All body bytes
-  are passed through opaque.
-- Does not perform rate limiting. This is delegated to Akamai (portal and B2B) and
-  APIGEE (B2B).
+  `wdp.api_route` at startup.
+- Does not inspect, log, cache, or transform request or response bodies.
+- Does not log response time.
+- Does not perform rate limiting. This is delegated to Akamai and APIGEE.
 - Does not use a service-to-service token when calling UAMS or CHAS. It forwards the
-  original caller's Bearer JWT as-is. An `oauth2-client` credential configuration exists
-  in all environment YMLs (`wdp-internal-auth`) but the token is never fetched or used —
-  this is dead configuration or an incomplete implementation of planned service-to-service
-  auth.
-- Does not call the CHAS `/entity-authorize` endpoint. The `entityHierarchy` parameter
-  required to route to that endpoint is always null in the current `CaseNumberFilter`
-  implementation.
-- Does not produce to or consume from Kafka. No Kafka dependency exists anywhere in
-  `pom.xml`.
-- Does not implement the transactional outbox pattern.
-- Does not apply Resilience4j circuit breakers, rate limiters, bulkheads, or retry
-  annotations on any outbound call. Resilience4j is not present in `pom.xml` and is
-  not on the classpath.
+  original caller's Bearer JWT as-is. An `oauth2-client` credential named `wdp-internal-auth`
+  exists in all environment YAMLs but uses the wrong Spring Boot property namespace
+  (`spring.security.oauth2.resourceserver.client` instead of the correct
+  `spring.security.oauth2.client`). These properties are not loaded by Spring Boot's OAuth2
+  client auto-configuration. Dead at both code level and property-binding level.
+- Does not set a meaningful `v-correlation-id` header on UAMS or CHAS calls.
+  `RequestCorrelation.setId()` is never called anywhere in the codebase. The header is
+  always sent as null. `ThreadLocal` is also architecturally incompatible with the reactive
+  WebFlux threading model.
+- Does not call the CHAS `/entity-authorize` endpoint. The routing capability exists in
+  `RestInvoker` but `entityHierarchy` is always null in the current filter pipeline — this
+  path is never activated.
+- Does not produce to or consume from Kafka.
+- Does not apply Resilience4j circuit breakers, rate limiters, bulkheads, or retry.
+- Does not authorize CORE, VAP, or LATAM requests at the platform or case level. These
+  platform types are not recognised anywhere in the gateway. Requests pass through Steps 3
+  and 4 with JWT validation only.
+- Does not refresh JWK public key sets on a schedule. Nimbus cache: key-ID-miss eviction
+  only, no TTL.
 
 ---
 
@@ -108,161 +133,153 @@ Gateway's `CachingRouteLocator`. Route changes require a pod restart.
 
 ```mermaid
 flowchart TD
-    IN["External Caller — HTTPS
+    IN["External Caller
     Merchant Portal via Akamai
-    Ops Portal direct
+    Ops Portal — direct
     B2B via Akamai → APIGEE"]
 
     NGINX["NGINX Ingress Controller
-    proxy-body-size: 25m
-    Base path: /api/merchant/gcp"]
+    Path-based routing: /api/merchant/gcp
+    7 XL-Deploy hostname placeholders
+    All route to port 8082"]
 
-    NETTY["Spring WebFlux / Netty
-    port 8082
-    base-path: /api/merchant/gcp"]
+    NETTY["Spring WebFlux / Netty — Port 8082
+    application.yml and K8s containerPort confirmed"]
 
     WL{{"Path in JWT whitelist?
-    authExceptions column
-    in wdp.api_route"}}
+    authExceptions from wdp.api_route
+    Ant-style match
+    ⚠️ Comma-split without trim"}}
 
     JWT["Step 1 — JWT Authentication
     Spring Security SecurityWebFilterChain
-    Extract Bearer or ?jwt / ?access_token param
-    Resolve issuer from JWT 'iss' claim
-    Check against trusted issuer list
-    Validate signature vs cached JWK Set"]
+    Bearer token or ?jwt / ?access_token param
+    Validate vs Nimbus-cached JWK Set
+    JWK cache: key-ID-miss eviction — no TTL"]
 
     E401["↩ 401 Unauthorized
-    Spring default JSON error body
+    Spring Security default JSON body
     WWW-Authenticate header"]
 
-    LOG_IN["Step 2 — Logging Inbound
-    LoggingGlobalFilter · order = -1
-    Logs: incoming path + matched routeId"]
+    LOG_IN["Step 2 — LoggingGlobalFilter · order = -1
+    Log path + matched route ID
+    ⚠️ No null guard on route attribute"]
 
-    E500_ROUTE["↩ 500 Internal Server Error
+    NULL_ROUTE{{"Route attribute null?
+    No route matched for path"}}
+
+    E500_NPE1["↩ 500 Internal Server Error
     NullPointerException
-    route attribute null
-    no null guard in LoggingGlobalFilter"]
+    LoggingGlobalFilter — route attr null"]
 
-    ND["⚠ Steps 3 and 4 both at Order = 0
-    Relative execution order is non-deterministic"]
+    STEP3_4_ORDER["⚠️ Steps 3 and 4 — both order = 0
+    No secondary ordering mechanism
+    Execution order NON-DETERMINISTIC"]
 
-    REGION{{"Region segment in path?
-    /US/ /UK/ /PIN/ /NAP/
-    case-insensitive substring"}}
+    REG{{"Step 3 — AuthorizationFilter · order = 0
+    Region segment in URL path?
+    /US/ /UK/ /PIN/ /NAP/ — case-insensitive
+    CORE / VAP / LATAM not recognised"}}
 
-    CLAIM{{"JWT AuthorizationList
-    claim present?"}}
+    CLAIM{{"AuthorizationList JWT claim
+    present?"}}
 
-    ROLES{{"Caller roles ∩ allowed roles
-    for region + firmType ≠ ∅?"}}
-
-    E500_NPE["↩ 500 Internal Server Error
+    E500_NPE2["↩ 500 Internal Server Error
     NullPointerException
-    on null AuthorizationList claim
-    latent bug — not caught"]
+    AuthorizationList claim absent"]
 
-    E403_ROLE["↩ 403 Forbidden
-    empty body — no JSON"]
+    FIRM3{{"Internal firm?
+    iss claim contains us_worldpay_fis_int"}}
 
-    CASEID{{"Platform AND valid
-    12-char caseId both
-    present in path?"}}
+    ROLES{{"JWT AuthorizationList ∩ allowed roles
+    for region + firm type — non-empty?"}}
 
-    INTERNAL{{"isInternalFirm?
-    JWT iss contains
-    'us_worldpay_fis_int'"}}
+    E403_ROLES["↩ 403 Forbidden · Empty body"]
 
-    PLAT{{"platform value?"}}
+    CASE{{"Step 4 — CaseNumberFilter · order = 0
+    Platform AND case ID both non-null?
+    Platform: /US/ or /PIN/ → PIN
+              /UK/ or /NAP/ → NAP
+    Case ID: 12-char / 2-alpha / first-char-alpha
+    Filter guards both before calling service"}}
 
-    UAMS["Step 4a — POST UAMS /authorize
-    Body: platform=NAP, caseNumber
-    Auth: forwards original caller JWT
-    Blocking RestTemplate
-    No timeout · No retry · No circuit breaker"]
+    FIRM4{{"Internal firm?
+    iss claim contains us_worldpay_fis_int"}}
 
-    CHAS["Step 4b — POST CHAS /authorize
-    Body: platform=PIN, caseNumber
-    Auth: forwards original caller JWT
-    Blocking RestTemplate
-    No timeout · No retry · No circuit breaker"]
+    AUTO_INT["Auto-authorized
+    Internal firm — no external call"]
 
-    UAMS_R{{"UAMS response?"}}
-    CHAS_R{{"CHAS response?"}}
+    PLAT{{"Platform type?"}}
 
-    E403_UAMS["↩ 403 Forbidden
-    empty body
-    RestClientException caught
-    FAIL-CLOSED"]
+    UAMS["Call UAMS /authorize · NAP platform
+    ⚠️ Blocking RestTemplate on Netty event-loop
+    Caller JWT forwarded as-is
+    v-correlation-id always null
+    No timeout / no retry / no circuit breaker"]
 
-    E403_CHAS["↩ 403 Forbidden
-    empty body
-    RestClientException caught
-    FAIL-CLOSED"]
+    CHAS["Call CHAS /authorize · PIN platform
+    ⚠️ Blocking RestTemplate on Netty event-loop
+    Caller JWT forwarded as-is
+    v-correlation-id always null
+    No timeout / no retry / no circuit breaker"]
 
-    BLOCK["⚠ Thread blocked indefinitely
-    No timeout configured
-    Progressive thread pool exhaustion
-    under sustained dependency hang"]
+    E403_UAMS["↩ 403 Forbidden · Empty body
+    UAMS non-2xx or RestClientException"]
 
-    REWRITE["Step 5 — Path Rewrite
-    Per-route regex substitution
+    E403_CHAS["↩ 403 Forbidden · Empty body
+    CHAS non-2xx or RestClientException"]
+
+    REWRITE["Path Rewrite
     originalPathRegex → replacementPath
-    Values loaded from wdp.api_route at startup"]
+    from wdp.api_route cache"]
 
-    E500_RW["↩ 500
-    Exception on invalid
-    regex in wdp.api_route"]
+    PROXY["Proxy to Backend
+    uri from wdp.api_route
+    Opaque body passthrough"]
 
-    PROXY["Step 6 — Backend Proxy
-    Spring Cloud Gateway proxy
-    HTTP to backend URI from wdp.api_route
-    No backend timeout configured"]
+    LOG_OUT["LoggingGlobalFilter — outbound pass
+    Log: inbound path + HTTP status code
+    No response time · No body inspection"]
 
-    E5XX["↩ 502 / 504
-    Backend unreachable
-    or Netty timeout"]
+    BACKEND["Backend HTTP Response
+    Proxied as-is to caller"]
 
-    LOG_OUT["Step 7 — Logging Outbound
-    LoggingGlobalFilter .then()
-    Logs: path + response status code"]
+    E502["↩ 502 / 504
+    Backend unreachable or Netty timeout"]
 
-    OUT["Response to Caller"]
-
-    IN --> NGINX --> NETTY --> WL
-    WL -->|"yes — bypass JWT"| LOG_IN
-    WL -->|"no"| JWT
-    JWT -->|"valid JWT"| LOG_IN
-    JWT -->|"invalid / missing / untrusted"| E401
-    LOG_IN -->|"route matched"| ND
-    LOG_IN -->|"route attribute null"| E500_ROUTE
-    ND --> REGION
-    REGION -->|"null — no region in path"| CASEID
-    REGION -->|"region found"| CLAIM
-    CLAIM -->|"absent"| E500_NPE
-    CLAIM -->|"present"| ROLES
-    ROLES -->|"empty — no matching role"| E403_ROLE
-    ROLES -->|"non-empty — role matched"| CASEID
-    CASEID -->|"platform or caseId null — skip"| REWRITE
-    CASEID -->|"both present"| INTERNAL
-    INTERNAL -->|"yes — auto-authorize"| REWRITE
-    INTERNAL -->|"no — external caller"| PLAT
+    IN --> NGINX --> NETTY
+    NETTY --> WL
+    WL -->|"Whitelisted — JWT bypassed"| LOG_IN
+    WL -->|"Not whitelisted"| JWT
+    JWT -->|"Invalid / missing / untrusted issuer"| E401
+    JWT -->|"JWT valid"| LOG_IN
+    LOG_IN --> NULL_ROUTE
+    NULL_ROUTE -->|"Null — NPE thrown"| E500_NPE1
+    NULL_ROUTE -->|"Route attr present"| STEP3_4_ORDER
+    STEP3_4_ORDER --> REG
+    STEP3_4_ORDER --> CASE
+    REG -->|"No region segment — filter skips"| CASE
+    REG -->|"Region found"| CLAIM
+    CLAIM -->|"Absent — NPE thrown"| E500_NPE2
+    CLAIM -->|"Present"| FIRM3
+    FIRM3 -->|"Internal"| CASE
+    FIRM3 -->|"External"| ROLES
+    ROLES -->|"Non-empty intersection"| CASE
+    ROLES -->|"Empty intersection"| E403_ROLES
+    CASE -->|"No platform OR no case ID"| REWRITE
+    CASE -->|"Both detected"| FIRM4
+    FIRM4 -->|"Internal"| AUTO_INT
+    FIRM4 -->|"External"| PLAT
+    AUTO_INT --> REWRITE
     PLAT -->|"NAP"| UAMS
     PLAT -->|"PIN"| CHAS
-    UAMS --> UAMS_R
-    UAMS_R -->|"2xx — authorized"| REWRITE
-    UAMS_R -->|"non-2xx or exception"| E403_UAMS
-    UAMS_R -->|"hung — no timeout"| BLOCK
-    CHAS --> CHAS_R
-    CHAS_R -->|"2xx — authorized"| REWRITE
-    CHAS_R -->|"non-2xx or exception"| E403_CHAS
-    CHAS_R -->|"hung — no timeout"| BLOCK
-    REWRITE -->|"regex applied"| PROXY
-    REWRITE -->|"invalid regex in DB"| E500_RW
-    PROXY -->|"backend responds"| LOG_OUT
-    PROXY -->|"backend unreachable"| E5XX
-    LOG_OUT --> OUT
+    UAMS -->|"HTTP 2xx"| REWRITE
+    UAMS -->|"Non-2xx or exception"| E403_UAMS
+    CHAS -->|"HTTP 2xx"| REWRITE
+    CHAS -->|"Non-2xx or exception"| E403_CHAS
+    REWRITE --> PROXY
+    PROXY --> LOG_OUT --> BACKEND
+    PROXY -->|"Backend unreachable"| E502
 ```
 
 ---
@@ -271,129 +288,116 @@ flowchart TD
 
 ### Inbound Interfaces
 
-| Source | Protocol | Endpoint / Trigger | Payload / Description |
-|--------|----------|--------------------|----------------------|
-| WDP Merchant Portal (COMP-49) | HTTPS via Akamai | All routes in `wdp.api_route` | Bearer JWT in `Authorization` header; any request body passed opaque |
-| WDP Ops Portal (COMP-50) | HTTPS direct (no Akamai) | All routes in `wdp.api_route` | Bearer JWT in `Authorization` header; any request body passed opaque |
-| External merchant systems | HTTPS via Akamai → APIGEE | All routes in `wdp.api_route` | Bearer JWT in `Authorization` header; any request body passed opaque |
-
-*The full route list is database-driven (26+ routes in `wdp.api_route`). Exact paths
-require direct DB access — see Remaining Gaps.*
+| Source | Protocol | Endpoint / Trigger | Payload |
+|--------|----------|--------------------|---------|
+| Merchant Portal | HTTPS via Akamai → NGINX Ingress | Path prefix `/api/merchant/gcp` — routes by `wdp.api_route` | JSON REST payloads — opaque to gateway |
+| Ops Portal | HTTPS direct → NGINX Ingress | Path prefix `/api/merchant/gcp` | JSON REST payloads — opaque |
+| B2B External Merchants | HTTPS via Akamai → APIGEE → NGINX Ingress | Path prefix `/api/merchant/gcp` | JSON REST payloads — opaque |
 
 ### Outbound Interfaces
 
-| Target | Protocol | Endpoint / Resource | Purpose | On failure |
+| Target | Protocol | Endpoint / Resource | Purpose | On Failure |
 |--------|----------|---------------------|---------|------------|
-| UserAccessManagementService (COMP-02) | REST (blocking RestTemplate) | `POST /merchant/gcp/access-management/authorize` | Case-level entity authorization for NAP platform requests | 403 empty body (fail-closed). Thread blocks indefinitely if UAMS hangs — no timeout |
-| CoreHierarchyAuthorizationService (COMP-03) | REST (blocking RestTemplate) | `POST /merchant/gcp/hierarchy-authorization/authorize` | Case-level entity authorization for PIN platform requests | 403 empty body (fail-closed). Thread blocks indefinitely if CHAS hangs — no timeout |
-| `wdp.api_route` (PostgreSQL via R2DBC) | Database read | `wdp.api_route` table | Load routing config, path rewrite rules, and JWT whitelist at pod startup | Pod fails to start if DB is unreachable at startup |
-| Backend microservices (all) | REST (Spring Cloud Gateway proxy) | Backend URIs from `wdp.api_route` `uri` column | Forward authenticated and authorized requests to target service | 502 / 504 from Netty. No retry. No backend timeout configured. |
+| `wdp.api_route` | R2DBC PostgreSQL (startup only) | `findAll()` — no custom query | Route configuration load — called twice at startup | Pod fails to start |
+| UAMS | REST — blocking `RestTemplate` | `POST {user.access-management-api-url}/authorize` | Case-level authorization — NAP platform | 403 empty body |
+| CHAS | REST — blocking `RestTemplate` | `POST {user.core-hierarchy-authorization-service-url}/authorize` | Case-level authorization — PIN platform | 403 empty body |
+| Backend microservices | HTTP reactive proxy | Per-route URIs from `wdp.api_route` | Forward authorized requests | 502 / 504 |
 
 ---
 
 ## Database Ownership
 
-### Tables Owned (written by this component)
+### Tables Owned
 
-This component owns no database state. It is stateless. No INSERT, UPDATE, or DELETE
-operations exist in the codebase.
+This component owns no database state. It is stateless.
 
-### Tables Read (not owned by this component)
+### Tables Read
 
-| Schema.Table | Owned by | Why accessed |
+| Schema.Table | Owned By | Why Accessed |
 |--------------|----------|--------------|
-| `wdp.api_route` | ⚠️ Writer unconfirmed — no write operations found in any component to date | Loaded at pod startup via R2DBC. Provides: route path predicates, originalPathRegex, replacementPath, backend URI, and JWT whitelist (authExceptions column). Cached in memory. Changes require pod restart. |
-
-**Confirmed columns in `wdp.api_route`** (from `ApiRoute.java`):
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | Long (PK) | Auto-generated primary key |
-| `path` | String | Path predicate pattern for Spring Cloud Gateway route matching |
-| `original_path_regex` | String | Regex applied to inbound path for the rewritePath filter |
-| `replacement_path` | String | Replacement expression for the rewritten path |
-| `uri` | String | Backend service URI (e.g. `http://service-name.namespace:8082`) |
-| `auth_exceptions` | String | Comma-separated paths that bypass JWT validation (the JWT whitelist) |
+| `wdp.api_route` | ⚠️ Write owner TBC — team confirmation required | Route predicates, path rewrite rules, backend URIs, JWT whitelist paths. Read twice at startup. Cached for pod lifetime. No `@Transactional` — default R2DBC auto-commit read. |
 
 ---
 
-## Architecture Decisions
+## Deployment and Operations
 
-| Decision | Detail |
-|----------|--------|
-| Single gateway for all traffic paths | Merchant Portal, Ops Portal, and B2B all enter through one gateway. No traffic type has a dedicated entry point. |
-| JWT validation via cached public keys | IDP public keys fetched once from `/.well-known/jwks.json` and cached. No per-request IDP call. |
-| Route configuration in database, not code | 26+ routes stored in `wdp.api_route`. No hardcoded routes in source. Loaded at startup — not hot-reloadable. |
-| Two-tier authorization model | Region-role check (Step 3) followed by case-level entity check (Step 4). Both must pass. |
-| Case-level auth split by platform | NAP → UAMS; PIN → CHAS. Routing determined by path segment substring match. |
-| Internal firm bypass | Callers whose JWT `iss` claim contains `us_worldpay_fis_int` bypass external auth call — auto-authorized. |
-| Gateway forwards caller JWT | No service-to-service token is used for UAMS/CHAS calls. Caller's original Bearer JWT is forwarded as-is. `oauth2-client` configuration exists in all environment YMLs but the token is never fetched or applied — dead or incomplete implementation. |
-| Planned: Consolidate case-level auth | NAP/PIN split between UAMS and CHAS to be replaced by a single unified authorization service. Not yet implemented. |
+### Kubernetes
 
----
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| Resource type | `Deployment` | `resources.yaml:L2` |
+| Container port | `8082` | `resources.yaml:L54` |
+| Application listen port | `8082` (`server.port: 8082` in `application.yml:L2`) — consistent with K8s | Confirmed |
+| Replica count | `{{ replicas-wdp-gateway }}` — XL Deploy placeholder | `resources.yaml:L8` |
+| Memory limit | `2048Mi` | `resources.yaml:L57` |
+| Memory request | `256Mi` | `resources.yaml:L59` |
+| CPU limit | **Not configured** | — |
+| CPU request | **Not configured** | — |
+| HPA | **Absent** | — |
+| PodDisruptionBudget | **Absent** | — |
+| Rolling update maxSurge | `1` | `resources.yaml:L11` |
+| Rolling update maxUnavailable | `0` | `resources.yaml:L12` |
+| `minReadySeconds` | ⚠️ **Misplaced — inoperative.** Value `30` placed at `spec.template.spec` (PodSpec). Not a valid PodSpec field. Kubernetes silently ignores it. Correct location: `spec.minReadySeconds` at Deployment level. | `resources.yaml:L24` |
+| Topology spread | Present. `topologyKey: kubernetes.io/hostname`, `maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`. Label selector correctly matches pod labels. | `resources.yaml:L25-L31` |
+| Ingress | 7 XL Deploy hostname placeholders. All use **path-based routing** at `/api/merchant/gcp` (`pathType: ImplementationSpecific`). All route to port 8082. | `resources.yaml:L104-L184` |
 
-## Risks and Constraints
+**Ingress hostname placeholders (all → port 8082, path `/api/merchant/gcp`):**
+`{{ hostName }}` · `{{ externalHostName }}` · `{{ internalhostName }}` · `{{ wdpInternalHostName }}` · `{{ hostName_pin }}` · `{{ wdpExternalHostName }}` · `{{ wdpreverseproxyHostName }}`
 
-| Severity | Risk |
-|----------|------|
-| 🔴 HIGH | **No timeout on UAMS/CHAS calls.** `RestTemplate` instantiated with no `ClientHttpRequestFactory` — connect timeout is JVM/OS default, read timeout is infinite. A single hung auth service will block a gateway thread indefinitely. Under sustained load this causes progressive thread pool exhaustion and gateway-wide degradation. |
-| 🔴 HIGH | **Blocking `RestTemplate` inside a reactive WebFlux pipeline.** `GlobalFilter` runs on Reactor event loop threads. Blocking calls inside event loop threads cause thread starvation. Correct approach is a reactive HTTP client (`WebClient` with `subscribeOn(Schedulers.boundedElastic())`). |
-| 🔴 HIGH | **No Resilience4j.** Not in `pom.xml`, not on classpath. No circuit breaker, rate limiter, or bulkhead on any outbound call. Combined with no timeout, a degraded UAMS or CHAS instance is a single point of failure for the entire gateway. |
-| 🟡 MEDIUM | **`NullPointerException` on missing `AuthorizationList` JWT claim.** If a well-formed JWT reaches a regional path without an `AuthorizationList` claim, `claim.asString().replaceAll()` throws `NullPointerException`. Spring converts this to 500, not 403. Latent bug — not caught. |
-| 🟡 MEDIUM | **`AuthorizationFilter` and `CaseNumberFilter` both at `Order = 0`.** Relative execution order is non-deterministic across JVM restarts. For requests that satisfy both filter conditions the result is correct regardless of order — but which filter's 403 fires is unpredictable, affecting log correlation. |
-| 🟡 MEDIUM | **No `PodDisruptionBudget` configured.** All pods could theoretically be evicted simultaneously during a node maintenance event with no minimum availability guarantee. |
-| 🟡 MEDIUM | **`spring-boot-starter-oauth2-client` imported but never invoked.** Service-account credentials configured for `wdp-internal-auth` across all environment YMLs. No code fetches or uses this token. Either a planned but incomplete service-to-service auth implementation or dead configuration. Requires clarification. |
-| 🟡 MEDIUM | **No structured JSON logging.** No Logstash appender or `logstash-logback-encoder` present. Logging uses Spring Boot default Logback with plain-text output. Log aggregation in a centralised platform (ELK/Splunk) relies on unstructured text parsing. |
-| 🟡 MEDIUM | **JVM heap not explicitly sized.** No `-Xms`, `-Xmx`, or `-XX:MaxRAMPercentage` set. Java 17 ergonomic defaults apply 25% of container memory limit as max heap (~512Mi against 2048Mi limit). OTel agent adds 50–150Mi overhead. Actual memory usage will far exceed the 256Mi memory request, causing scheduling pressure on nodes near their allocation ceiling. |
-| 🟡 MEDIUM | **`LoggingGlobalFilter` has no null guard on route attribute.** If no route is matched and the route attribute is null, the filter throws `NullPointerException`, producing a 500 with no log correlation. |
-| 🟢 LOW | **`spring-boot-starter-web` (Tomcat) present alongside reactive gateway.** Suppressed via `spring.main.web-application-type: reactive` but adds classpath weight. |
-| 🟢 LOW | **`postgresql` JDBC driver present alongside R2DBC.** Gateway uses R2DBC exclusively. JDBC driver unused but adds classpath weight. |
-| 🟢 LOW | **`reactor-netty` pinned to 1.2.2 as a temporary bug fix.** Overrides Spring Cloud BOM. Documented comment in `pom.xml` explains workaround for `reactor-netty#3559`. Should be reviewed when Spring Cloud is next upgraded. |
+### Observability
 
----
-
-## Scaling and Deployment
-
-| Parameter | Value |
-|-----------|-------|
-| **Kubernetes resource type** | Deployment |
-| **Replica count** | XL Deploy placeholder: `{{ replicas-wdp-gateway }}`. Actual per-environment values not visible in source — injected at deploy time. |
-| **Memory limit** | 2048Mi |
-| **Memory request** | 256Mi |
-| **CPU limit** | None configured |
-| **CPU request** | None configured |
-| **HPA** | Not configured |
-| **Rolling update** | `type: RollingUpdate` · `maxSurge: 1` · `maxUnavailable: 0` · `minReadySeconds: 30` — zero-downtime safe |
-| **PodDisruptionBudget** | Not configured — see Risks |
-| **Topology spread** | Configured. `topologyKey: kubernetes.io/hostname` · `maxSkew: 1` · `whenUnsatisfiable: ScheduleAnyway` (soft preference). Label selector `app: wdp-gateway${BRANCH_NAME_PLACEHOLDER}` matches pod template labels exactly — no label mismatch. |
-| **OpenTelemetry** | OTel Java agent attached via Kubernetes OpenTelemetry Operator. Annotation: `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default` on pod template. |
-| **Spring Actuator** | Endpoints `health` and `gateway` exposed. Port 8082 (same as application — no management port separation). Full path: `/api/merchant/gcp/actuator/health`. |
-| **Logstash / structured logging** | Not configured — see Risks. |
+| Capability | Status | Detail |
+|------------|--------|--------|
+| OpenTelemetry | Present — operator-injected | Pod annotation `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default` (`resources.yaml:L22`). Agent injected by Kubernetes OTel Operator at runtime — not in container image. |
+| Spring Boot Actuator | Present | `spring-boot-starter-actuator` (`pom.xml:L37`). Endpoints exposed: `health` and `gateway` only (`application.yml:L16-L22`). Same port as application. Full health path: `/api/merchant/gcp/actuator/health`. |
+| Structured logging | **Absent** | No `logback-spring.xml`. No `logstash-logback-encoder` in `pom.xml`. Spring Boot default Logback plain-text output. |
 
 ---
 
-## Incomplete and Planned Work
+## Planned and Incomplete Work
+
+### Dead Dependencies in `pom.xml`
+
+| Dependency | Lines | Why Unused |
+|------------|-------|-----------|
+| `spring-boot-starter-web` | `pom.xml:L50-L52` | No `@Controller` or `@RestController` in source. `spring.main.web-application-type: reactive` suppresses Tomcat at runtime. Adds Tomcat and Spring MVC to classpath unnecessarily. |
+| `postgresql` (JDBC driver) | `pom.xml:L74-L77` | No JDBC usage. Gateway uses R2DBC exclusively. |
+| `spring-boot-starter-oauth2-client` | `pom.xml:L93-L95` | No OAuth2 client code. Dead configuration only (see below). |
+
+### Dead Configuration
 
 | Item | Detail |
 |------|--------|
-| `pom.xml` comment — reactor-netty pin | Temporary bug fix for `reactor-netty#3559`. Marked for removal when Spring Cloud is next upgraded. |
-| Dead `oauth2-client` configuration | `wdp-internal-auth` service-account credentials configured in all environment YMLs. Token never fetched or used. Planned service-to-service auth not wired up. |
-| Planned: unified case-level auth service | Consolidate NAP/PIN split (currently UAMS/CHAS) into a single authorization service. Not started. |
-| No TODO/FIXME in Java source | None found in any Java source file. |
-| No feature flags | No `@ConditionalOnProperty`, `@Profile`, or any conditional bean annotation in any configuration or filter class. |
+| `wdp-internal-auth` OAuth2 client config | Present in all 7 environment YAMLs (local through prod) under the wrong namespace: `spring.security.oauth2.resourceserver.client.*`. The correct path is `spring.security.oauth2.client.*`. Spring Boot's OAuth2 client auto-configuration does not bind from `resourceserver.client`. Dead at both code level and property-binding level across all environments. |
+| `SERVER_SERVLET_CONTEXT_PATH` K8s env var | `resources.yaml:L61-L62`. Servlet/Tomcat-specific property — no effect in WebFlux/Netty. The correct WebFlux equivalent (`spring.webflux.base-path`) is already set in `application.yml:L14`. |
+
+### Temporary Workaround
+
+| Item | Detail |
+|------|--------|
+| `reactor-netty` version pin | `pom.xml:L106-L118`. `reactor-netty-core` and `reactor-netty-http` pinned to `1.2.2`. Both excluded from `spring-cloud-starter-gateway` and `r2dbc-postgresql` to enforce the pin. Comment: *"temporary fix for a bug when forwarding Swagger UI — remove when Spring Cloud is upgraded."* References `https://github.com/reactor/reactor-netty/issues/3559`. |
+
+### Dead Code
+
+| Item | Detail |
+|------|--------|
+| `extractCaseIdFromRequestParameters()` in `CommonExtractors` (`CommonExtractors.java:L184-L200`) | Never called anywhere in the codebase. `CaseNumberFilter` calls only `extractCaseIdFromPath()`. |
+| `RequestCorrelation` ThreadLocal | `setId()` never called in the codebase. `getId()` always returns null. `v-correlation-id` header on every UAMS and CHAS call is always null. `ThreadLocal` is also incompatible with the reactive threading model. |
+| `// For PIN` entity-hierarchy paths in `AuthorizationServiceImpl` (lines 65, 70) | Two branches that populate `level4Entity` and `entityHierarchy`. Never reachable from the current filter pipeline — `CaseNumberFilter` always passes null for these parameters. The `/entity-authorize` capability in `RestInvoker` is similarly unreachable. |
 
 ---
 
 ## Remaining Gaps
 
-| Gap | What is missing | Action needed |
+| Gap | What Is Missing | Action Needed |
 |-----|----------------|---------------|
-| **Full route list** | The 26+ routes in `wdp.api_route` — path patterns, backend URIs, rewrite rules — are not visible from source alone. | Run: `SELECT id, path, original_path_regex, replacement_path, uri, auth_exceptions FROM wdp.api_route ORDER BY id;` against a non-prod environment. |
-| **JWT whitelist paths** | Actual paths in `authExceptions` column are database-driven and not visible in source. Only confirmed entry is the actuator health path. | Same query as above — inspect `auth_exceptions` column values. |
-| **Replica count per environment** | XL Deploy placeholder `{{ replicas-wdp-gateway }}` — actual dev/test/prod values not in source. | Ask team: *What are the replica counts for `wdp-gateway` in dev, test, and prod?* |
-| **`wdp.api_route` write owner** | No component found that writes to this table. Something must manage route creation and updates. | Ask team: *Which service or process creates and updates rows in `wdp.api_route`?* |
-| **CORE / VAP / LATAM case-level auth path** | Gateway source only recognises `NAP` and `PIN` as platform values. No `CORE` string exists in gateway code. How CORE, VAP, and LATAM requests receive case-level entity authorization is not determinable from source alone. | Ask team: *What URL path structure do CORE, VAP, and LATAM requests use? How does case-level entity authorization work for those platforms today?* |
-| **`oauth2-client` dead config intent** | Whether `wdp-internal-auth` config is abandoned, planned, or an incomplete implementation is unclear. | Ask team: *Was service-to-service auth between gateway and UAMS/CHAS ever planned? Should this config be removed?* |
+| **Full route list** | 26+ routes in `wdp.api_route` — entirely database-driven, not visible from source | DB query: `SELECT id, path, original_path_regex, replacement_path, uri, auth_exceptions FROM wdp.api_route ORDER BY id;` |
+| **`wdp.api_route` write owner** | No component found that writes to this table | Team confirmation: *Which service or process creates and updates rows in `wdp.api_route`?* |
+| **CORE / VAP / LATAM authorization** | These platform types receive no role-level or case-level authorization at the gateway | Architect/team confirmation: *Intentional? Handled downstream?* |
+| **Replica counts** | XL Deploy placeholder — per-env values not in source | Team confirmation per environment |
+| **`minReadySeconds` remediation** | Currently misplaced — inoperative | Architect decision: *Move to `spec.minReadySeconds` or remove?* |
+| **`wdp-internal-auth` remediation** | Wrong namespace, dead code, all envs | Team decision: *Remove from all environment YAMLs?* |
+| **`gcp-wdp-gateway-secrets` content** | SecretRef referenced in manifest — content not in repo | Runtime/infra inspection: *What keys and values does this secret provide?* |
 
 ---
 
@@ -405,117 +409,116 @@ operations exist in the codebase.
 
 ## REST API Contracts
 
-**Auth model:** Bearer JWT validated against trusted IDP issuers (cached JWK public keys).
-No API key. No service-to-service token.
+**Auth model:** Bearer JWT (or `?jwt` / `?access_token` query param) validated against
+trusted IDP issuers via Nimbus-cached JWK public keys — key-ID-miss eviction, no TTL,
+no scheduled refresh. No API key. No service-to-service token.
 
-**Note on endpoint structure:** The API Gateway does not expose application-defined REST
-endpoints in the traditional sense. Its inbound surface is entirely defined by the 26+
-routes stored in `wdp.api_route`. Routes are not visible from source code — they require
-direct database access. The contracts below describe the gateway-level response behaviour
-and the two external service calls made during the filter pipeline.
+**Note:** The gateway exposes no application-defined REST endpoints. Its inbound surface
+is entirely defined by the 26+ routes in `wdp.api_route`. The contracts below describe
+gateway-level response behaviour and the two outbound authorization calls in the pipeline.
 
 ---
 
-### Inbound Request Handling — Gateway-Level Response Contract
-
-All requests matching a route in `wdp.api_route` are subject to the 4-filter pipeline.
-
-**HTTP response codes**
+### Gateway-Level Response Contract
 
 | Status | Trigger | Error body |
 |--------|---------|------------|
-| `2xx` | Backend responded successfully — proxied as-is | Backend response body (opaque passthrough) |
-| `401` | JWT missing, expired, or untrusted issuer (non-whitelisted path) | Spring Boot default JSON: `{"timestamp":…,"path":…,"status":401,"error":"Unauthorized","message":…}` + `WWW-Authenticate` header |
-| `403` | Region-role intersection empty, OR UAMS/CHAS returned non-2xx or network exception | **Empty body — no JSON.** Callers must handle empty 403 body explicitly. |
-| `500` | `NullPointerException` — route attribute null (no route matched), OR missing `AuthorizationList` claim on a regional path | Spring Boot default JSON error body |
-| `502` / `504` | Backend service unreachable or Netty timeout | Netty-generated error |
+| `2xx` | Backend responded — proxied as-is | Backend response body (opaque passthrough) |
+| `401` | JWT invalid/missing on non-whitelisted path | Spring Security default JSON + `WWW-Authenticate` header |
+| `403` | Empty role intersection OR UAMS/CHAS non-2xx or exception | **Empty body — no JSON. Callers must handle explicitly.** |
+| `500` | NPE: route attr null (unmatched path) OR `AuthorizationList` claim absent on regional path | Spring Boot default JSON error body |
+| `502`/`504` | Backend unreachable or Netty timeout | Netty-generated |
 
-**Known route pattern examples** (from unit tests only — full list requires DB query):
+**Allowed roles by region and firm type** (`application.yml:L27-L32` — pod restart required to change):
 
-| Pattern | Target service |
-|---------|----------------|
-| `/api/merchant/gcp/case-search/pin/cases/search/{caseId}/…` | CaseSearchService (COMP — TBC) |
-| `/api/merchant/gcp/case-search/nap/cases/search/{caseId}/…` | CaseSearchService (COMP — TBC) |
-| `/api/merchant/gcp/actuator/health` | Actuator (self — whitelisted, JWT bypassed) |
-
-**Allowed roles by region and firm type** (from `application.yml` — pod restart required to change):
-
-| Region | Firm Type | Allowed Roles |
-|--------|-----------|---------------|
-| UK / NAP | Internal | `WDP_NAP_REGULAR`, `WDP_NAP_ADVANCED`, `WDP_NAP_SUPERVISOR`, `WDP_NAP_ADMIN`, `WDP_NAP_READ_ONLY`, `WDP_NAP_CSM`, `WDP_NAP_ORG_MANAGER`, `WDP_NAP_ORG_MNGR` |
-| UK / NAP | External | `WDP_NAP_REGULAR`, `WDP_NAP_ADMIN` |
-| US / PIN | Internal | `WDP_PIN_REGULAR`, `WDP_PIN_ADVANCED`, `WDP_PIN_SUPERVISOR`, `WDP_PIN_ADMIN`, `WDP_PIN_READ_ONLY`, `vantiv-iq-merchant-chargebacks` |
-| US / PIN | External | `WDP_PIN_REGULAR`, `WDP_PIN_ADMIN`, `vantiv-iq-merchant-chargebacks` |
+| Region segment | Firm type | Allowed roles |
+|----------------|-----------|---------------|
+| `/UK/` or `/NAP/` | Internal | `WDP_NAP_REGULAR`, `WDP_NAP_ADVANCED`, `WDP_NAP_SUPERVISOR`, `WDP_NAP_ADMIN`, `WDP_NAP_READ_ONLY`, `WDP_NAP_CSM`, `WDP_NAP_ORG_MANAGER`, `WDP_NAP_ORG_MNGR` |
+| `/UK/` or `/NAP/` | External | `WDP_NAP_REGULAR`, `WDP_NAP_ADMIN` |
+| `/US/` or `/PIN/` | Internal | `WDP_PIN_REGULAR`, `WDP_PIN_ADVANCED`, `WDP_PIN_SUPERVISOR`, `WDP_PIN_ADMIN`, `WDP_PIN_READ_ONLY`, `vantiv-iq-merchant-chargebacks` |
+| `/US/` or `/PIN/` | External | `WDP_PIN_REGULAR`, `WDP_PIN_ADMIN`, `vantiv-iq-merchant-chargebacks` |
 
 ---
 
-### Outbound Call: UserAccessManagementService — `/authorize`
-
-Called by `CaseNumberFilter` for NAP platform requests where both platform and caseId
-are present in the path and the caller is not an internal firm.
+### Outbound Call: UAMS `/authorize` — NAP Platform Case Authorization
 
 | Parameter | Value |
 |-----------|-------|
 | **Config key** | `user.access-management-api-url` |
-| **Dev URL** | `http://user-access-management-service-develop.gcp-ff:8082/merchant/gcp/access-management` |
-| **Prod URL** | `http://user-access-management-service.wdp-micro:8082/merchant/gcp/access-management` |
-| **Endpoint appended** | `/authorize` (always — `/entity-authorize` is never called from this filter) |
-| **HTTP Method** | `POST` |
-| **Request body** | JSON: `{"platform": "NAP", "caseNumber": "<caseId>"}` — `merchantId`, `level4Entity`, `entityHierarchy` always null and omitted |
-| **Auth** | `Authorization: Bearer <original-caller-JWT>` (caller token forwarded as-is — no service token) |
-| **Correlation header** | `x-correlation-id: <ThreadLocal value>` |
-| **Response read** | None — response type is `void.class`. Pass/fail determined by HTTP status code only. |
-| **Pass condition** | HTTP 2xx |
-| **Fail condition** | HTTP 4xx/5xx or any network exception → `RestClientException` → 403 returned to caller |
-| **Timeout** | None configured — infinite read timeout |
+| **Endpoint** | `/authorize` (always — `/entity-authorize` never called) |
+| **Method** | POST |
+| **Request body** | `platform = "NAP"`, `caseNumber = <caseId>`. All other fields always null. |
+| **Auth** | `Authorization: Bearer <original-caller-JWT>` |
+| **Correlation** | `v-correlation-id` — **always null** (`RequestCorrelation.setId()` never called) |
+| **Response** | `void` — pass/fail by HTTP status only |
+| **Pass** | HTTP 2xx |
+| **Fail** | HTTP 4xx/5xx or `RestClientException` → 403 empty body |
+| **Connection timeout** | **Not configured** (JDK default — effectively infinite) |
+| **Read timeout** | **Not configured** (JDK default — effectively infinite) |
 | **Retry** | None |
-| **Circuit breaker** | None — Resilience4j not present in `pom.xml` |
+| **Circuit breaker** | None |
+| **HTTP client** | Blocking `RestTemplate` (`new RestTemplate()`) on **Netty event-loop thread** — ⚠️ thread starvation risk |
 
 ---
 
-### Outbound Call: CoreHierarchyAuthorizationService — `/authorize`
-
-Called by `CaseNumberFilter` for PIN platform requests where both platform and caseId
-are present in the path and the caller is not an internal firm.
+### Outbound Call: CHAS `/authorize` — PIN Platform Case Authorization
 
 | Parameter | Value |
 |-----------|-------|
 | **Config key** | `user.core-hierarchy-authorization-service-url` |
-| **Dev URL** | `http://core-hierarchy-authorization-service-develop.gcp-ff:8082/merchant/gcp/hierarchy-authorization` |
-| **Prod URL** | `http://core-hierarchy-authorization-service.wdp-micro:8082/merchant/gcp/hierarchy-authorization` |
-| **Endpoint appended** | `/authorize` (always — `/entity-authorize` never called from this filter) |
-| **HTTP Method** | `POST` |
-| **Request body** | JSON: `{"platform": "PIN", "caseNumber": "<caseId>"}` |
-| **Auth** | `Authorization: Bearer <original-caller-JWT>` (same pattern as UAMS) |
+| **Endpoint** | `/authorize` (always) |
+| **Method** | POST |
+| **Request body** | `platform = "PIN"`, `caseNumber = <caseId>`. All other fields always null. |
+| **Auth** | `Authorization: Bearer <original-caller-JWT>` |
+| **Correlation** | `v-correlation-id` — **always null** |
 | **All other parameters** | Identical to UAMS — same `RestInvoker.authorizeUser()` implementation |
-| **Timeout** | None configured — infinite read timeout |
+| **Connection timeout** | **Not configured** |
+| **Read timeout** | **Not configured** |
 | **Retry** | None |
-| **Circuit breaker** | None — Resilience4j not present in `pom.xml` |
+| **Circuit breaker** | None |
+| **HTTP client** | Blocking `RestTemplate` on **Netty event-loop thread** — ⚠️ thread starvation risk |
 
 ---
 
 ## Deviation Flags
 
+### DEC Standard Compliance
+
 | DEC | Status | Detail | Severity |
 |-----|--------|--------|----------|
-| **DEC-001** (Transactional Outbox) | ✅ Compliant — N/A | Gateway performs no database writes. No outbox table. No INSERT/UPDATE/DELETE anywhere in codebase. | — |
-| **DEC-003** (Kafka partition key = merchantId) | ✅ Compliant — N/A | No Kafka involvement. Not a producer. | — |
-| **DEC-004** (PAN encryption before write) | ✅ Compliant | Gateway does not inspect or log request/response bodies. Body bytes are opaque passthrough. No PAN exposure risk at this layer. | — |
-| **DEC-005** (Kafka offset committed manually after processing) | ✅ Compliant — N/A | No Kafka consumer. | — |
-| **DEC-014** (Resilience4j on outbound calls) | 🔴 **DEVIATION** | Resilience4j is **not present in `pom.xml`** — not imported, not on classpath, not configured on any bean. No circuit breaker on UAMS or CHAS calls. Combined with no timeout and a blocking `RestTemplate`, a degraded auth service is a single point of failure for the entire gateway under load. | **HIGH** |
+| **DEC-001** (Transactional Outbox) | ✅ NOT APPLICABLE | No database writes. | — |
+| **DEC-003** (Kafka partition key = merchantId) | ✅ NOT APPLICABLE | No Kafka. | — |
+| **DEC-004** (PAN encryption before write) | ✅ COMPLIES | No body inspection. Opaque passthrough. | — |
+| **DEC-005** (Kafka offset after processing) | ✅ NOT APPLICABLE | No Kafka consumer. | — |
+| **DEC-019** (Clear PAN in persistent store) | ✅ COMPLIES | No database writes. | — |
+| **DEC-020** (Idempotency — at-least-once) | ✅ NOT APPLICABLE | Stateless proxy. No state creation. | — |
 
-**Additional architectural deviations (non-DEC):**
+*DEC-014 (Resilience4j) was formally voided in WDP-DECISIONS.md v2.0. Absence of
+Resilience4j is a platform-wide accepted position.*
+
+---
+
+### Additional Architectural Risks
 
 | Concern | Detail | Severity |
 |---------|--------|----------|
-| Blocking `RestTemplate` in reactive pipeline | `GlobalFilter` runs on Reactor event loop threads. Blocking I/O inside event loop threads causes thread starvation. Platform standard for reactive services is `WebClient`. | 🔴 HIGH |
-| No structured logging | No Logstash appender or JSON log format configured. If platform standard requires structured logs for ELK/Splunk ingestion this is a gap. Confirm with team. | 🟡 MEDIUM |
-| No PodDisruptionBudget | All replicas can be evicted simultaneously during node maintenance. Standard practice for production services is a PDB with `minAvailable: 1`. | 🟡 MEDIUM |
+| Blocking `RestTemplate` on Netty event-loop | UAMS and CHAS calls block Reactor event-loop threads directly. No thread offloading. One hung auth service stalls all concurrent gateway threads. `WebClient` is the correct reactive-stack HTTP client. | 🔴 HIGH |
+| No timeout on UAMS / CHAS | No connection or read timeout. Combined with blocking event-loop execution, a degraded auth service is a gateway-wide SPOF with no bounded failure time. | 🔴 HIGH |
+| CORE / VAP / LATAM — no authorization | Requests for these platforms skip both role check and case-level authorization. JWT validation only. Intentionality unconfirmed — team confirmation required. | 🔴 HIGH |
+| `v-correlation-id` always null | `RequestCorrelation.setId()` never called. Every UAMS and CHAS call carries a null correlation header. Cross-service tracing via correlation ID is non-functional. `ThreadLocal` is also incompatible with reactive threading. | 🟡 MEDIUM |
+| Steps 3 and 4 non-deterministic order | Both `order = 0`, no secondary mechanism. Execution order non-deterministic across JVM restarts. Failure attribution and log ordering unpredictable. | 🟡 MEDIUM |
+| `minReadySeconds: 30` misplaced | Under `spec.template.spec` (PodSpec) — silently ignored. Rolling deployments have no readiness wait. | 🟡 MEDIUM |
+| No PodDisruptionBudget | All replicas may be evicted simultaneously during node maintenance. | 🟡 MEDIUM |
+| No CPU limits | CPU unconstrained in K8s manifest. | 🟡 MEDIUM |
+| No structured logging | No Logstash appender, no JSON log format. Gateway is the primary observability surface for all platform traffic. | 🟡 MEDIUM |
+| `authExceptions` trim bug | Comma-split without trim — space after comma creates a leading-space entry that silently fails to match, enforcing JWT auth on a path that should be whitelisted. | 🟡 MEDIUM |
+| NPE on missing `AuthorizationList` claim | Unhandled NPE → 500 instead of clean 403. | 🟡 MEDIUM |
+| NPE on unmatched route in LoggingGlobalFilter | No null guard on route attribute. Unmatched path → NPE → 500 instead of clean 404. | 🟡 MEDIUM |
+| Double DB query at startup | DB hit twice on every pod start — blocking + reactive. | 🟢 LOW |
+| `extractCaseIdFromRequestParameters()` dead code | Latent dead method. If inadvertently activated, introduces query-parameter-based case ID extraction not covered by current security model. | 🟢 LOW |
 
 ---
 
 *End of WDP-COMP-01-API-GATEWAY.md*
-*File status: 📝 DRAFT — architect confirmation PENDING*
-*Update WDP-COMP-INDEX.md doc status from PENDING to MIGRATING after upload.*
-*Update WDP-DB.md `wdp.api_route` row with confirmed column list.*
-*Update WDP-HANDOVER.md with two corrections to Confirmed Architectural Facts — see session notes.*
+*File status: 📝 DRAFT 🔍 — source-verified 2026-04-30, architect confirmation PENDING*
+*After architect confirmation: update WDP-COMP-INDEX.md doc status to ✅ COMPLETE.*

@@ -1,7 +1,8 @@
 # WDP-COMP-26-QUESTIONNAIRE-SERVICE
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: mdvs-gcp-questionnaire-service using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 1.1 DRAFT | April 2026*
+*Source-verified: 2026-04-28 via GitHub Copilot CLI on `mdvs-gcp-questionnaire-service`*
+*Architect confirmation: PENDING*
 
 ---
 
@@ -20,7 +21,9 @@
 | **App name**      | `Questionnaire-Service` (Spring application name)                     |
 | **Artifact ID**   | `questionnaire-service` (Maven)                                       |
 | **Version**       | `2.1.8`                                                               |
-| **Base path**     | `/merchant/gcp/questionnaire` (env var `SERVER_SERVLET_CONTEXT_PATH`) |
+| **Runtime**       | Spring Boot 3.5.4 / Java 17                                           |
+| **Base path**     | `/merchant/gcp/questionnaire` (env `SERVER_SERVLET_CONTEXT_PATH`)     |
+| **Endpoint count**| **20** (15 Visa + 5 Dispute)                                          |
 | **Status**        | `✅ Production`                                                        |
 | **Doc status**    | `📝 DRAFT`                                                            |
 | **Sections present** | `Core \| Block A — REST`                                           |
@@ -34,47 +37,52 @@
 QuestionnaireService is the persistence and retrieval store for all dispute-response
 questionnaires in WDP. A questionnaire captures the structured evidence and reasoning
 a merchant submits to the card network as part of a representment or arbitration
-response. This service receives questionnaire payloads from the WDP dispute portals,
-enriches them with financial figures from the case-actions-service, serialises the
-full payload to a PostgreSQL JSON blob, and serves them back on demand.
+response. The service receives questionnaire payloads from the WDP dispute portals,
+enriches them with financial figures from `mdvs-gcp-case-actions-service`, serialises
+the full payload to a PostgreSQL JSON blob, and serves them back on demand.
 
-The service exposes two logically distinct controller families. The
-`VisaQuestionnaireController` (prefix `/visa`) handles Visa-specific dispute stages:
-Representment, Pre-Compliance Response, Pre-Arbitration Response, Allocation
-Arbitration, and Allocation Pre-Arbitration. The `DisputeQuestionnaireController`
-(no prefix) handles Non-Visa representment (MasterCard, Amex, Discover, etc.) and
-the document-status lookup that tells callers whether a supporting document is
-required for a given combination of response reason, reason code, and compelling
-evidence type.
+The service exposes two logically distinct controller families. `VisaQuestionnaireController`
+(prefix `/visa`) handles Visa-specific dispute stages: Representment, Pre-Compliance
+Response, Pre-Arbitration Response, Allocation Arbitration, and Allocation Pre-Arbitration.
+`DisputeQuestionnaireController` (no class-level prefix) handles Non-Visa representment
+(MasterCard, Amex, Discover, etc.), document-name UPSERT, and the document-status
+lookup that tells callers whether a supporting document is required for a given
+combination of response reason, reason code, and compelling evidence type.
 
-Each questionnaire type has a dedicated request object. The entire request object
-is serialised as a JSON blob into a single text column (`C_QSTNNAIR`) in
-`wdp.disputes_questionnaire`. There are no questionnaire templates stored in the
-database; the schema is code-defined and enforced by JSR-303 bean validation
-annotations on the request POJOs.
+For every mutating operation (POST and PUT) on representment, pre-compliance,
+pre-arbitration, allocation arbitration, and allocation pre-arbitration, the service
+makes exactly one outbound REST call to `mdvs-gcp-case-actions-service` to retrieve
+the `ActionSummary` containing `disputeWorkableAmount`, `disputeSourceAmount`,
+`stageCode`, and `creditDebitIndicator`. It uses these values to validate the merchant's
+response amount and compute write-off, CTM, and response amount percentages before
+persisting. GET operations involve no outbound calls — they are pure database reads.
+The B1 PUT `/document` UPSERT also makes no outbound call, since it only manages the
+document name list.
 
-For every mutating operation (POST and PUT), the service makes exactly one outbound
-REST call to `mdvs-gcp-case-actions-service` to retrieve the `ActionSummary`
-containing the workable dispute amount, source amount, and stage code. It uses these
-values to validate the merchant's response amount and compute write-off, CTM, and
-response amount percentages before persisting. GET operations involve no outbound
-calls — they are pure database reads.
+The entire request object is serialised as a JSON blob into a single text column
+(`C_QSTNNAIR`) in `wdp.disputes_questionnaire`. There are no questionnaire templates
+stored in the database; the schema is code-defined and enforced by JSR-303 bean
+validation annotations on the request POJOs.
 
 **What it does NOT do**
 
 - Does not trigger any case state transition. Saving or submitting a questionnaire
-  does not call CaseManagementService or DisputeService.
-- Does not handle PAN data. No card number field in any request or response POJO,
-  and no EncryptionService dependency.
-- Does not publish to Kafka. No Kafka dependency of any kind.
-- Does not use a transactional outbox. All writes are synchronous JPA saves.
+  does not call CaseManagementService, DisputeService, or any orchestration component.
+- Does not handle PAN data. No card-number field exists in any request, response,
+  or entity, and there is no EncryptionService dependency. **DEC-004/019 compliant.**
+- Does not publish to Kafka. No Kafka dependency of any kind in `pom.xml`.
+- Does not consume from Kafka. No `@KafkaListener`, no consumer container factory.
+- Does not run on a schedule. No `@Scheduled`, no `@EnableScheduling`, no batch dependency.
+- Does not use a transactional outbox.
 - Does not delegate document storage to DocumentManagementService, S3, or DynamoDB.
   All questionnaire data is stored in its own PostgreSQL tables.
 - Does not perform role or scope authorization beyond JWT issuer validation. There
-  are no `@PreAuthorize` annotations or scope assertions.
-- Does not determine which questionnaire a ContestService submission should use.
-  Whether ContestService reads from this service before submitting to the card
-  network is not determinable from source — requires team confirmation.
+  are no `@PreAuthorize` annotations or scope assertions anywhere in source.
+- Does not declare any `@Transactional` boundary. Every JPA call relies on Spring
+  Data JPA's per-call default transaction — see Risks.
+- Does not determine which questionnaire a downstream service should use.
+  Whether ContestService (COMP-20) or any other component reads from this service
+  before submitting to the card network is **not determinable from source**.
 
 ---
 
@@ -82,101 +90,114 @@ calls — they are pure database reads.
 
 ```mermaid
 flowchart TD
-    IN(["HTTP Request\n+ JWT Bearer token"])
+    IN(["HTTP Request<br/>+ JWT Bearer token"])
 
-    JWT{{"JWT valid?\n(Spring Security / trusted issuers)"}}
-    JWT_FAIL["HTTP 401\nMissing or invalid JWT"]
+    JWT{{"JWT valid?<br/>(Spring Security /<br/>trusted issuers)"}}
+    JWT_FAIL["HTTP 401<br/>Missing or invalid JWT"]
 
-    CORR["HttpInterceptor.preHandle\nReads or generates v-correlation-id\nSets in MDC + response header"]
+    CORR["HttpInterceptor.preHandle<br/>Reads or generates v-correlation-id<br/>Sets in MDC + response header"]
 
-    CTRL{{"Controller routing\n(URL path prefix)"}}
+    METHOD_OK{{"Method allowed<br/>on path?"}}
+    METHOD_405["HTTP 405<br/>HttpRequestMethodNot<br/>SupportedException"]
 
-    %% ── VISA MUTATING PATH ──────────────────────
-    VISA_MUT["VisaQuestionnaireController\nPOST or PUT\n/visa/{platform}/..."]
+    JSON_OK{{"Request body parses?"}}
+    JSON_500["HTTP 500<br/>HttpMessageNotReadableException<br/>(non-standard — should be 400)"]
 
-    VISA_VAL["@Valid bean validation\n+ QuestionnaireValidator\n(platform, actionSeq, caseNumber,\nresponseReason, nested objects)"]
-    VISA_VAL_FAIL["HTTP 400\nBusinessValidationException\nor constraint violation"]
+    CTRL{{"Controller routing<br/>(URL path prefix +<br/>HTTP method)"}}
 
-    PUT_CHECK{{"PUT only:\nRecord exists?\nfindByCaseNumberAndActionSeq"}}
-    NOT_FOUND["HTTP 404\nQuestionnaire not found"]
+    %% ── VISA / NON-VISA MUTATING PATH (converged) ──
+    MUT_PATH["Mutating path<br/>POST or PUT<br/>(Visa A1-A5 + B2/B4)"]
 
-    GET_ACTION["SearchActionDetailsService.getCaseAction\n→ REST GET mdvs-gcp-case-actions-service\n→ ActionSummary\n(disputeWorkableAmount,\ndisputeSourceAmount, stageCode)"]
-    ACTION_FAIL["HTTP 500\nRestClientException rethrown\n(no retry, no fallback)"]
+    PLATFORM_VAL{{"Platform enum valid?<br/>CORE / NAP / VAP /<br/>LATAM / PIN"}}
+    PLATFORM_FAIL["HTTP 500<br/>(IllegalArgumentException<br/>via RuntimeException handler)"]
 
-    NAP_CHECK{{"Platform is NAP?"}}
-    AMT_NAP["Validate responseAmount\nvs disputeWorkableAmount"]
-    AMT_OTHER["Validate responseAmount\nvs disputeSourceAmount"]
-    AMT_FAIL["HTTP 400\nBusinessValidationException\n(null amount or exceeds dispute)"]
+    BEAN_VAL["@Valid JSR-303<br/>+ QuestionnaireValidator<br/>(type-specific cross-field rules)"]
+    BEAN_FAIL["HTTP 400<br/>BusinessValidationException<br/>or constraint violation"]
 
-    PCT["CalculationUtil.setAmountPercentage\nCompute writeOff%, ctm%,\nresponse%  — set on request object"]
+    PUT_CHECK{{"PUT only:<br/>findByCaseNumberAndActionSeq<br/>row exists?"}}
+    NOT_FOUND["HTTP 404<br/>Questionnaire not found"]
 
-    MAP_ENTITY["QuestionnaireMapper\nSerialise request → JSON\nSet userId, timestamps, stageCode\n→ QuestionnaireEntity"]
+    GET_ACTION["SearchActionDetailsService.getCaseAction<br/>→ REST GET case-actions-service<br/>(NO timeout, NO retry,<br/>NO circuit breaker)"]
+    ACTION_FAIL["HTTP 500<br/>RestClientException rethrown"]
 
-    DB_SAVE["questionnaireRepository.save\n→ wdp.disputes_questionnaire"]
-    DB_FAIL["HTTP 500\nSQLException / System error"]
+    NAP_CHECK{{"platform == NAP?"}}
+    AMT_NAP["Validate responseAmount<br/>vs disputeWorkableAmount"]
+    AMT_OTHER["Validate responseAmount<br/>vs disputeSourceAmount"]
+    AMT_FAIL["HTTP 400<br/>BusinessValidationException"]
 
-    POST_OK["HTTP 201\n{qstnnairId}"]
+    PCT["CalculationUtil.setAmountPercentage<br/>writeOff% / ctm% / response%<br/>(scale 12, ROUND_DOWN)"]
+
+    MAP_ENTITY["QuestionnaireMapper<br/>Serialise request → JSON<br/>Set userId, timestamps,<br/>caseStage from ActionSummary"]
+
+    DB_SAVE["questionnaireRepository.save<br/>→ wdp.disputes_questionnaire<br/>(default per-call TX,<br/>NO @Transactional)"]
+    DB_FAIL["HTTP 500<br/>SQLException"]
+
+    POST_OK["HTTP 201<br/>Visa: {qstnnairId}<br/>Non-Visa B2: empty body"]
     PUT_OK["HTTP 200 empty body"]
 
-    %% ── VISA GET PATH ──────────────────────────
-    VISA_GET["VisaQuestionnaireController\nGET\n/visa/{platform}/..."]
-    GET_LOOKUP["questionnaireRepository\n.findByCaseNumberAndActionSeq\n→ wdp.disputes_questionnaire"]
+    %% ── VISA / NON-VISA GET PATH ──
+    GET_PATH["GET path<br/>(Visa A6-A10, B3)"]
+    GET_LOOKUP["findByCaseNumberAndActionSeq<br/>→ wdp.disputes_questionnaire"]
     GET_NULL{{"Record found?"}}
-    GET_404["HTTP 404\nQuestionnaire details not available"]
-    GET_DESER["QuestionnaireMapper.mapEntityToModel\nDeserialise JSON blob\n→ typed Response object\n(sets documents list from entity)"]
-    GET_OK["HTTP 200\nTyped response\n(PreCompResponse / RepresentmentResponse\n/ AllocationArbResponse / etc.)"]
+    GET_404["HTTP 404"]
+    GET_DESER["mapEntityToModel<br/>Deserialise JSON blob<br/>Set documents from N_DOCUMENT_NAME"]
+    GET_OK["HTTP 200<br/>Typed response"]
 
-    %% ── NON-VISA MUTATING PATH ─────────────────
-    DISP_MUT["DisputeQuestionnaireController\nPOST or PUT /representment\n/{platform}/representment/..."]
-    DISP_VAL["Same validation pattern as Visa\ncaseNetwork @NotBlank (mandatory)"]
-
-    %% ── B1 PUT /document UPSERT PATH ───────────
-    DOC_PUT["DisputeQuestionnaireController\nPUT /{platform}/document/..."]
-    DOC_LOOKUP["questionnaireRepository\n.findByCaseNumberAndActionSeq\n→ wdp.disputes_questionnaire"]
+    %% ── B1 PUT /document UPSERT ──
+    DOC_PUT["B1 PUT /{platform}/document/<br/>{caseNumber}/action/{actionSeq}"]
+    DOC_LOOKUP["findByCaseNumberAndActionSeq<br/>(NOT inside @Transactional —<br/>TOCTOU race possible)"]
     DOC_EXISTS{{"Record exists?"}}
-    DOC_NEW["Create stub QuestionnaireEntity\nqstnnairRequest = '{}'\n+ insert timestamps"]
+    DOC_NEW["Create stub QuestionnaireEntity<br/>qstnnairRequest = '{}'<br/>+ insertedBy / insertedTimestamp"]
     DOC_REUSE["Reuse existing entity"]
-    DOC_SET["Set documents list\n+ updatedBy, updatedTimestamp"]
-    DOC_SAVE["questionnaireRepository.save\n→ wdp.disputes_questionnaire"]
-    DOC_OK["HTTP 200 empty body\n(no call to case-actions-service)"]
+    DOC_SET["Set documents list,<br/>updatedBy, updatedTimestamp"]
+    DOC_SAVE["questionnaireRepository.save<br/>→ wdp.disputes_questionnaire"]
+    DOC_OK["HTTP 200 empty body<br/>(NO call to case-actions)"]
 
-    %% ── B5 GET /document RULE LOOKUP PATH ──────
-    DOC_GET["DisputeQuestionnaireController\nGET /{platform}/document\n(query: responseReason, reasonCode,\ncompEvidenceType optional)"]
-    RULE_QUERY["docStatusRepo\n.findByResponseReasonAndReasonCodeAndCompEvidenceType\n→ wdp.disputes_questionnaire_doc_status_rules\n(multi-fallback pattern)"]
-    RULE_FOUND{{"Rule found\n(after all fallbacks)?"}}
-    RULE_404["HTTP 404\nDocument-status rule not found"]
-    RULE_OK["HTTP 200\nDocumentStatusResponse\n{isDocumentRequired: Boolean}"]
+    %% ── B5 GET /document RULE LOOKUP ──
+    DOC_GET["B5 GET /{platform}/document<br/>(query: responseReason,<br/>reasonCode, compEvidenceType?)"]
+    EVID_BLANK{{"compEvidenceType<br/>blank?"}}
+    RULE_2P["Single 2-param lookup<br/>findByResponseReasonAndReasonCode"]
+    RULE_3P["3-attempt fallback chain"]
+    FB1["Attempt 1: exact (RR, RC, CE)"]
+    FB2{{"null?"}}
+    FB2A["Attempt 2: (RR, 'NA', CE)"]
+    FB3{{"null?"}}
+    FB3A["Attempt 3: (RR, RC, 'NA')"]
+    RULE_FOUND{{"Rule found?"}}
+    RULE_404["HTTP 404"]
+    RULE_OK["HTTP 200<br/>{isDocumentRequired: Boolean}"]
 
-    %% ── NON-VISA GET PATH ──────────────────────
-    DISP_GET["DisputeQuestionnaireController\nGET /{platform}/representment/..."]
-
-    %% ── WIRING ─────────────────────────────────
+    %% ── WIRING ──
     IN --> JWT
-    JWT -->|"invalid / missing"| JWT_FAIL
+    JWT -->|"invalid"| JWT_FAIL
     JWT -->|"valid"| CORR
-    CORR --> CTRL
+    CORR --> METHOD_OK
+    METHOD_OK -->|"no"| METHOD_405
+    METHOD_OK -->|"yes"| JSON_OK
+    JSON_OK -->|"no — malformed JSON"| JSON_500
+    JSON_OK -->|"yes"| CTRL
 
-    CTRL -->|"POST or PUT\n/visa/..."| VISA_MUT
-    CTRL -->|"GET\n/visa/..."| VISA_GET
-    CTRL -->|"POST or PUT\n/{platform}/representment/..."| DISP_MUT
-    CTRL -->|"PUT\n/{platform}/document/..."| DOC_PUT
-    CTRL -->|"GET\n/{platform}/representment/..."| DISP_GET
-    CTRL -->|"GET\n/{platform}/document"| DOC_GET
+    CTRL -->|"POST or PUT mutating"| MUT_PATH
+    CTRL -->|"GET representment/precomp/etc"| GET_PATH
+    CTRL -->|"PUT /document"| DOC_PUT
+    CTRL -->|"GET /document"| DOC_GET
 
-    VISA_MUT --> VISA_VAL
-    VISA_VAL -->|"validation fails"| VISA_VAL_FAIL
-    VISA_VAL -->|"valid — POST"| GET_ACTION
-    VISA_VAL -->|"valid — PUT"| PUT_CHECK
+    MUT_PATH --> PLATFORM_VAL
+    PLATFORM_VAL -->|"invalid"| PLATFORM_FAIL
+    PLATFORM_VAL -->|"valid"| BEAN_VAL
+    BEAN_VAL -->|"fails"| BEAN_FAIL
+    BEAN_VAL -->|"valid + POST"| GET_ACTION
+    BEAN_VAL -->|"valid + PUT"| PUT_CHECK
     PUT_CHECK -->|"not found"| NOT_FOUND
     PUT_CHECK -->|"found"| GET_ACTION
 
     GET_ACTION -->|"RestClientException"| ACTION_FAIL
     GET_ACTION -->|"success"| NAP_CHECK
 
-    NAP_CHECK -->|"yes (NAP)"| AMT_NAP
+    NAP_CHECK -->|"yes"| AMT_NAP
     NAP_CHECK -->|"no"| AMT_OTHER
-    AMT_NAP -->|"null or exceeds"| AMT_FAIL
-    AMT_OTHER -->|"null or exceeds"| AMT_FAIL
+    AMT_NAP -->|"null/exceeds"| AMT_FAIL
+    AMT_OTHER -->|"null/exceeds"| AMT_FAIL
     AMT_NAP -->|"valid"| PCT
     AMT_OTHER -->|"valid"| PCT
 
@@ -185,47 +206,63 @@ flowchart TD
     DB_SAVE -->|"POST success"| POST_OK
     DB_SAVE -->|"PUT success"| PUT_OK
 
-    VISA_GET --> GET_LOOKUP --> GET_NULL
+    GET_PATH --> GET_LOOKUP --> GET_NULL
     GET_NULL -->|"null"| GET_404
     GET_NULL -->|"found"| GET_DESER --> GET_OK
 
-    DISP_MUT --> DISP_VAL
-    DISP_VAL -->|"validation fails"| VISA_VAL_FAIL
-    DISP_VAL -->|"valid — POST"| GET_ACTION
-    DISP_VAL -->|"valid — PUT"| PUT_CHECK
-
     DOC_PUT --> DOC_LOOKUP --> DOC_EXISTS
     DOC_EXISTS -->|"null — create"| DOC_NEW --> DOC_SET
-    DOC_EXISTS -->|"found — update"| DOC_REUSE --> DOC_SET
+    DOC_EXISTS -->|"found"| DOC_REUSE --> DOC_SET
     DOC_SET --> DOC_SAVE --> DOC_OK
 
-    DOC_GET --> RULE_QUERY --> RULE_FOUND
-    RULE_FOUND -->|"null (all fallbacks exhausted)"| RULE_404
+    DOC_GET --> EVID_BLANK
+    EVID_BLANK -->|"yes"| RULE_2P
+    EVID_BLANK -->|"no"| RULE_3P
+    RULE_3P --> FB1 --> FB2
+    FB2 -->|"yes"| FB2A --> FB3
+    FB2 -->|"no"| RULE_FOUND
+    FB3 -->|"yes"| FB3A --> RULE_FOUND
+    FB3 -->|"no"| RULE_FOUND
+    RULE_2P --> RULE_FOUND
+    RULE_FOUND -->|"null"| RULE_404
     RULE_FOUND -->|"found"| RULE_OK
-
-    DISP_GET --> GET_LOOKUP
 ```
 
-**Multi-fallback lookup chain for GET /{platform}/document**
-(when `compEvidenceType` is provided, applied in order until a non-null result is found):
-1. Exact match: `responseReason` + `reasonCode` + `compEvidenceType`
-2. `reasonCode = "NA"` + `compEvidenceType`
-3. `reasonCode` + `compEvidenceType = "NA"`
-4. If still null → HTTP 404
+**Mutating-path step sequence (POST and PUT, Visa and Non-Visa converged 11 steps):**
+1. JWT validation by Spring Security filter chain
+2. `HttpInterceptor.preHandle` — read/generate `v-correlation-id`, set in MDC, echo to response header
+3. K8s ingress / Spring routing → controller method by URL prefix + HTTP method
+4. Platform enum validation (`SourceSystemName.valueOf(platform.toUpperCase())`)
+5. `@Valid` JSR-303 + `QuestionnaireValidator` cross-field rules
+6. (PUT only) `getSavedQuestionnaire` → 404 if not found
+7. `searchActionDetailsService.getCaseAction(...)` REST call to `case-actions-service`
+8. NAP branch: validate `responseAmount` against `disputeWorkableAmount` (NAP) or `disputeSourceAmount` (other)
+9. `CalculationUtil.setAmountPercentage` — overwrites writeOff%, ctm%, response% on the request
+10. `QuestionnaireMapper.mapModelToEntity` — Jackson serialises request to JSON; sets userId, timestamps, `caseStage` from ActionSummary
+11. `questionnaireRepository.save` — write to `wdp.disputes_questionnaire`
 
-**NAP amount branch note**
-On the Visa POST/PUT path, when `platform = NAP`, the amount is validated against
-`disputeWorkableAmount`. For all other platforms the validation uses
-`disputeSourceAmount`. Both values are returned by `case-actions-service` in the
-`ActionSummary`.
+**A4 Allocation Arbitration variant**: amount validation uses `caseFilingAmount` rather than `responseAmount`; additionally enforces `contactFax` XOR `contactOther` mutual exclusion within `issuerAcquirerContactInfo` (HTTP 400 if both set).
 
-**Asymmetric write-off validation (incomplete work)**
-On POST endpoints: `checkWriteOffReasonWriteOffNote` is commented out. A merchant
-can create a questionnaire with a `writeOffAmount` but without providing
-`writeOffReason` or `writeOffNote`.
-On PUT endpoints: the same check is active. A merchant cannot update without
-providing both fields when `writeOffAmount` is present.
-This is a known asymmetry. See Risk Register below.
+**A2 Pre-Compliance cross-field rule (symmetric — corrected from prior draft):**
+- `preCompResponse == DECL` → `continuePreFilingReason` REQUIRED **and** `partialAcceptanceReason` MUST BE ABSENT
+- `preCompResponse == PART` → `partialAcceptanceReason` REQUIRED **and** `continuePreFilingReason` MUST BE ABSENT
+
+**B1 PUT `/document` upsert path** — does **not** call `case-actions-service`. Find-then-decide is **not** inside any `@Transactional`, so two concurrent calls on the same `(caseNumber, actionSeq)` can both find null and both insert.
+
+**B5 GET `/document` multi-fallback** (only when `compEvidenceType` is non-blank):
+1. Exact `(responseReason, reasonCode, compEvidenceType)`
+2. `(responseReason, "NA", compEvidenceType)`
+3. `(responseReason, reasonCode, "NA")`
+4. Still null → HTTP 404
+
+When `compEvidenceType` is blank, a single 2-parameter lookup is performed (no fallback chain).
+
+**Asymmetric write-off validation (deliberate code state):**
+- `checkWriteOffReasonWriteOffNote` is **commented out** on every POST handler (5 Visa POSTs and B2 Non-Visa POST).
+- `checkWriteOffReasonWriteOffNote` is **active** on every PUT handler (5 Visa PUTs and B4 Non-Visa PUT).
+- `checkCTMTemplate` method body is fully commented out → no-op on every endpoint, regardless of POST/PUT.
+
+**Non-standard error mapping**: `HttpMessageNotReadableException` (malformed JSON body) → **HTTP 500**, not the conventional HTTP 400. See Risks.
 
 ---
 
@@ -235,20 +272,22 @@ This is a known asymmetry. See Risk Register below.
 
 | Source | Protocol | Endpoint / Topic / Trigger | Payload / Description |
 |--------|----------|----------------------------|-----------------------|
-| WDP Merchant Portal (COMP-49) | REST / HTTPS | All `/visa/` and `/{platform}/` endpoints | Merchant questionnaire submissions and reads |
-| WDP Ops Portal (COMP-50) | REST / HTTPS | All endpoints (probable) | Operations team questionnaire management |
-| Unknown orchestration service | REST / HTTPS | All endpoints | Copilot confirmed callers not determinable from source — team confirmation required |
+| WDP Merchant Portal (COMP-49) | REST / HTTPS | All `/visa/` and `/{platform}/` endpoints | Merchant questionnaire submissions and reads (probable; team confirmation pending) |
+| WDP Ops Portal (COMP-50) | REST / HTTPS | All endpoints | Operations team questionnaire management (probable; team confirmation pending) |
+| Unknown orchestration service(s) | REST / HTTPS | All endpoints | No feign client, caller stub, or contract test for this service was found inside its own repo. Caller identity must be confirmed by the platform team. |
 
-*Platform path parameter valid values: `CORE`, `NAP`, `VAP`, `LATAM`, `PIN`*
+*Platform path-parameter valid values, enforced by `SourceSystemName` enum: `CORE`, `NAP`, `VAP`, `LATAM`, `PIN`. Invalid values trigger `IllegalArgumentException` → HTTP 500 (see Risks).*
 
 ### Outbound Interfaces
 
-| Target | Protocol | Endpoint / Topic / Resource | Purpose | On failure |
-|--------|-----------|-----------------------------|---------|------------|
-| `mdvs-gcp-case-actions-service` | HTTP REST (plain within cluster) | `GET /merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions/{actionSequence}` | Retrieve `ActionSummary` (disputeWorkableAmount, disputeSourceAmount, stageCode, creditDebitIndicator) on every mutating request | `RestClientException` rethrown → HTTP 500. No retry, no circuit breaker, no fallback |
-| `wdp.disputes_questionnaire` | PostgreSQL (WDP Aurora) | JPA `save()` | Persist or update questionnaire JSON payload | `SQLException` → HTTP 500 |
-| `wdp.disputes_questionnaire_doc_status_rules` | PostgreSQL (WDP Aurora) | JPA read-only | Document-requirement rule lookup for GET /document | Null result → HTTP 404 |
-| IdP (token endpoint) | HTTPS | `idp_token_url` (env var) | Client-credentials token for outbound call to case-actions-service (`wdp-internal-auth` registration, scope `openid`) | Exception propagated → HTTP 500 |
+| Target | Protocol | Endpoint / Resource | Purpose | On failure |
+|--------|----------|---------------------|---------|------------|
+| `mdvs-gcp-case-actions-service` | HTTP REST (HTTPS only on `local` profile) | `GET /merchant/gcp/case-actions/{platform}/case/{caseNumber}/actions/{actionSequence}` | Retrieve `ActionSummary` (disputeWorkableAmount, disputeSourceAmount, stageCode, creditDebitIndicator) on every mutating request | `RestClientException` rethrown → HTTP 500. **No connect timeout, no read timeout, no retry, no fallback, no circuit breaker.** |
+| Enterprise IdP (token endpoint) | HTTPS | `${idp_token_url}` | Client-credentials token (registration `wdp-internal-auth`, scope `openid`, grant `client_credentials`) for outbound call to case-actions-service | Token-fetch exception propagates → HTTP 500. No timeout override visible in this repo. |
+| `wdp.disputes_questionnaire` | PostgreSQL (Aurora) — **`DriverManagerDataSource`** (not HikariCP) | JPA `save()` | Persist or update questionnaire JSON payload | `SQLException` → HTTP 500. |
+| `wdp.disputes_questionnaire_doc_status_rules` | PostgreSQL (Aurora) — **`DriverManagerDataSource`** | JPA read-only | Document-requirement rule lookup for B5 GET `/document` | Null result after fallback chain → HTTP 404. |
+
+**Datasource note**: `PersistenceConfig` uses `DriverManagerDataSource` rather than HikariCP. This means **no application-tier connection pool** — every request opens a fresh JDBC connection and closes it when the operation finishes. Effective pooling depends entirely on PgBouncer / Aurora-side pooling if any. See Risks.
 
 ---
 
@@ -258,27 +297,99 @@ This is a known asymmetry. See Risk Register below.
 
 | Schema.Table | Purpose | Key columns | Retention / Notes |
 |--------------|---------|-------------|-------------------|
-| `wdp.disputes_questionnaire` | Primary questionnaire store. One row per (caseNumber, actionSeq). Entire request payload stored as a serialised JSON blob. Also stores attached document names. | `I_QSTNNAIR_ID` (PK, auto-increment sequence), `I_CASE` (caseNumber), `I_ACTION_SEQ`, `C_CASE_STAGE`, `C_QSTNNAIR` (JSON blob — full request), `N_DOCUMENT_NAME` (document list), `userId`, `createdAt`, `updatedAt` | ⚠️ **SHARED TABLE** — also written by COMP-15 EvidenceConsumer (upserts document names on RESPDOC WDP path). JPA entity has index on `(I_CASE, I_ACTION_SEQ)` but no `@UniqueConstraint`. A second POST for the same (caseNumber, actionSeq) will insert a duplicate row. DB-level unique constraint existence not determinable from source — DBA confirmation required. |
+| `wdp.disputes_questionnaire` | Primary questionnaire store. One row per `(caseNumber, actionSeq)` is the **intended** semantics — the JPA entity has a non-unique `@Index` on `(I_CASE, I_ACTION_SEQ)` but **no `@UniqueConstraint`**. Whether a DB-level UNIQUE exists is **not determinable from source** — there are no Liquibase, Flyway, or SQL-migration files in the repo. Full request payload stored as a serialised JSON blob; document names stored separately. | `I_QSTNNAIR_ID` (PK, sequence `wdp.disputes_questionnaire_i_qstnnair_id_sequence`), `I_CASE`, `I_ACTION_SEQ`, `C_CASE_STAGE`, `C_QSTNNAIR` (JSON blob), `N_DOCUMENT_NAME`, `X_INSRT` (insertedBy), `Z_INSRT` (insertedTimestamp), `X_UPDT` (updatedBy), `Z_UPDT` (updatedTimestamp) | ⚠️ **SHARED TABLE** — also written by COMP-37 DocumentManagementService (UPSERT on Endpoint 11 questionnaire path; `@Transactional(rollbackOn=Exception.class)`; last-write-wins on `(caseNumber, actionSequence)` PK; republishes Kafka each time) and by COMP-15 EvidenceConsumer (upserts document names on RESPDOC WDP path). COMP-26 itself uses **no** `@Transactional` on any path — every JPA call is its own per-call default transaction. Retention policy not documented. |
 
 ### Tables Read (not owned by this component)
 
 | Schema.Table | Owned by | Why accessed |
 |--------------|----------|--------------|
-| `wdp.disputes_questionnaire_doc_status_rules` | ⚠️ Owner TBC (likely config/admin managed) | Document-status lookup: determines whether a supporting document is required for a given `responseReason` + `reasonCode` + `compEvidenceType` combination. Read-only via `docStatusRepo`. |
+| `wdp.disputes_questionnaire_doc_status_rules` | ⚠️ Owner TBC — **not written from this repo** (strictly read-only here). PK column `id`, sequence `disputes_questionnaire_doc_i_doc_status_rule_id_seq`. | Document-status lookup for B5 GET `/document` — determines whether a supporting document is required for a given `responseReason` + `reasonCode` + `compEvidenceType` combination. |
+
+**Repository inventory (exhaustive):**
+
+| Repository | Entity | Table | Access |
+|------------|--------|-------|--------|
+| `QuestionnaireRepository` | `QuestionnaireEntity` | `wdp.disputes_questionnaire` | R/W |
+| `DocRequiredStatusRulesRepository` | `DocumentRequiredStatusRulesEntity` | `wdp.disputes_questionnaire_doc_status_rules` | R only |
+
+**No other tables touched.** No raw SQL writes anywhere in source.
 
 ---
 
-## Risks and Known Issues
+## Configuration and Scaling
 
-| Risk | Description | Severity | Action |
-|------|-------------|----------|--------|
-| ⚠️ POST idempotency gap | No duplicate-prevention check on POST. A second POST for the same `(caseNumber, actionSeq)` inserts a new row rather than updating. JPA entity has a DB index but no `@UniqueConstraint`. Whether a DB-level unique constraint exists outside JPA is unknown. | 🔴 HIGH | DBA must confirm constraint. If absent, concurrent POSTs can create phantom questionnaire rows. |
-| ⚠️ No timeout on `case-actions-service` | `CommonConfig` creates a plain `new RestTemplate()` with no `HttpComponentsClientHttpRequestFactory`. Default JVM socket timeout applies — typically unlimited. Any slowness or hang in `case-actions-service` blocks the mutating request thread with no bound. | 🔴 HIGH | DEC-014 deviation. Architect decision required: configure explicit connection and read timeouts. |
-| ⚠️ No circuit breaker on `case-actions-service` | No Resilience4j dependency in `pom.xml`. No circuit breaker, bulkhead, or rate limiter on the outbound REST call. If `case-actions-service` is degraded, all mutating requests will fail or hang. | 🟠 MEDIUM-HIGH | DEC-014 deviation. Confirm with team whether a formal exception to DEC-014 has been accepted. |
-| ⚠️ Asymmetric write-off validation | `checkWriteOffReasonWriteOffNote` is commented out on all POST endpoints but active on PUT. A merchant can create a questionnaire with `writeOffAmount` but no `writeOffReason`/`writeOffNote`, but cannot then update it in the same state. | 🟡 MEDIUM | Requires team decision: restore validation on POST or formally document the asymmetry as intentional. |
-| ⚠️ CTM template never validated | `checkCTMTemplate` is commented out on all POST and PUT endpoints. The method body is also fully commented out. `ctmTemplate` is never validated as required when `ctmAmount` is present. | 🟡 MEDIUM | Confirm with team whether CTM template validation is deferred or deprecated. |
-| ⚠️ Known callers unconfirmed | Copilot cannot determine callers from source alone. `@OpenAPIDefinition` describes the service as "used to create, update and search questionnaire info". Whether ContestService or another orchestration component reads from this service before submitting to the card network is unknown. | 🟡 MEDIUM | Team confirmation required. |
-| ⚠️ `${app.name}` env var | `management.metrics.tags.application: ${app.name}` references an env var not declared in `application.yaml` or `resources.yaml`. If not injected at runtime, the metric tag will be unresolved. | 🟢 LOW | Confirm env var injection source in XL Deploy / DeployIt config. |
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| K8s resource type | `Deployment` + `Service` (ClusterIP) + `Ingress` | 3 resources in `resources.yaml` |
+| Replica count | `{{ replicas-gcp-questionnaire-service }}` | XL Deploy / DeployIt template placeholder. **Only** replica reference in repo — no env override files exist. |
+| Memory request / limit | `1024Mi` / `2048Mi` | |
+| CPU request / limit | **Not configured** | No `cpu` field under `requests` or `limits` |
+| HPA | **Absent** | No `HorizontalPodAutoscaler` in repo |
+| PodDisruptionBudget | **Absent** | |
+| Rollout strategy | `RollingUpdate`, `maxSurge: 1`, `maxUnavailable: 0` | |
+| `minReadySeconds` | `30` — ⚠️ **mis-indented under `spec.template.spec` (Pod spec) instead of `spec` (Deployment spec)**; likely ignored by Kubernetes | See Risks |
+| Topology spread | `maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, `topologyKey: kubernetes.io/hostname`, `matchLabels: app: mdvs-gcp-questionnaire-service` | Selector and topology label match — no mismatch |
+| Container / service port | `8082` | |
+| Ingress | `nginx` ingress class, CORS enabled, TLS via `{{ ingressTLSsecretName }}`, **6 host rules** via templated host names | All hosts route to path `/merchant/gcp/questionnaire` |
+| K8s namespace | **Not in `resources.yaml`** — `${K8S_NAMESPACE}` placeholder in `deployit-manifest.xml` | Namespace value comes from XL Deploy / DeployIt config |
+| Database connection pool | **`DriverManagerDataSource`** — no HikariCP, no app-tier pool, no connection / query timeout | New connection per JPA call. Effective pooling depends on PgBouncer / Aurora-side, not visible in repo. |
+| Async / thread pool | None declared | Inbound REST threads from Tomcat only |
+| Observability | OpenTelemetry Java agent injected via `instrumentation.opentelemetry.io/inject-java`; Spring Actuator (`info`, `health`, `prometheus`) on port 8082; liveness `/livez`, readiness `/readyz`; Logstash `LogstashTcpSocketAppender` named `awselk` to `${logstash_server_host_port}` | No startup probe declared. |
+
+**Spring profiles in repo:** Only the base `application.yaml` exists — there are no `application-{profile}.yaml` files. Profile-specific overrides are inline (`local`, `dev`, `test`, `stg`, `uat`, `cert`, `prod`) and only override the `case-actions-service` URL. `local` uses HTTPS; all other profiles use HTTP within the cluster. JWT issuers, IdP URL, server port, and Logstash destination are env-var-driven (not profile-overridden).
+
+---
+
+## Key Architectural Decisions
+
+| Decision | ADR reference | Notes |
+|----------|---------------|-------|
+| No transactional outbox; no Kafka producer | DEC-001 — DEVIATION (by design for REST API) | Component is a pure synchronous CRUD service; outbox pattern does not apply |
+| No PAN handling; no encryption dependency | DEC-004 / DEC-019 — COMPLIES | No card-number field anywhere in entity, request, or response |
+| No application-level idempotency on POST | DEC-020 — DEVIATION | Duplicate POSTs insert duplicate rows; no `Idempotency-Key`, no dedupe table, no `@Version`, no DB UNIQUE confirmed |
+| No Resilience4j on outbound REST | (DEC-014 platform-VOID) — factual record | Bare `new RestTemplate()` with no timeout / retry / circuit breaker on the only outbound call |
+| No `@Transactional` boundaries declared anywhere | Local — significant deviation | Every JPA operation runs in Spring Data JPA's per-call default transaction. Multi-step flows (PUT find-then-save, B1 UPSERT find-then-decide-then-save) span multiple short transactions and are vulnerable to TOCTOU races. |
+| `DriverManagerDataSource` instead of HikariCP | Local — significant deviation | New JDBC connection per JPA call; no application-tier pool. |
+| JWT-only auth, no scope or `@PreAuthorize` | Local | Any valid JWT from a trusted issuer is accepted on all 20 endpoints |
+
+---
+
+## Risks and Constraints
+
+**Severity scale:** 🔴 HIGH · 🟡 MEDIUM · 🟢 LOW
+
+| Severity | Risk | Consequence |
+|----------|------|-------------|
+| 🔴 HIGH | **No `@Transactional` anywhere in service code** | PUT (find → save) and B1 UPSERT (find → decide → save) span multiple per-call transactions. Concurrent B1 calls for the same `(caseNumber, actionSeq)` can both find null and both insert, producing duplicate rows. PUT path can read an entity, have it updated by another path, and then overwrite without `@Version` detecting the conflict. |
+| 🔴 HIGH | **POST idempotency gap** — no application-level pre-existing-row check, no `Idempotency-Key` header, no DB-level UNIQUE confirmed (no migration files in repo) | Duplicate POSTs for the same `(caseNumber, actionSeq)` insert phantom rows. Retry by callers (or accidental double-submit by portals) silently corrupts the questionnaire history. |
+| 🔴 HIGH | **No timeout on outbound `case-actions-service` REST call** — `new RestTemplate()` with no `HttpComponentsClientHttpRequestFactory`, no `setConnectTimeout`, no `setReadTimeout` | Default JVM socket timeout (effectively unbounded). Any slowness or hang in `case-actions-service` blocks the mutating request thread indefinitely; under load, all Tomcat worker threads can be tied up waiting. Same applies to the IdP token fetch — no timeout configured. |
+| 🟠 MEDIUM-HIGH | **No Resilience4j circuit breaker / retry on outbound REST** — no Resilience4j artifact in `pom.xml`, no `@CircuitBreaker` / `@Retry` / `@Bulkhead` annotations, no manual retry | If `case-actions-service` is degraded, every mutating request on this service fails immediately or hangs. No graceful degradation, no fail-fast circuit. |
+| 🟡 MEDIUM | **`DriverManagerDataSource` instead of HikariCP** | No application-tier connection pool. Each JPA operation opens a new JDBC connection. Throughput is bounded by Postgres's accept-rate and PgBouncer (if present). Connection storm risk under traffic spikes. |
+| 🟡 MEDIUM | **`HttpMessageNotReadableException` → HTTP 500 (not 400)** | Malformed JSON from a caller is reported as a server error rather than a client error. Misleading to upstream observability and breaks normal client error-handling conventions. |
+| 🟡 MEDIUM | **`minReadySeconds: 30` mis-indented under Pod spec**, not Deployment spec | Likely ignored by K8s — rolling updates may proceed faster than the 30-second cool-off the manifest authors intended. Effective rollout behaviour does not match declared intent. |
+| 🟡 MEDIUM | **Asymmetric write-off validation** — `checkWriteOffReasonWriteOffNote` commented out on POST, active on PUT | Merchant can create a questionnaire with `writeOffAmount` but no `writeOffReason`/`writeOffNote` via POST; cannot then update it without filling those fields (or must abandon and POST a duplicate). Inconsistent contract. |
+| 🟡 MEDIUM | **CTM template never validated** — `checkCTMTemplate` body fully commented out across POST and PUT | `ctmTemplate` is functionally optional despite being present in `RepresentmentRequest`. Data-quality risk on stored CTM records. |
+| 🟡 MEDIUM | **Invalid platform string returns HTTP 500, not 400** | `SourceSystemName.valueOf(...)` throws `IllegalArgumentException` for an unknown platform; the `RuntimeException` handler maps it to 500. Client-side typo on `{platform}` is misreported as server failure. |
+| 🟡 MEDIUM | **Known callers unconfirmed** — no inbound contract test, feign client, or stub in this repo references this service | Migration / change-impact analysis cannot be performed from source alone. ContestService (COMP-20) relationship is also unconfirmed. |
+| 🟢 LOW | **`StandardEntityError` and `createDuplicateResponseEntity` are dead code** | Defined in `GlobalExceptionHandler` but not reachable from any active `@ExceptionHandler`. Maintenance hazard. |
+| 🟢 LOW | **`${app.name}` env var referenced for metrics tag but not declared** in `application.yaml` or `resources.yaml` | If not injected via XL Deploy, the Prometheus `application` tag will resolve unset/blank, degrading dashboards. |
+| 🟢 LOW | **Two commented-out hardcoded Logstash IPs** (`10.43.145.125:5044`) in `logback-spring.xml` | Dev/staging artefact; no production impact, but should be removed. |
+| 🟢 LOW | **TODO at `GlobalExceptionHandler`** for `HttpRequestMethodNotSupportedException` (METHOD_NOT_ALLOWED) | Error handler note marked incomplete; current behaviour returns 405 correctly, but the work item is unresolved. |
+
+---
+
+## Planned Changes
+
+- ⚠️ OPEN QUESTION: Are there any planned remediations for the no-`@Transactional` posture and the `DriverManagerDataSource` decision? Both are local platform deviations that affect concurrency safety and connection-storm risk.
+- ⚠️ OPEN QUESTION: Has the absence of Resilience4j been formally accepted as a platform exception for this service, given DEC-014 has been voided?
+- ⚠️ OPEN QUESTION: POST idempotency — DB UNIQUE on `(I_CASE, I_ACTION_SEQ)` to be added, or accept the current duplicate-row behaviour?
+- ⚠️ OPEN QUESTION: Restore `checkWriteOffReasonWriteOffNote` on POST, or formally document the asymmetry as intentional?
+- ⚠️ OPEN QUESTION: Restore or remove `checkCTMTemplate` — is CTM template validation deferred or deprecated?
+- ⚠️ OPEN QUESTION: Fix `HttpMessageNotReadableException` → 400 mapping, or document as accepted behaviour?
+
+No quarterly migration plan visible in source. Review at next architect session.
+
+---
 
 ---
 
@@ -289,254 +400,91 @@ This is a known asymmetry. See Risk Register below.
 
 ## REST API Contracts
 
-**Framework:** Spring Boot 3.5.4 / Java 17
-**Auth model:** Spring OAuth2 Resource Server with `JwtIssuerAuthenticationManagerResolver`.
-Trusted issuers loaded from config key `jwt.trustedIssuers` (env var `jwt_trusted_issuer_urls`).
-JWT required on all endpoints except `/actuator/health`, `/livez`, `/readyz`,
-and (non-prod only) Swagger UI paths.
-**Role/scope check:** None. No `@PreAuthorize` or scope assertions. Any valid JWT from
-a trusted issuer is accepted.
-**Outbound auth:** Client-credentials OAuth2 token obtained from IdP (`wdp-internal-auth`
-registration, grant type `client_credentials`, scope `openid`). Attached as `Bearer`
-on all outbound calls to `case-actions-service`.
+**Authentication model**: All endpoints (except `/actuator/health`, `/livez`, `/readyz`, and Swagger UI in non-prod profiles) require a Bearer JWT validated by Spring Security `JwtIssuerAuthenticationManagerResolver`. Trusted issuers are loaded from config key `jwt.trustedIssuers` (env `jwt_trusted_issuer_urls`). Any valid JWT from a trusted issuer is accepted — there are no `@PreAuthorize` annotations, no scope or role checks anywhere in source.
+
+**Outbound auth**: Client-credentials OAuth2 token from enterprise IdP (registration `wdp-internal-auth`, grant `client_credentials`, scope `openid`, token URL `${idp_token_url}`). Attached as Bearer on every call to `case-actions-service`.
+
+**Base URL pattern**: `https://<host>/merchant/gcp/questionnaire/<...>` (context path from env `SERVER_SERVLET_CONTEXT_PATH`).
+
+**Inbound interceptor**: `HttpInterceptor` (the only `HandlerInterceptor` registered) reads `v-correlation-id` from the request header (or generates a UUID), sets it in MDC and `RequestCorrelation`, and echoes it back on the response header. No other filters or `OncePerRequestFilter` implementations.
 
 ---
 
-### Group A — VisaQuestionnaireController (prefix `/visa`)
+### Group A — VisaQuestionnaireController (class-level prefix `/visa`)
 
-*All paths below are relative to base path `/merchant/gcp/questionnaire`.*
+*Paths below are relative to base path `/merchant/gcp/questionnaire`.*
+*Platform path-parameter valid values: `CORE`, `NAP`, `VAP`, `LATAM`, `PIN`.*
 
-*Platform path parameter valid values: `CORE`, `NAP`, `VAP`, `LATAM`, `PIN`*
+#### A-POST — Create Visa Questionnaire (5 endpoints)
 
----
+| # | Method | Path | Request body | 201 Response |
+|---|--------|------|--------------|--------------|
+| A1 | POST | `/visa/{platform}/representment/{caseNumber}/action/{actionSeq}` | `RepresentmentRequest` | `{"qstnnairId":"<id>"}` |
+| A2 | POST | `/visa/{platform}/precomresp/{caseNumber}/action/{actionSeq}` | `QuestionnairePreCompRequest` | `{"qstnnairId":"<id>"}` |
+| A3 | POST | `/visa/{platform}/prearbresp/{caseNumber}/action/{actionSeq}` | `QuestionnairePreArbRequest` | `{"qstnnairId":"<id>"}` |
+| A4 | POST | `/visa/{platform}/allocarb/{caseNumber}/action/{actionSeq}` | `AllocationArbRequest` | `{"qstnnairId":"<id>"}` |
+| A5 | POST | `/visa/{platform}/allocprearb/{caseNumber}/action/{actionSequence}` | `VISAAllocationPreArbRequest` | `{"qstnnairId":"<id>"}` |
 
-#### Endpoint Group A-POST — Create Visa Questionnaire (5 endpoints)
+All five share the converged 11-step mutating flow. Endpoint-specific validation:
+- **A2**: symmetric DECL/PART rule (see Internal Processing Flow section)
+- **A3**: `reasonForNotFullResponsibility @NotBlank`
+- **A4**: amount validates against `caseFilingAmount`; `contactFax` XOR `contactOther` mutual exclusion
+- **A5**: `validatePreArbitrationResponseReason` enforces CREDIT_PROCESSED → `creditProcessed` required, COMPELLING_EVIDENCE → `compellingEvidence` required
 
-| # | Method | Path (after base) | Request object | 201 Response |
-|---|--------|-------------------|----------------|-------------|
-| A1 | POST | `/visa/{platform}/representment/{caseNumber}/action/{actionSeq}` | `RepresentmentRequest` | `{"qstnnairId": "<id>"}` |
-| A2 | POST | `/visa/{platform}/precomresp/{caseNumber}/action/{actionSeq}` | `QuestionnairePreCompRequest` | `{"qstnnairId": "<id>"}` |
-| A3 | POST | `/visa/{platform}/prearbresp/{caseNumber}/action/{actionSeq}` | `QuestionnairePreArbRequest` | `{"qstnnairId": "<id>"}` |
-| A4 | POST | `/visa/{platform}/allocarb/{caseNumber}/action/{actionSeq}` | `AllocationArbRequest` | `{"qstnnairId": "<id>"}` |
-| A5 | POST | `/visa/{platform}/allocprearb/{caseNumber}/action/{actionSequence}` | `VISAAllocationPreArbRequest` | `{"qstnnairId": "<id>"}` |
+⚠️ **All A-POST endpoints**: `checkWriteOffReasonWriteOffNote` and `checkCTMTemplate` are **commented out** at the call site — see Internal Processing Flow.
 
-All POST endpoints share the same 11-step processing flow (see Internal Processing Flow
-above). Key differences per endpoint:
+#### A-PUT — Update Visa Questionnaire (5 endpoints)
 
-- **A2 (precomresp):** Additional cross-field validation — if `preCompResponse == DECL`
-  then `continuePreFilingReason` required and `partialAcceptanceReason` absent; if
-  `PART` then `partialAcceptanceReason` required.
-- **A3 (prearbresp):** `reasonForNotFullResponsibility` is `@NotBlank`.
-- **A4 (allocarb):** Amount validation uses `caseFilingAmount` instead of `responseAmount`.
-  Extra validation: `contactFax` and `contactOther` within `issuerAcquirerContactInfo`
-  cannot both be set (HTTP 400).
-- **A5 (allocprearb):** Additional `prearbitrationReason` validation via
-  `validatePreArbitrationResponseReason` — applies CREDIT_PROCESSED / COMPELLING_EVIDENCE
-  checks same as A1.
-
-**⚠️ Commented-out validation on all POST endpoints:**
-`checkWriteOffReasonWriteOffNote` is commented out — `writeOffReason` and `writeOffNote`
-are not validated on POST even when `writeOffAmount` is present.
-`checkCTMTemplate` is commented out — `ctmTemplate` is not validated when `ctmAmount` is present.
-
----
-
-**`RepresentmentRequest` (A1 POST/PUT Visa Representment):**
-
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `disputeResponse` | String (enum) | ✅ | `DECL` or `PART` |
-| `responseReason` | String (enum) | ✅ | Values from `ResponseReason` enum |
-| `responseAmount` | BigDecimal | ✅ | > 0, max 16 integer + 4 decimal places |
-| `writeOffAmount` | BigDecimal | Optional | > 0 |
-| `writeOffDirection` | String (enum) | Conditional | Required if `writeOffAmount` present |
-| `writeOffReason` | String | Conditional | Required on PUT if `writeOffAmount` present; NOT validated on POST (commented out) |
-| `writeOffNote` | String | Conditional | Required on PUT if `writeOffAmount` present; NOT validated on POST (commented out) |
-| `ctmAmount` | BigDecimal | Optional | |
-| `ctmTemplate` | String | Optional | Validation commented out — never checked as required |
-| `reasonForNotFullResponsibility` | String | Optional | max 10,000 chars |
-| `comments` | String | Optional | max 5,000 chars |
-| `explanation` | String | Optional | max 10,000 chars |
-| `creditProcessed` | List\<CreditProcessed\> | Conditional | Required (non-null, non-empty) if `responseReason == CREDIT_PROCESSED` |
-| `compellingEvidence` | CompellingEvidence | Conditional | Required (non-null) if `responseReason == COMPELLING_EVIDENCE` |
-| `invalidDispute` | InvalidDispute | Optional | |
-| `nonFiatCurrencyNonFungibleToken` | Object | Optional | |
-| `transactionMatching` | String | Optional | |
-| `userId` | String | ✅ | |
-| `writeOffAmountPercentage` | BigDecimal | Computed | Overwritten by service; may be present in body but is ignored |
-| `ctmAmountPercentage` | BigDecimal | Computed | Same |
-| `responseAmountPercentage` | BigDecimal | Computed | Same |
-
----
-
-**`QuestionnairePreCompRequest` (A2 POST/PUT Visa Pre-Compliance):**
-
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `preCompResponse` | String | ✅ | `DECL` or `PART` |
-| `responseAmount` | BigDecimal | ✅ | |
-| `writeOffAmount` | BigDecimal | Optional | |
-| `writeOffDirection` | String | Conditional | |
-| `continuePreFilingReason` | String | Conditional | Required if `preCompResponse == DECL` |
-| `partialAcceptanceReason` | String | Conditional | Required if `preCompResponse == PART` |
-| `userId` | String | ✅ | |
-| Amount percentages | BigDecimal ×3 | Computed | writeOff%, ctm%, response% |
-
----
-
-**`AllocationArbRequest` (A4 POST/PUT Visa Allocation Arbitration):**
-
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `filingReason` | String | ✅ | max 5,000 chars |
-| `allocationArbResponse` | String | ✅ | `DECL` or `PART` |
-| `caseFilingAmount` | BigDecimal | ✅ | Used for amount validation (not `responseAmount`) |
-| `writeOffAmount` | BigDecimal | Optional | |
-| `writeOffDirection` | String | Conditional | |
-| `comments` | String | Optional | |
-| `issuerAcquirerContactInfo` | Object | Optional | `contactFax` XOR `contactOther` — both set simultaneously → HTTP 400 |
-| `userId` | String | ✅ | |
-
----
-
-**`NonVisaRepresentmentRequest` (B2 POST / B4 PUT Non-Visa):**
-
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `disputeResponse` | String | ✅ | `DECL` or `PART` |
-| `caseNetwork` | String | ✅ | `@NotBlank` — mandatory for non-Visa path |
-| `responseAmount` | BigDecimal | ✅ | |
-| `comments` | String | ✅ | `@NotBlank` |
-| `writeOffAmount` | BigDecimal | Optional | |
-| `writeOffDirection` | String | Conditional | |
-| `representmentReasonCodes` | String | Optional | |
-| `userId` | String | ✅ | |
-
----
-
-**`DocumentRequest` (B1 PUT Document names):**
-
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `documents` | List\<String\> | ✅ | Not empty |
-| `userId` | String | ✅ | |
-
----
-
-**GET /{platform}/document — Query Parameters:**
-
-| Parameter | Type | Required | Notes |
-|-----------|------|----------|-------|
-| `responseReason` | String | ✅ | |
-| `reasonCode` | String | ✅ | |
-| `compEvidenceType` | String | Optional | max 6 chars |
-
----
-
-#### Endpoint Group A-PUT — Update Visa Questionnaire (5 endpoints)
-
-| # | Method | Path (after base) | Request object | 200 Response |
-|---|--------|-------------------|----------------|-------------|
-| A11 | PUT | `/visa/{platform}/representment/{caseNumber}/action/{actionSeq}` | `RepresentmentRequest` | 200 empty body |
-| A12 | PUT | `/visa/{platform}/precomresp/{caseNumber}/action/{actionSeq}` | `QuestionnairePreCompRequest` | 200 empty body |
-| A13 | PUT | `/visa/{platform}/prearbresp/{caseNumber}/action/{actionSeq}` | `QuestionnairePreArbRequest` | 200 empty body |
-| A14 | PUT | `/visa/{platform}/allocarb/{caseNumber}/action/{actionSeq}` | `AllocationArbRequest` | 200 empty body |
-| A15 | PUT | `/visa/{platform}/allocprearb/{caseNumber}/action/{actionSequence}` | `VISAAllocationPreArbRequest` | 200 empty body |
+| # | Method | Path | Request body | 200 Response |
+|---|--------|------|--------------|--------------|
+| A11 | PUT | `/visa/{platform}/allocarb/{caseNumber}/action/{actionSeq}` | `AllocationArbRequest` | empty body |
+| A12 | PUT | `/visa/{platform}/precomresp/{caseNumber}/action/{actionSeq}` | `QuestionnairePreCompRequest` | empty body |
+| A13 | PUT | `/visa/{platform}/allocprearb/{caseNumber}/action/{actionSequence}` | `VISAAllocationPreArbRequest` | empty body |
+| A14 | PUT | `/visa/{platform}/representment/{caseNumber}/action/{actionSeq}` | `RepresentmentRequest` | empty body |
+| A15 | PUT | `/visa/{platform}/prearbresp/{caseNumber}/action/{actionSeq}` | `QuestionnairePreArbRequest` | empty body |
 
 PUT differs from POST in two ways:
-1. `findByCaseNumberAndActionSeq` called first — HTTP 404 if not found (no upsert).
-2. `checkWriteOffReasonWriteOffNote` is **active** — `writeOffReason` and `writeOffNote`
-   are validated on PUT when `writeOffAmount` is present.
+1. `getSavedQuestionnaire(caseNumber, actionSeq)` is called first → HTTP 404 if absent (no upsert)
+2. `checkWriteOffReasonWriteOffNote` is **active** — `writeOffReason` and `writeOffNote` required when `writeOffAmount` is present
+3. `checkCTMTemplate` remains a no-op (method body commented out)
 
-Note: `checkCTMTemplate` remains commented out on PUT as well — `ctmTemplate` is
-never validated on any endpoint.
+#### A-GET — Read Visa Questionnaire (5 endpoints)
 
----
-
-#### Endpoint Group A-GET — Read Visa Questionnaire (5 endpoints)
-
-| # | Method | Path (after base) | 200 Response object |
-|---|--------|-------------------|---------------------|
+| # | Method | Path | 200 Response |
+|---|--------|------|--------------|
 | A6 | GET | `/visa/{platform}/precomresp/{caseNumber}/action/{actionSeq}` | `PreCompResponse` |
 | A7 | GET | `/visa/{platform}/allocarb/{caseNumber}/action/{actionSeq}` | `AllocationArbResponse` |
 | A8 | GET | `/visa/{platform}/representment/{caseNumber}/action/{actionSeq}` | `RepresentmentResponse` |
 | A9 | GET | `/visa/{platform}/prearbresp/{caseNumber}/action/{actionSeq}` | `CollaborationPreArbResponse` |
-| A10 | GET | `/visa/{platform}/allocprearb/{caseNumber}/action/{actionSequence}` | `VISAAllocationPreArbResponse` |
+| A10 | GET | `/visa/{platform}/allocprearb/{caseNumber}/action/{actionSeq}` | `VISAAllocationPreArbResponse` |
 
-All GET endpoints share the same pattern:
-1. JWT + correlation-id + path validation
-2. `questionnaireRepository.findByCaseNumberAndActionSeq` → `wdp.disputes_questionnaire`
-3. If null → HTTP 404 "Questionnaire details not available"
-4. `QuestionnaireMapper.mapEntityToModel` — deserialises JSON blob + sets `documents`
-   list from entity column
-5. Returns HTTP 200 + typed response
-
-No outbound call to `case-actions-service` on GET operations.
+Shared pattern: JWT + correlation-id + path validation → `findByCaseNumberAndActionSeq` → 404 if null → `mapEntityToModel` deserialises JSON blob and copies documents list → 200 + typed response. **No outbound call to `case-actions-service` on GET.**
 
 ---
 
-### Group B — DisputeQuestionnaireController (no prefix)
+### Group B — DisputeQuestionnaireController (no class-level prefix)
 
-*All paths below are relative to base path `/merchant/gcp/questionnaire`.*
+*Paths below are relative to base path `/merchant/gcp/questionnaire`. Platform path variable is on every endpoint.*
 
----
+#### B1 — PUT `/{platform}/document/{caseNumber}/action/{actionSeq}`
+**UPSERT** — creates a stub row with `qstnnairRequest = "{}"` if none exists, then sets the document names list. Does **not** call `case-actions-service`. Find-then-decide-then-save runs across multiple per-call transactions (no `@Transactional`); concurrent B1 calls for the same key can both insert. Returns 200 empty body.
 
-#### B1 — PUT /{platform}/document/{caseNumber}/action/{actionSeq}
+| Field | Type | Required |
+|-------|------|----------|
+| `documents` | `List<String>` | ✅ non-empty |
+| `userId` | String | ✅ |
 
-**Upsert endpoint — creates a minimal stub row if none exists, then sets document names.**
+#### B2 — POST `/{platform}/representment/{caseNumber}/action/{actionSeq}`
+Non-Visa representment create. Same converged 11-step flow as Visa POSTs using `NonVisaRepresentmentRequest`. `caseNetwork` and `comments` are both `@NotBlank`. Returns **201 with empty body** (Visa POSTs return `{"qstnnairId":"..."}`).
 
-| Step | What happens |
-|------|-------------|
-| 1–4 | JWT + correlation-id + path validation |
-| 5 | `findByCaseNumberAndActionSeq` → `wdp.disputes_questionnaire` |
-| 6a | If null → create new `QuestionnaireEntity` with `qstnnairRequest = "{}"` + insert timestamps |
-| 6b | If found → reuse existing entity |
-| 7 | Set `documents` list, `updatedBy`, `updatedTimestamp` |
-| 8 | `questionnaireRepository.save()` |
-| 9 | HTTP 200 empty body |
+#### B3 — GET `/{platform}/representment/{caseNumber}/action/{actionSeq}`
+Same pattern as Visa GET group. Returns `NonVisaRepresentmentResponse` (includes `caseNetwork`).
 
-**Does NOT call `case-actions-service`.** This endpoint only manages the document
-name list — it does not validate amounts or compute percentages.
+#### B4 — PUT `/{platform}/representment/{caseNumber}/action/{actionSeq}`
+Same as Visa PUT pattern with `NonVisaRepresentmentRequest`. `checkWriteOffReasonWriteOffNote` active; `checkCTMTemplate` no-op.
 
----
-
-#### B2 — POST /{platform}/representment/{caseNumber}/action/{actionSeq}
-
-Same 11-step flow as Visa POST (A1) using `NonVisaRepresentmentRequest`.
-`caseNetwork` is mandatory (`@NotBlank`).
-Returns HTTP 201 **empty body** (unlike Visa POST which returns `{"qstnnairId": "<id>"}`).
-
----
-
-#### B3 — GET /{platform}/representment/{caseNumber}/action/{actionSeq}
-
-Same pattern as Visa GET group. Returns `NonVisaRepresentmentResponse` which
-includes `caseNetwork`.
-
----
-
-#### B4 — PUT /{platform}/representment/{caseNumber}/action/{actionSeq}
-
-Same as Visa PUT group using `NonVisaRepresentmentRequest`.
-Both `checkWriteOffReasonWriteOffNote` and `checkCTMTemplate` are active on this
-endpoint (although `checkCTMTemplate`'s method body is commented out, so CTM
-validation is still a no-op).
-
----
-
-#### B5 — GET /{platform}/document
-
-Document-requirement lookup. Determines whether a supporting document is required
-for a given combination of `responseReason`, `reasonCode`, and (optional)
-`compEvidenceType`.
-
-Multi-fallback lookup pattern against `wdp.disputes_questionnaire_doc_status_rules`:
-1. Exact match on all three fields
-2. `reasonCode = "NA"` + `compEvidenceType`
-3. `reasonCode` + `compEvidenceType = "NA"`
-4. If still null → HTTP 404
-
-Returns HTTP 200 + `DocumentStatusResponse { isDocumentRequired: Boolean }`.
+#### B5 — GET `/{platform}/document`
+Document-requirement lookup. Query parameters: `responseReason` (required), `reasonCode` (required), `compEvidenceType` (optional, ≤ 6 chars). Multi-fallback chain when `compEvidenceType` is non-blank; single 2-param lookup otherwise (see Internal Processing Flow). Returns `DocumentStatusResponse { isDocumentRequired: Boolean }` or 404.
 
 ---
 
@@ -545,78 +493,29 @@ Returns HTTP 200 + `DocumentStatusResponse { isDocumentRequired: Boolean }`.
 | Code | Trigger |
 |------|---------|
 | 200 | Successful GET; successful PUT |
-| 201 | Successful POST (create) |
-| 400 | Bean validation failure; business validation failure; invalid path params; conflicting fields (contactFax + contactOther); method not supported |
-| 401 | Missing or invalid JWT |
-| 404 | Questionnaire not found for `(caseNumber, actionSeq)`; document-status rule not found |
-| 500 | PostgreSQL error; `case-actions-service` unreachable or RestClientException; JSON mapping error; any uncaught RuntimeException |
+| 201 | Successful POST |
+| 400 | Bean validation failure (`MethodArgumentNotValidException`, `MethodArgumentTypeMismatchException`, `InvalidFormatException`, `ConstraintViolationException`, `MissingServletRequestPartException`); business validation failure (`BusinessValidationException` with BAD_REQUEST); A4 contactFax+contactOther conflict |
+| 401 | Missing or invalid JWT (Spring Security filter — pre-controller) |
+| 404 | Questionnaire not found for `(caseNumber, actionSeq)`; document-status rule not found after fallback chain; `NoHandlerFoundException` |
+| **405** | `HttpRequestMethodNotSupportedException` (HTTP method not permitted on path) |
+| 500 | PostgreSQL error; `case-actions-service` unreachable / `RestClientException`; **malformed JSON body (`HttpMessageNotReadableException`)**; **invalid platform value (`IllegalArgumentException` from `SourceSystemName.valueOf`)**; any uncaught `RuntimeException` |
 
-**Error response body structure (all non-2xx responses):**
+**No 403, 409, 415, 422, 503 paths exist** — confirmed across both controllers and the global exception handler.
+
+**Error response body (all non-2xx responses):**
 ```json
 {
   "errors": [
     {
-      "message": "Human-readable error message",
+      "errorMessage": "Human-readable error message",
       "target": "Field name or error category"
     }
   ]
 }
 ```
+*(Field name is `errorMessage`, not `message` — corrected from prior draft.)*
 
-**Notes:**
-- `StandardEntityError` format (with `status`, `errorCode`, `entity` fields) exists in
-  `GlobalExceptionHandler` for duplicate-detection scenarios but is not wired to any
-  active exception path in current code.
-- All mutating endpoints propagate `RestClientException` from `case-actions-service`
-  as HTTP 500 with no retry, no fallback, and no circuit breaker.
-
----
-
-## Scaling and Deployment
-
-| Item | Value | Source |
-|------|-------|--------|
-| K8s resource type | `Deployment` | `resources.yaml:2` |
-| Replica count | `{{ replicas-gcp-questionnaire-service }}` — XL Deploy / DeployIt template placeholder; exact production value not in source | `resources.yaml:8` |
-| Memory limit | `2048Mi` | `resources.yaml:57` |
-| Memory request | `1024Mi` | `resources.yaml:59` |
-| CPU limit | **Not configured** — no `cpu` field under `limits` | `resources.yaml:55–59` |
-| CPU request | **Not configured** | `resources.yaml:55–59` |
-| HPA | **Absent** — no `HorizontalPodAutoscaler` in `resources.yaml` | |
-| Rolling update | `RollingUpdate`, `maxSurge: 1`, `maxUnavailable: 0` | `resources.yaml:10–13` |
-| `minReadySeconds` | 30 seconds | `resources.yaml:24` |
-| PodDisruptionBudget | **Absent** — not in `resources.yaml` | |
-| Topology spread | Configured: `maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, `topologyKey: kubernetes.io/hostname`, `matchLabels: app: mdvs-gcp-questionnaire-service` | `resources.yaml:25–31` |
-| Topology label mismatch | **None observed** — Deployment selector and topology spread both use the same `app:` label | |
-| K8s namespace | **Not in source** — inferred as `wdp-micro` from peer-service URL pattern in `application.yaml`. Confirm from DeployIt config. | |
-| OTel agent | Configured via annotation `instrumentation.opentelemetry.io/inject-java` | `resources.yaml:29–31` |
-| Spring Actuator | Exposed: `info`, `health`, `prometheus`. Liveness: `/livez`. Readiness: `/readyz`. Both on server port 8082. | `application.yaml` |
-| Logstash appender | Present: `LogstashTcpSocketAppender` (`awselk`) in `logback-spring.xml`. Destination from `logstash.server.host.port` env var. | |
-| Log level | Runtime-configurable via `log_level` env var | `application.yaml` |
-
----
-
-## Planned and Incomplete Work
-
-| Item | Description | Impact |
-|------|-------------|--------|
-| `checkWriteOffReasonWriteOffNote` commented out on POST | Commented out in all 5 Visa POST handlers and both Non-Visa POST handlers. No code comment explaining why. Likely a deferred validation. | POST/PUT asymmetry — see Risk Register |
-| `checkCTMTemplate` commented out on all POST and PUT | Method body also fully commented out in `QuestionnaireValidator.java`. `ctmTemplate` never validated when `ctmAmount` present. Effect: `ctmTemplate` field in `RepresentmentRequest` is functionally optional despite its presence. | Data quality risk — CTM data may be stored incomplete |
-| TODO in `GlobalExceptionHandler.java:167` | `StandardError error = new StandardError(e.getMessage(), ApplicationConstants.METHOD_NOT_ALLOWED); // TODO` | Minor — error handler incomplete for METHOD_NOT_ALLOWED case |
-| Commented-out Logstash IPs | Two hardcoded Logstash destinations (`10.43.145.125:5044`) commented out in `logback-spring.xml` | Development/staging artifact — no production impact |
-| `${app.name}` metrics tag | `management.metrics.tags.application: ${app.name}` — env var not declared in `application.yaml` or `resources.yaml`. Unresolved if not injected at runtime. | Metrics tagging gap |
-
----
-
-## Platform Standard Deviation Flags
-
-| Decision | Status | Detail | Severity |
-|----------|--------|--------|----------|
-| **DEC-001** — Transactional outbox | ⛔ DEVIATION | No outbox table. No Kafka producer. All writes are synchronous JPA `save()` calls. This is by design for a pure REST API — however, if DEC-001 is interpreted as applying to all WDP services, this is a deviation. | 🟡 LOW (by design for REST API) |
-| **DEC-003** — Kafka partition key = merchantId | ✅ NOT APPLICABLE | Service does not publish to Kafka. No Kafka dependency in `pom.xml`. | — |
-| **DEC-004** — PAN encryption | ✅ NOT APPLICABLE | No PAN-related field in any request or response POJO. No encryption utilities. PAN is not touched by this service. | — |
-| **DEC-005** — Manual Kafka offset commit | ✅ NOT APPLICABLE | No Kafka consumer. | — |
-| **DEC-014** — Resilience4j on all outbound calls | ⛔ DEVIATION | No Resilience4j dependency in `pom.xml`. The single outbound call to `case-actions-service` uses a bare `RestTemplate` with no circuit breaker, bulkhead, rate limiter, or timeout configuration. **This is the highest-severity deviation.** | 🔴 HIGH |
+`StandardEntityError` (with `status` / `errorCode` / `entity` fields) and the private helper `createDuplicateResponseEntity()` exist in `GlobalExceptionHandler` but are **dead code** — neither is reachable from any active `@ExceptionHandler`.
 
 ---
 
@@ -624,16 +523,28 @@ Returns HTTP 200 + `DocumentStatusResponse { isDocumentRequired: Boolean }`.
 
 | Gap | What is needed | Action |
 |-----|---------------|--------|
-| **Known callers** — not determinable from source | Team confirmation of which portals and orchestration services call QuestionnaireService | Team confirmation |
-| **ContestService relationship** — not determinable from source | Does ContestService (COMP-20) read questionnaire data from this service before submitting to the card network? Or does it own that retrieval via another path? | Team confirmation — also follow-up Copilot question on COMP-20 repo: *"Does ContestService or any other component make an HTTP call to the gcp-questionnaire-service before submitting a representment or arbitration to a card network?"* |
-| **DB-level unique constraint on `(I_CASE, I_ACTION_SEQ)`** | JPA entity has an `@Index` but no `@UniqueConstraint`. Whether a DB-level unique constraint exists outside JPA is not visible in source. | DBA confirmation — run: `SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'disputes_questionnaire';` |
-| **Exact replica count** | `{{ replicas-gcp-questionnaire-service }}` is a template placeholder. Exact production value lives in XL Deploy or DeployIt config. | XL Deploy / DeployIt config review |
-| **K8s namespace** | Inferred as `wdp-micro` from peer-service URL patterns. Not explicitly in source. | Confirm from DeployIt deployment manifest |
-| **`wdp.disputes_questionnaire_doc_status_rules` owner** | Who writes this lookup table? Likely managed by an admin or configuration service. | Team confirmation |
-| **DEC-014 formal exception** | Whether the absence of Resilience4j has been formally accepted as a platform exception for this service, or whether it is an unaddressed gap. | Architect decision required |
+| **Known callers** — not determinable from source | Team confirmation of which portals and orchestration services call this service | Team confirmation |
+| **ContestService relationship (COMP-20)** | Does ContestService call this service before submitting representment / arbitration to a card network? | Cross-component Copilot pass on `mdvs-gcp-contest-service` repo |
+| **DB-level UNIQUE constraint on `wdp.disputes_questionnaire(I_CASE, I_ACTION_SEQ)`** | No DDL or migration in repo. JPA entity has only a non-unique `@Index`. | DBA confirmation: `SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'disputes_questionnaire';` |
+| **DB-level NOT NULL constraints** | Same — no DDL in repo, only JPA annotations | DBA confirmation |
+| **Owner of `wdp.disputes_questionnaire_doc_status_rules`** | This repo only reads. Writer not located. | Team confirmation; cross-repo grep |
+| **Exact replica count** | Template placeholder only; no values file in repo | XL Deploy / DeployIt config review |
+| **K8s namespace** | `${K8S_NAMESPACE}` placeholder in deployit-manifest; no `namespace:` key in any YAML | XL Deploy / DeployIt config review |
+| **`${app.name}` env var injection** | Referenced in metrics tag config but not declared | XL Deploy / DeployIt config review |
+| **Production Logstash host:port** | Env var `${logstash_server_host_port}` — value not in repo | Team / infra confirmation |
+| **TLS certificate for Ingress** | `{{ ingressTLSsecretName }}` placeholder | Infra confirmation |
+| **IdP token endpoint timeout** | Spring's OAuth2 client uses an internal `RestTemplate`; no override visible | Runtime observation or infra config review |
+| **Effective Postgres pooling** | App uses `DriverManagerDataSource` (no app-tier pool) | Confirm whether PgBouncer or Aurora-side pooling is in front of this service |
+| **DEC-014 formal exception** | Whether absence of Resilience4j has been formally accepted | Architect decision |
+| **No-`@Transactional` posture** | Whether multi-step operations are intentionally split across per-call transactions | Architect decision |
+| **POST idempotency posture** | Whether duplicate-row insertion on POST is accepted or to be remediated (DB UNIQUE + caller `Idempotency-Key`) | Architect decision |
+| **`checkWriteOffReasonWriteOffNote` POST asymmetry** | Restore validation or document as intentional | Team / architect decision |
+| **`checkCTMTemplate` removal vs restoration** | Validator body commented out everywhere | Team / architect decision |
+| **`HttpMessageNotReadableException` → 500 instead of 400** | Fix mapping or document as accepted | Team / architect decision |
+| **`minReadySeconds` indentation fix** | Currently mis-placed under Pod spec | DevOps follow-up |
 
 ---
 
-*End of WDP-COMP-26-QUESTIONNAIRE-SERVICE.md*
-*File status: 📝 DRAFT — awaiting architect confirmation*
-*Remember to update WDP-COMP-INDEX.md, WDP-KAFKA.md, and WDP-DB.md with entries from this file.*
+*End of WDP-COMP-26-QUESTIONNAIRE-SERVICE.md v1.1 DRAFT.*
+*File status: 📝 DRAFT — source-verified 2026-04-28 against `mdvs-gcp-questionnaire-service`. Architect confirmation pending.*
+*Platform-level impacts captured in WDP-CHANGE-LOG.md Pending Entry. WDP-DB.md row update pending; WDP-COMP-INDEX.md row update pending; no WDP-KAFKA.md changes (component is Kafka-free).*

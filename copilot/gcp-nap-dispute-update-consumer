@@ -1,0 +1,498 @@
+You are auditing the WDP component NAPOutcomeProcessor in the repository
+gcp-nap-dispute-update-consumer. A prior pass already produced a DRAFT
+architecture document. Your job is to CONFIRM OR CORRECT the items listed
+under "ALREADY DOCUMENTED" from source, and to CLOSE the items listed under
+"GAPS TO FILL" by reading the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that explicitly
+and label it "not determinable from source". Do NOT guess. Do NOT summarise
+without evidence. Do NOT use the existing document as a substitute for
+source — treat it as a hypothesis to verify.
+
+═══════════════════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT
+═══════════════════════════════════════════════════════════════════════════
+
+The existing component file `WDP-COMP-39-NAP-OUTCOME-PROCESSOR.md` is
+provided alongside this prompt. Treat its contents as HYPOTHESES to verify
+— not ground truth.
+
+For each claim in the existing document, you must do ONE of:
+  (a) Confirm: "Still accurate — <relative/path>:Lstart-Lend"
+  (b) Correct: write a CORRECTION block stating
+        - what the doc says
+        - what the source actually shows
+        - file:lines evidence
+        - which section of the doc needs updating
+
+At the end of your report (Section 10), list every claim from the
+existing document that you could NOT verify from source — neither
+confirmed nor contradicted.
+
+Do NOT re-document items in the ALREADY DOCUMENTED block from scratch.
+Use one-line confirmations or CORRECTION blocks only.
+
+═══════════════════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — confirm or correct each
+═══════════════════════════════════════════════════════════════════════════
+
+For each item below, output either "Still accurate — <file>:<lines>" or a
+CORRECTION block.
+
+REPOSITORY AND BUILD
+  - Spring Boot 3.5.7, Java 17, Maven artifact `com.wp.gcp:gcp-nap-dispute-update-consumer:1.2.2`
+  - Dependencies declared in pom.xml: spring-kafka, spring-data-jpa, spring-retry, spring-boot-starter-actuator
+  - UNUSED dependencies declared in pom.xml: spring-boot-starter-cache, springdoc-openapi-starter-webmvc-ui, spring-boot-starter-oauth2-resource-server
+  - `io.github.resilience4j` is NOT a dependency
+
+KAFKA CONSUMER
+  - Single `@KafkaListener`, single topic, single consumer factory
+  - Topic config key `${kafka_consumer_topic}`, group config key `${kafka_group_id}`
+  - AckMode = `MANUAL_IMMEDIATE`, `setSyncCommits(true)`
+  - `acknowledgment.acknowledge()` is the FIRST call inside `KafkaConsumer.onMessage()`, before all downstream processing — pre-ACK at-most-once pattern
+  - Concurrency = 1 (Spring Kafka default — `setConcurrency()` not invoked on `ConcurrentKafkaListenerContainerFactory`)
+  - `${max_poll_records}` and `${max_poll_interval}` resolved from env, no committed default
+  - Deserializer: `ErrorHandlingDeserializer` wrapping `JsonDeserializer<NotificationEvent>`
+  - `CommonErrorHandler` registered as a no-op anonymous class — failed deserialization returns null, NPE in listener, swallowed by no-op handler, message silently dropped
+
+ENTRY ROUTING
+  - Filter: `platform == "NAP"` (case-insensitive — `equalsIgnoreCase`)
+  - Non-NAP messages silently discarded with log only — no DB write, no error record
+  - Topic shared with COMP-40 VisaResponseQuestionnaire — separation by platform field only
+
+PROCESSING PIPELINE — SEQUENCED STEPS
+  - Prior-error reprocess loop (queries `NAP.DISPUTE_EVENT_CONSUMER_ERROR` for FAILED1/FAILED2 records by `caseNumber` AND `sourceSystemName = "NAP"`) runs BEFORE current-message processing
+  - Escalation on prior-error reprocess: FAILED1 → FAILED2 → ERROR (no new row inserted; existing record updated)
+  - Current message proceeds regardless of prior-error reprocess outcome
+  - Step 1 — Case Lookup (REST GET `${case_search_url}`, `@Retryable`)
+  - Step 2 — Case Action Lookup (REST GET `${case_action_search_url}`, `@Retryable`)
+  - Action-summary check: `reqActionSummaries` (matching `actionSequences`) AND `currentActionSummaries` (matching `currentActionSequence`)
+  - `OutcomeDeptTransPercntge` non-blank gate determines `isSrv118ProcessingRequired`
+  - `daptNoticeId` non-blank gate determines `isSrv117ProcessingRequired`
+  - Amex + REPR/MDCL/OPAB action code → SRV118 graceful skip
+  - Step 3 — Display Code Service (REST POST `${display_code_url}`, `@Retryable`)
+  - Step 4 — Response Rules lookup (DB read `NAP.NAP_UPDATE_RESPONSE_RULES`, `@Retryable`)
+  - Step 5 — SRV118 POST (REST POST `${nap_notification_srv118_url}`, `@Retryable`, fixed delay)
+  - Step 6 — SRV117 construction with display code lookup for disputeReason
+  - Step 7 — SRV117 POST (REST POST `${nap_notification_srv117_url}`, `@Retryable`, fixed delay)
+  - Final step — IDP token ThreadLocal cleared via `tokenService.clear()`
+  - SRV118 build branches on `stageCode == REQ` (REQ-path vs normal-path payload)
+  - SRV118 status field hardcoded to "2" (SUCCESS_STATUS)
+
+OUTBOUND DEPENDENCIES
+  - WDP Case Search (`${case_search_url}`) — REST GET
+  - WDP Case Action Service (`${case_action_search_url}`) — REST GET
+  - WDP Display Code Service (`${display_code_url}`) — REST POST
+  - WDP Notes Service note lookup (`${note_lookup_url}`) — REST GET — FULLY COMMENTED OUT
+  - WDP Notes Service add note (`${add_note_url}`) — REST POST — error-path SNOTE, fire-and-forget
+  - WDP IDP Token Service (`${wdp_token_service_url}`) — REST GET — bearer for internal calls
+  - NAP-DPS SRV118 (`${nap_notification_srv118_url}`) — REST POST
+  - NAP-DPS SRV117 (`${nap_notification_srv117_url}`) — REST POST
+  - `RestTemplate` in `CommonConfig` is created with NO connection or read timeout
+  - `getDisplayCodeDetails()` instantiates a SECOND inline `new RestTemplate()` also without timeouts
+
+DATABASE
+  - Owns: writes `NAP.DISPUTE_EVENT_CONSUMER_ERROR`
+  - Reads (does not own): `NAP.NAP_UPDATE_RESPONSE_RULES`
+  - All writes are standalone JPA `save()` / `saveAll()` — no `@Transactional` wrapping multiple writes
+  - Audit user constant `"NCSEUDPTC"`
+  - Status values written to `C_ERROR_STA`: FAILED1, FAILED2, SKIPPED, ERROR, PROCESSED
+  - `C_EVENT_TYPE` values: OUT_SRV118, OUT_SRV117
+  - Raw inbound `NotificationEvent` JSON stored in `C_KAFKA_EVENT` column
+
+DEAD / COMMENTED CODE
+  - `notesLookup()` step in `NotificationServiceImpl.processSrv118Notification()` fully commented out — `dataRecord` always null in SRV118 payload
+  - `checkCRMRAction()` method fully commented out — CRMR action mapping not active
+  - `napnotification.workFlowRequired` and `napnotification.workFlowNames` referenced only in commented-out code
+
+DEPLOYMENT (resources.yaml)
+  - `kind: Deployment`
+  - Replica count: XL Deploy variable `{{ replicas-gcp-nap-dispute-update-consumer }}`
+  - Memory request 1024Mi, limit 2048Mi
+  - CPU request and CPU limit NOT configured
+  - No `HorizontalPodAutoscaler` resource
+  - No `PodDisruptionBudget` resource
+  - Topology spread: maxSkew=1, whenUnsatisfiable=ScheduleAnyway, topologyKey=kubernetes.io/hostname
+  - Labels aligned between pod template and labelSelector — no drift
+  - OTel injection via pod annotation `instrumentation.opentelemetry.io/inject-java`
+  - Spring Actuator endpoints exposed: info, health, prometheus
+  - Logstash via logstash-logback-encoder:7.4 in application.yml
+  - Prometheus custom tag `application: ${app.name}`
+  - Readiness probe path `/merchant/gcp/update-consumer/nap/readyz` port 8082
+  - Liveness probe path `/livez` port 8082
+
+NAP-DPS SECURITY
+  - SRV118/SRV117 requests set ONLY `Accept` and `Content-Type` headers via `getHttpHeaders(isSrv118)`
+  - NO `Authorization` header set
+  - File `napcacrt.jks` exists at the repo root
+
+═══════════════════════════════════════════════════════════════════════════
+GAPS TO FILL — answer from source
+═══════════════════════════════════════════════════════════════════════════
+
+For each numbered question below, produce a direct answer with file:line
+citations. If the answer is not determinable from source, say so explicitly.
+
+1. NAP-DPS AUTHENTICATION WIRING
+   - Is `napcacrt.jks` referenced anywhere in source — application.yml,
+     application-*.yml, any `@Bean` defining `RestTemplate`,
+     `SSLContext`, `KeyStore`, `KeyManagerFactory`, `TrustManagerFactory`,
+     `HttpClientBuilder`, `ClientHttpRequestFactory`, or property
+     references like `server.ssl.*` / `javax.net.ssl.trustStore`?
+   - If yes — show the wiring path and which RestTemplate(s) use it.
+   - If no — state explicitly that the JKS file is not loaded by any
+     code in the repo, and that NAP-DPS calls go out via the default
+     `RestTemplate` with no client cert and no Authorization header.
+   - Search for any `Authorization` header construction in the entire
+     `nap-dps` / `napnotification` call chain — including helper or
+     interceptor classes.
+
+2. NAP.NAP_UPDATE_RESPONSE_RULES — OWNERSHIP IN THIS REPO
+   - Is there a JPA `@Entity` annotated for this table in this repo?
+   - Is there any DDL, schema migration (Liquibase / Flyway), or
+     `schema.sql` that creates or modifies this table?
+   - List every Spring Data repository or query that READS this table.
+   - Confirm there are zero writes from this component (no `save()`,
+     no `update()`, no `delete()`, no native UPDATE/INSERT).
+
+3. NAP.DISPUTE_EVENT_CONSUMER_ERROR — SHARED TABLE WITH COMP-05?
+   - Quote the exact prior-error query — what columns are filtered
+     (`caseNumber`, `sourceSystemName`, `C_ERROR_STA`, others)?
+   - Is there any DDL, schema migration, or Liquibase changelog for
+     this table in this repo? (Expected answer: no — COMP-05 is the
+     schema owner.)
+   - List every column this component writes vs reads.
+   - Does the Entity definition include `sourceSystemName` (or
+     equivalent) as a column? What value does this component set on
+     INSERT?
+
+4. PAN / CARD DATA EXPOSURE
+   - Trace the `cardNumber` field in the SRV117 request payload
+     (`NapNotificationSrv117Request`) back to its source. Is it
+     populated from a field in the inbound `NotificationEvent`? Is
+     it derived via a REST call? Cite the exact assignment.
+   - Does the inbound `NotificationEvent` JSON contain a clear PAN
+     field?
+   - When the raw `NotificationEvent` JSON is persisted to
+     `C_KAFKA_EVENT`, is any PAN field redacted, masked, or removed
+     before write? Or is the entire payload persisted verbatim?
+   - Is `cardNumber` ever logged at any log level?
+   - Are `Encryption Service`, `Token Service` (PCI), or
+     `pan-handling` libraries imported in pom.xml or referenced in
+     source? (Expected: no.)
+
+5. OUTER EXCEPTION BOUNDARY
+   - Show the exact try/catch structure around the listener entry
+     point. What types are caught? Does anything ever rethrow?
+   - Show the exact try/catch structure around
+     `processSrv118Notification()` and `processSrv117Notification()`.
+   - Confirm structurally that no exception path causes
+     `KafkaConsumer.onMessage()` to throw out to Spring Kafka — i.e.
+     the consumer-never-halts claim.
+
+6. TRANSACTION BOUNDARIES
+   - Search for every `@Transactional` annotation in this repo. List
+     each method that carries it, plus the propagation and
+     rollbackFor settings.
+   - For the prior-error reprocess loop: is the loop wrapped in any
+     transaction? Is each per-record reprocess in its own transaction?
+   - For the error table writes: are they all per-call auto-commits
+     via Spring Data `save()` with no explicit `@Transactional`?
+
+7. SINGLE ENTRY PATH CONFIRMATION
+   - Confirm explicitly that there are NO classes annotated with any
+     of: `@RestController`, `@Controller`, `@RequestMapping`,
+     `@GetMapping`, `@PostMapping`, `@PutMapping`, `@DeleteMapping`,
+     `@PatchMapping`, `@Scheduled`, `@EnableScheduling`, additional
+     `@KafkaListener` (beyond the single one already documented),
+     `@JmsListener`, `@RabbitListener`.
+   - Confirm there is no Spring Cloud Stream binding, no Spring Batch
+     `JobLauncher`, no Quartz job, no webhook controller, no SQS or
+     SNS listener.
+   - List the Spring Boot Actuator endpoints that ARE exposed and
+     confirm none of them trigger application logic (i.e. only
+     observability — health, info, prometheus).
+
+8. ROLLING UPDATE STRATEGY
+   - Re-check `resources.yaml`, any Helm template, any Kustomize
+     overlay, and any deployment manifest in the repo for a
+     `strategy:` block on the Deployment.
+   - If present: state RollingUpdate / Recreate, maxSurge, maxUnavailable.
+   - If not present: state "not in repo" and explicitly list every
+     deployment-shaped file present (Dockerfile, resources.yaml,
+     Chart.yaml, values.yaml, etc.) so I know what is missing vs absent.
+
+9. SPRING RETRY WIRING
+   - Is `@EnableRetry` present on a `@Configuration` class? Cite it.
+     If absent, all `@Retryable` annotations are silent no-ops — flag
+     this as a critical finding.
+   - List every method annotated with `@Retryable` plus its config
+     (max attempts, delay, backoff, retry-for, exclude).
+   - For each `@Retryable` method, list its corresponding `@Recover`
+     method and describe what the recover branch does — including
+     which `C_ERROR_STA` value is written and whether SNOTE is sent.
+
+10. CONCURRENCY = 1 INTENT
+    - Search for any comment, commit message, or property override
+      that documents the concurrency=1 choice. If none, state
+      "default-by-omission, no documented intent".
+
+11. EDIA MIGRATION SCAFFOLD
+    - Search for any reference to "EDIA", "edia", feature-flag-style
+      properties (e.g. `*.enabled`, `*.feature`, `*.toggle`), TODO
+      comments, FIXME comments, or commented-out alternative routes
+      that could indicate migration scaffolding.
+    - State explicitly whether any such scaffolding exists.
+
+12. ENV-INJECTED PROPERTY DEFAULTS
+    - For each of the following config keys, check whether any
+      committed `application-{env}.yml` (e.g. `application-dev.yml`,
+      `application-cert.yml`, `application-prod.yml`) pins a concrete
+      value vs leaving it env-only:
+        - `${kafka_consumer_topic}`
+        - `${kafka_group_id}`
+        - `${napnotification.retrycount}`
+        - `${napnotification.retrydelay}`
+        - `${max_poll_records}`
+        - `${max_poll_interval}`
+        - `${case_search_url}`, `${case_action_search_url}`,
+          `${display_code_url}`, `${note_lookup_url}`,
+          `${add_note_url}`, `${wdp_token_service_url}`,
+          `${nap_notification_srv118_url}`,
+          `${nap_notification_srv117_url}`
+    - State for each: "value committed in <file>" or "env-only".
+
+13. SECURITY POSTURE
+    - `spring-boot-starter-oauth2-resource-server` is on the classpath.
+      Is there a `SecurityFilterChain` `@Bean` defined? If yes, what
+      does it permit / deny?
+    - If no `SecurityFilterChain` bean exists and no security config
+      is present, state "default Spring Security auto-config — no
+      HTTP surface to protect, default is irrelevant".
+
+14. MIGRATION_STATUS FIELD USAGE
+    - Where is `migrationStatus` from `NotificationEvent` used in this
+      component? List every read site. Confirm whether it drives any
+      branching logic, or is only persisted to
+      `DISPUTE_EVENT_CONSUMER_ERROR.C_MIGRATION_STATUS` on error.
+
+═══════════════════════════════════════════════════════════════════════════
+REPORT STRUCTURE — use these section headings in this order
+═══════════════════════════════════════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ────────────────────────────
+
+a) STEPS IN ORDER
+   Every processing step from inbound Kafka message to the final
+   `tokenService.clear()`. For each step: what happens, which service
+   or table is called, what the output of that step is. Cite file:lines.
+
+b) DECISION POINTS
+   Every branch in the flow — the condition evaluated and every
+   possible outcome with the path it leads to. Cite file:lines.
+   Include at minimum: platform filter; prior-error presence;
+   case-found; action-summary-found (req+current matrix);
+   OutcomeDeptTransPercntge non-blank; responseRules null vs found;
+   Amex + REPR/MDCL/OPAB exempt; writeOfReason non-blank; display-code
+   found; stageCode == REQ; SRV117 gate; SRV118 HTTP success; SRV117
+   HTTP success.
+
+c) SKIP AND BYPASS CONDITIONS
+   Every condition that short-circuits processing. What is checked,
+   what value triggers the skip, where control goes after the skip.
+   Include: non-NAP platform discard; case-not-found halt; action-
+   summaries-empty halt; req-only-found SRV118 skip; OutcomeDeptTrans
+   blank SKIPPED; Amex graceful skip; SRV118 skipped → SRV117 may
+   still proceed.
+
+d) FAILURE PATH PER STEP
+   For each step that calls an external dependency (REST or DB) —
+   what happens if the call fails. Per step, not globally. State
+   exception type caught, number of retries (config key + value if
+   resolvable), `@Recover` branch behaviour, and which C_ERROR_STA
+   value is written.
+
+e) MULTIPLE ENTRY PATHS
+   Confirm the component has exactly one inbound trigger (the single
+   `@KafkaListener`). State explicitly: no REST controller, no
+   scheduler, no second `@KafkaListener`, no JMS/Rabbit/SQS listener,
+   no Actuator-triggered re-driver, no Spring Batch job. (See GAP 7.)
+
+f) STATE AT EACH STEP
+   For the error table record state machine:
+   FAILED1 → FAILED2 → ERROR escalation; SKIPPED terminal; PROCESSED
+   terminal. State which step/branch transitions to which value.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ───────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   How the component determines which path to take. Field, value,
+   branch. Include: platform filter; SRV118 vs SRV117 gating; REQ-
+   stage vs normal-stage payload variant; Amex network exemption.
+
+b) BUSINESS RULES APPLIED
+   Validation, eligibility, or rule applied inside this component
+   (not delegated). Include: matching `actionSequences` /
+   `currentActionSequence` to action summaries; OutcomeDeptTransPercntge
+   non-blank rule; daptNoticeId non-blank rule; Amex + REPR/MDCL/OPAB
+   exempt rule; writeOfReason / reasonCode display-code resolution.
+
+c) DATA TRANSFORMATIONS
+   Inbound NotificationEvent → outbound NapNotificationSrv118Request /
+   NapNotificationSrv117Request field map. Confirm/correct: status
+   hardcoded "2"; dataRecord always null; cardNumber source.
+
+d) IDEMPOTENCY MECHANISM
+   Detection key fields. Duplicate behaviour. Gaps — including the
+   crash window between offset commit and processing completion (at-
+   most-once, not at-least-once). Confirm explicitly that there is
+   NO idempotency key check on inbound — duplicate Kafka delivery (if
+   it happened) would re-call NAP-DPS.
+
+── SECTION 3 — CONTRACTS ──────────────────────────────────
+
+For Kafka Consumer (apply this section):
+   Exact topic name (or env var key + any committed default),
+   consumer group ID (or env var key), AckMode, offset commit timing
+   relative to processing, concurrency, max poll records, max poll
+   interval, deserialiser, bad payload behaviour.
+
+For REST API: state "not present" — this component exposes no REST
+endpoints (only Actuator observability endpoints).
+
+For Kafka Producer: state "not present" — this component publishes
+no Kafka events.
+
+For Batch/Scheduler: state "not present" — this component has no
+scheduled or batch entry points.
+
+── SECTION 4 — DEPENDENCIES ───────────────────────────────
+
+For every outbound call (8 REST + 1 DB read + 1 DB write):
+  - Service name / logical target
+  - Protocol and auth method (bearer via IDP token? mTLS? none?)
+  - Purpose — at which step in the flow
+  - Connection timeout (state "not configured" if absent)
+  - Read timeout (state "not configured" if absent)
+  - Retry: count config key, delay config key, backoff type
+  - Circuit breaker: explicitly "not configured" — no Resilience4j
+  - Behaviour if unavailable: halt / skip / FAILED1 / FAILED2 / ERROR
+
+── SECTION 5 — DATABASE ───────────────────────────────────
+
+For every table read or written:
+  - Schema and exact table name
+  - Read or write — state clearly
+  - Purpose — at which step in the flow
+  - Key columns used in queries or writes
+  - Whether writes are in the same transaction as other writes at
+    that step (expected: no — all standalone saves)
+  - Transaction manager bean used (or "default" / "none")
+  - Whether SELECT FOR UPDATE / row locks used
+
+Confirm explicitly:
+  - No write to NAP.NAP_UPDATE_RESPONSE_RULES (read-only)
+  - No DDL or schema migration in this repo for either table
+  - Any tables NOT touched that the existing doc might have implied
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ──────────────
+
+For each standard, output: COMPLIES / DEVIATES / NOT APPLICABLE
+with evidence cited to file:lines.
+
+  DEC-001: Transactional outbox — N/A. Component does not publish
+    to Kafka. Confirm absence of `KafkaTemplate`, `ProducerFactory`,
+    `@KafkaProducer`, and any `*_outbox` table reference.
+  DEC-003: Kafka partition key = merchantId — N/A (consumer only).
+  DEC-004: PAN encryption before any persistent write — answer
+    based on GAP 4 findings.
+  DEC-005: Kafka offset commit timing — state DEVIATES; pre-ACK at
+    `acknowledgment.acknowledge()` first call in onMessage. Quote
+    the file:lines.
+  DEC-019: Clear PAN written to any persistent store — answer based
+    on GAP 4 findings (specifically `C_KAFKA_EVENT` raw-payload
+    storage and SRV118/117 outbound payload).
+  DEC-020: Idempotency — full at-least-once implemented? Pre-ACK
+    pattern is structurally at-most-once. State DEVIATES with the
+    crash-window gap.
+
+── SECTION 7 — SCALING AND DEPLOYMENT ─────────────────────
+
+  - Kubernetes resource type
+  - Replica count — exact value or placeholder, state which and which
+    XL Deploy variable
+  - Memory and CPU limits and requests
+  - HPA — present or absent (cite the manifest)
+  - Rolling update strategy (see GAP 8)
+  - PodDisruptionBudget — present or absent
+  - Topology spread — functional or label mismatch
+  - Liveness / readiness / startup probes — paths and ports
+  - Ports exposed
+  - Observability — OTel agent, Actuator endpoints, Logstash, Prometheus
+
+If the K8s manifest, Helm chart, or values.yaml is NOT in the repo,
+state "not in repo" for that subset and explicitly list what IS in
+the repo (Dockerfile, application.yaml, resources.yaml, Chart.yaml,
+values.yaml, etc.) so I know what is missing vs absent.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ────────────────
+
+  - Commented-out code — at minimum: `notesLookup()` step in
+    `processSrv118Notification()`; `checkCRMRAction()` method.
+    State what they did and any visible reason. List any others.
+  - Unused dependencies in pom.xml (confirm or correct the existing
+    list: spring-boot-starter-cache, springdoc-openapi-starter-
+    webmvc-ui, spring-boot-starter-oauth2-resource-server)
+  - Feature flags / toggles active in production — exact property
+    names and behaviour, plus default value if env var unset
+  - TODO / FIXME references — file:line and verbatim text
+  - Stub implementations returning fixed responses (e.g. SRV118
+    status = "2" hardcoded — confirm intentional vs stub)
+  - Properties configured but never read (search for `@Value` or
+    yaml keys with no injection point) — at minimum confirm
+    `napnotification.workFlowRequired` and
+    `napnotification.workFlowNames` are dead
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ──────────────────────
+
+For EACH of sections 1 through 8 above, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+  determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ──────────
+
+List every claim from the existing component document that you
+could NOT cross-check against code or config — neither confirmed
+nor contradicted. These will need follow-up from the team or from
+runtime observation. Examples likely to land here: exact runtime
+values for env-injected properties, replica count, NAP-DPS response
+body schema, NAP_UPDATE_RESPONSE_RULES external owner, EDIA
+migration timeline.
+
+REFERENCED BUT NOT FOUND IN REPO
+List any file paths the existing document cites that you cannot
+locate in the repo. Do not invent file paths.
+
+═══════════════════════════════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════════════════════════════
+
+- Cite file paths and line ranges for every concrete claim.
+  Format: <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does
+  not reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms
+  existing documentation, a one-paragraph "still accurate —
+  file:lines" is acceptable.
+- If you would restate something the reference document already
+  states verbatim, replace that prose with "Document accurate —
+  <file>:<lines>". Do not restate.
+- Do not invent file paths. If a file is referenced in the existing
+  doc but you cannot locate it, list it under "REFERENCED BUT NOT
+  FOUND IN REPO" at the end.

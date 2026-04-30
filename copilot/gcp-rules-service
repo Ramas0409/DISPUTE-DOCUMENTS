@@ -1,0 +1,470 @@
+You are auditing the WDP component RulesService in the repository
+gcp-rules-service. A prior pass already produced a DRAFT architecture
+document. Your job is to CONFIRM OR CORRECT the items listed under
+"ALREADY DOCUMENTED" from source, and to CLOSE the items listed under
+"GAPS TO FILL" by reading the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that
+explicitly and label it "not determinable from source". Do NOT guess.
+Do NOT summarise without evidence. Do NOT use the existing document as
+a substitute for source — treat it as a hypothesis to verify.
+
+═══════════════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT
+═══════════════════════════════════════════════════════════════════════
+
+The existing component file `WDP-COMP-32-RULES-SERVICE.md` is provided
+alongside this prompt. Treat every claim in it as a HYPOTHESIS to
+verify against source.
+
+For each documented claim:
+  - If source confirms it: write "Still accurate — <file>:<lines>"
+    (one line; do not restate the claim).
+  - If source contradicts it: write a CORRECTION block:
+      DOC SAYS:   <quote the doc claim>
+      SOURCE SHOWS: <state the actual value, cited to file:lines>
+      DOC SECTION TO UPDATE: <which heading in the existing file>
+
+At the end of the report (Section 10), list every documented claim
+that could NOT be verified from source — neither confirmed nor
+contradicted.
+
+═══════════════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — confirm or correct only, do NOT re-document
+═══════════════════════════════════════════════════════════════════════
+
+Identity & topology
+  - Artifact `com.wp.gcp:rules-service:1.5.6`
+  - K8s deployment name `mdvs-gcp-rules-service`
+  - Servlet context path `/merchant/gcp/rules`, port `8082`
+  - Two datasources: `spring.datasource.wdp` (primary) and
+    `spring.datasource.nap`, both on the same Aurora cluster
+  - No Kafka dependency anywhere in `pom.xml` (no `spring-kafka`,
+    no `kafka-clients`)
+
+Endpoints — 14 active + 2 commented out, all under context
+`/merchant/gcp/rules`. Confirm each entry exists at the exact path
+and HTTP method below; correct any path or method that differs.
+For each, confirm the backing table named in the DRAFT.
+
+  Active:
+    POST /actionrules            → wdp.dispute_action_rules
+    POST /pre-action             → wdp.pre_action_status_rules
+    POST /newactions             → wdp.dispute_new_action_rules
+    POST /nap/newactions         → nap.dispute_nap_new_case_action_rules
+    POST /outgoing/action        → wdp.dispute_new_case_action_respond_rules
+    POST /firstaction            → wdp.dispute_first_action_rules
+    POST /expiryrules            → wdp.dispute_case_exp_rules
+    POST /workflow               → wdp.workflow_rules
+    POST /business-event         → wdp.business_event_rules
+    GET  /notification           → wdp.notification_rules
+    GET  /cbk-response           → wdp.nap_chbk_response_rules
+    POST /queue-status/skip      → wdp.disputes_visa_queue_status_rules
+    POST /accepttype             → wdp.dispute_accept_item_rules
+    POST /docdetailstype         → wdp.dispute_doc_details_type_rules
+
+  Disabled (controller @-mapping commented out, backing code intact):
+    POST /documentType  → wdp.document_type_rules
+    GET  /eventRule     → wdp.dispute_update_event_log_rules
+
+Per-endpoint behavioural claims to confirm or correct:
+  - /actionrules `migrationStatus="N"` short-circuits to a hardcoded
+    all-N ActionRulesResponse without calling the DB.
+  - `ApplicationConstants.MIGRATION_STATUS = "Y"` (the constant holds
+    the non-bypass sentinel, not the bypass one).
+  - /actionrules reads JWT `AuthorizationList` claim, intersects with
+    `app.action.roles`, passes filtered set as IN clause.
+  - /actionrules has progressive `NA` fallback retries.
+  - /firstaction and /nap/newactions HTTP 400 on >1 matching rows
+    ("Duplicate records found").
+  - /notification returns HTTP 200 with null body when no rule found.
+  - /business-event returns HTTP 200 with empty/null fields when no
+    rule found.
+  - /cbk-response returns HTTP 200 empty list when no rule found.
+  - All other endpoints return HTTP 404 when no rule found.
+  - `RuleNotFoundException` is the canonical not-found exception.
+  - Response transform: null/blank → "NA"; integer null day count → 0;
+    string fields trimmed null-safely.
+
+Cross-cutting:
+  - Spring Security OAuth2 Resource Server with `${jwt_trusted_issuers}`.
+  - Whitelisted paths exactly: /lives, /readyz, /actuator/health,
+    /swagger-ui/**, /rulesservice-api-docs*.
+  - No role/scope enforcement in SecurityFilterChain — only JWT validity
+    is checked. /actionrules is the sole exception via AuthorizationList
+    intersection.
+  - `HttpInterceptor.preHandle()` handles v-correlation-id (read or
+    generate, MDC set, response header copy).
+  - Bean Validation JSR-380 + `GlobalExceptionHandler` →
+    `StandardErrorResponse` { errors: [{errorMessage, target}] }.
+  - Spring Cache `@Cacheable` per endpoint, ConcurrentHashMap-backed,
+    eviction scheduler `cacheEvictScheduler = 900000 ms` (15 min).
+  - No Resilience4j (`io.github.resilience4j` absent from pom.xml).
+  - DB failures propagate as HTTP 500 — no retry, no fallback.
+
+Persistence:
+  - 15 wdp tables read + 1 nap table read.
+  - Zero writes anywhere — no @Transactional propagation that mutates
+    state, no INSERT/UPDATE/DELETE in any DAO.
+
+Deployment (from `resources.yaml` and any K8s manifest in repo):
+  - Deployment kind, replicas placeholder `replicas-gcp-rules-service`
+  - Memory limit 2048Mi, request 1024Mi
+  - CPU limit and request both absent
+  - HPA absent, PDB absent
+  - Topology spread `whenUnsatisfiable: ScheduleAnyway`,
+    `topologyKey: kubernetes.io/hostname`, label uses
+    `BRANCH_NAME_PLACEHOLDER`
+  - OTel injection annotation present
+  - Spring Actuator + Prometheus + Logstash all present
+  - Liveness `/merchant/gcp/rules/lives` (initialDelay 30, period 10,
+    failureThreshold 3); readiness `/merchant/gcp/rules/ready`
+
+Planned / incomplete:
+  - /documentType and /eventRule controller mappings commented out;
+    DAO/service/entity intact
+  - `releaseVersionMap` commented out in NewActionRulesServiceImpl and
+    RespondNewCaseActionServiceImpl
+  - `<destination>10.43.145.125:5044</destination>` commented out in
+    logback-spring.xml
+  - `json-path 2.8.0` declared in <properties> but no <dependency>
+  - `ApplicationProps.version` (Map<String,String>) loaded, never
+    referenced
+  - Stale TODO in `WorkflowRulesDaoImpl.getWorkflowName()` and
+    `GlobalExceptionHandler.httpRequestMethodNotSupportedException()`
+
+Do NOT re-document any of the above from scratch. Either confirm with
+file:lines or write a CORRECTION block.
+
+═══════════════════════════════════════════════════════════════════════
+GAPS TO FILL — answer these from source
+═══════════════════════════════════════════════════════════════════════
+
+1. LIVENESS / READINESS PATH RECONCILIATION
+   The whitelist lists /lives and /readyz. The deployment manifest
+   names liveness /merchant/gcp/rules/lives and readiness
+   /merchant/gcp/rules/ready. /readyz and /ready cannot both be
+   correct. Reconcile by reading: (a) the SecurityConfig whitelist,
+   (b) the controller method backing each path, (c) the deployment
+   probe paths. State the actual paths and any K8s probe pointing to
+   a path that does not exist or returns non-200 in source.
+
+2. WorkflowRuleRequest BEAN VALIDATION
+   Enumerate every JSR-380 annotation (@NotNull, @NotBlank, @Pattern,
+   @Size, @Valid, custom validators) on every field of
+   `WorkflowRuleRequest`. Cite file:lines for each.
+
+3. /notification, /business-event, /cbk-response — INTENTIONAL OR
+   ACCIDENTAL non-404?
+   For each of these three endpoints, locate the not-found return
+   path in the service impl. State whether source contains evidence
+   of intent (explicit null return with javadoc/inline comment, or
+   explicit empty-list/empty-DTO construction with comment) or
+   whether it appears to be an oversight (e.g. uncommented
+   `Optional.orElse(null)` returned through a non-throwing path).
+   Three different patterns across three endpoints is significant —
+   call out whether the pattern looks deliberate or coincidental.
+
+4. @Cacheable KEY STRATEGY PER ENDPOINT
+   For every endpoint method annotated with @Cacheable, surface:
+   - cache name(s)
+   - explicit `key = ...` SpEL or default KeyGenerator
+   - sync flag, condition, unless
+   State whether two requests differing only in null vs blank
+   optional fields would resolve to the same cache key.
+
+5. CACHE EVICTION SEMANTICS
+   Find the @Scheduled method that runs every 15 minutes. State:
+   - which CacheManager / cache(s) it acts on
+   - whether it calls clear() on every cache or selective subset
+   - whether it logs its run
+   Cite file:lines.
+
+6. /actionrules FALLBACK SEQUENCE — EXACT
+   Walk the orchestration in the /actionrules service impl. State:
+   - the exact order of fallback queries
+   - the exact fields rewritten to "NA" at each step
+   - the termination condition (first non-empty, or accumulate, or
+     return last-tried)
+   - whether each fallback hits the cache independently
+   Cite file:lines for each step.
+
+7. SecurityFilterChain FILTER INVENTORY
+   List every filter registered in `SecurityConfig.filterChain()` in
+   declaration order. Confirm there is no caller-identity custom
+   filter (clientId, X-Caller, mTLS, IP allowlist) that the prior
+   pass missed. Cite file:lines.
+
+8. /lives PROBE WIRING
+   Is /merchant/gcp/rules/lives backed by:
+   (a) a custom @GetMapping("/lives") controller method
+       returning a fixed OK or status-string, or
+   (b) Spring Actuator's HealthIndicator chain re-exposed under
+       this path?
+   If (a), state which controller and what the response body is.
+
+9. K8s DEPLOYMENT FILE INVENTORY
+   List every deployment-related file in the repo by relative path:
+     - Dockerfile(s)
+     - resources.yaml or k8s/*.yaml
+     - values.yaml or any Helm chart files
+     - any XL Deploy descriptors
+   For each variable referenced as a placeholder (e.g.
+   `{{ replicas-gcp-rules-service }}`), state whether a default value
+   is set anywhere in the repo, or if it is purely externalised.
+   If `values.yaml` or Helm chart is NOT in the repo, state
+   "not in repo" explicitly and confirm what IS present.
+
+10. CALLER-IDENTITY-AWARE BEHAVIOUR
+    Search every controller and service for any code that:
+    - reads JWT subject / azp / clientId / scope claim and changes
+      response content based on it
+    - filters response rows based on caller identity
+    - has ANY conditional logic gated on caller identity beyond the
+      /actionrules AuthorizationList intersection
+    If none exists, state explicitly: "every authenticated caller
+    receives identical response content for identical inputs".
+
+11. /actionrules JWT AuthorizationList CLAIM ABSENCE
+    Confirm:
+    - the exact location where `AuthorizationList` claim is read
+    - the exact exception thrown if absent or empty
+    - the path through GlobalExceptionHandler that yields HTTP 400
+      with "Token is blank"
+    - whether the message string is configurable
+
+12. DISABLED ENDPOINTS — comment evidence
+    For `/documentType` and `/eventRule` controller mappings, surface:
+    - any inline comment, javadoc, or TODO accompanying the
+      commented-out @-mapping
+    - any commit-message reference visible in code (e.g. "JIRA-1234")
+    - any feature flag or property gating these endpoints elsewhere
+    State explicitly if no evidence of WHY they were disabled exists.
+
+═══════════════════════════════════════════════════════════════════════
+REPORT STRUCTURE — use these exact section headings, in this order
+═══════════════════════════════════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ─────────────────────────────────────────
+
+a) STEPS IN ORDER
+   Every processing step from HTTP request arrival to response, for
+   the universal flow shared by all endpoints. For each step: what
+   happens, which class/service is invoked, what its output is.
+   Cite file:lines.
+
+b) DECISION POINTS
+   Every branch in the flow — condition evaluated and every possible
+   outcome with the path it leads to. Include at minimum:
+     - whitelist match
+     - JWT validation result
+     - bean validation result
+     - service-layer validation result
+     - /actionrules migrationStatus check
+     - cache hit/miss
+     - DB result null/non-null
+     - retry-fallback eligibility (per endpoint)
+     - duplicate-records check (firstaction/nap newactions)
+   Cite file:lines.
+
+c) SKIP AND BYPASS CONDITIONS
+   - /actionrules migrationStatus="N" full DB bypass
+   - whitelist short-circuit
+   - cache hit short-circuit
+   For each: condition checked, value triggering bypass, where control
+   goes after.
+
+d) FAILURE PATH PER STEP
+   For each step that calls a dependency (DB only), state:
+   - exception type caught (or not caught)
+   - retry behaviour (none expected, but confirm)
+   - escalation path (HTTP status, error body)
+   Per step, not globally.
+
+e) MULTIPLE ENTRY PATHS
+   Confirm explicitly: only entry path is REST controllers under
+   context `/merchant/gcp/rules`. No Kafka listener exists. No
+   scheduler exists (other than the 15-min cache evictor — internal,
+   not an entry path). No webhook. No JMS. State each negative
+   explicitly.
+
+f) STATE AT EACH STEP
+   This component is stateless beyond the in-process cache. State
+   that explicitly. Cache entries are the only "state" — describe
+   their lifecycle (insert on miss after DB, eviction on TTL).
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ────────────────────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   How each request is routed by the controller layer to the
+   correct service. /actionrules role-filter logic. /firstaction
+   `reversalInd="Y"` branch.
+
+b) BUSINESS RULES APPLIED
+   Validation rules applied INSIDE this component (not delegated):
+   - enum range checks (ResponseType in {CBK,RFI}; ConsumerName,
+     StageCode, ActionCode, Owner, UserType, Platform enum membership)
+   - literal-string-"null" rejection on /cbk-response
+   - duplicate-records-found guard on /firstaction and /nap/newactions
+   - JWT AuthorizationList claim presence check on /actionrules
+
+c) DATA TRANSFORMATIONS
+   Inbound DTO → entity SELECT params; entity → response DTO. Per
+   endpoint summary acceptable. Highlight:
+   - blank/null → "NA" rewriting (which fields, which endpoints)
+   - integer-null → 0 conversion (which fields)
+   - multi-action expansion (up to 2 or 4 items)
+   - Y/y aggregation across rows on /actionrules (any "y" → "Y")
+
+d) IDEMPOTENCY MECHANISM
+   This service is read-only — strict idempotency is intrinsic.
+   Document only: cache deduplication window (15-min TTL) and any
+   gap where two identical requests within the TTL window could
+   diverge (e.g. cache eviction race, replica-local cache —
+   different replicas hold different caches and could disagree
+   between updates of the underlying table).
+
+── SECTION 3 — CONTRACTS ───────────────────────────────────────────────
+
+For REST API:
+  Per endpoint (all 14 active + 2 disabled):
+    - HTTP method, path
+    - request body / params with field-level validation
+    - response body shape
+    - every HTTP status code returned, with the trigger condition
+    - auth model (JWT only, except /actionrules also reads
+      AuthorizationList claim)
+  Confirm each row from the existing doc. Mark any deviation as
+  CORRECTION.
+
+State explicitly:
+  - "Kafka Consumer: not present"
+  - "Kafka Producer: not present"
+  - "Batch / Scheduler: not present (the 15-min cache evictor is
+    not a business batch — internal maintenance only; document it
+    in Section 1.f)"
+
+── SECTION 4 — DEPENDENCIES ────────────────────────────────────────────
+
+For every outbound call (DB only — confirm no other outbound
+exists):
+  Service / target | Protocol | Purpose | Connection timeout |
+  Read timeout | Retry | Circuit breaker | Behaviour if unavailable
+
+Two rows expected:
+  PostgreSQL Aurora `wdp` schema (JDBC, primary datasource)
+  PostgreSQL Aurora `nap` schema (JDBC, secondary datasource)
+
+For each: state "not configured" for any timeout/retry/CB that is
+absent. Cite the datasource bean configuration file:lines.
+
+If any RestTemplate / WebClient / Feign client exists in the repo
+unexpectedly, surface it with file:lines — even if commented out
+or unwired.
+
+── SECTION 5 — DATABASE ────────────────────────────────────────────────
+
+For every table read:
+  Schema.table | Read or write | Purpose / endpoint served |
+  Key columns used | Transactional? (every entry should be NO)
+
+Confirm explicitly:
+  - the 16 tables in the existing doc are correct (full list)
+  - no other tables are touched
+  - no @Transactional method anywhere mutates state
+  - DataSource bean qualifier names (wdpDataSource, napDataSource
+    or other)
+  - whether @Primary is on the wdp datasource bean
+  - whether SELECT FOR UPDATE / row locks are used (do NOT expect
+    any — confirm absence)
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ────────────────────────────
+
+For each, output COMPLIES / DEVIATES / NOT APPLICABLE with cited
+evidence:
+  DEC-001 outbox: NOT APPLICABLE (no writes, no Kafka)
+  DEC-003 partition key=merchantId: NOT APPLICABLE (no Kafka)
+  DEC-004 PAN encryption: NOT APPLICABLE (no PAN handled — confirm
+    no PAN-shaped fields appear in any DTO or entity)
+  DEC-005 manual offset commit: NOT APPLICABLE (no Kafka consumer)
+  DEC-019 clear PAN persisted: NOT APPLICABLE (no writes)
+  DEC-020 at-least-once idempotency: NOT APPLICABLE (read-only
+    service)
+  DEC-014 Resilience4j on outbound calls: DEVIATES (confirm absence
+    of dependency; no circuit breaker on DB).
+
+If you find any DEC reference that DOES apply — flag it.
+
+── SECTION 7 — SCALING AND DEPLOYMENT ──────────────────────────────────
+
+If `resources.yaml` / Helm chart / values.yaml exist, populate every
+row below from source:
+  Kubernetes resource type
+  Replica count (placeholder name and any default)
+  Memory limit / request
+  CPU limit / request
+  HPA present/absent (cite manifest)
+  Rolling update strategy (maxSurge / maxUnavailable / minReadySeconds)
+  PodDisruptionBudget present/absent
+  Topology spread — settings and label-mismatch risk
+  Liveness / readiness / startup probes (path, port, timing)
+  Ports exposed
+  OTel agent / Actuator endpoints exposed / Logstash appender
+    config
+
+If the K8s manifest, Helm chart, or values.yaml is NOT in the repo,
+state "not in repo" for the entire deployment row and explicitly
+list what IS present (Dockerfile path, application.yaml path,
+logback-spring.xml path, etc.).
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ─────────────────────────────
+
+Confirm or correct each of the items in the existing doc, plus
+surface anything NEW found during this pass:
+  - commented-out controller mappings (/documentType, /eventRule)
+  - commented-out releaseVersionMap
+  - commented-out Logstash destination
+  - unused json-path property
+  - unread ApplicationProps.version
+  - stale TODO comments
+  - feature flags active in production with their default value if
+    env unset
+  - properties configured but never @Value-injected
+  - stub implementations returning fixed responses
+  - unused Maven dependencies (run a quick grep — for every
+    <dependency> in pom.xml, state whether at least one import
+    references it)
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ───────────────────────────────────
+
+For each of Sections 1–8 above, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern / not
+  determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ───────────────────────
+
+List every claim from the existing component document that you
+could neither confirm nor contradict from code or config alone.
+These are flagged for architect / runtime / DBA follow-up and will
+not be re-asked of Copilot on a re-run.
+
+═══════════════════════════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════════════════════════
+
+- Cite file paths and line ranges for every concrete claim. Format:
+  <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does
+  not reveal. Do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms the
+  existing doc, "Document accurate — <file>:<lines>" is acceptable
+  in place of restating the prose.
+- Do NOT invent file paths. If the existing doc references a file
+  you cannot locate, list it under "REFERENCED BUT NOT FOUND IN
+  REPO" at the very end of the report.

@@ -1,0 +1,470 @@
+You are auditing the WDP component EncryptionService in the
+repository wdp-encryption-service. A prior pass already produced
+a DRAFT architecture document. Your job is to CONFIRM OR CORRECT
+the items listed under 'ALREADY DOCUMENTED' from source, and to
+CLOSE the items listed under 'GAPS TO FILL' by reading the code
+and config directly.
+
+Produce a single structured research report organised under the
+section headings below. For every claim, cite the file path and
+line range you read it from. Where source does not show the
+answer, state that explicitly and label it 'not determinable
+from source'. Do NOT guess. Do NOT summarise without evidence.
+Do NOT use the existing document as a substitute for source —
+treat it as a hypothesis to verify.
+
+═══════════════════════════════════════════════════════════════
+REFERENCE DOCUMENT
+═══════════════════════════════════════════════════════════════
+
+The existing component file (WDP-COMP-35-ENCRYPTION-SERVICE.md)
+is provided alongside this prompt. Treat it as HYPOTHESES to
+verify, not as ground truth. For each documented claim:
+  (a) confirm with file:line, OR
+  (b) write a CORRECTION block stating:
+        - what the doc says
+        - what the source actually shows (file:line + value)
+        - which section of the doc needs updating
+At the end of the report, in Section 10, list every documented
+claim that you could NOT verify from source.
+
+═══════════════════════════════════════════════════════════════
+ALREADY DOCUMENTED — confirm or correct (do NOT rediscover)
+═══════════════════════════════════════════════════════════════
+
+Identity / runtime
+- Spring Boot 3.5, Java 17, port 8082, context path
+  /merchant/gcp/encryption.
+- Auth: Spring Security OAuth2 Resource Server, local JWKS
+  validation via JwtIssuerAuthenticationManagerResolver, prod
+  issuer https://login8.fiscloudservices.com/...
+- Auth whitelist (no token): /readyz, /livez, /actuator/health,
+  /actuator/prometheus, /actuator/info,
+  /encryptionservice-api-docs/**, /swagger-ui/**
+
+Cryptographic model
+- HPAN = HMAC-SHA256, 64-char lowercase hex.
+- pan_ct = AES-256-GCM, 12-byte random IV via SecureRandom, IV
+  prepended to ciphertext+GCM-tag, whole array Base64-encoded.
+- HMAC key loaded once at startup from AWS Secrets Manager,
+  held in memory for JVM lifetime, must be 32 bytes.
+- DEK rotation interval is in DAYS, configured via
+  ${dek_rotation_interval_days} — NOT hours. (The platform
+  index document still says "6-hour DEK cache" and is wrong.)
+- DEK envelope encryption: KMS CMK encrypts a service-generated
+  DEK; only the KMS-wrapped DEK is persisted in
+  wdp.data_enc_key; plaintext DEK held in memory.
+
+Encrypt path
+- Order: JWT → @Valid (pan numeric, 13–19 digits) → DEK
+  freshness check → rotateDEK if stale (synchronous, blocks
+  request thread) → HMAC.hashPAN → findByHpan idempotency
+  check → either updateLastSeenAtByHpan (hit) or AES-GCM
+  encrypt + INSERT (miss) → 200 with HPAN.
+- pan_ct is NEVER returned to any caller.
+- rotateDEK exception handling: KMS or DB failure swallowed,
+  old DEK retained, processing continues.
+
+Decrypt path
+- Order: JWT → @Valid (hpan non-empty; reason field accepted
+  but unused) → findByHpan → findById(dek_id) called TWICE
+  (bug: isPresent() then get()) → kmsClient.decrypt() (called
+  on every request — NO in-memory DEK cache on decrypt path)
+  → AES-256-GCM decrypt → updateLastSeenAtByHpan
+  (@Transactional) → 200 with cleartext PAN.
+- Same HPAN may be decrypted unlimited times. No one-time-use,
+  no rate limit, no consume-on-read.
+
+Exception mapping
+- PANEncryptionException → HTTP 404 (semantic error — crypto
+  failure mapped to NOT_FOUND).
+- PANDecryptionException → HTTP 404 (covers HPAN-not-found,
+  DEK-not-found, KMS failure, AES failure — indistinguishable).
+- Other RuntimeException / DB exception → HTTP 500.
+- @ToString(exclude="pan") on decrypt response.
+
+Database
+- Owns wdp.hash_key_store (id, hpan, pan_ct, dek_id,
+  inserted_at, last_seen_at).
+- Owns wdp.data_enc_key (dek_id, dek_enc, inserted_at).
+- JPA entity declares NO unique=true on hash_key_store.hpan.
+- DB-level UNIQUE constraints on either table are NOT
+  determinable from this repo (no migration scripts).
+- Single PostgreSQL datasource; @Transactional short
+  transactions on encrypt INSERT and decrypt UPDATE.
+
+Outbound dependencies
+- AWS KMS: region-only config, no explicit timeout, no
+  Resilience4j, AWS SDK v2 default legacy retry (3 attempts)
+  implicit.
+- AWS Secrets Manager: region-only config, no explicit
+  timeout, no Resilience4j; startup-only.
+- PostgreSQL: HikariCP defaults, no explicit query/connection
+  timeout in repo.
+
+Caller registry (design intent ONLY — not technically enforced)
+- Encrypt: COMP-07 VisaDisputeBatch, COMP-08
+  FirstChargebackBatch, COMP-09 CaseFillingBatch, COMP-11
+  FileProcessor, COMP-27 CaseSearchService (v2 search path).
+- Decrypt: COMP-14 CaseCreationConsumer only (design
+  convention; no technical enforcement; any valid JWT from a
+  trusted issuer can call decrypt).
+
+Deployment
+- Kubernetes Deployment.
+- Replicas templated as {{ replicas-wdp-encryption-service }}.
+- Memory: limit 2048Mi, request 1024Mi.
+- CPU: not configured (limit and request).
+- Rolling update: maxSurge=1, maxUnavailable=0,
+  minReadySeconds=30.
+- Liveness /livez: initial 30s, period 10s, timeout 5s,
+  threshold 3.
+- Readiness /readyz: initial 20s, period 10s, timeout 5s,
+  threshold 3.
+- HPA, PodDisruptionBudget, TopologySpread: all absent.
+- Service: ClusterIP, exposed via Nginx Ingress with TLS.
+- OTel Java agent injected via pod annotation
+  instrumentation.opentelemetry.io/inject-java.
+
+Known issues already asserted
+- Base64 bug on rotateDEK() decryptAndStore() path.
+- DEKServiceImpl.findById() called twice on every decrypt.
+- DEK startup failure silently swallowed; DEK rotation
+  failure silently swallowed.
+- Multi-pod DEK rotation race (no distributed lock).
+- HTTP 404 for crypto failures (semantic error).
+- EncryptionKeys.java is dead code: @Component, fields hmac /
+  dek / decEnc never populated, never injected.
+- spring-boot-starter-oauth2-client dependency present;
+  OAuthAuthorizationClientManager bean registered as
+  wdp-internal-auth; no outbound HTTP call uses it.
+- One // TODO in GlobalExceptionHandler.java line 138 on
+  METHOD_NOT_ALLOWED target string.
+
+For each item above:
+  - Write 'Still accurate — <file>:<lines>', OR
+  - Write a CORRECTION block (doc says X / source shows Y at
+    file:line / which Section to update).
+Do NOT re-document items in this block from scratch.
+
+═══════════════════════════════════════════════════════════════
+GAPS TO FILL — answer from source
+═══════════════════════════════════════════════════════════════
+
+1. Production replica count — does resources.yaml or any
+   committed values.yaml carry a default for
+   {{ replicas-wdp-encryption-service }}? If only the template
+   variable exists, mark 'not in repo'.
+
+2. DEK rotation interval default — does
+   application.yaml (or a profile-specific YAML, or
+   bootstrap.yaml) carry a hardcoded default for
+   ${dek_rotation_interval_days}? Quote the YAML key + value.
+
+3. JWKS issuer config — where is ${jwt_trusted_issuer_urls}
+   (or equivalent) referenced in YAML? Is the production URL
+   committed or only injected via secret?
+
+4. Decrypt-endpoint caller restriction — confirm the
+   absence of method-level @PreAuthorize, hasAuthority,
+   hasRole, scope/audience checks, allowlists, or any other
+   caller-identity restriction. Inspect the SecurityFilterChain
+   bean(s) AND the controller annotations exhaustively. List
+   every authorisation point and what it gates.
+
+5. HTTP request body / log filter PAN assurance — search the
+   repo for any of these and report findings:
+     CommonsRequestLoggingFilter
+     AbstractRequestLoggingFilter
+     OncePerRequestFilter implementations
+     HandlerInterceptor implementations
+     Logback / Logstash encoder request-body capture
+     MDC writers that read request body
+     spring.mvc.log-request-details / spring.web.* logging keys
+   If none present, confirm explicitly.
+
+6. AWS SDK retry / timeout overrides — search for any custom
+   KmsClient / KmsAsyncClient / SecretsManagerClient builder.
+   Report whether retryPolicy, retryMode, apiCallTimeout,
+   apiCallAttemptTimeout, or httpClientBuilder are configured.
+   If none, state 'AWS SDK v2 defaults apply (legacy retry, 3
+   attempts, no API call timeout)' and cite the bean definition
+   or the absence-of-config.
+
+7. HikariCP / JPA query timeout — search application.yaml and
+   DataSourceConfig / JpaConfig for: connectionTimeout,
+   validationTimeout, maxLifetime, idleTimeout, leakDetection,
+   query-timeout, javax.persistence.query.timeout. Quote each
+   key + value. State 'default' explicitly where the key is
+   absent.
+
+8. wdp.hash_key_store.hpan DB-level UNIQUE — search for
+   Liquibase changelog (db/changelog/**), Flyway migrations
+   (db/migration/**), schema.sql, JPA @Table(uniqueConstraints)
+   / @Index annotations. Report findings or 'not in repo'.
+
+9. wdp.data_enc_key constraints — same sweep as item 8;
+   specifically whether dek_id is sequence-generated PK only
+   or whether other indexes / uniques exist on inserted_at.
+
+10. Distributed lock primitives — search exhaustively for:
+    ShedLock, Redisson, pg_advisory_lock, SELECT FOR UPDATE,
+    JdbcLockProvider, @SchedulerLock, any custom advisory lock.
+    Confirm explicitly absent or cite presence.
+
+11. rotateDEK() Base64 bug — exact mechanism. Locate the
+    specific line(s) in the decrypt-and-store branch where the
+    bug occurs. Quote the offending statement with file:line.
+    Describe what input form is passed in vs what the called
+    method expects (Base64-encoded String vs raw bytes vs
+    decoded bytes, etc.).
+
+12. Encrypt-path transaction boundaries — does findByHpan
+    idempotency SELECT and the subsequent INSERT run inside
+    ONE @Transactional, or in two separate Spring-Data short
+    transactions? Cite the method-level annotation and the
+    enclosing service method. If two separate transactions,
+    this is a duplicate-insert race window — call it out.
+
+13. Decrypt-path transaction boundaries — what does the
+    @Transactional on updateLastSeenAtByHpan cover? Does it
+    bracket KMS + AES + UPDATE, or only the UPDATE? Cite the
+    method-level annotation and the call sequence.
+
+14. Caller list verification — does this repo contain any
+    integration test stub, OpenAPI client, RestTemplate
+    configuration, or feature toggle that names the expected
+    upstream callers (COMP-07/08/09/11/14/27)? If absent,
+    state 'caller list is design-asserted, not verifiable
+    from this repo'.
+
+15. TLS / ingress boundary — quote the resources.yaml fragment
+    that confirms ClusterIP service type and the ingress
+    annotation that handles TLS termination. Report whether
+    any mTLS or backend re-encryption is configured.
+
+16. Probe DEK-state coverage — confirm by inspecting
+    LivenessHealthIndicator / ReadinessHealthIndicator (or
+    Spring Actuator group config in application.yaml) that
+    neither probe inspects the initialized flag or DEK state.
+    If only Spring defaults are in use, that is also
+    confirmation.
+
+17. @PostConstruct loadHMACKey() failure path — quote the
+    method body. Confirm whether exception is allowed to
+    propagate (Spring context fails → pod crash-loop) or is
+    caught somewhere.
+
+18. Citation gap-fill — for every ALREADY DOCUMENTED claim
+    above where the existing draft does not carry a file:line
+    citation, produce one. List those items explicitly under
+    Section 9 (Confidence Assessment) per section.
+
+═══════════════════════════════════════════════════════════════
+REPORT STRUCTURE — use these section headings, in this order
+═══════════════════════════════════════════════════════════════
+
+── SECTION 1 — PROCESSING FLOW ─────────────────────────────────
+
+a) STEPS IN ORDER
+   Document encrypt and decrypt as two separate ordered step
+   sequences. For each step: what happens, which collaborator
+   (service/repository/SDK client) is called, what the output
+   of that step is. Cite file:lines.
+
+b) DECISION POINTS
+   Every branch — JWT validity, @Valid pass/fail, DEK
+   freshness, idempotency hit/miss, exception mapping
+   branches in GlobalExceptionHandler. Condition + every
+   outcome. Cite file:lines.
+
+c) SKIP AND BYPASS CONDITIONS
+   Any short-circuit. Specifically: idempotency hit on
+   encrypt path skips AES + INSERT. Anything else?
+
+d) FAILURE PATH PER STEP
+   For each step that calls a dependency (KMS, Secrets
+   Manager, PostgreSQL, in-process HMAC/AES) — what happens
+   on failure. Per step, not globally. State exception type
+   caught, retries, post-exhaustion behaviour.
+
+e) MULTIPLE ENTRY PATHS
+   Two business endpoints (encrypt, decrypt) plus actuator,
+   probes, swagger. Describe each separately and confirm or
+   correct that there is no Kafka listener, no scheduler, no
+   webhook, no other entry path. State explicitly.
+
+f) STATE AT EACH STEP
+   For both flows, what state changes (DB row, in-memory DEK,
+   in-memory initialized flag) at each step.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ────────────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   How the GlobalExceptionHandler routes each exception type
+   to each HTTP status. The DEK freshness check as a routing
+   condition. Inbound endpoint dispatch.
+
+b) BUSINESS RULES APPLIED
+   @Valid constraints on pan (numeric, 13–19), hpan (NotEmpty),
+   HMAC key length check (32 bytes), DEK age check.
+
+c) DATA TRANSFORMATIONS
+   Inbound EncryptionRequest.pan → HPAN (HMAC-SHA256 hex) and
+   pan_ct (Base64 IV‖ciphertext). Inbound DecryptionRequest.hpan
+   → outbound DecryptionResponse.pan. Confirm reason field is
+   accepted but unused.
+
+d) IDEMPOTENCY MECHANISM
+   findByHpan check on encrypt. Detection key = hpan. Gap
+   analysis — concurrent crash window between SELECT and
+   INSERT, multi-replica race, no DB-level UNIQUE on hpan.
+   Decrypt has no idempotency or one-time-use.
+
+── SECTION 3 — CONTRACTS ───────────────────────────────────────
+
+REST API only. State explicitly 'not present' for Kafka
+consumer, Kafka producer, and Batch/Scheduler.
+
+For REST API:
+- Every endpoint: method, full path including context path,
+  request fields with constraints, response fields, every
+  HTTP status code and what triggers it, auth model, known
+  callers (cited where verifiable from this repo, otherwise
+  marked 'design-asserted'), error body structure.
+- Include the actuator + probe endpoints + swagger endpoints
+  separately and confirm auth whitelist.
+
+── SECTION 4 — DEPENDENCIES ────────────────────────────────────
+
+For each outbound: AWS KMS, AWS Secrets Manager, PostgreSQL.
+Per dependency:
+  Logical target
+  Protocol and auth method
+  Purpose (which step in the flow)
+  Connection timeout — quote config or 'not configured'
+  Read / API call timeout — quote config or 'not configured'
+  Retry: count, delay, backoff (or 'AWS SDK v2 default')
+  Circuit breaker — Resilience4j? (expected absent)
+  Behaviour if unavailable: halt / skip / degrade / item lost
+
+── SECTION 5 — DATABASE ────────────────────────────────────────
+
+For wdp.hash_key_store and wdp.data_enc_key:
+  Schema and exact table name
+  Read or write — state clearly per access path
+  Purpose — at which step in the flow
+  Key columns used in queries / writes
+  Whether writes are in the same @Transactional as other
+  writes at that step
+  Transaction manager bean used (default 'transactionManager'
+  or named)
+  Whether SELECT FOR UPDATE / row locks used (expected: no)
+
+Confirm explicitly: any tables NOT touched. (None expected.)
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ────────────────────
+
+For each, state COMPLIES / DEVIATES / NOT APPLICABLE with
+file:line evidence:
+
+DEC-001 Transactional outbox — does this component publish
+  any message via an outbox table? Expected: NOT APPLICABLE
+  (no Kafka, no async publish).
+
+DEC-003 Kafka partition key = merchantId — expected:
+  NOT APPLICABLE.
+
+DEC-004 PAN encryption — this component IS the DEC-004
+  enforcement boundary. Confirm explicitly that no clear PAN
+  is written to any persistent store anywhere in this
+  service. Confirm @ToString exclusions, log statement
+  masking, and no commit of plaintext to either owned table.
+
+DEC-005 Kafka offset — expected: NOT APPLICABLE.
+
+DEC-019 Clear PAN written — expected: COMPLIES (no clear
+  PAN persisted by this service). Confirm.
+
+DEC-020 Idempotency — does the encrypt path implement full
+  at-least-once duplicate protection? Expected: PARTIAL —
+  in-memory check via findByHpan but NO DB-level UNIQUE in
+  repo, so the multi-replica concurrent-INSERT window
+  exists. Confirm and cite.
+
+(DEC-014 Resilience4j is VOID at the platform level — DO
+NOT report it as a deviation. If asked, state 'platform-VOID,
+absence is factual record only, not a deviation'.)
+
+── SECTION 7 — SCALING AND DEPLOYMENT ──────────────────────────
+
+  Kubernetes resource type
+  Replica count — exact value or template variable + which
+  Memory and CPU limits and requests
+  HPA — present or absent (cite manifest)
+  Rolling update strategy
+  PodDisruptionBudget — present or absent
+  Topology spread — present / absent / mismatched labels
+  Liveness / readiness / startup probes
+  Ports exposed
+  Observability — OTel agent annotation, Spring Actuator,
+  Logstash / Logback config
+
+If the K8s manifest, Helm chart, or values.yaml is NOT
+present in the repo, state 'not in repo' for the missing
+items and list explicitly what IS in the repo (Dockerfile,
+application.yaml, resources.yaml, etc.) so we know what is
+absent vs missing.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ─────────────────────
+
+  Commented-out code blocks — file:line + verbatim + why
+  Unused dependencies in pom.xml — confirm
+  spring-boot-starter-oauth2-client is unused; check for
+  others
+  Feature flags active in production — exact flag names if
+  any
+  TODO / FIXME references — file:line + verbatim text
+  Stub implementations returning fixed responses
+  Properties configured but never read — search for @Value
+  / yaml keys with no injection point. Specifically check
+  EncryptionKeys.java fields hmac / dek / decEnc.
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ───────────────────────────
+
+For EACH of sections 1 through 8 above, state:
+  Confidence: High / Medium / Low
+  Basis: direct source reading / inferred from pattern /
+         not determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ───────────────
+
+List every claim from the existing component document that
+could NOT be cross-checked against code or config — neither
+confirmed nor contradicted. Likely candidates: production
+replica count, production rotation interval, downstream
+caller verification, DB-level UNIQUE constraints, log
+pipeline PAN assurance.
+
+═══════════════════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════════════════
+
+- Cite file paths and line ranges for every concrete claim.
+  Format: <relative/path>:Lstart-Lend
+- State 'not determinable from source' for any item the code
+  does not reveal — do not guess.
+- Use plain Markdown. No code blocks except when quoting a
+  short annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms
+  existing documentation, a one-paragraph
+  'still accurate — file:lines' is acceptable.
+- If you would restate something the reference document
+  already states verbatim, replace that prose with
+  'Document accurate — <file>:<lines>'. Do not restate.
+- Do not invent file paths. If a file is referenced in the
+  existing doc but you cannot locate it (e.g. migration
+  scripts, Helm chart, values.yaml, EncryptionKeys.java),
+  list it under 'REFERENCED BUT NOT FOUND IN REPO' at the
+  end, before Section 10.

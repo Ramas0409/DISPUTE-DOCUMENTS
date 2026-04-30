@@ -1,0 +1,453 @@
+You are auditing the WDP component DisplayCodeService in the repository
+gcp-display-code-service (Worldpay-mdvs-gcp-display-code-service.git).
+A prior pass already produced a DRAFT architecture document. Your job is
+to CONFIRM OR CORRECT the items listed under 'ALREADY DOCUMENTED' from
+source, and to CLOSE the items listed under 'GAPS TO FILL' by reading
+the code and config directly.
+
+Produce a single structured research report organised under the section
+headings below. For every claim, cite the file path and line range you
+read it from. Where source does not show the answer, state that
+explicitly and label it 'not determinable from source'. Do NOT guess.
+Do NOT summarise without evidence. Do NOT use the existing document as
+a substitute for source — treat it as a hypothesis to verify.
+
+────────────────────────────────────────────────────────────
+REFERENCE DOCUMENT
+────────────────────────────────────────────────────────────
+
+The file `WDP-COMP-28-DISPLAY-CODE-SERVICE.md` is provided alongside
+this prompt. Treat every assertion in it as a HYPOTHESIS, not as
+ground truth.
+
+For each documented claim:
+- If source confirms it: write "Still accurate — <file>:<lines>" and
+  do NOT restate the claim.
+- If source contradicts it: write a CORRECTION block stating
+  (a) what the doc says verbatim, (b) what source actually shows
+  with file:line citation, (c) which section of the doc needs
+  updating.
+
+At the END of the report, list every documented claim that you
+could NOT cross-check against code or config — neither confirmed
+nor contradicted. These are runtime / environment / team-owned
+items the team will need to resolve out of band.
+
+────────────────────────────────────────────────────────────
+ALREADY DOCUMENTED — CONFIRM OR CORRECT (do not re-document)
+────────────────────────────────────────────────────────────
+
+Identity:
+- Artifact id `display-code-service` version 1.5.6
+- Spring Boot 3 / Java 17
+- Component type: REST API only — no Kafka, no batch, no scheduler
+- Service port 8082; context path `/merchant/gcp/display-code`
+
+Endpoints:
+- POST /search — multi-domain code lookup; conditional userPermission in response
+- GET /privileges — privilege flags for the calling user including fullPan
+- JWT validated locally by Spring Security OAuth2 Resource Server using
+  JwtIssuerAuthenticationManagerResolver; trusted issuers from
+  `jwt_trusted_issuer_urls` runtime secret. Not delegated to an upstream gateway.
+- HTTP status code map: 200, 400 (multiple conditions including invalid
+  platform enum, empty/blank/unknown displayCodeTypes element, malformed
+  body, blank JWT claims), 401, 404, 405, 500
+
+Internal flow — POST /search:
+1. Correlation-ID interceptor (preHandle generates UUID if absent → ThreadLocal + MDC; afterCompletion clears)
+2. JWT validation
+3. Platform validation (blank → null; valid enum → use; invalid string → HTTP 400)
+4. @Cacheable lookup with key (displayCodeTypes, roles, platform, userType); hit returns response with zero DB calls
+5. displayCodeTypes validation (non-empty, all known in displayCodeMapping)
+6. Branch on disputeAction membership:
+   - if present, separate query per sub-type CH1, CH2, RE2, REQ, ACF, APC, PAB, ARB; assembled into nested object
+   - for all other types, one JPQL per cType
+7. Trim whitespace and sort each list by longDescription, case-insensitive
+8. JWT roles non-empty → query `wdp.dispute_static_tabs_rules` findByRoles(roles, userType), OR-aggregate Y/N flags; fullPan ALWAYS null on this path; platform list derived by role-name substring matching against the `Platform` enum
+9. JWT roles empty → userPermission = null in response
+
+Internal flow — GET /privileges:
+- Roles ∩ LOOKUP_ROLES empty → mapDefaultResponse all-N, HTTP 200, no DB call
+- Otherwise getPermissions(validRoles), OR-aggregate, fullPan from FULLPAN_ROLES set, platform list from hardcoded NAP_ROLES / US_ROLES sets
+- Path is NOT @Cacheable
+
+Config:
+- displayCodeMapping injected from env var `display_code_types`
+- Map immutable at runtime
+- disputeAction config value is a comma-separated list of sub-type cType constants
+
+Database:
+- PostgreSQL, schema `wdp`
+- Two JPA entities: `wdp.display_codes` and `wdp.dispute_static_tabs_rules`
+- BOTH read-only at runtime; no INSERT / UPDATE / DELETE in service code
+- Tables populated by DBA scripts / migrations
+- DataSource: `DriverManagerDataSource` — no connection pool
+- `hibernate.show-sql = true` active in PersistenceConfig
+- JpaTransactionManager wired but no transactional write paths
+
+Caching:
+- Spring @Cacheable("displayCodes") over ConcurrentMapCacheManager
+- In-memory, lazy on first request, no TTL, no proactive eviction, invalidated only by pod restart
+- Cache key tuple as above
+- Each replica has its own cache — no cross-replica coherence
+
+Outbound dependencies:
+- PostgreSQL `wdp` (JDBC/JPA) — no retry, no circuit breaker, no timeout
+- External IdP — JWKS endpoint URL list from `jwt_trusted_issuer_urls`; Spring Security caches at startup
+- Logstash — LogstashTcpSocketAppender 7.4 → `${logstash_server_host_port}`
+- NO Kafka, NO outbound REST to other WDP services
+
+K8s / scaling (from `resources.yaml`):
+- Kind: Deployment
+- Replica placeholder `{{ replicas-mdvs-gcp-display-code-service }}` (XL Deploy)
+- Memory: request 1024Mi / limit 2048Mi
+- CPU: neither request nor limit set
+- HPA: absent
+- PodDisruptionBudget: absent
+- Rolling update: maxSurge:1, maxUnavailable:0
+- Topology spread: maxSkew:1, whenUnsatisfiable:ScheduleAnyway, topologyKey:kubernetes.io/hostname; selector includes `${BRANCH_NAME_PLACEHOLDER}` token
+- OTel agent injection annotation present
+- Spring Actuator endpoints exposed: info, health, prometheus
+
+Platform compliance:
+- DEC-001 Outbox — NOT APPLICABLE (no Kafka publish)
+- DEC-003 Partition key — NOT APPLICABLE
+- DEC-004 PAN encryption — COMPLIANT (no PAN handled; fullPan is a permission flag, not PAN)
+- DEC-005 Offset commit — NOT APPLICABLE
+- DEC-014 Resilience4j — DEVIATION (no dependency, no @CircuitBreaker)
+- DEC-019 Clear PAN persisted — COMPLIANT (no persistent writes at all at runtime)
+- DEC-020 Idempotency — NOT APPLICABLE (read-only)
+
+Code-quality flags:
+- `userId` on DisplayCodeSearchRequest declared but never read
+- Commented-out hardcoded Logstash IP addresses in logback-spring.xml
+- Bare `// TODO` in GlobalExceptionHandler on the HttpRequestMethodNotSupportedException handler
+
+────────────────────────────────────────────────────────────
+GAPS TO FILL — answer each from source
+────────────────────────────────────────────────────────────
+
+1. Full caller inventory beyond COMP-04: scan READMEs, integration tests,
+   OpenAPI spec, comments, design notes for any reference to caller
+   service names. List each caller mention found, with file:line.
+   If only COMP-04 is referenced in this repo, state that.
+
+2. HikariCP / connection-pool migration: scan for any TODO, FIXME,
+   deprecation comment, branch reference, or JIRA reference indicating
+   the DriverManagerDataSource is being replaced. Search pom.xml for
+   any HikariCP / DBCP2 dependency present-but-unused. Report file:line
+   for any finding, or "no migration evidence found".
+
+3. PostgreSQL instance: locate the JDBC URL (raw or via env-var
+   indirection). Report the host pattern, the env-var name, and any
+   secret reference. State whether the URL pattern matches the WDP
+   shared Aurora `globaldisputedatabase` host pattern or a separate
+   instance. If only the env-var name is in source, report that and
+   mark the actual host "not in repo".
+
+4. Kubernetes probes: in resources.yaml, list each of livenessProbe /
+   readinessProbe / startupProbe — state the HTTP path, port, initial
+   delay, period, timeout, failure threshold. For any absent probe
+   type, state "ABSENT".
+
+5. Connection-level timeouts:
+   - JDBC URL: any socket timeout / login timeout query parameters?
+   - IdP JWKS: any RestTemplate / WebClient timeout customisation by
+     Spring Security OAuth2 Resource Server, or framework default?
+   - LogstashTcpSocketAppender: keepAliveDuration, connectionTimeout,
+     reconnectionDelay if configured.
+   For each: state configured value with file:line, OR "not configured —
+   framework default".
+
+6. Spring profile activation pattern: does application.yaml use the
+   `${gcp_env}` pattern selecting application-{dev|stg|uat|prod|cert|
+   test|local}? Cite file:line.
+
+7. Outbound REST clients: scan the codebase for any RestTemplate,
+   WebClient, Feign, OkHttp, HttpClient, or RestClient bean. List
+   every match with file:line, OR confirm "no outbound HTTP client
+   beans found anywhere in the codebase".
+
+8. @Transactional on read paths: does the service layer use
+   @Transactional(readOnly = true) or are reads unannotated? Cite
+   file:line for the service class headers.
+
+9. Two platform-derivation strategies (POST /search substring match
+   vs GET /privileges hardcoded role sets): is the divergence
+   referenced in any code comment, commit message visible in HEAD, or
+   design note in repo? Cite file:line for any comment found, OR
+   "no in-source comment explains the divergence".
+
+10. Repository content inventory for K8s / config:
+    - List every file present in the repo at: resources.yaml /
+      Dockerfile / application.yaml / application-*.yaml /
+      logback-spring.xml / logback.xml / pom.xml / build.gradle.
+    - Confirm absence of: Helm chart (Chart.yaml / templates/), 
+      values.yaml, PodDisruptionBudget manifest, HPA manifest,
+      ConfigMap manifest, ServiceMonitor manifest.
+    - For each absent file, state "not in repo".
+
+11. Health probe path naming: when probes exist (Section 4 above), do
+    they use Actuator `/actuator/health` or service-prefixed paths
+    such as `/merchant/gcp/display-code/livez` and `/readyz`?
+    Cite file:line.
+
+12. Whitelisted SecurityFilterChain paths in non-prod: in the security
+    config class, list every path that bypasses JWT validation.
+    Cite file:line.
+
+13. displayCodeMapping parsing: how is the env var `display_code_types`
+    parsed into a map at startup? What happens on malformed input —
+    does the application fail to start, or log and continue? Cite
+    file:line for the @Value / parsing logic and any validation.
+
+14. minReadySeconds placement: confirm whether `minReadySeconds: 30`
+    is at `spec.minReadySeconds` (effective) or under
+    `spec.template.spec` (silently ignored — pattern observed on
+    COMP-25, COMP-34, COMP-08). Cite resources.yaml line.
+
+15. Container port consistency: confirm port 8082 across Dockerfile
+    EXPOSE, application.yaml server.port, resources.yaml containerPort.
+    Cite file:line for each. Flag any mismatch.
+
+────────────────────────────────────────────────────────────
+REPORT STRUCTURE — use these section headings in this order
+────────────────────────────────────────────────────────────
+
+Use exactly these top-level headings and sub-headings. Omit nothing.
+
+── SECTION 1 — PROCESSING FLOW ──────────────────────────────
+
+a) STEPS IN ORDER
+   Confirm or correct the POST /search and GET /privileges step
+   sequences listed in ALREADY DOCUMENTED. Per step: what runs,
+   which service or table is touched, what the output is. Cite
+   file:lines for each step.
+
+b) DECISION POINTS
+   Confirm or correct each branch:
+   - JWT validity gate
+   - endpoint routing (search vs privileges)
+   - platform field validation (blank / valid / invalid)
+   - cache hit / miss
+   - displayCodeTypes validation
+   - disputeAction membership branch (multi-query vs single-query)
+   - JWT roles empty / non-empty
+   - LOOKUP_ROLES membership (privileges path)
+   For each: condition evaluated and the path taken on each outcome.
+
+c) SKIP AND BYPASS CONDITIONS
+   - Cache hit short-circuits all DB calls
+   - Empty roles bypasses permission DB query
+   - Empty LOOKUP_ROLES intersection bypasses permission DB query
+   - Whitelisted non-prod paths bypass JWT validation
+   For each: what is checked, what value triggers the skip,
+   where control goes after.
+
+d) FAILURE PATH PER STEP
+   For each step that calls an external dependency:
+   - PostgreSQL display_codes query failure
+   - PostgreSQL dispute_static_tabs_rules query failure
+   - JWT validation failure (invalid / expired / untrusted issuer)
+   - Startup-time JWKS unreachable
+   State exception type caught (or uncaught), retry count (state
+   "none" if absent), post-exhaustion behaviour. Cite file:lines.
+
+e) MULTIPLE ENTRY PATHS
+   The component has two HTTP entry points — POST /search and
+   GET /privileges. Describe each separately. State where they
+   converge (correlation interceptor, JWT validation, permission DB
+   query) and where they diverge. Confirm explicitly that no other
+   entry types exist: no Kafka listener, no scheduler, no webhook,
+   no SQS/SNS handler. Cite the absence with file:line evidence
+   (e.g. pom.xml has no spring-kafka).
+
+f) STATE AT EACH STEP
+   N/A — service is stateless. State this explicitly.
+
+── SECTION 2 — FUNCTIONAL BEHAVIOUR ─────────────────────────
+
+a) CLASSIFICATION AND ROUTING LOGIC
+   How disputeAction sub-type loop is constructed; how each
+   logical domain name is mapped to its DB cType via
+   displayCodeMapping; how platform value is normalised to enum.
+   Cite file:lines.
+
+b) BUSINESS RULES APPLIED
+   - displayCodeTypes non-empty validation (@NotEmpty)
+   - displayCodeTypes element non-blank validation
+   - displayCodeTypes element present in displayCodeMapping
+   - platform string is a valid Platform enum value if non-blank
+   - JWT iss claim non-blank
+   For each: where applied, expected vs failure outcome.
+
+c) DATA TRANSFORMATIONS
+   - DB row → DisplayCodeDetail mapping (code, description,
+     longDescription)
+   - Whitespace trim on returned fields
+   - Sort by longDescription case-insensitive
+   - disputeAction sub-types nested into a map by sub-type
+   - userPermission OR-aggregation of Y/N flags across all matching
+     role rows
+   - fullPan derivation (FULLPAN_ROLES set)
+   - platform list derivation (substring match vs hardcoded sets)
+   Cite file:lines.
+
+d) IDEMPOTENCY MECHANISM
+   N/A — read-only GET-style semantics. State explicitly. No
+   client-supplied idempotency-key is honoured. The cache key tuple
+   is the only request-deduplication mechanism, and it is by-replica.
+
+── SECTION 3 — CONTRACTS ────────────────────────────────────
+
+REST API:
+- For each of POST /search and GET /privileges:
+  - method, path, request fields (body / headers / query),
+    response shape (success and error), every HTTP status code with
+    its trigger condition, auth model
+- Confirm or correct the existing endpoint tables.
+- List the @ControllerAdvice / @ExceptionHandler mappings and
+  which exception → which HTTP status.
+
+Kafka Consumer: NOT PRESENT — confirm absence by stating "no
+@KafkaListener, no MessageListener, no spring-kafka dependency".
+
+Kafka Producer: NOT PRESENT — confirm absence by stating "no
+KafkaTemplate, no Producer bean, no spring-kafka dependency".
+
+Batch / Scheduler: NOT PRESENT — confirm absence by stating "no
+@Scheduled methods, no Spring Batch dependency, no CronJob manifest".
+
+── SECTION 4 — DEPENDENCIES ─────────────────────────────────
+
+For each outbound call, fill all fields:
+
+Dependency 1 — PostgreSQL `wdp.display_codes` and
+`wdp.dispute_static_tabs_rules`:
+- Service / target: PostgreSQL `wdp` schema
+- Protocol / auth: JDBC / username+password (or IAM if so)
+- Purpose: code lookup and permission resolution
+- Connection timeout: state value or "not configured"
+- Read timeout: state value or "not configured"
+- Retry: count, delay, backoff or "none"
+- Circuit breaker: state "not configured" if absent
+- Behaviour if unavailable: HTTP 500, no fallback, no degraded path
+
+Dependency 2 — External IdP (JWKS):
+- URL pattern from `jwt_trusted_issuer_urls`
+- Protocol / auth: HTTPS, no auth on JWKS endpoint
+- Purpose: JWT signature key retrieval at startup, periodic refresh
+- Connection / read timeouts: from Spring Security defaults unless
+  customised — state which
+- Retry / circuit breaker: state "not configured" if absent
+- Startup behaviour if unreachable: state observed behaviour
+
+Dependency 3 — Logstash:
+- TCP socket via LogstashTcpSocketAppender to
+  `${logstash_server_host_port}`
+- Connection timeout, keepAliveDuration, reconnectionDelay: state
+  value or "framework default"
+- Behaviour if unreachable: state non-fatal (log events lost
+  silently) or otherwise.
+
+If any other outbound HTTP / TCP / message-queue dependency is
+discovered during the gap-fill scan (Gap 7), add it as
+Dependency 4+.
+
+── SECTION 5 — DATABASE ─────────────────────────────────────
+
+For each table:
+- Schema and exact table name
+- Read or write — state "READ ONLY at runtime" for both
+- Purpose — at which step in the flow
+- Key columns used in queries
+- Whether any @Transactional spans the query — state read-only flag
+  if present
+- Transaction manager bean used (JpaTransactionManager)
+- Whether SELECT FOR UPDATE / row locks are used — state "no" if so
+
+Confirm explicitly: no other tables in either `wdp` or `nap` schema
+are touched by this service.
+
+── SECTION 6 — PLATFORM STANDARD DEVIATIONS ─────────────────
+
+Output COMPLIES / DEVIATES / NOT APPLICABLE per standard, with
+file:line evidence for the determinative source.
+
+- DEC-001 Transactional outbox: NOT APPLICABLE (no Kafka publish).
+  Confirm by absence of spring-kafka and KafkaTemplate.
+- DEC-003 Partition key = merchantId: NOT APPLICABLE.
+- DEC-004 PAN encryption before persist: COMPLIANT — confirm by
+  scanning entity classes for any `pan` / `cardNumber` /
+  `accountNumber` / `acctNum` field.
+- DEC-005 Offset commit: NOT APPLICABLE.
+- DEC-019 Clear PAN persisted: COMPLIANT — confirm by absence of
+  any persistent write at runtime.
+- DEC-020 Idempotency: NOT APPLICABLE (read-only).
+
+Confirm DEC-014 Resilience4j DEVIATION: state pom.xml file:line
+showing absence of `io.github.resilience4j` dependency, and confirm
+no `@CircuitBreaker`, `@Retry`, `@RateLimiter`, `@Bulkhead`
+annotation appears anywhere.
+
+── SECTION 7 — SCALING AND DEPLOYMENT ───────────────────────
+
+If `resources.yaml` is in the repo, confirm or correct every value
+already documented (replica placeholder, memory, CPU, HPA, PDB,
+rolling update, topology spread, OTel annotation, ports).
+
+If Helm chart / values.yaml / PodDisruptionBudget / HPA / ConfigMap
+manifests are NOT in the repo, state "not in repo" per file. List
+what IS in the repo (e.g. `resources.yaml`, `Dockerfile`,
+`application.yaml`) so the gap is explicit.
+
+State liveness / readiness / startup probe configuration per
+Gap 4 above.
+
+── SECTION 8 — PLANNED AND INCOMPLETE WORK ──────────────────
+
+- Commented-out code: list each block, what it did, why
+- Unused dependencies in pom.xml: list any dependency declared but
+  not imported anywhere
+- Feature flags active in production: exact env-var or property
+  name, behaviour when set / unset, default value
+- TODO / FIXME references: file:line and verbatim text
+- Stub implementations returning fixed responses
+- @Value or yaml keys configured but never read by any component
+
+── SECTION 9 — CONFIDENCE ASSESSMENT ────────────────────────
+
+For EACH of Sections 1 through 8 above, state:
+- Confidence: High / Medium / Low
+- Basis: direct source reading / inferred from pattern / not
+  determinable from source alone
+
+── SECTION 10 — ITEMS NOT VERIFIABLE FROM SOURCE ────────────
+
+List every claim from the existing component document that you
+could NOT cross-check against code or config — neither confirmed
+nor contradicted. Examples likely to land here: production replica
+count, exact production cron values, exact env-var values for
+runtime secrets, whether IdP startup-time unreachability has
+actually caused production failures.
+
+────────────────────────────────────────────────────────────
+OUTPUT RULES
+────────────────────────────────────────────────────────────
+
+- Cite file paths and line ranges for every concrete claim.
+  Format: <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does
+  not reveal. Do not guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms
+  existing documentation, a one-paragraph "still accurate —
+  file:lines" is acceptable.
+- If you would restate something the reference document already
+  states verbatim, replace that prose with "Document accurate —
+  <file>:<lines>". Do not restate.
+- Do not invent file paths. If a file is referenced in the
+  existing doc but you cannot locate it, list it under
+  "REFERENCED BUT NOT FOUND IN REPO" at the end.

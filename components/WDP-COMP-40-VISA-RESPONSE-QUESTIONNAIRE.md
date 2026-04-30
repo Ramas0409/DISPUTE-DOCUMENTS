@@ -1,7 +1,10 @@
 # WDP-COMP-40-VISA-RESPONSE-QUESTIONNAIRE
 **Worldpay Dispute Platform — Component Reference**
-*Version: 1.0 DRAFT | April 2026*
-*Extracted from: gcp-visa-respond-questionnaire-consumer using GitHub Copilot CLI | Architect-confirmed: PENDING*
+*Version: 1.1 DRAFT | April 2026*
+*Source: v1.0 DRAFT (Copilot CLI extraction) + 2026-04-29 source-verification pass via GitHub Copilot CLI against `gcp-visa-respond-questionnaire-consumer`*
+*Architect-confirmed: PENDING*
+
+*v1.1 reconciliation scope: line-number re-verification (all confirmed accurate); per-env suffix corrected (`-cers` → `-cert`); `minReadySeconds: 30` confirmed misplaced under `spec.template.spec` and silently ignored at runtime (matches COMP-25 / COMP-28 / COMP-34 / COMP-08 pattern); probe sub-parameters added; observability detail expanded (Prometheus export confirmed, MDC enrichment confirmed HTTP-only — absent on Kafka path); `getDisputeFilingDetails` `allocarb` loop semantics clarified (iterates all `visaResponseIds`, uploads per iteration); IDP token confirmed fetched per message with no caching despite `spring-boot-starter-cache` on classpath; upload query-param list corrected (three params: `actionSequence`, `documentType`, `uploadedBy`); IDP token call confirmed to occur **before** Decision A filter — wasted RTT on every discarded event; explicit DEC-019 (COMPLIES) and DEC-020 (DEVIATES HIGH) deviation rows added; `${app.name}` Prometheus tag reference is undefined in any config file.*
 
 ---
 
@@ -19,7 +22,7 @@
 | **Artefact** | `com.wp.gcp:gcp-visa-respond-questionnaire-consumer:0.0.1-SNAPSHOT` |
 | **Runtime** | Spring Boot 3.5.7 · Java 17 |
 | **Status** | ✅ Production |
-| **Doc status** | 📝 DRAFT |
+| **Doc status** | 📝 DRAFT v1.1 — source-verified 2026-04-29, architect confirmation pending |
 | **Sections present** | `Core · Block B (Kafka Consumer)` |
 
 ---
@@ -37,20 +40,26 @@ to DocumentManagementService (COMP-37) for persistent storage in S3 with
 DynamoDB metadata.
 
 The component routes Visa API calls through one of two paths depending on
-the acquiring platform: non-NAP platforms use a DataPower gateway with a raw
-licence key (`vantiveLicense`); NAP platform uses a local Visa Adapter
+the acquiring platform: non-NAP platforms use a DataPower gateway with a
+raw licence key (`vantiveLicense`); NAP platform uses a local Visa Adapter
 (`mdvs-gcp-visa-adapter`) with an IDP Bearer token. The `platform` field
-from the inbound event drives this routing — it is not used to filter which
-events are processed.
+from the inbound event drives this routing — it is not used to filter
+which events are processed.
 
-The component supports five Visa questionnaire response types — representment,
-pre-compliance response, pre-arbitration response, allocation arbitration, and
-allocation pre-arbitration — each mapped to a distinct Visa RTSI endpoint. An
-event with any other `responseType` value is silently discarded.
+The component supports five Visa questionnaire response types —
+representment, pre-compliance response, pre-arbitration response,
+allocation arbitration, and allocation pre-arbitration — each mapped to a
+distinct Visa RTSI retrieval endpoint. Allocation arbitration (`allocarb`)
+is the only response type that iterates: for each `visaResponseIds`
+element it calls `getDisputeFilingDetails` and uploads the resulting image
+as a separate document. The other four response types call once with the
+first `visaResponseIds` element and upload a single document. Any other
+`responseType` value is silently discarded.
 
-On a processing failure after all retries are exhausted, the component adds an
-SNOTE to the case via NotesService (COMP-25) as the sole error recording
-mechanism. There is no dead-letter queue and no local error table.
+On a processing failure after all retries are exhausted, the component
+adds an SNOTE to the case via NotesService (COMP-25) as the sole error
+recording mechanism. There is no dead-letter queue, no local error table,
+and no DB of any kind.
 
 **What it does NOT do**
 
@@ -58,18 +67,25 @@ mechanism. There is no dead-letter queue and no local error table.
   accepted; `platform` is used only to select the RTSI URL/auth combination.
 - Does not process non-Visa disputes — events with a null or empty
   `visaResponseIds` are silently discarded at the filter check.
-- Does not update any case table or action table after uploading the document
-  — case association is handled entirely by DocumentManagementService using
-  the `platform`, `caseNumber`, and `actionSequence` URL parameters.
-- Does not upload the `additionalImagesList` from the RTSI response — only
-  the primary questionnaire image (`disputeAsImageResponseDescriptor`) is
-  uploaded. Additional images are extracted but silently discarded.
-  **⚠️ This is confirmed incomplete work.**
-- Does not persist any local state — no JPA, JDBC, Hibernate, or DynamoDB SDK
-  dependency exists in this component. It is fully stateless.
+- Does not update any case table or action table after uploading the
+  document — case association is handled entirely by
+  DocumentManagementService using the `platform`, `caseNumber`, and
+  `actionSequence` URL parameters.
+- Does not upload the `additionalImagesList` from the RTSI response —
+  only the primary questionnaire image
+  (`disputeAsImageResponseDescriptor`) is uploaded. Additional images are
+  extracted but silently discarded. ⚠️ Confirmed incomplete work.
+- Does not persist any local state — no JPA, JDBC, Hibernate, or
+  DynamoDB SDK on classpath. Fully stateless.
 - Does not use a transactional outbox — DEC-001 deviation.
-- Does not use Resilience4j — DEC-014 deviation. Spring Retry provides the
-  sole resilience mechanism.
+- Does not use Resilience4j — DEC-014 deviation (platform-VOID posture).
+  Spring Retry provides the sole resilience mechanism.
+- Does not cache the IDP Bearer token — every Kafka message triggers a
+  fresh token fetch despite `spring-boot-starter-cache` being on the
+  classpath. ⚠️ Performance concern at high volume.
+- Does not propagate MDC correlation context into Kafka-triggered
+  processing — `HttpInterceptor` MDC enrichment is HTTP-only and the
+  Kafka listener path has no equivalent.
 - Does not use case-level authorisation. There is no auth check on the
   inbound event; auth is only applied on outbound calls.
 
@@ -79,63 +95,73 @@ mechanism. There is no dead-letter queue and no local error table.
 
 ```mermaid
 flowchart TD
-    IN["Kafka: internal-integration-events\nContestEvent received\n(caseNumber partition key header)"]
+    IN["Kafka: internal-integration-events\nContestEvent received\n(caseNumber as record key)"]
 
     S1["Step 1 — Message receipt + deserialisation\nConcurrentKafkaListenerContainerFactory\nErrorHandlingDeserializer → ContestEvent"]
 
     S2["Step 2 — Offset committed\nMANUAL_IMMEDIATE — BEFORE processing\n⚠️ At-most-once semantics"]
 
-    S3["Step 3 — processContestEvent() invoked\nEventConsumerServiceImpl"]
+    S3["Step 3 — log platform"]
 
-    S4["Step 4 — IDP Token retrieval\nGET wdp-idp-token-service\nNo retry · No CB"]
+    S4["Step 4 — processContestEvent() invoked\nEventConsumerServiceImpl"]
+
+    S5["Step 5 — IDP Token retrieval\nGET wdp-idp-token-service\n⚠️ No retry · No CB · No cache\n⚠️ Always called BEFORE filter"]
 
     DECF{{"Decision A\nvisaResponseIds non-null\nAND non-empty\nAND responseType non-blank?"}}
 
-    SKIP_F["Silent return\nNo log · No error\nOffset already committed"]
+    SKIP_F["Silent return\nNo log · No error\n⚠️ IDP token already wasted\nOffset already committed"]
 
     DECR{{"Decision B\nresponseType\n(case-insensitive match\nagainst 5 constants)"}}
 
     SKIP_R["Unknown responseType\nSilent fall-through\nNo log · No error"]
 
+    LOOP{{"Decision B'\nresponseType == allocarb?"}}
+
+    LOOP_BODY["Step 7L — Loop body\nfor each visaResponseId in list:\n  call getDisputeFilingDetails\n  upload document\n  separate upload per ID"]
+
     DECP{{"Decision C\nplatform == 'nap'?"}}
 
-    RTSI_DP["Step 7a — Visa RTSI via DataPower\nPOST ${dispute_rtsi_url}\nAuth: vantiveLicense\n(non-NAP platforms)"]
+    RTSI_DP["Step 7a — Visa RTSI via DataPower\nPOST ${dispute_rtsi_url}\nAuth: vantiveLicense (raw, not Bearer)\n(non-NAP — single URL for all)"]
 
-    RTSI_AD["Step 7b — Visa RTSI via Visa Adapter\nPOST mdvs-gcp-visa-adapter\nAuth: Bearer idpToken\n(NAP platform only)"]
+    RTSI_AD["Step 7b — Visa RTSI via Visa Adapter\nPOST mdvs-gcp-visa-adapter\nAuth: Bearer idpToken\n(NAP only)"]
 
     DECV{{"Decision D\nstatusCode == I-300000000\nAND responseData != null?"}}
 
-    RETRY["Spring Retry\nServiceException\nRetry count: ${app.retrycount}\nDelay: ${app.retrydelay}\nFixed backoff · No CB"]
+    RETRY["Spring Retry\nServiceException\nRetry: ${app.retrycount}\nDelay: ${app.retrydelay}\nFixed backoff · No CB"]
 
     S9["Step 9 — Image extraction\ndisputeAsImageResponseDescriptor.imageData\n→ quesImageBase64Encoded\ncontentType → quesImageContentType\n⚠️ additionalImagesList extracted but NOT uploaded"]
 
-    S10["Step 10 — Upload to DocumentManagementService\nPOST mdvs-gcp-document-management-service\nFile: RESPQDOC + actionSequence + ext\nmultipart/form-data · Auth: Bearer idpToken\nSpring Retry same count/delay"]
+    S10["Step 10 — Upload to DocumentManagementService\nPOST mdvs-gcp-document-management-service\nFile: RESPQDOC + actionSequence + ext\nQuery params: actionSequence,\ndocumentType=RESPQDOC,\nuploadedBy=WVRQCONSUM\nmultipart/form-data · Auth: Bearer idpToken\nSpring Retry same count/delay"]
 
     DECN{{"Decision E\ndocumentResponse == null?"}}
 
     ERR_SE["ServiceException thrown\n'response from upload\ndocument api is null'"]
 
-    CATCH{{"Decision F\nServiceException caught\nfrom any step 4–10?"}}
+    CATCH{{"Decision F\nServiceException caught\nfrom step 7–10?"}}
 
     S11["Step 11 — Add case note\nPOST mdvs-gcp-notes-service\nnoteType=SNOTE · userId=WVRQCONSUM\nNo retry · Exception caught + logged only"]
 
-    OUT["Document stored in DocumentManagementService\n(S3 + DynamoDB via COMP-37)\nProcessing complete"]
+    OUT["Document(s) stored in DocumentManagementService\n(S3 + DynamoDB via COMP-37)\nProcessing complete"]
 
-    DESER_ERR["Deserialization failure\nErrorHandlingDeserializer delivers\nnull/default ContestEvent\nCommonErrorHandler: empty no-op\nOffset already committed\nFilter check (Decision A) silently discards"]
+    DESER_ERR["Deserialization failure\nErrorHandlingDeserializer delivers\nnull/default ContestEvent\nCommonErrorHandler: empty no-op\nOffset already committed\nFilter (Decision A) silently discards"]
 
-    IDP_ERR["IDP token failure\nServiceException propagates\nto KafkaConsumer catch\nLogged + swallowed\nOffset already committed"]
+    IDP_ERR["IDP token failure\nServiceException propagates\nto outer KafkaConsumer catch\nLogged + swallowed\nOffset already committed\n⚠️ No SNOTE written"]
 
     IN --> S1
     S1 -->|"Valid payload"| S2
     S1 -->|"Deserialisation failure"| DESER_ERR
     S2 --> S3
     S3 --> S4
-    S4 -->|"Token obtained"| DECF
-    S4 -->|"ServiceException"| IDP_ERR
+    S4 --> S5
+    S5 -->|"Token obtained"| DECF
+    S5 -->|"ServiceException"| IDP_ERR
     DECF -->|"Either check fails"| SKIP_F
-    DECF -->|"Both pass"| DECR
-    DECR -->|"allocprearb → getDisputePreArbDetails\nallocarb → getDisputeFilingDetails (loops all IDs)\nrepresentment → getDisputeResponseDetails\nprearbresp → getDisputePreArbResponseDetails\nprecomresp → getDisputePreCompResponseDetails"| DECP
+    DECF -->|"All pass"| DECR
     DECR -->|"No match"| SKIP_R
+    DECR -->|"Match — one of 5"| LOOP
+    LOOP -->|"Yes — allocarb"| LOOP_BODY
+    LOOP -->|"No — other 4 types"| DECP
+    LOOP_BODY --> DECP
     DECP -->|"nap"| RTSI_AD
     DECP -->|"non-NAP"| RTSI_DP
     RTSI_DP --> DECV
@@ -173,8 +199,8 @@ flowchart TD
 
 | Target | Protocol | Endpoint / Resource | Purpose | On failure |
 |---|---|---|---|---|
-| `wdp-idp-token-service` | REST HTTP GET | `/merchant/gcp/idp-token/token` | Obtain IDP Bearer token for outbound auth | ServiceException propagates; caught + swallowed; processing lost |
-| Visa RTSI via DataPower | REST HTTP POST JSON | `${dispute_rtsi_url}` (non-NAP) | Retrieve Visa questionnaire image | Spring Retry then ServiceException → addCaseNote |
+| `wdp-idp-token-service` | REST HTTP GET | `/merchant/gcp/idp-token/token` | Obtain IDP Bearer token for outbound auth (per-message, uncached) | ServiceException propagates; caught + swallowed; processing lost |
+| Visa RTSI via DataPower | REST HTTP POST JSON | `${dispute_rtsi_url}` (non-NAP — single URL for CORE/VAP/LATAM/PIN) | Retrieve Visa questionnaire image | Spring Retry then ServiceException → addCaseNote |
 | Visa Adapter (`mdvs-gcp-visa-adapter`) | REST HTTP POST JSON | `/merchant/wdp/visaadapter` (NAP only) | Retrieve Visa questionnaire image via local adapter | Spring Retry then ServiceException → addCaseNote |
 | DocumentManagementService (COMP-37) | REST HTTP POST multipart/form-data | `/merchant/gcp/document-management/{platform}/documents/{caseNumber}` | Upload questionnaire image as RESPQDOC | Spring Retry then ServiceException → addCaseNote |
 | NotesService (COMP-25) | REST HTTP POST JSON | `/merchant/gcp/notes/{platform}/case/{caseNumber}` | Write SNOTE on processing failure | Exception caught + logged only; not re-thrown |
@@ -187,14 +213,14 @@ flowchart TD
 
 This component owns no database state. It is fully stateless.
 
-There is no JPA, JDBC, Hibernate, DynamoDB SDK, or any database driver in
-`pom.xml`. No `@Entity`, `@Repository`, or `DataSource` bean exists anywhere
-in the codebase.
+There is no JPA, JDBC, Hibernate, DynamoDB SDK, or any database driver
+on classpath. No `@Entity`, `@Repository`, or `DataSource` bean exists
+anywhere in the codebase.
 
 ### Tables Read (not owned by this component)
 
-This component reads no database tables directly. All persistent state is
-managed by downstream services it calls.
+This component reads no database tables directly. All persistent state
+is managed by downstream services it calls.
 
 ---
 
@@ -202,16 +228,23 @@ managed by downstream services it calls.
 
 | Risk | Severity | Detail |
 |---|---|---|
-| At-most-once Kafka semantics — DEC-005 violation | ⚠️ HIGH | `acknowledgement.acknowledge()` is called at `KafkaConsumer.java:30`, **before** `processContestEvent()` at line 32. If the JVM crashes or any downstream call fails after the offset is committed, the message is permanently lost with no reprocessing path. |
-| No timeouts on RestTemplate | ⚠️ HIGH | `CommonConfig.java` creates `new RestTemplate()` with no `ClientHttpRequestFactory` customisation. All outbound REST calls — IDP token, Visa RTSI, DocumentManagementService, NotesService — rely on OS-level TCP timeouts (effectively infinite). With concurrency=1, a single hung dependency blocks all consumer processing. |
-| additionalImagesList never uploaded | ⚠️ MEDIUM | `VisaRTSIServiceImpl.setImageDataFromRTSIResponse()` extracts `disputeImageAttachment.attachment[]` into `additionalImagesList` in `DisputesRTSIResult`, but `DisputeServiceImpl.uploadDocument()` only uses `quesImageBase64Encoded`. The additional images are silently discarded. Confirmed incomplete work — no TODO comment, no issue reference. |
-| No idempotency mechanism | ⚠️ MEDIUM | No duplicate check before calling RTSI or uploading. Under at-most-once semantics this is low-risk in practice, but any requeue or replay scenario would result in duplicate RTSI calls and duplicate document uploads. |
-| IDP token failure swallowed with at-most-once offset | ⚠️ MEDIUM | If `wdp-idp-token-service` is unavailable at Step 4, a `ServiceException` is thrown, propagates to the `KafkaConsumer.listener()` catch block, is logged and swallowed. The offset is already committed. The event is permanently lost with no case note written (case note path only fires inside `processContestEvent` try-catch, which is after IDP token call). |
-| No Resilience4j — DEC-014 violation | ℹ️ LOW | `pom.xml` contains no `resilience4j` dependency. Spring Retry (`spring-retry`, `spring-aspects`) provides the sole retry mechanism via `@Retryable` on `VisaRTSIService` and `DisputeService` interfaces. No circuit breaker, rate limiter, or bulkhead is configured on any outbound call. Consistent with platform-wide pattern. |
-| Consumer group ID assumption corrected | ℹ️ INFO | The production consumer group is `internal-integration-events-ques-group` (from `application-prod.yaml`). The previously documented assumption of `visa-response-questionnaire-group` was incorrect. |
-| Log label mismatch — DEC-003 signal | ℹ️ INFO | `KafkaConsumer.java` logs `"key-MerchantId:{}"` but binds the `caseNumber` variable. This suggests the partition key convention was changed from `merchantId` to `caseNumber` on the producer side but the log label was not updated. |
-| `DisputeFilingInfo` field commented out | ℹ️ INFO | `ResponseData.java` lines 44–45 have `@JsonProperty("DisputeFilingInfo")` and its `List<DisputeFilingInfo>` field commented out. The class exists in the codebase but is not wired into deserialisation. Likely a deserialization conflict or speculative addition. |
-| `testUploadDocument_valid` unit test disabled | ℹ️ INFO | The happy-path test for `uploadDocument` is commented out due to a mock setup issue. The document upload success path has no working unit test coverage. |
+| At-most-once Kafka semantics — DEC-005 deviation | 🔴 HIGH | `acknowledgement.acknowledge()` is called **before** `processContestEvent()`. If the JVM crashes or any downstream call fails after the offset is committed, the message is permanently lost with no reprocessing path. Consistent with platform-wide pre-ACK pattern. |
+| No timeouts on RestTemplate — DEC-014 platform-VOID posture | 🔴 HIGH | `CommonConfig` creates `new RestTemplate()` with no `ClientHttpRequestFactory` customisation. All five outbound calls — IDP token, Visa RTSI, Visa Adapter, DocumentManagementService, NotesService — rely on OS-level TCP timeouts (effectively infinite). With concurrency=1, a single hung dependency blocks all consumer processing on that pod. |
+| `minReadySeconds: 30` silently ignored — runtime defect | 🔴 HIGH | The `minReadySeconds: 30` declaration is misplaced inside `spec.template.spec` instead of `spec`. Kubernetes silently ignores it at this position. The intended 30-second rollout stability gate is not actually applied — new pods are considered Ready as soon as the readiness probe passes. **Same defect class as COMP-25 / COMP-28 / COMP-34 / COMP-08.** Confirms a recurring platform manifest-template defect. |
+| `additionalImagesList` never uploaded | 🟡 MEDIUM | `VisaRTSIServiceImpl.setImageDataFromRTSIResponse()` extracts `disputeImageAttachment.attachment[]` into `additionalImagesList` in `DisputesRTSIResult`, but `DisputeServiceImpl.uploadDocument()` only uses `quesImageBase64Encoded`. The additional images are silently discarded. Confirmed incomplete work — no TODO, no issue reference. |
+| No idempotency mechanism — DEC-020 deviation | 🔴 HIGH | No `idempotency-key` header read, no duplicate check, no DB constraint (no DB at all), no in-memory dedup. Under at-most-once semantics duplicate-from-Kafka is unlikely; under any replay (offset reset, partition reassignment with leftover in-flight) duplicate RTSI calls and duplicate document uploads would occur. Severity tracks DEC-005. |
+| IDP token failure swallowed with at-most-once offset | 🟡 MEDIUM | If `wdp-idp-token-service` is unavailable at Step 5, a `ServiceException` propagates to the outer `KafkaConsumer.listener()` catch, is logged at INFO level and swallowed. The offset is already committed. The event is permanently lost with no SNOTE written (the case-note path is reached only via the catch block inside `processContestEvent`'s downstream flow — IDP failure occurs upstream of any RTSI/upload step that the catch is positioned to cover). |
+| IDP token fetched per message — no cache | 🟡 MEDIUM | `IdpTokenServiceImpl.getIdpToken()` calls `idpRestInvoker.getIdpToken()` directly with no caching layer. No `@Cacheable`, no `ConcurrentHashMap`, no Redis, no `OAuth2AuthorizedClient`. `spring-boot-starter-cache` is on classpath but no `@EnableCaching` and no cache configuration exists. Performance concern at high volume; correlates with the "always fetch token before filter" wasted-call path. |
+| IDP token called before filter — wasted RTT | 🟢 LOW | The IDP token call occurs at Step 5, before Decision A. Every message that fails the filter (every COMP-19 `AcceptEvent`, every event with null `visaResponseIds`) still incurs an IDP token round-trip. Compounds with the no-cache risk above. |
+| Kafka path has no MDC enrichment | 🟡 MEDIUM | `HttpInterceptor` enriches MDC for HTTP requests only (Spring MVC interceptor). The Kafka listener path performs no `MDC.put`. Log correlation across Kafka-triggered processing depends entirely on what the OTel agent surfaces — no application-level MDC fields per message. |
+| Custom Micrometer metrics absent | 🟡 MEDIUM | No custom `Counter` / `Timer` / `Gauge` / `@Timed` declarations anywhere. No per-outcome counters (filtered, skipped, retried, exhausted, success, RTSI-failure, upload-failure). Default JVM and Kafka-client meters only. Same observability gap as COMP-43 / COMP-17 / COMP-18 / COMP-51. |
+| `${app.name}` Prometheus tag undefined | 🟢 LOW | `application.yml` references `${app.name}` for `management.metrics.tags.application` but `app.name` is not defined in any config file. Only `spring.application.name` is set. Resolves empty or fails silently — startup warning expected. |
+| No Resilience4j — DEC-014 platform-VOID | 🟢 LOW (accepted) | No `io.github.resilience4j` dependency. Spring Retry (`@Retryable`) provides the sole retry mechanism on `VisaRTSIService` and `DisputeService` interfaces only. No circuit breaker, rate limiter, or bulkhead is configured. Consistent with platform-wide pattern. |
+| Consumer group ID confirmed | ℹ️ INFO | Production consumer group is `internal-integration-events-ques-group` — corrects an earlier assumption of `visa-response-questionnaire-group`. |
+| Log label `key-MerchantId` mismatched | ℹ️ INFO | `KafkaConsumer.java` logs `"key-MerchantId :{}"` but binds the `caseNumber` variable (Kafka record key). Suggests partition-key convention shifted from `merchantId` to `caseNumber` on the producer side without log-label update. |
+| Per-env suffix correction | ℹ️ INFO | v1.0 DRAFT listed `-cers` as a non-prod suffix. Source shows `-cert` (file `application-cert.yaml`). |
+| `DisputeFilingInfo` field commented out | ℹ️ INFO | `ResponseData.java:L44–45` — `@JsonProperty("DisputeFilingInfo")` and `List<DisputeFilingInfo>` field commented out. Class still in codebase but not wired into deserialisation. Likely a deserialisation conflict or speculative addition. |
+| `testUploadDocument_valid` unit test disabled | ℹ️ INFO | `DisputeServiceTest.java:L75–76` — happy-path test for `uploadDocument` commented out due to a mock setup incompatibility. The document upload success path has no working unit test coverage. |
 
 ---
 
@@ -221,12 +254,17 @@ managed by downstream services it calls.
 
 ## Kafka Consumer Contracts
 
-**Consumer framework:** Spring Kafka `@KafkaListener` via `ConcurrentKafkaListenerContainerFactory`
-(`notificationListener` bean)
-**Offset commit strategy:** `MANUAL_IMMEDIATE` — ⚠️ committed **before** processing begins
-(at-most-once — **DEC-005 deviation**)
-**Error handling strategy:** Spring Retry on RTSI and DocumentManagementService calls;
-SNOTE written to NotesService on final failure; no DLQ topic; no local error table.
+**Consumer framework:** Spring Kafka `@KafkaListener` via
+`ConcurrentKafkaListenerContainerFactory` (bean name `notificationListener`).
+Single `@KafkaListener` in the codebase — no second listener exists.
+
+**Offset commit strategy:** `MANUAL_IMMEDIATE` — ⚠️ committed **before**
+processing begins (at-most-once — **DEC-005 deviation**).
+
+**Error handling strategy:** Spring Retry on RTSI and
+DocumentManagementService calls; SNOTE written to NotesService on final
+failure; no DLQ topic; no local error table; deserialisation failures
+silently discarded by empty-no-op `CommonErrorHandler`.
 
 ---
 
@@ -236,88 +274,66 @@ SNOTE written to NotesService on final failure; no DLQ topic; no local error tab
 |---|---|
 | **Topic name (prod)** | `internal-integration-events` |
 | **Config key** | `spring.kafka.consumer.topic` |
-| **Non-prod suffix** | Per-environment suffix applied: `-dev`, `-uat`, `-stg`, `-cers`, `-test` |
+| **Non-prod suffixes** | Per-environment files: `-dev`, `-uat`, `-stg`, `-cert`, `-test` *(corrected from `-cers` in v1.0)* |
 | **Consumer group (prod)** | `internal-integration-events-ques-group` |
 | **Consumer group config key** | `spring.kafka.consumer.groupId` |
 | **AckMode** | `MANUAL_IMMEDIATE` — hardcoded in `KafkaConsumerConfig` |
 | **SyncCommits** | `true` — hardcoded |
 | **auto.commit** | `false` — hardcoded (`ENABLE_AUTO_COMMIT_CONFIG = false`) |
 | **auto.offset.reset** | `latest` — hardcoded |
-| **Offset commit timing** | ⚠️ Committed at `KafkaConsumer.java:30` — **before** `processContestEvent()` at line 32. At-most-once. |
-| **Concurrency** | `1` — default (no `factory.setConcurrency()` call present) |
+| **Offset commit timing** | ⚠️ Committed at `KafkaConsumer.java:L30` — **before** `processContestEvent()` at `:L32`. At-most-once. |
+| **Concurrency** | `1` — default (no `factory.setConcurrency()` call) |
 | **Max poll records** | `500` — `spring.kafka.consumer.maxPollRecords` |
 | **Max poll interval** | `600,000 ms` (10 min) — `spring.kafka.consumer.maxPollInterval` |
 | **Key deserialiser** | `StringDeserializer` — hardcoded |
 | **Value deserialiser** | `ErrorHandlingDeserializer` wrapping `JsonDeserializer<ContestEvent>` — type headers retained (`setRemoveTypeHeaders(false)`) |
+| **Bad payload behaviour** | `ErrorHandlingDeserializer` produces null/default `ContestEvent`; `CommonErrorHandler` is empty no-op; filter check (Decision A) silently discards |
 | **Security protocol** | `SASL_SSL` — hardcoded |
 | **SASL mechanism** | `AWS_MSK_IAM` — `software.amazon.msk.auth.iam.IAMLoginModule` |
-| **Ordering guarantee** | Per partition — key is `caseNumber` (from producer side); key used for logging only in this consumer |
+| **Container factory bean** | `notificationListener` |
+| **Ordering guarantee** | Per partition — record key is `caseNumber` (from producer side); key used for logging only in this consumer |
 
 **Inbound message payload — `ContestEvent`**
 
 | Field | Type | Notes |
 |---|---|---|
 | `platform` | String | Acquiring platform value — `NAP`, `CORE`, `VAP`, `LATAM`, `PIN`. Used solely to select RTSI URL/auth. No platform filter applied. |
-| `caseNumber` | String | WDP internal case number — also the Kafka partition key |
+| `caseNumber` | String | WDP internal case number — also the Kafka record key |
 | `actionSequences` | List\<String\> | New action sequences created by ContestService |
 | `currentActionSequence` | List\<String\> | Single-element list — used as `actionSequence` query param in DocumentManagementService upload URL |
-| `userId` | String | Operator ID — not used by this consumer (case note uses hardcoded `WVRQCONSUM` instead) |
-| `visaResponseIds` | List\<String\> | Visa RTSI response IDs. **Null for non-Visa events — triggers silent discard at filter check.** |
-| `networkCaseId` | String | Card network case reference — mapped to `visaCaseNumber` in RTSI request |
-| `responseType` | String | Questionnaire response type — drives routing to one of five RTSI methods: `allocprearb`, `allocarb`, `representment`, `prearbresp`, `precomresp` |
-
-**Event classification / routing**
-
-Routing is a two-stage filter:
-
-**Stage 1 (Decision A):** `visaResponseIds` must be non-null AND non-empty,
-AND `responseType` must be non-blank (`StringUtils.isNotBlank`). If either
-check fails, the method exits silently with no log message. The offset is
-already committed at this point.
-
-**Stage 2 (Decision B):** `responseType` is matched case-insensitively
-against five string constants. Each constant maps to a specific Visa RTSI
-endpoint:
-
-| responseType value | Constant | RTSI method |
-|---|---|---|
-| `allocprearb` | `ALLOC_PREARBITRATION_VISA` | `getDisputePreArbDetails` |
-| `allocarb` | `ALLOC_ARBITRATION_VISA` | `getDisputeFilingDetails` (iterates all `visaResponseIds`) |
-| `representment` | `COLL_DISPUTE_RESPONSE_VISA` | `getDisputeResponseDetails` |
-| `prearbresp` | `PREARBITRATION_RESPONSE_VISA` | `getDisputePreArbResponseDetails` |
-| `precomresp` | `PRECOMPLIANCE_RESP_VISA` | `getDisputePreCompResponseDetails` |
-
-If `responseType` matches none of the five constants, the `if/else-if`
-chain falls through silently — no log, no error.
-
-**Platform routing inside each RTSI method (Decision C):**
-
-| Platform | RTSI route | Auth |
-|---|---|---|
-| `NAP` (case-insensitive) | `mdvs-gcp-visa-adapter` (local Visa Adapter) | `Authorization: Bearer <idpToken>` |
-| All other platforms | DataPower gateway `${dispute_rtsi_url}` | `Authorization: <vantiveLicense>` (raw string, not Bearer-prefixed) |
+| `userId` | String | Inbound — **not** propagated to SNOTE (SNOTE userId is hardcoded `WVRQCONSUM`) |
+| `visaResponseIds` | List\<String\> | Filter discriminator. For `allocarb`: iterated in full. For other 4 types: only `get(0)` used. |
+| `responseType` | String | Routing discriminator. Case-insensitive match against five constants. |
+| `networkCaseId` | String | Mapped to `visaCaseNumber` in RTSI request |
 
 **On processing failure**
 
 | Failure scenario | Retry? | Behaviour |
 |---|---|---|
 | Deserialization failure | No | `ErrorHandlingDeserializer` delivers null/default `ContestEvent`; `CommonErrorHandler` is empty no-op; filter check silently discards; offset already committed |
-| IDP token service unavailable (Step 4) | No | `ServiceException` propagates to `KafkaConsumer.listener()` catch; logged + swallowed; offset already committed; **no case note written** |
-| Visa RTSI call fails — non-success status code (Step 7–8) | Yes — Spring Retry | `@Retryable` retries with count `${app.retrycount}` and fixed delay `${app.retrydelay}`; after max attempts → `ServiceException` caught → `addCaseNote()` called |
-| DocumentManagementService upload fails (Step 10) | Yes — Spring Retry | Same `@Retryable` as above; after max attempts → `ServiceException` caught → `addCaseNote()` called |
-| DocumentManagementService returns null response (Step 10) | No | `ServiceException("response from upload document api is null")` thrown → caught → `addCaseNote()` called |
-| NotesService unavailable (Step 11 — error path) | No | Exception caught inside `addCaseNote()`; logged at `ERROR` level; not re-thrown |
-| Any hung dependency (RestTemplate no timeout) | N/A | Thread blocked indefinitely; with concurrency=1, entire consumer processing halts |
+| IDP token service unavailable (Step 5) | No | `ServiceException` propagates to outer `KafkaConsumer.listener()` catch; logged INFO + swallowed; offset already committed; **no SNOTE written** |
+| Decision A short-circuit (filter fail) | N/A | Silent return after IDP token already fetched; no log; offset already committed |
+| Decision B short-circuit (unknown responseType) | N/A | Silent fall-through; no log; no SNOTE; offset already committed |
+| Visa RTSI call fails — non-success status code (Step 7–8) | Yes — Spring Retry | `@Retryable` retries with count `${app.retrycount}` and fixed delay `${app.retrydelay}`; after max attempts → `ServiceException` caught → `addCaseNote()` |
+| DocumentManagementService upload fails (Step 10) | Yes — Spring Retry | Same `@Retryable`; after max attempts → `ServiceException` caught → `addCaseNote()` |
+| DocumentManagementService returns null response (Step 10) | No | `ServiceException("response from upload document api is null")` → caught → `addCaseNote()` |
+| `allocarb` — failure on iteration N | Yes — Spring Retry per call | After exhaustion on iteration N: outer catch → SNOTE written. Iterations 1..N-1 succeeded — uploaded documents remain. Iterations N+1..end **never attempted**. Partial-success state is left in DocumentManagementService. |
+| NotesService unavailable (Step 11 — error path) | No | Exception caught inside `addCaseNote()`; logged ERROR; not re-thrown |
+| Any hung dependency (RestTemplate no timeout) | N/A | Thread blocked indefinitely; with concurrency=1, entire consumer processing on that pod halts |
 
 ---
 
 ## ━━━ DEPENDENCIES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-> ⚠️ **Platform-wide risk present in this component:** No timeouts on
-> `RestTemplate`. `CommonConfig.java` creates `new RestTemplate()` with no
-> `ClientHttpRequestFactory` customisation. With `concurrency=1`, a single
-> hung dependency blocks all consumer processing indefinitely.
-> No Resilience4j dependency present. Spring Retry is the sole resilience mechanism.
+> ⚠️ **Platform-wide risks present in this component:**
+> (1) No timeouts on `RestTemplate` — `CommonConfig` creates a single
+> shared `new RestTemplate()` with no `ClientHttpRequestFactory`
+> customisation. With `concurrency=1`, a single hung dependency blocks
+> all consumer processing on the pod.
+> (2) No Resilience4j (DEC-014 platform-VOID). Spring Retry is the sole
+> resilience mechanism, and it is applied to RTSI and document-upload
+> calls only — IDP token and SNOTE calls have neither retry nor circuit
+> breaker.
 
 ### 1. IDP Token Service (`wdp-idp-token-service`)
 
@@ -328,23 +344,23 @@ chain falls through silently — no log, no error.
 | Config key | `idpService.tokenUrl` |
 | Protocol | HTTP GET |
 | Auth | None (no auth headers sent on this call) |
-| Processing step | Step 4 — before any routing logic |
+| Processing step | Step 5 — **before** Decision A filter |
+| Caching | **None** — fetched per-message. `spring-boot-starter-cache` on classpath but no `@EnableCaching`, no cache config. |
 | Connect timeout | None configured |
 | Read timeout | None configured |
 | Retry | **No** — no `@Retryable` on `IdpTokenService` interface |
 | Circuit breaker | **None** — no Resilience4j |
-| On unavailable | `ServiceException` propagates to `KafkaConsumer.listener()` catch; logged + swallowed; offset already committed; event permanently lost; no case note written |
+| On unavailable | `ServiceException` propagates to outer `KafkaConsumer.listener()` catch; logged INFO + swallowed; offset already committed; event permanently lost; no SNOTE written |
 
 ### 2. Visa RTSI API via DataPower (non-NAP platforms)
 
 | Property | Value |
 |---|---|
 | Service name | Visa RTSI via DataPower gateway |
-| Prod URL | `${dispute_rtsi_url}` (Kubernetes secret; local config: `https://ws-int.cert.infoftps.com/merchant/claimsresolution/visasysteminterface/v1`) |
-| Config key | `app.rtsiService.disputeRtsiUrl` |
+| URL config key | `app.rtsiService.disputeRtsiUrl` → `${dispute_rtsi_url}` |
+| Platforms covered | All non-NAP — single URL for CORE, VAP, LATAM, PIN |
 | Protocol | HTTP POST (JSON) |
 | Auth | `Authorization: <vantiveLicense>` (raw string from `vantive_license` secret; not Bearer-prefixed) |
-| Platforms | All non-NAP platforms |
 | Processing step | Step 7 |
 | Connect timeout | None configured |
 | Read timeout | None configured |
@@ -363,7 +379,6 @@ chain falls through silently — no log, no error.
 | Config key | `app.rtsiService.disputeRtsiAdapterUrl` |
 | Protocol | HTTP POST (JSON) |
 | Auth | `Authorization: Bearer <idpToken>` |
-| Platforms | NAP only |
 | Processing step | Step 7 (NAP path) |
 | Connect timeout | None configured |
 | Read timeout | None configured |
@@ -376,7 +391,7 @@ chain falls through silently — no log, no error.
 | Field in RTSI request | Source in ContestEvent |
 |---|---|
 | `visaCaseNumber` | `contestEvent.networkCaseId` |
-| Response ID field | `contestEvent.visaResponseIds.get(0)` (first element, except `allocarb` which iterates all) |
+| Response ID | For 4 types: `contestEvent.visaResponseIds.get(0)`. For `allocarb`: iterated per element (separate call per ID). |
 | `includeDisputeAsImageInd` | `"true"` (hardcoded) |
 | `RequestHeader` | Empty object (no fields populated) |
 
@@ -389,6 +404,17 @@ chain falls through silently — no log, no error.
 | `responseData.disputeAsImageResponseDescriptor.contentType` | `quesImageContentType` | `image/tiff`, `application/pdf`, or `image/jpeg` |
 | `responseData.imagesList[]` | `docIdList` | Existing doc attachment IDs — extracted but not used in upload |
 | `responseData.disputeImageAttachment.attachment[]` | `additionalImagesList` | ⚠️ Extracted but **never uploaded** — confirmed incomplete work |
+
+**`responseType` → RTSI method mapping:**
+
+| `responseType` (case-insensitive) | RTSI method | Iteration |
+|---|---|---|
+| `allocprearb` | `getDisputePreArbDetails` | First ID only |
+| `allocarb` | `getDisputeFilingDetails` | **All IDs — separate upload per iteration** |
+| `representment` | `getDisputeResponseDetails` | First ID only |
+| `prearbresp` | `getDisputePreArbResponseDetails` | First ID only |
+| `precomresp` | `getDisputePreCompResponseDetails` | First ID only |
+| Any other value | — | Silent fall-through, no processing |
 
 ### 4. Document Management Service (`mdvs-gcp-document-management-service`)
 
@@ -406,7 +432,7 @@ chain falls through silently — no log, no error.
 | Circuit breaker | **None** — no Resilience4j |
 | On unavailable after retries | `ServiceException` caught → `addCaseNote()` called |
 
-**Upload request parameters:**
+**Upload request parameters (3 query params confirmed):**
 
 | Parameter | Value |
 |---|---|
@@ -440,7 +466,7 @@ chain falls through silently — no log, no error.
 | Read timeout | None configured |
 | Retry | **No** — no `@Retryable` on `addCaseNote()` |
 | Circuit breaker | **None** — no Resilience4j |
-| On unavailable | Exception caught inside `addCaseNote()`; logged at `ERROR` level; not re-thrown |
+| On unavailable | Exception caught inside `addCaseNote()`; logged ERROR; not re-thrown |
 
 **Note written on failure:**
 
@@ -457,34 +483,56 @@ chain falls through silently — no log, no error.
 
 | Decision | Status | Severity | Detail |
 |---|---|---|---|
-| **DEC-001** — Transactional Outbox | ⚠️ NON-COMPLIANT | HIGH | Not implemented. This component writes no local state before making outbound calls. No outbox table, no outbox write, no outbox poller. The component is a pass-through: event → RTSI API → DocumentManagementService. |
-| **DEC-003** — Kafka Partition Key | ✅ N/A (consumer) | — | This component reads from the topic but does not produce to it. The partition key received is `caseNumber` (as logged), though the log label erroneously says `key-MerchantId` — a copy-paste mismatch from when the convention was `merchantId`. The key plays no role in consumer processing logic. |
-| **DEC-004** — PAN Encryption | ✅ NOT APPLICABLE | — | No PAN data is processed or stored. This component handles binary document images from Visa's dispute system. No card number fields exist in `ContestEvent`, `DisputesRTSIResult`, or any request/response model. No `EncryptionService` call. |
-| **DEC-005** — Kafka Offset Commit | ⚠️ NON-COMPLIANT | HIGH | At-most-once semantics. `acknowledgement.acknowledge()` is called at `KafkaConsumer.java:30`, **before** `eventConsumerService.processContestEvent()` at line 32. If any processing step fails, the offset is already committed and the message is permanently lost. Remediation: move `acknowledge()` to after `processContestEvent()` succeeds. |
-| **DEC-014** — Resilience4j | ⚠️ NON-COMPLIANT | LOW | No `resilience4j` dependency in `pom.xml`. Spring Retry (`spring-retry`, `spring-aspects`) via `@Retryable` on `VisaRTSIService` and `DisputeService` interfaces is the sole resilience mechanism. No circuit breaker, rate limiter, or bulkhead is configured. Consistent with platform-wide pattern. |
+| **DEC-001** — Transactional Outbox | ⛔ DEVIATES | 🔴 HIGH | Not implemented. Component writes no local state and produces no Kafka events. Pure pass-through: event → RTSI → upload. No outbox table possible (no DB). Any partial-success state on `allocarb` (iterations 1..N-1 succeeded, N failed) cannot be reconciled — uploaded documents persist; SNOTE records the failure but does not roll back the prior uploads. |
+| **DEC-003** — Kafka partition key = merchantId | ✅ NOT APPLICABLE | — | Consumer only — does not produce. Producer-side key is `caseNumber` (cross-component log evidence). Log label `key-MerchantId` is a stale label-only mismatch — no behavioural impact. |
+| **DEC-004** — PAN encryption before persistence | ✅ NOT APPLICABLE | — | No PAN data is processed or persisted. `Case.java` (RTSI response DTO) has an `accountNumber` field but it is never written to any persistent store (no DB, no file, no queue). No `EncryptionService` call. |
+| **DEC-005** — Manual offset commit after all processing | ⛔ DEVIATES | 🔴 HIGH | At-most-once. `acknowledgement.acknowledge()` precedes `processContestEvent()`. JVM crash or any unhandled processing failure after commit results in permanent message loss. Consistent with platform-wide pre-ACK pattern (COMP-05/14/15/16/17/18/39/41/42/43). |
+| **DEC-014** — Resilience4j on outbound calls | ⛔ DEVIATES | 🟢 LOW (accepted) | Platform-VOID posture. `io.github.resilience4j` absent from `pom.xml`. Spring Retry on `VisaRTSIService` and `DisputeService` interfaces only — no retry on IDP token, no retry on SNOTE write. No circuit breaker, rate limiter, or bulkhead anywhere. |
+| **DEC-019** — No clear PAN in persistent store | ✅ COMPLIES | — | No persistent writes of any kind. `Case.java` `accountNumber` field exists in an RTSI response DTO but is never written. Codebase scan for `pan` / `cardNumber` / `accountNumber` / `acctNum` returns only DTO declarations — no `save`, `persist`, `INSERT`, `UPDATE`, or file-write surfaces. |
+| **DEC-020** — Full at-least-once idempotency | ⛔ DEVIATES | 🔴 HIGH | Pre-ACK at-most-once defeats the at-least-once contract. No `idempotency-key` header read, no application-level dedup table, no DB UNIQUE constraint (no DB at all), no in-memory dedup. Under any replay scenario duplicate RTSI calls and duplicate document uploads would occur. Severity tracks DEC-005. |
+| **DEC-023** — Replica = 1 hard constraint | ✅ NOT APPLICABLE | — | Standard scaled stateless Kafka consumer. Concurrency=1 per pod; multiple replicas distribute across consumer-group partitions with no duplication risk under at-most-once. No `@SchedulerLock`, ShedLock, or advisory lock anywhere — confirmed absent. |
 
 ---
 
 ## ━━━ SCALING AND DEPLOYMENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-| Property | Value | Source |
+### Kubernetes Configuration
+
+| Parameter | Value |
+|---|---|
+| **Resource type** | `Deployment` |
+| **Replica count** | `{{ replicas-gcp-visa-respond-questionnaire-consumer }}` — XL Deploy template variable; production value not in repo |
+| **Memory limit** | `2048Mi` |
+| **Memory request** | `1024Mi` |
+| **CPU limit** | Not configured (Burstable QoS) |
+| **CPU request** | Not configured |
+| **HPA** | Absent — no `HorizontalPodAutoscaler` in repo |
+| **PodDisruptionBudget** | Absent — no PDB manifest in repo |
+| **Topology spread constraints** | Absent — `topologySpreadConstraints` not present in `resources.yaml` |
+| **Rolling update** | `RollingUpdate` — `maxSurge: 1`, `maxUnavailable: 0` |
+| **`minReadySeconds`** | ⚠️ **`30` declared but misplaced** under `spec.template.spec.minReadySeconds` instead of `spec.minReadySeconds`. **Silently ignored by Kubernetes at this position.** Same defect class as COMP-25 / COMP-28 / COMP-34 / COMP-08. The deployment effectively has no rollout stability gate — pods are considered Ready as soon as readiness probe passes. |
+| **Liveness probe** | HTTP `GET /merchant/gcp/respond-questionnaire/livez` on port `8082` — `initialDelaySeconds: 30, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3` |
+| **Readiness probe** | HTTP `GET /merchant/gcp/respond-questionnaire/readyz` on port `8082` — `initialDelaySeconds: 20, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3` |
+| **Startup probe** | Absent |
+| **Probe backing** | Spring Boot Actuator health groups via `additional-path` — `management.endpoint.health.group.liveness.additional-path: server:/livez`, `management.endpoint.health.group.readiness.additional-path: server:/readyz`. No custom controller. Same pattern as COMP-32 / COMP-28. |
+| **Container port** | `8082` |
+| **K8s manifest inventory in repo** | `resources.yaml` only (Deployment + Service + Ingress). No Helm chart, no `values.yaml`, no Kustomize, no separate PDB or HPA manifest, no Dockerfile, no NetworkPolicy. |
+
+### Observability
+
+| Component | Status | Detail |
 |---|---|---|
-| Kubernetes resource type | `Deployment` | `resources.yaml:2` |
-| Replica count | `{{ replicas-gcp-visa-respond-questionnaire-consumer }}` | Template variable — environment-specific, resolved at deploy time |
-| Memory limit | `2048Mi` | `resources.yaml:55` |
-| Memory request | `1024Mi` | `resources.yaml:57` |
-| CPU limit | **Not specified** | `resources.yaml` — no CPU limit defined |
-| CPU request | **Not specified** | `resources.yaml` — no CPU request defined |
-| HPA | **Not present** | No `HorizontalPodAutoscaler` in `resources.yaml` |
-| PodDisruptionBudget | **Not present** | Not in `resources.yaml` |
-| Topology spread constraints | **Not configured** | Not in `resources.yaml`. With multiple replicas all pods could land on the same node. Given concurrency=1 per pod, multiple replicas create multiple consumer instances in the same group; Kafka partition assignment handles distribution. |
-| Rolling update strategy | `maxSurge: 1, maxUnavailable: 0` | `resources.yaml:9–11` |
-| minReadySeconds | `30` | `resources.yaml:29` |
-| OTel agent | **Present** | Annotation: `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default` (`resources.yaml:22`) |
-| Actuator health | **Exposed** | `management.endpoints.web.exposure.include: info,health,prometheus` (`application.yml:15`) |
-| Liveness probe | `/merchant/gcp/respond-questionnaire/livez` (port 8082) | `resources.yaml:47` |
-| Readiness probe | `/merchant/gcp/respond-questionnaire/readyz` (port 8082) | `resources.yaml:39` |
-| Logstash appender | **Present** | `logback-spring.xml:13` — destination from `${logstash_server_host_port}` (two previous hardcoded IPs commented out) |
+| OpenTelemetry agent | ✅ Present | Pod annotation `instrumentation.opentelemetry.io/inject-java: opentelemetry-operator-system/default` |
+| Spring Actuator | ✅ Present | Endpoints exposed: `info`, `health`, `prometheus` (`management.endpoints.web.exposure.include`) |
+| Prometheus metrics export | ✅ Enabled | `management.metrics.export.prometheus.enabled: true` in `application.yml` |
+| Micrometer Prometheus registry | ⚠️ Not explicit | Not declared as a direct dependency in `pom.xml`; relies on transitive resolution from `spring-boot-starter-actuator` (Spring Boot 3.x). Runtime confirmation needed. |
+| Custom Micrometer metrics | ❌ Absent | No custom `Counter` / `Timer` / `Gauge` / `@Timed`. No per-outcome counters. Default JVM and Kafka-client meters only. |
+| MDC enrichment — HTTP path | ✅ Present | `HttpInterceptor` adds `correlationId` to MDC on `preHandle`, removes on `afterCompletion`. |
+| MDC enrichment — Kafka path | ❌ Absent | No `MDC.put` in the Kafka listener or service layer. Log correlation across Kafka-triggered processing is not provided at the application level — only OTel agent context is available. |
+| Logstash appender | ✅ Present | `LogstashTcpSocketAppender` → `${LOGSTASH_SERVER_HOST_PORT}`. Two earlier hardcoded IP destinations are XML-commented and disabled. |
+| Console appender | ✅ Present | Plain pattern alongside Logstash |
+| `${app.name}` Prometheus tag | ⚠️ Undefined | `application.yml` references `${app.name}` for `management.metrics.tags.application` but `app.name` is not defined in any config — only `spring.application.name` is set. Resolves empty / produces startup warning. |
+| Swagger UI | Non-prod only | `springdoc-openapi-starter-webmvc-ui` on classpath; SecurityConfig whitelist excludes Swagger paths in PROD |
 
 ---
 
@@ -494,70 +542,44 @@ chain falls through silently — no log, no error.
 
 | Item | Location | Detail |
 |---|---|---|
-| `additionalImagesList` never uploaded | `DisputeServiceImpl.uploadDocument()` | `VisaRTSIServiceImpl.setImageDataFromRTSIResponse()` populates `additionalImagesList` from `disputeImageAttachment.attachment[]` in `DisputesRTSIResult`, but `uploadDocument()` only uses `quesImageBase64Encoded`. Additional images are silently discarded. No TODO comment, no issue reference. Likely a to-be-implemented feature. |
-| `DisputeFilingInfo` field commented out | `ResponseData.java:44–45` | `@JsonProperty("DisputeFilingInfo")` and `List<DisputeFilingInfo>` commented out. Class still exists in codebase but not wired into deserialisation. Likely a deserialisation conflict or speculative addition. |
-| `testUploadDocument_valid` unit test disabled | `DisputeServiceTest.java:75` | Happy-path test for `uploadDocument` commented out — mock setup incompatibility (`post` vs `postUploadDoc`). The document upload success path has no working unit test coverage. |
+| `additionalImagesList` never uploaded | `DisputeServiceImpl.uploadDocument()` | `VisaRTSIServiceImpl.setImageDataFromRTSIResponse()` populates `additionalImagesList` from `disputeImageAttachment.attachment[]` in `DisputesRTSIResult`, but `uploadDocument()` only consumes `quesImageBase64Encoded`. Additional images are silently discarded. No TODO comment, no issue reference. Likely a to-be-implemented feature. |
+| `DisputeFilingInfo` field commented out | `ResponseData.java:L44–45` | `@JsonProperty("DisputeFilingInfo")` and `List<DisputeFilingInfo>` field commented out. Class still in codebase but not wired into deserialisation. Likely a deserialisation conflict or speculative addition. |
+| `testUploadDocument_valid` unit test disabled | `DisputeServiceTest.java:L75–76` | Happy-path test for `uploadDocument` commented out — mock setup incompatibility. The document upload success path has no working unit test coverage. |
 
 ### Operational Anomalies
 
-| Item | Location | Detail |
-|---|---|---|
-| Log label mismatch | `KafkaConsumer.java` | Log label says `key-MerchantId` but binds `caseNumber` variable. Suggests partition key convention changed from `merchantId` to `caseNumber` on the producer side but the log was not updated. |
-| `addCaseNote` userId constant mismatch | `ApplicationConstants.java` | `USER_ID = "WVRQCONSUM"` used in production case notes. Test utility `TestDataUtil.buildContestEvent()` sets `userId = "WQRCONSU"` — different strings. The hardcoded system identity `WVRQCONSUM` is used in notes regardless of the event's `userId` field. |
-| `DisputeFilingInfo` field in RTSI response suppressed | `ResponseData.java` | Field added speculatively or causing JSON deserialisation conflict; disabled without issue reference. |
-
-### pom.xml Dependencies Declared But Potentially Unused at Runtime
-
-| Dependency | Notes |
+| Item | Detail |
 |---|---|
-| `spring-boot-devtools` | Dev-only tooling; should be `<scope>runtime</scope>` or `<optional>true</optional>` — it is neither |
-| `springdoc-openapi-starter-webmvc-ui` | OpenAPI / Swagger UI; Swagger paths excluded from security whitelist in PROD but library is still loaded |
-| `httpclient` (Apache 4.5.14) | Declared but not used explicitly — `RestTemplate` defaults to `SimpleClientHttpRequestFactory` unless an `HttpClient` factory is configured. No `HttpClient` bean present. Likely unused at runtime. |
+| Log label mismatch | `KafkaConsumer.java` log format reads `"key-MerchantId :{}"` but binds the `caseNumber` variable (`@Header(KafkaHeaders.RECEIVED_KEY)`). Stale label following producer-side key convention change from `merchantId` to `caseNumber`. |
+| `addCaseNote` userId constant mismatch | `ApplicationConstants.USER_ID = "WVRQCONSUM"` is used in production case notes. Test utility `TestDataUtil.buildContestEvent()` sets `userId = "WQRCONSU"` — different strings. The hardcoded system identity `WVRQCONSUM` is used in notes regardless of the event's `userId` field. |
+| Per-env suffix correction | v1.0 DRAFT listed `-cers` as a non-prod profile suffix. Source shows `-cert` (file `application-cert.yaml`). |
+| `${app.name}` undefined property | `application.yml` references `${app.name}` for Prometheus tags but that key is not defined anywhere — only `spring.application.name` is set. |
+
+### pom.xml Dependencies — Audit
+
+| Dependency | Status | Notes |
+|---|---|---|
+| `spring-boot-devtools` | Present | Disabled in packaged JAR by Spring Boot Maven plugin convention. Not actively used at runtime. Best-practice deviation: should be `<scope>runtime</scope>` or `<optional>true</optional>`. |
+| `springdoc-openapi-starter-webmvc-ui` | Present | Swagger UI; configured but blocked in PROD via SecurityConfig whitelist. Loaded but inert in production. |
+| `httpclient` (Apache 4.5.14) | Present | No explicit usage found — no `HttpClientBuilder`, no custom `ClientHttpRequestFactory`. `RestTemplate` defaults to `SimpleClientHttpRequestFactory`. Likely unused at runtime; transitive dependency only. |
+| `spring-boot-starter-cache` | Present | ⚠️ **Unused.** No `@EnableCaching`, no `@Cacheable`, no cache configuration anywhere. Adds startup noise without function. The IDP-token-per-message pattern would be the obvious caching candidate but is not wired. |
+| `spring-boot-starter-oauth2-client` | Present | Used by `SecurityConfig` for JWT issuer resolution. |
+| `spring-boot-starter-oauth2-resource-server` | Present | Used by `SecurityConfig` for OAuth2 resource-server validation. |
 
 ### Feature Flags / Migration Flags
 
-None found in source code or configuration.
+None. No `@ConditionalOnProperty`, no toggle configuration, no feature-flag library.
 
 ### Stub Implementations
 
-None found. All service implementations contain real logic.
+None. All service interfaces have concrete implementations.
 
----
+### TODO / FIXME
 
-## ━━━ WDP-KAFKA.md UPDATE REFERENCE ━━━━━━━━━━━━━━━━━━━━━━
-
-**Section 3 — Topic Registry: correct consumer group entry for `internal-integration-events`**
-
-| Topic | Consumer | Consumer Group | Notes |
-|---|---|---|---|
-| `internal-integration-events` | COMP-40 VisaResponseQuestionnaire | `internal-integration-events-ques-group` | **Corrects prior assumption of `visa-response-questionnaire-group`** — confirmed from `application-prod.yaml` |
-
-**Section 4 — Consumer Map row for COMP-40:**
-
-| Component | Consumes from | Produces to | Notes |
-|---|---|---|---|
-| COMP-40 VisaResponseQuestionnaire | `internal-integration-events` | None | AckMode: MANUAL_IMMEDIATE. Offset committed **before** processing — at-most-once. Concurrency=1. No DLQ. No local error table. Stateless. |
-
----
-
-## ━━━ WDP-DB.md UPDATE REFERENCE ━━━━━━━━━━━━━━━━━━━━━━━━━
-
-**No entries required.** This component owns no database tables and reads no database tables directly. All persistence is delegated to DocumentManagementService (COMP-37) which manages its own S3 + DynamoDB state.
-
----
-
-## ━━━ REMAINING GAPS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-| Gap | Type | Action |
-|---|---|---|
-| Exact replica count per environment | Environment config | Confirm from Kubernetes / XL Deploy for each environment — value is a template variable |
-| Exact `app.retrycount` and `app.retrydelay` values in production | Environment config | Confirm from Kubernetes secrets `api_retrycount` / `api_retrydelay` — no default in YAML |
-| `additionalImagesList` — intentional gap or planned feature? | Architect decision | Decide: (1) is this a known backlog item with a user story? (2) should it be recorded as a formal gap in WDP-DECISIONS.md rebuild? |
-| DEC-005 remediation — is at-most-once accepted? | Architect decision | The pre-ACK pattern means any processing failure permanently loses the event. Recommend formal ADR when WDP-DECISIONS.md is rebuilt — either accept the risk with documented recovery procedure, or remediate by moving `acknowledge()` after `processContestEvent()` succeeds. |
-| No timeout on RestTemplate — accepted or remediation planned? | Architect decision | `CommonConfig.java` creates `new RestTemplate()` with no timeout. With concurrency=1, a hung dependency blocks all consumer processing. Consistent with platform-wide pattern but high operational risk. |
+None — full source scan returns zero matches.
 
 ---
 
 *End of WDP-COMP-40-VISA-RESPONSE-QUESTIONNAIRE.md*
-*File status: 📝 DRAFT — content complete, architect confirmation pending.*
-*Remember to update WDP-COMP-INDEX.md, WDP-KAFKA.md, and WDP-HANDOVER.md after confirmation.*
+*File status: 📝 DRAFT v1.1 — source-verified 2026-04-29, architect confirmation pending.*
+*Supersedes v1.0 DRAFT. See WDP-CHANGE-LOG.md entry dated 2026-04-29 for the platform-level impact.*
