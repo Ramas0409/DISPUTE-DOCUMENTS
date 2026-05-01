@@ -1,9 +1,9 @@
 # WDP-COMP-INDEX.md
 **Worldpay Dispute Platform — Master Component Registry**
-*Version: 2.1 | Reconciled: 2026-04-25*
-*Source: v2.0 (April 2026) + 2026-04-18/23/24/25 source-verification reconciliation*
+*Version: 2.2 | Reconciled: 2026-04-30*
+*Source: v2.1 (April 2026) + 2026-04-28/29/30 source-verification reconciliation*
 
-*v2.1 reconciliation scope: 20 of 40 DRAFT component files have undergone source-verified correction passes against their repositories. All carry "📝 DRAFT — source-verified [date], architect confirmation pending" status. Component descriptions updated where the audit changed key facts. Reconciled components: COMP-07, 08, 09, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 27, 37, 41, 43.*
+*v2.2 reconciliation scope: 18 additional component files have undergone source-verified correction passes against their repositories between 2026-04-28 and 2026-04-30. Combined with the 2026-04-25 reconciliation (20 components), this brings the total source-verified count to **38 of 51 components**. All carry "📝 DRAFT 🔍 — source-verified [date], architect confirmation pending" status. **COMP-51 CaseExpiryProcessor is a new component added in this reconciliation pass — total component count is now 51.** Reconciled in this pass: COMP-01, 02, 03, 04, 05, 06, 22, 25, 26, 28, 30, 32, 35, 36, 39, 40, 42, 51.*
 
 ---
 
@@ -82,7 +82,7 @@ is a cross-reference, not a separate service.
 - ⬜ NOT STARTED — no content exists yet (no repo or planned feature)
 - 🔲 UI — tracked as separate action item
 
-**v2.1 source-verification status:** 20 components carry the 🔍 marker. The corresponding source-verification dates are listed in the Reconciliation Tracker section below.
+**v2.2 source-verification status:** 38 of 51 components carry the 🔍 marker. The corresponding source-verification dates are listed in the Reconciliation Tracker section below. Architect confirmation is the next gate for all 38.
 
 ---
 
@@ -92,27 +92,49 @@ is a cross-reference, not a separate service.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 01 | API Gateway | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-01-API-GATEWAY.md |
-| 02 | UserAccessManagementService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-02-UAMS.md |
-| 03 | CoreHierarchyAuthorizationService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-03-CHAS.md |
+| 01 | API Gateway | REST API | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-30) | WDP-COMP-01-API-GATEWAY.md |
+| 02 | UserAccessManagementService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.0 (2026-04-29) | WDP-COMP-02-UAMS.md |
+| 03 | CoreHierarchyAuthorizationService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-29) | WDP-COMP-03-CHAS.md |
 
 **01 — API Gateway**
 Single entry point for all WDP traffic. Runs a 4-layer JWT authentication,
 request logging, region-role authorization, and case-level entity authorization
 filter pipeline before proxying requests to backend microservices. URL-based
-routing configuration loaded from database at startup.
+routing configuration loaded from database at startup. Listen port confirmed
+as 8082 across all 7 environments; Ingress uses path-based routing at
+`/api/merchant/gcp`.
+⚠️ **(2026-04-30) Blocking RestTemplate on Netty event loop (HIGH):** UAMS
+and CHAS calls have no timeout — single degraded auth service can exhaust
+all gateway threads. ADR-CAND pending.
+⚠️ **(2026-04-30) CORE/VAP/LATAM authorization gap (HIGH):** these platform
+types receive no role-level or case-level authorization at the gateway —
+intentional or remediation? ADR-CAND pending.
+⚠️ `v-correlation-id` always null (no MDC populator); `wdp-internal-auth`
+config dead across all 7 envs (wrong namespace).
 
 **02 — UserAccessManagementService (UAMS)**
 Access control and user lifecycle management for the NAP platform. Owns the
-merchant entity hierarchy and ACL. Exposes the /authorize endpoint called by
-the API Gateway for NAP platform case-level authorization. Proxies all user
-lifecycle operations to SunGard IdP.
+NAP merchant entity hierarchy (`nap_parent_entity`, `nap_child_entity`,
+`nap_merchant`, `nap_entity_rel`) and `wdp.acl`. Exposes a 3-layer
+authorization model on `/authorize` (consumer authorization → entity-class
+gate → entity-value lookup) called by the API Gateway for NAP platform
+case-level authorization. Proxies all user lifecycle operations to SunGard
+IdP. Kafka-free at runtime.
+⚠️ **🔴 (2026-04-29) DEC-021 wrong-TM scope expansion:** **7 methods**
+across 4 NAP tables use `wdpTransactionManager` instead of
+`napTransactionManager` — rollback on failure does not cover NAP-schema
+writes. Affects `nap_parent_entity`, `nap_child_entity`, `nap_merchant`,
+`nap_entity_rel`. Same severity class as DEC-019.
 
 **03 — CoreHierarchyAuthorizationService (CHAS)**
 Read-only authorization service for PIN, CORE, VAP, and LATAM platforms.
 Validates JWT entity claims against Core enterprise merchant hierarchy in
 IBM DB2. Exposes the /authorize endpoint called by the API Gateway for all
 non-NAP platform case-level authorization. Owns no data and performs no writes.
+Exposes nine REST endpoints across V1 and V2 controllers; V2 family adds
+paginated entity-type search and default-entity lookup.
+⚠️ **(2026-04-29) Security finding:** `validateOrgId()` commented out on
+GET /orgentity. Formal ADR pending.
 
 ---
 
@@ -120,29 +142,54 @@ non-NAP platform case-level authorization. Owns no data and performs no writes.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 04 | NAPDisputeEventService ⚠️ Decommission-scoped | REST API + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-04-NAP-DISPUTE-EVENT-SERVICE.md |
-| 05 | NAPDisputeEventProcessor ⚠️ Decommission-scoped | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-05-NAP-DISPUTE-EVENT-PROCESSOR.md |
-| 06 | NAPDisputeDeclineBatch ⚠️ Decommission-scoped | Batch/Scheduler | ✅ Production | 📝 DRAFT | WDP-COMP-06-NAP-DISPUTE-DECLINE-BATCH.md |
+| 04 | NAPDisputeEventService ⚠️ Decommission-scoped | REST API + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-29) | WDP-COMP-04-NAP-DISPUTE-EVENT-SERVICE.md |
+| 05 | NAPDisputeEventProcessor ⚠️ Decommission-scoped | Kafka Consumer | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-29) | WDP-COMP-05-NAP-DISPUTE-EVENT-PROCESSOR.md |
+| 06 | NAPDisputeDeclineBatch ⚠️ Decommission-scoped | Batch/Scheduler | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-30) | WDP-COMP-06-NAP-DISPUTE-DECLINE-BATCH.md |
 
 **04 — NAPDisputeEventService**
 REST-to-Kafka bridge for inbound NAP dispute events. Receives SRV-116 events
 and operator responses via REST, enriches via synchronous lookups against
-internal WDP services, and publishes enriched NapEvent to nap-dispute-events
-topic. Document upload path proxies directly to DocumentManagementService
-without Kafka involvement. Stateless — no database.
+internal WDP services, and publishes enriched NapEvent (~138 fields) to
+nap-dispute-events topic. Document upload path proxies directly to
+DocumentManagementService without Kafka involvement. **Stateless — confirmed
+no database connection (2026-04-29).**
+⚠️ **🔴 (2026-04-29) PCI concern — CVV in `toString()` may surface in logs.**
+Cross-link to COMP-05 (CVV persisted at rest in `NAP.DISPUTE_EVENT_CONSUMER_ERROR`).
+⚠️ **DEC-001 deviation** — direct synchronous publish on inbound HTTP thread,
+no outbox.
+⚠️ **DEC-003 partial deviation** — `cardAcceptorCodeId` on POST /event new
+disputes; `merchantId` on update/outcome paths.
+⚠️ **Hidden coupling** — `${kafka_retry_count}` / `${kafka_retry_delay}` also
+govern CaseManagement, FraudSwitch, and DisplayCodeService REST retries.
 
 **05 — NAPDisputeEventProcessor**
 Kafka consumer on nap-dispute-events topic. Translates NAP dispute notifications
 into case management actions via REST calls to downstream services. Classifies
-events as SRV116, WIN/LOSS, or SRV118 by field inspection. Uses at-most-once
-offset commit (DEC-005 deviation). Database-backed DLQ — no Kafka dead-letter
-topic. Currently in hybrid CB911 migration state.
+events as SRV116, WIN/LOSS, or SRV118 by field inspection. Uses pre-ACK
+offset commit (DEC-005 deviation). Database-backed DLQ (`NAP.DISPUTE_EVENT_CONSUMER_ERROR`)
+— no Kafka dead-letter topic. Touches **4 DB tables** (primary error +
+`NAP.BUSINESS_RULE_CONSUMER_ERROR` + `NAP.mcm_queue_data` + `NAP.issuer_raised_dispute_timefrm_rules`).
+Currently in hybrid CB911 migration state.
+⚠️ **🔴 (2026-04-29) CVV persisted at rest:** `C_CVV` column directly mapped
+on the entity, AND raw `NotificationEvent` JSON serialised into `C_KAFKA_EVENT`
+which also contains the `cvv` field. PCI-DSS storage violation — architect
+decision required (remediate or document approved exception).
+⚠️ **🔴 Shared-error-table consumption hazard with COMP-23/24/39:** prior-error
+scan filters on `arn` OR `networkCaseId` + `sourceSystemName='NAP'` only —
+no `C_EVENT_TYPE` filter. Rows from peers may be reprocessed through COMP-05's
+SRV116/WIN_LOSS/SRV118 pipeline. Same defect class as COMP-39 — uniform ADR
+required.
 
 **06 — NAPDisputeDeclineBatch**
-Spring Batch job that polls nap.action table for open PAB actions, queries
-Visa network via Visa Adapter HyperSearch, and creates IDCL draft actions for
-pre-arbitration declined cases. VISA and NAP platform only. Runs as Kubernetes
-Deployment with internal Spring @Scheduled cron. No Kafka involvement.
+Spring Batch job that polls `nap.action` for open PAB/OPAB actions on
+migrated NAP Visa cases, queries Visa network state via the internal Visa
+Adapter HyperSearch endpoint, and creates IDCL draft actions for cases in
+Pre-Arb Declined states. VISA + NAP only. Runs as Kubernetes Deployment with
+internal Spring `@Scheduled` cron (auto-launch disabled — scheduler is sole
+launcher). Two PostgreSQL datasources: NAP (read), WDP (Spring Batch
+metadata). No Kafka — but vestigial Kafka libraries remain on classpath.
+⚠️ No probes, no idempotency guard, no `RestTemplate` timeouts, no retries.
+⚠️ Decommission-scoped — all MEDIUM risks accepted.
 
 ---
 
@@ -303,7 +350,9 @@ Consumes from case-action-events (expiry) topic and maintains wdp.case_expiry
 table — the active expiry schedule per case and action. State-machine driven
 via internal apiName token. Uses wdp.outgoing_event_outbox for idempotency and
 predecessor control (channel_type=EXPIRY_EVENTS). Terminal consumer — no
-Kafka publish.
+Kafka publish. **Paired with COMP-51 CaseExpiryProcessor** as the writer half
+of the Case Expiry Subsystem (COMP-51 reads `wdp.case_expiry` and acts on
+past-due rows).
 ⚠️ **(2026-04-25) Cross-action predecessor interference (RISK-045):** query
 not scoped on `i_action_seq` — stuck row for action A blocks events for
 action B on same case.
@@ -311,6 +360,9 @@ action B on same case.
 and `case_expiry` write run in separate transactional boundaries. ACK
 timing is inconsistent (Path A pre-ACK, Path B mid-flow ACK). Both
 unrecoverable on every successful execution path.
+⚠️ **🔴 Shared write to `wdp.case_expiry` with COMP-51** — no row-level
+lock, no version column, no SELECT FOR UPDATE. Race possible between
+COMP-17 upsert and COMP-51 retry-counter UPDATE.
 
 **18 — NotificationOrchestrator** *(repository: wp-mfd/wdp-outgoing-consumer)*
 Central outbound routing component. Consumes from outgoing-events topic and
@@ -337,11 +389,11 @@ v2.0 — zero references in source).
 | 19 | AcceptService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-23) | WDP-COMP-19-ACCEPT-SERVICE.md |
 | 20 | ContestService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-23) | WDP-COMP-20-CONTEST-SERVICE.md |
 | 21 | ChargebackService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-25) | WDP-COMP-21-CHARGEBACK-SERVICE.md |
-| 22 | DisputeService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-22-DISPUTE-SERVICE.md |
+| 22 | DisputeService | REST API | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-28) | WDP-COMP-22-DISPUTE-SERVICE.md |
 | 23 | CaseManagementService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-23) | WDP-COMP-23-CASE-MANAGEMENT-SERVICE.md |
 | 24 | CaseActionService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-23) | WDP-COMP-24-CASE-ACTION-SERVICE.md |
-| 25 | NotesService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT | WDP-COMP-25-NOTES-SERVICE.md |
-| 26 | QuestionnaireService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-26-QUESTIONNAIRE-SERVICE.md |
+| 25 | NotesService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-28) | WDP-COMP-25-NOTES-SERVICE.md |
+| 26 | QuestionnaireService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-28) | WDP-COMP-26-QUESTIONNAIRE-SERVICE.md |
 
 **19 — AcceptService**
 Processes merchant decisions to accept a dispute. Calls Visa and MasterCard
@@ -394,6 +446,15 @@ Aurora or IBM DB2 depending on core_migration_status flag) and POST
 orchestration). **Kafka-free at runtime** — Kafka producer to `business-rules`
 is wired in source but all publish call sites are commented out in production.
 RISK-021.
+⚠️ **(2026-04-28) Source-verified zero writes** — no `INSERT`, `UPDATE`,
+`DELETE`, no Spring Data repositories, no `@Modifying`, no `JdbcTemplate`.
+The COMP-37 column-level UPDATE on `wdp.CASE` is now confirmed orphan to
+COMP-22 — the cross-component review item recorded for COMP-22/COMP-37 is
+**closed on the COMP-22 side**. The COMP-37 INSERT/DELETE owner question
+stands.
+⚠️ **(2026-04-28) `business-rules` publish disablement attribution:** commit
+`c29018cd` by Shringi Nitin (WP) on 2025-08-08, message "code changes (#93)".
+No in-source rationale recorded.
 
 **23 — CaseManagementService**
 Authoritative owner of the dispute case record across all five platforms (NAP,
@@ -438,6 +499,12 @@ schema (nap/wdp) — separate JPA entity managers, transaction managers, and
 datasources, never mixed. Publishes AddNotesBREvent to business-rules Kafka
 topic for all non-SNOTE note types. ⚠️ DEC-001 deviation — DB write and Kafka
 publish share @Transactional boundary but are not atomically coupled.
+⚠️ **(2026-04-28) Mid-batch atomicity:** per-event loop inside `@Transactional`
+produces deterministic Kafka-orphan events on partial-batch failure (not
+just JVM-crash window).
+⚠️ **`kafka_business_event_topic` env var has no default** in `application.yaml` —
+service fails to start if unset (operational footgun). COMP-25 has no
+awareness of COMP-23/24 co-writers on `wdp.NOTES`.
 
 **26 — QuestionnaireService**
 Persistence and retrieval store for all dispute-response questionnaires. Two
@@ -446,6 +513,11 @@ Pre-Arbitration, Allocation stages) and DisputeQuestionnaireController (non-Visa
 + document-status lookup). Serialises full questionnaire payload as JSON blob
 into wdp.disputes_questionnaire. No Kafka.
 ⚠️ POST idempotency gap — duplicate POSTs insert new rows.
+⚠️ **(2026-04-28) No `@Transactional` boundary on any path** — every JPA
+call runs in Spring Data JPA's per-call default transaction. PUT (find →
+save) and B1 UPSERT (find → decide → save) span multiple short transactions
+and are vulnerable to TOCTOU races. App tier uses `DriverManagerDataSource`
+(no HikariCP) — effective pooling depends on PgBouncer / Aurora-side.
 
 ---
 
@@ -454,11 +526,11 @@ into wdp.disputes_questionnaire. No Kafka.
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
 | 27 | CaseSearchService | REST API | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-24) | WDP-COMP-27-CASE-SEARCH-SERVICE.md |
-| 28 | DisplayCodeService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-28-DISPLAY-CODE-SERVICE.md |
+| 28 | DisplayCodeService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-28) | WDP-COMP-28-DISPLAY-CODE-SERVICE.md |
 
 **27 — CaseSearchService**
 Platform-wide read layer for dispute case data across all five acquiring
-platforms. 14 active REST endpoints across six controllers. Platform routing
+platforms. 15 active REST endpoints across six controllers. Platform routing
 via {platform}/{region} path variable selecting between nap.* and wdp.* schemas.
 Case detail endpoints use parallel async fan-out (Spring @Async, 10-thread pool)
 calling up to five downstream services concurrently. Display code lookups
@@ -479,8 +551,13 @@ Reference-data lookup hub. Returns structured code/description lists for ~40
 code domain types given requested domain names and optional platform filter.
 Secondary function resolves UI tab permissions from wdp.dispute_static_tabs_rules.
 All results cached in-memory (no TTL, no eviction — pod restart only).
-⚠️ Correction: does NOT determine TIER1 eligibility — it returns raw code lists;
-eligibility logic belongs to the calling service.
+⚠️ **(2026-04-28) Correction confirmed:** does NOT determine TIER1 sub-product
+eligibility — service returns raw code lists; eligibility logic is the caller's
+responsibility (e.g. COMP-04 NAPDisputeEventService).
+⚠️ **(2026-04-28) Two repository projections on `wdp.dispute_static_tabs_rules`:**
+`findByRoles` (POST /search) returns 11 Y/N flag columns; `getPermissions`
+(GET /privileges) returns 17 Y/N flag columns. The 6-column delta is the
+source of permission-shape divergence between endpoints.
 
 ---
 
@@ -489,7 +566,7 @@ eligibility logic belongs to the calling service.
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
 | 29 | FaxQueueService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-29-FAX-QUEUE-SERVICE.md |
-| 30 | UserQueueSkillService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-30-USER-QUEUE-SKILL-SERVICE.md |
+| 30 | UserQueueSkillService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-28) | WDP-COMP-30-USER-QUEUE-SKILL-SERVICE.md |
 
 **29 — FaxQueueService**
 Manages full lifecycle of inbound fax documents received from merchants. Backend
@@ -504,6 +581,12 @@ records from JWT claims on portal session start. Manages queue creation and
 assignment, skill creation and assignment, and queue criterion rules.
 Auto-enrols internal users with NAP queue roles into SKILLS_INTERNAL queues
 on first insert.
+⚠️ **🔴 (2026-04-28) DEC-021 wrong-TM:** service-level `@Transactional` on
+`createQueue` / `updateQueue` binds to `@Primary usTransactionManager` —
+**UK writes to `nap.queues`, `nap.queue_criterion`, `nap.user_queue` are
+NOT covered by the outer TX** (per-repository implicit TX only).
+⚠️ POST /user has no `@Transactional` — auto-enrol side-effect runs in a
+separate implicit transaction; failure leaves orphaned `nap.users` row.
 
 ---
 
@@ -512,7 +595,7 @@ on first insert.
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
 | 31 | BusinessRulesService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-31-BUSINESS-RULES-SERVICE.md |
-| 32 | RulesService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-32-RULES-SERVICE.md |
+| 32 | RulesService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-28) | WDP-COMP-32-RULES-SERVICE.md |
 
 **31 — BusinessRulesService**
 CRUD management service for business rules — owns nap.rules, nap.rule_criterion,
@@ -525,9 +608,11 @@ called at execution time.
 **32 — RulesService**
 Read-only configuration service. Serves workflow rule configuration, action
 configuration, and stage-locking rules used by the dispute portals. Owns no
-writes — all tables are populated via database migrations or admin tooling.
-Used by portal UIs to determine available actions and locked-out case stages
-for non-migrated merchants.
+writes — all 16 rule tables (15 in `wdp` schema + 1 in `nap` schema) are
+populated via database migrations or admin tooling. Used by portal UIs to
+determine available actions and locked-out case stages for non-migrated
+merchants. Two of the disabled endpoints (document-type-rules and
+dispute-update-event-log-rules) still keep their underlying tables mapped.
 
 ---
 
@@ -559,25 +644,32 @@ dependencies.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 35 | EncryptionService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-35-ENCRYPTION-SERVICE.md |
-| 36 | TokenService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-36-TOKEN-SERVICE.md |
+| 35 | EncryptionService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-29) | WDP-COMP-35-ENCRYPTION-SERVICE.md |
+| 36 | TokenService | REST API | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-29) | WDP-COMP-36-TOKEN-SERVICE.md |
 | 37 | DocumentManagementService | REST API + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-23) | WDP-COMP-37-DOCUMENT-MANAGEMENT-SERVICE.md |
 | 38 | APILogService | REST API | ✅ Production | 📝 DRAFT | WDP-COMP-38-API-LOG-SERVICE.md |
 
 **35 — EncryptionService**
 Sole component authorised to handle plaintext PAN data in WDP. Implements
 two-token PAN strategy (DEC-007) — HPAN for deterministic lookups, EPAN for
-reversible storage. Uses AWS KMS with 6-hour DEK cache (DEC-008). Global
-dependency — all inbound processing paths that touch PAN halt if this service
-is unavailable.
+reversible storage. Owns `wdp.hash_key_store` (HPAN→ciphertext mapping)
+and `wdp.data_enc_key` (KMS-wrapped DEK registry). Uses AWS KMS with 6-hour
+DEK cache (DEC-008). Global dependency — all inbound processing paths that
+touch PAN halt if this service is unavailable. Ciphertext never leaves the
+service.
+⚠️ **(2026-04-29) DEK rotation under multi-pod** is uncoordinated — no
+distributed lock; multiple pods may insert DEK rows during rotation.
 
 **36 — TokenService**
-Centralised JWT token management for all WDP consumers and batch jobs. Two-layer
-cache: AWS ElastiCache Redis (primary) and Spring in-memory OAuth2 store
-(secondary). Falls through to IDP client_credentials grant only on full cache
-miss. ⚠️ Redis hash must be written by an external component not in this
-repository — identity of that writer is an open question. Note: no relation to
-PAN tokenisation — JWT management only.
+Centralised JWT token management for all WDP consumers and batch jobs.
+Two-layer cache: AWS ElastiCache Redis (primary) and Spring in-memory OAuth2
+store (secondary). Falls through to IDP `client_credentials` grant only on
+full cache miss. Note: no relation to PAN tokenisation — JWT management only.
+⚠️ **(2026-04-29) Source-verified read-only on Redis hash** — COMP-36
+performs HGET only; **zero write operations exist anywhere in the
+wdp-idp-token-service repository**. The `wdpinternalidptoken:token` hash
+is populated by an UNKNOWN EXTERNAL COMPONENT not present in any audited
+WDP repo. External writer identity remains an open question.
 
 **37 — DocumentManagementService**
 Handles evidence document storage and retrieval. Documents stored in S3 with
@@ -614,23 +706,35 @@ incorrect — confirmed from source.
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 39 | NAPOutcomeProcessor | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-39-NAP-OUTCOME-PROCESSOR.md |
-| 40 | VisaResponseQuestionnaire | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-40-VISA-RESPONSE-QUESTIONNAIRE.md |
+| 39 | NAPOutcomeProcessor | Kafka Consumer + REST API | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-29) | WDP-COMP-39-NAP-OUTCOME-PROCESSOR.md |
+| 40 | VisaResponseQuestionnaire | Kafka Consumer | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-29) | WDP-COMP-40-VISA-RESPONSE-QUESTIONNAIRE.md |
 
 **39 — NAPOutcomeProcessor**
 Consumes internal-integration-events and delivers dispute outcomes to NAP-DPS
 for NAP platform money movement. Filters to platform=NAP only — all other
-platform events silently discarded. Processes both SRV116 (accept/contest)
-and SRV117/SRV118 events. Built-in prior-error reprocessing on each message
-cycle. ⚠️ Pre-ACK (DEC-005 deviation). ⚠️ notesLookup and checkCRMRAction
-both commented out in production. Planned migration to EDIA route.
+platform events silently discarded. Drives SRV118 (chargeback outcome /
+representment) and/or SRV117 (department notice letter) outbound calls.
+Built-in prior-error reprocessing on every Kafka message. Also exposes a
+JWT-authenticated `POST /event` REST endpoint for manual operator
+reprocessing of a single error record.
+⚠️ Pre-ACK (DEC-005 deviation, same as COMP-05).
+⚠️ **🔴 (2026-04-29) Shared-error-table consumption hazard (RISK candidate):**
+prior-error scan filters on `caseNumber` + `sourceSystemName="NAP"` +
+status IN (FAILED1, FAILED2) **with no `C_EVENT_TYPE` filter**. Records
+written by COMP-05/23/24 may be reprocessed through COMP-39's SRV118/SRV117
+pipeline. Same defect class as COMP-05 — uniform ADR required.
+⚠️ `notesLookup`, `checkCRMRAction` commented out. `napcacrt.jks`
+unreferenced — NAP-DPS auth handled outside the component. Planned
+migration to EDIA route — no source scaffolding visible.
 
 **40 — VisaResponseQuestionnaire**
 Consumes internal-integration-events and retrieves the Visa questionnaire
 submitted as part of a merchant contest. Filters to non-null visaResponseIds
 only — AcceptService events silently discarded. Calls Visa RTSI API to retrieve
 questionnaire, then stores via DocumentManagementService (S3 + DynamoDB).
-⚠️ Pre-ACK (DEC-005 deviation).
+⚠️ Pre-ACK (DEC-005 deviation). Single `@KafkaListener` in codebase.
+Stateless. Container factory `notificationListener`. Consumer group
+`internal-integration-events-ques-group`.
 
 ---
 
@@ -639,7 +743,7 @@ questionnaire, then stores via DocumentManagementService (S3 + DynamoDB).
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
 | 41 | ThirdPartyNotificationConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT 🔍 v1.1 (2026-04-25) | WDP-COMP-41-THIRD-PARTY-NOTIFICATION-CONSUMER.md |
-| 42 | BENConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT | WDP-COMP-42-BEN-CONSUMER.md |
+| 42 | BENConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-29) | WDP-COMP-42-BEN-CONSUMER.md |
 | 43 | CoreNotificationConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT 🔍 v2.0 (2026-04-25) | WDP-COMP-43-CORE-NOTIFICATION-CONSUMER.md |
 | 44 | EDIAConsumer | Kafka Consumer + Kafka Producer | 🔴 Planned | ⬜ NOT STARTED | WDP-COMP-44-EDIA-CONSUMER.md |
 
@@ -663,10 +767,15 @@ Dead Spring Retry imports (RISK-080).
 **42 — BENConsumer**
 Consumes external-request-events and delivers dispute lifecycle notifications
 to BEN merchant notification platform via Kafka publish to a BEN-owned MSK
-cluster (separate SASL/JAAS config from WDP MSK). ⚠️ There is no REST or
-webhook call to BEN — delivery is Kafka-only. Merchants receive notifications
-via BEN and call back ChargebackService for dispute details and actions.
-Confirmed from WDP-INTEGRATIONS.md v2.0.
+cluster (separate SASL/JAAS config from WDP MSK). Idempotency via
+`wdp.outgoing_event_outbox` (`channel_type=BEN_EVENTS`, `created_by=WBENC`).
+⚠️ There is no REST or webhook call to BEN — delivery is Kafka-only.
+Merchants receive notifications via BEN and call back ChargebackService for
+dispute details and actions. Confirmed source-verified 2026-04-29.
+⚠️ Predecessor-scope pattern shared with COMP-17 — `caseNumber + channel_type
++ id < currentId` applied as in-memory filter after `findByCaseNumber`
+returns ALL channel_types. Cross-action interference within BEN_EVENTS
+channel possible.
 
 **43 — CoreNotificationConsumer**
 Consumes core-request-events and writes dispute case and occurrence records
@@ -753,9 +862,72 @@ Management, and Org Management sections. Dashboard section planned.
 
 ---
 
-## v2.1 Reconciliation Tracker
+### Case Expiry Subsystem (Batch Driver)
 
-This table records the source-verification dates for the 20 components reconciled between 2026-04-18 and 2026-04-25. Each component has been source-verified against its production repository by Claude Code; architect confirmation is the next gate.
+*Added 2026-04-25. The Case Expiry Subsystem is the COMP-17 + COMP-51 pairing
+that maintains the active expiry schedule and acts on past-due deadlines.
+COMP-17 (Event Consumers section) is the writer half — it upserts/deletes
+`wdp.case_expiry` rows on Kafka events. COMP-51 (this section) is the reader
+half — it scans the table on a cron schedule and acts on past-due rows.
+The two share `wdp.case_expiry` with no row-level coordination — see
+WDP-DB.md Section 4 🔴 HIGH shared-write entry.*
+
+| # | Component | Type | Prod Status | Doc Status | File |
+|---|-----------|------|-------------|------------|------|
+| 51 | CaseExpiryProcessor | Batch/Scheduler | ✅ Production | 📝 DRAFT 🔍 v1.0 (2026-04-25) | WDP-COMP-51-CASE-EXPIRY-PROCESSOR.md |
+
+**51 — CaseExpiryProcessor**
+Scheduled Spring Batch job that scans `wdp.case_expiry` for past-due
+deadlines and acts on each row by calling Case Action / Case Management /
+Expiry Rules APIs and one of three terminal APIs (Update Action / Accept /
+Add Action). Reader half of the Case Expiry Subsystem; **COMP-17 is the
+writer half**. Captures retry-exhausted failures into
+`wdp.outgoing_event_outbox` with `channel_type=EXPIRY_BATCH` and
+`created_by=WCSEEXPB`.
+⚠️ **🔴 Shared write to `wdp.case_expiry` with COMP-17** — no row-level
+lock, no version column, no SELECT FOR UPDATE. Race possible on
+`i_retry_count` overwrite and mid-flight upsert during chunk processing.
+⚠️ **EXPIRY_BATCH outbox rows have no identified consumer** — COMP-51
+writes status=ERROR direct (no PUBLISHED→FAILED transition); COMP-12
+Scheduler3 reads FAILED/PENDING_DEFERRED only. Architect decision
+required — define consumer or formally accept as audit-only.
+⚠️ Replicas=1 enforced operationally (DEC-023 OPERATIONAL ONLY pattern,
+same as COMP-07/08/09).
+
+---
+
+## v2.2 Reconciliation Tracker
+
+This section records the source-verification dates for components reconciled in this round (2026-04-28 to 2026-04-30). Each component has been source-verified against its production repository by Claude Code or Copilot CLI; architect confirmation is the next gate.
+
+### v2.2 reconciliation pass (18 components)
+
+| Date | Component | Version | Repo |
+|------|-----------|---------|------|
+| 2026-04-28 | COMP-22 DisputeService | v1.0 → v2.0 | (per source) |
+| 2026-04-28 | COMP-25 NotesService | v1.0 → v1.1 | (per source) |
+| 2026-04-28 | COMP-26 QuestionnaireService | v1.0 → v1.1 | (per source) |
+| 2026-04-28 | COMP-28 DisplayCodeService | v1.0 → v1.1 | (per source) |
+| 2026-04-28 | COMP-30 UserQueueSkillService | v1.0 → v1.1 | (per source) |
+| 2026-04-28 | COMP-32 RulesService | v1.0 → v1.1 | (per source) |
+| 2026-04-29 | COMP-02 UserAccessManagementService | NEW v1.0 (first source-verified pass) | (per source) |
+| 2026-04-29 | COMP-03 CoreHierarchyAuthorizationService | v1.0 → v1.1 | (per source) |
+| 2026-04-29 | COMP-04 NAPDisputeEventService | v1.0 → v2.0 | (per source) |
+| 2026-04-29 | COMP-05 NAPDisputeEventProcessor | v1.0 → v2.0 | (per source) |
+| 2026-04-29 | COMP-35 EncryptionService | v1.0 → v1.1 | (per source) |
+| 2026-04-29 | COMP-36 TokenService | v1.0 → v1.1 | wdp-idp-token-service |
+| 2026-04-29 | COMP-39 NAPOutcomeProcessor | v1.0 → v2.0 | (per source) |
+| 2026-04-29 | COMP-40 VisaResponseQuestionnaire | v1.0 → v1.1 | (per source) |
+| 2026-04-29 | COMP-42 BENConsumer | v1.0 → v2.0 | (per source) |
+| 2026-04-30 | COMP-01 API Gateway | v1.0 → v2.0 | wp-mfd/wdp-gateway |
+| 2026-04-30 | COMP-06 NAPDisputeDeclineBatch | v1.0 → v1.1 | (per source) |
+| 2026-04-25 | COMP-51 CaseExpiryProcessor | NEW v1.0 (new component) | (per source) |
+
+All 18 entries have a corresponding Pending Entry in WDP-CHANGE-LOG.md (consumed in this reconciliation).
+
+### v2.1 reconciliation pass (20 components — historical)
+
+This table records the prior reconciliation pass for context. All 20 entries were absorbed into v2.1 derivative documents on 2026-04-25.
 
 | Date | Component | Version | Repo |
 |------|-----------|---------|------|
@@ -780,8 +952,6 @@ This table records the source-verification dates for the 20 components reconcile
 | 2026-04-25 | COMP-41 ThirdPartyNotificationConsumer | v1.0 → v1.1 | (per source) |
 | 2026-04-25 | COMP-43 CoreNotificationConsumer | v1.0 → v2.0 | (per source) |
 
-All 20 entries have a corresponding Reconciled entry in WDP-CHANGE-LOG.md.
-
 ---
 
 ## Migration Progress Summary
@@ -789,19 +959,19 @@ All 20 entries have a corresponding Reconciled entry in WDP-CHANGE-LOG.md.
 | Status | Count | Components |
 |--------|-------|------------|
 | ✅ COMPLETE (individual file created and confirmed) | 0 | (COMP-13 reverted to DRAFT after 2026-04-18 source-verification surfaced 3 latent runtime bugs) |
-| 📝 DRAFT 🔍 (source-verified, architect confirmation pending) | 20 | COMP-07, 08, 09, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 27, 37, 41, 43 |
-| 📝 DRAFT (Copilot CLI analysis, source-verification pending) | 21 | COMP-01, 02, 03, 04, 05, 06, 22, 25, 26, 28, 29, 30, 31, 32, 34, 35, 36, 38, 39, 40, 42 |
+| 📝 DRAFT 🔍 (source-verified, architect confirmation pending) | 38 | COMP-01, 02, 03, 04, 05, 06, 07, 08, 09, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 32, 35, 36, 37, 39, 40, 41, 42, 43, 51 |
+| 📝 DRAFT (Copilot CLI analysis, source-verification pending) | 4 | COMP-29, 31, 34, 38 |
 | 📋 PENDING (enterprise-owned, lower priority) | 1 | COMP-10 DM Mainframe |
 | ⬜ NOT STARTED | 6 | COMP-33 (OrgManagementService — no repo found), COMP-44 (EDIAConsumer — planned), COMP-45, COMP-46, COMP-47 (File Generation — planned next sprint), COMP-48 (NYCEFileGenerationProcessor — planned) |
 | 🔲 UI — separate action item | 2 | COMP-49 WDP Merchant Portal, COMP-50 WDP Ops Portal |
 
 **Phase 1, 2, and 3 (source-verification) progress:**
-- All 41 available component files have been created.
-- 20 of 41 have undergone source-verified correction passes against their repositories between 2026-04-18 and 2026-04-25.
-- Remaining 21 source-verifications are pending (lower-priority components — e.g. COMP-04, 05, 06 are decommission-scoped).
-- No component has yet been architect-confirmed. The "✅ COMPLETE" criterion (architect-confirmed) is the next gate.
+- All 51 components are registered.
+- 38 of 51 have undergone source-verified correction passes against their repositories between 2026-04-18 and 2026-04-30.
+- Remaining 4 source-verifications are pending (COMP-29, 31, 34, 38).
+- No component has yet been architect-confirmed. The "✅ COMPLETE" criterion (architect-confirmed) is the next gate for all 38 source-verified components.
 
-**Remaining:** COMP-33 (no repo), COMP-44/45/46/47/48 (planned features), COMP-49/50 (UI — separate action).
+**Remaining audit work:** COMP-29, 31, 34, 38 (DRAFT awaiting source-verification); COMP-10 (PENDING enterprise); COMP-33 (no repo); COMP-44/45/46/47/48 (planned features); COMP-49/50 (UI — separate action).
 
 ---
 
@@ -822,16 +992,19 @@ All 20 entries have a corresponding Reconciled entry in WDP-CHANGE-LOG.md.
 
 ## Adding New Components (Quarterly Update Protocol)
 
-1. Assign the next sequential number (current last: 50)
+1. Assign the next sequential number (current last: 51)
 2. Add a row to the registry table in the correct logical section
 3. Write the one-line responsibility summary below the table
 4. Create the component file using WDP-COMP-TEMPLATE.md
-5. After the file is complete, update WDP-KAFKA.md and WDP-DB.md
-   with entries from the new component
+5. After the file is complete, append a Pending Entry to WDP-CHANGE-LOG.md
+   capturing the platform-level impact across WDP-DB.md, WDP-KAFKA.md,
+   WDP-DECISIONS.md, WDP-NFRS.md, WDP-INTEGRATIONS.md, WDP-ARCHITECTURE.md
+   (do NOT rewrite those derivatives inline — they are reconciled in
+   dedicated reconciliation sessions)
 6. Update WDP-HANDOVER.md to note the new component and its number
 
 ---
 
-*Last updated: 2026-04-25 (v2.1 reconciliation)*
-*Current component count: 50*
-*Next available number: 51*
+*Last updated: 2026-04-30 (v2.2 reconciliation)*
+*Current component count: 51*
+*Next available number: 52*
