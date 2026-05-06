@@ -1,7 +1,6 @@
 # WDP-FLOW-INDEX.md
 **Worldpay Dispute Platform — Workflow Document Index**
-*Version: 1.1 | April 2026*
-*Reconciled: 2026-04-30 — absorbed Pending Entries from WDP-CHANGE-LOG.md for COMP-40 (Visa contest end-to-end note) and COMP-51 (Case Expiry Subsystem now-confirmed component participants).*
+*Version: 1.1*
 
 ---
 
@@ -116,7 +115,7 @@ Each workflow file follows this structure:
 when each flow document is authored. These are NOT a replacement for the
 flow document — they are inputs for the eventual author.*
 
-### FLOW-07 Merchant Contest — Visa contest end-to-end variant *(added 2026-04-29 from COMP-40 audit)*
+### FLOW-07 Merchant Contest — Visa contest end-to-end variant
 
 When the Visa contest end-to-end flow document is authored, capture the
 following partial-success behaviour explicitly:
@@ -135,7 +134,7 @@ following partial-success behaviour explicitly:
   `visaResponseIds` (e.g. AcceptService events that share the same topic).
   This filtering must be diagrammed at the consumer boundary.
 
-### FLOW-11 Case Expiry — Subsystem Lifecycle *(refined 2026-04-25 from COMP-51 audit)*
+### FLOW-11 Case Expiry — Subsystem Lifecycle
 
 When this flow is authored, capture the following confirmed participant
 chain and shared-state risks:
@@ -241,6 +240,5 @@ When LATAM and VAP integrations go to production, add:
 
 ---
 
-*Last updated: 2026-04-30 (v1.1 reconciliation)*
 *Current workflow count: 11 core flows identified, 0 documented*
 *Next available FLOW ID: 15 (12–14 reserved for variant flows)*

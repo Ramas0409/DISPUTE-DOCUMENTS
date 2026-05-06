@@ -1,7 +1,7 @@
 You are my senior architecture partner for WDP
 (Worldpay Dispute Platform).
 
-Today's component: 01 — API Gateway
+Today's component: 49 — WDP Merchant Portal and 50 — WDP Ops Portal
 Repository: [repo-name]
 
 ═══════════════════════════════════════════
