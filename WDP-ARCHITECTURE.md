@@ -82,7 +82,7 @@ WDP interacts with four categories of external actors:
 
 **Acquiring Platforms** are the financial platforms that hold merchant accounts and are responsible for money movement when a dispute is resolved. WDP receives dispute events from acquiring platforms and delivers dispute outcomes back to them. Current acquiring platforms are NAP, CORE, LATAM, and VAP.
 
-**Merchants & Operations Teams** interact with WDP through the Merchant Portal and the Ops Portal to view disputes, take actions, manage queues, and submit evidence and responses.
+**Merchants & Operations Teams** interact with WDP through WDP Portal — a single Angular SPA that runs in Merchant mode (merchant-facing) and Ops mode (operations-facing) — to view disputes, take actions, manage queues, and submit evidence and responses.
 
 **External Notification & Intelligence Systems** receive dispute lifecycle events from WDP. These include SignifyD and JustAI for fraud intelligence, BEN for merchant notifications, and the enterprise EDIA streaming platform for acquiring platform integrations.
 
@@ -146,8 +146,8 @@ graph LR
     end
 
     subgraph UI_ACCESS["UI & Access Layer"]
-        MP[Merchant Portal]
-        OP[Ops Portal]
+        MP[WDP Portal\nMerchant Mode]
+        OP[WDP Portal\nOps Mode]
         AK[Akamai]
         APIGEE[APIGEE]
         AGW[API Gateway]
@@ -256,31 +256,47 @@ Regardless of the inbound path, all dispute events converge at `chbk_outbox_row`
 
 ### 3.1 Portal UIs & Major UI Sections
 
-WDP exposes two portal UIs, both running on AWS EKS:
+WDP exposes a single Angular SPA that runs in two distinct runtime modes — Merchant and Ops — both deployed on AWS EKS. The two modes share a single repository and a single build artifact; mode identity is derived from DNS hostname plus IDP firm name combination, with `EnvironmentService` selecting `apiBaseUrl` per host. There is no separate build, no compile-time flag, and no distinct entry point.
 
-**WDP Merchant Portal** is the merchant-facing UI. It allows merchants to view their disputes, take actions, submit evidence, and manage their organisation and users. Traffic routes through Akamai for CDN and edge security before reaching the WDP API Gateway.
+**Merchant mode** is the merchant-facing surface. Traffic routes through Akamai for CDN and edge security before reaching the WDP API Gateway.
 
-**WDP Ops Portal** is the internal operations-facing UI. It allows WDP operations teams to manage disputes, configure queues, manage users and organisations, and monitor dispute processing. Ops Portal connects directly to the WDP API Gateway — it does not route through Akamai.
+**Ops mode** is the internal operations surface. It connects directly to the WDP API Gateway — it does not route through Akamai.
 
-**Major UI sections by portal:**
+**User types.** Three distinct user types are assigned at runtime by `WdpSharedService`:
+- `MERCHANT_USER` — external merchant users via merchant DNS.
+- `OPS_USER` — internal Worldpay operations users via Ops DNS.
+- `PB_USER` — Worldpay-internal users (`us_worldpay_fis_int` firm) authenticated via merchant DNS, distinct from MERCHANT_USER.
 
-| UI Section | Merchant Portal | Ops Portal |
-|---|---|---|
-| Disputes | ✅ | ✅ |
-| Queues | ❌ | ✅ |
-| User Management | ✅ | ✅ |
-| Org Management | ✅ | ✅ |
-| Dashboard | 🔴 Planned | 🔴 Planned |
+**Documentation note.** COMP-49 and COMP-50 share documentation. `WDP-COMP-49-WDP-PORTAL.md` is the canonical file covering both modes; `WDP-COMP-50-OPS-PORTAL.md` is a stub pointer.
 
-**Disputes Section** is the primary working area. It provides dispute search, dispute detail view, and all dispute actions including accept, contest, evidence submission, and notes.
+**Major UI sections by mode:**
 
-**Queues Section** (Ops Portal only) provides queue-based workload management for operations teams. Cases are routed to queues based on configurable skill-based routing rules. Operators work through disputes assigned to their queues. Also includes Fax Queue functionality for ops teams to act on merchant faxes.
+| UI Section | Merchant | Ops | Platform Scope |
+|---|---|---|---|
+| Disputes | ✅ | ✅ | All |
+| Queues | ❌ | ✅ | All |
+| User Management | ✅ | ✅ | All |
+| Org Management | ✅ | ✅ | All |
+| Administration | ❌ | ✅ | NAP only |
+| Fax Matching | ❌ | ✅ | CORE only |
+| Fax Analytics | ❌ | ✅ | CORE only |
+| Card Authorization History | ❌ | ✅ | CORE only |
+| Card Settlement | ❌ | ✅ | CORE + PIN |
+| Card Dispute History | ❌ | ✅ | CORE + PIN |
+| Dashboard | 🔴 Planned | 🔴 Planned | All |
+| Automations | 🔴 Planned | 🔴 Planned | All |
+
+**Disputes Section** is the primary working area. It provides dispute search, dispute detail view, and all dispute actions including accept, contest (Defend), evidence submission, and notes. Dispute search export returns synchronously up to 200 records; above that threshold (or when `isAlwaysLFTExport=true`) the export is asynchronous via Large File Transfer.
+
+**Queues Section** (Ops mode only) provides queue-based workload management for operations teams. Cases are routed to queues based on configurable skill-based routing rules. Operators work through disputes assigned to their queues.
 
 **User Management Section** allows administrators to manage users within their organisation — creating, modifying, and deactivating users and managing their roles and permissions.
 
 **Org Management Section** allows administrators to manage organisational hierarchies, configure merchant accounts, and manage org-level settings and routing rules.
 
-**Dashboard Section** 🔴 Planned — will provide dispute analytics and insights to merchants and operations teams. Not yet developed.
+**Platform-specific Ops sections.** Several Ops-mode sections are scoped to specific acquiring platforms: Administration (NAP only), Fax Matching and Fax Analytics (CORE only, backed by COMP-29 FaxQueueService), Card Authorization History (CORE only), Card Settlement and Card Dispute History (CORE + PIN). These reflect platform-specific operational workflows rather than platform-wide capability.
+
+**Dashboard Section** and **Automations Section** are 🔴 Planned — left-nav entries are commented out in source; not yet developed.
 
 ### 3.2 APIGEE (B2B / System-to-System)
 
@@ -296,7 +312,7 @@ APIGEE is responsible for:
 
 ### 3.3 API Gateway
 
-The WDP API Gateway is the single internal entry point for all requests from all paths — Merchant Portal, Ops Portal, and B2B. It is responsible for:
+The WDP API Gateway is the single internal entry point for all requests from all paths — WDP Portal Merchant mode, Ops mode, and B2B. It is responsible for:
 
 - **Authentication** — validates JWT tokens issued by the shared IDP for all incoming requests
 - **Authorization** — calls UserAccessManagementService to verify the caller has permission to perform the requested action
@@ -304,13 +320,13 @@ The WDP API Gateway is the single internal entry point for all requests from all
 
 ```mermaid
 graph LR
-    subgraph MERCHANT_PORTAL["Merchant Portal Path"]
-        MP[WDP Merchant Portal]
+    subgraph MERCHANT_PORTAL["Merchant Mode Path"]
+        MP[WDP Portal\nMerchant Mode]
         AK1[Akamai\nCDN & Edge Security]
     end
 
-    subgraph OPS_PORTAL["Ops Portal Path"]
-        OP[WDP Ops Portal]
+    subgraph OPS_PORTAL["Ops Mode Path"]
+        OP[WDP Portal\nOps Mode]
     end
 
     subgraph B2B_PATH["B2B / System-to-System Path"]
@@ -387,6 +403,8 @@ These services handle all actions that can be taken on a dispute case. They are 
 - NAP dispute events across all networks — for NAP Outcome Processor to notify NAP-DPS
 - Visa dispute events across all acquiring platforms — for VisaResponseQuestionnaire to retrieve and attach the Visa questionnaire to the dispute case
 
+ContestService supports three contest modes, surfaced in the merchant UI as "Defend": `SELF_ASSISTANCE` (merchant submits the response directly), `WORLDPAY_ASSISTANCE` (Worldpay operations team prepares the response on behalf of the merchant), and `RETRIEVAL_RESPONSE` (retrieval-request response, distinct from a chargeback contest). The mode determines which questionnaire is presented and which downstream submission path is taken.
+
 **ChargebackService** is the **sole externally-exposed WDP REST API** and the primary merchant-facing and partner-facing gateway, available to merchant systems via APIGEE → Akamai. It supports both read operations (case search, case detail, activity search, document retrieval) and action operations (contest, accept, add note, change owner, document upload). Two partner identities are coded for the simplified-authorization flow: SignifyD and JustAI (consumer name `JUSTTAI`, double-T spelling in source — active in production). After receiving outbound notifications, third-party systems (SignifyD, BEN, JustAI) call back ChargebackService for full dispute details and actions.
 
 ⚠️ ChargebackService is the largest single-component outbound-integration owner in WDP — 38 distinct downstream call sites across 12 target applications, all on a single shared `RestTemplate` with no pool, no timeouts, no retries, no circuit breaker. The documented "concurrent ACL+case-lookup" pattern is **effectively serial under current production sizing** (`asyncExecutor` core=1, max=1, queue=5) — see WDP-NFRS.md RISK-026.
@@ -411,7 +429,7 @@ These services handle all actions that can be taken on a dispute case. They are 
 
 ### 4.3 Queue & Workflow Services
 
-**FaxQueueService** handles fax communications sent by merchants to WDP. Operations teams act on merchant faxes through this service. Available to Ops Portal users only.
+**FaxQueueService** handles fax communications sent by merchants to WDP. Operations teams act on merchant faxes through this service. Available to Ops mode (OPS_USER) only.
 
 ⚠️ **Detailed fax functionality to be covered in a dedicated section under Queues during component-level documentation.**
 
@@ -602,7 +620,7 @@ From **WPG:**
 Bypass condition (`enrichment_failure=true OR function_code=603`) is honoured **only on POST `/event`**. Case-update and outcome paths do not pass through `EventBusinessValidator.validateRequest`. The `enrichmentFailure` field on the outbound `NapEvent` is a **pass-through copy** of the inbound flag — COMP-04 never sets it itself.
 
 ⚠️ **NAP path has TWO REST surfaces for manual operator reprocessing:**
-- **COMP-05 NAPDisputeEventProcessor** — JWT-authenticated `POST /event` for inbound NAP error reprocessing (Ops Portal access path).
+- **COMP-05 NAPDisputeEventProcessor** — JWT-authenticated `POST /event` for inbound NAP error reprocessing (Ops mode access path).
 - **COMP-39 NAPOutcomeProcessor** — JWT-authenticated `POST /event` for outbound NAP error reprocessing.
 
 Both endpoints drive the same business pipeline as the Kafka path with **no per-record locking**. A manual reprocess POST and a Kafka prior-error scan can race on the same record. See ADR-CAND-037.
@@ -1172,7 +1190,7 @@ VisaResponseQuestionnaire consumes from `internal-integration-events` and retrie
 - Calls DocumentManagementService to store questionnaire document in S3 and metadata in DynamoDB
 
 
-⚠️ **Manual reprocess REST endpoint surface.** COMP-39 hosts JWT-authenticated `POST /event` for manual NAP outbound error reprocessing (Ops Portal access path). The manual reprocessing surface is hosted by **COMP-39, not COMP-05**. See §5.1 for the COMP-05 inbound reprocess sibling.
+⚠️ **Manual reprocess REST endpoint surface.** COMP-39 hosts JWT-authenticated `POST /event` for manual NAP outbound error reprocessing (Ops mode access path). The manual reprocessing surface is hosted by **COMP-39, not COMP-05**. See §5.1 for the COMP-05 inbound reprocess sibling.
 
 ⚠️ **NAP-DPS authentication gap (RISK-179).** COMP-39 sets no Authorization header on outbound NAP-DPS calls; no client certificate is loaded. `napcacrt.jks` is an unreferenced orphan in the COMP-39 repo. Authentication is handled outside the component at Ingress / service mesh / network layer — pending team confirmation.
 
@@ -1964,14 +1982,14 @@ This section provides a single reference table covering all WDP components with 
 
 | Component | Status | Notes |
 |---|---|---|
-| WDP Merchant Portal | ✅ Production | |
-| WDP Ops Portal | ✅ Production | |
-| Disputes Section | ✅ Production | Both portals |
-| Queues Section | ✅ Production | Ops Portal only |
-| User Management Section | ✅ Production | Both portals |
-| Org Management Section | ✅ Production | Both portals |
+| WDP Portal (Merchant + Ops modes) | ✅ Production | Single Angular SPA, two runtime modes — see §3.1 |
+| WDP Portal — Ops mode (stub) | ✅ Production | Documented inside COMP-49 |
+| Disputes Section | ✅ Production | Both modes |
+| Queues Section | ✅ Production | Ops mode only |
+| User Management Section | ✅ Production | Both modes |
+| Org Management Section | ✅ Production | Both modes |
 | Dashboard Section | 🔴 Planned | Dispute analytics for merchants — not yet developed |
-| Akamai | ✅ Production | CDN & edge security — Merchant Portal and B2B path |
+| Akamai | ✅ Production | CDN & edge security — Merchant mode and B2B path |
 | APIGEE | ✅ Production | B2B / system-to-system path only |
 | API Gateway | ✅ Production | Single entry point — ⚠️ **CORE/VAP/LATAM gateway-level authorization absent (RISK-class)**; ⚠️ blocking RestTemplate on Netty event-loop (RISK-093) |
 | IDP | ✅ Production | Shared enterprise OAuth 2.0 |
@@ -1994,7 +2012,7 @@ This section provides a single reference table covering all WDP components with 
 | DocumentManagementService | ✅ Production | 6th publisher of `business-rules` |
 | CaseSearchService | ✅ Production | |
 | **DisplayCodeService** | ✅ Production | ⚠️ Permission-shape divergence between `/search` (11 flags) and `/privileges` (17 flags) — RISK-149 |
-| FaxQueueService | ✅ Production | Ops Portal only — fax detail section pending |
+| FaxQueueService | ✅ Production | Ops mode only — fax detail section pending |
 | **UserQueueSkillService** | ✅ Production | ⚠️ **DEC-021 second offender (RISK-class HIGH)** |
 | BusinessRulesService | ✅ Production | Rule management only — does not execute rules |
 | **RulesService** | ✅ Production | ⚠️ **Pure read-only confirmed; `migrationStatus="N"` undocumented prod kill-switch (RISK-164 / ADR-CAND-049)** |

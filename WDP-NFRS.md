@@ -82,10 +82,10 @@ NFRs are organised into five confirmed sections (Performance, Availability and R
 | Notification delivery from case state change | < 30 seconds | | Stage 1 design target |
 | Encryption API — encrypt | < 50 ms | P95 | Excl. rare DEK refresh |
 | Encryption API — decrypt | < 75 ms | P95 | Incl. KMS call when DEK cached |
-| Merchant portal — queue list load | < 1 second | | Stage 2 UI target |
-| Merchant portal — queue case list load | < 2 seconds | | Stage 2 UI target |
-| Merchant portal — dispute detail load | < 2 seconds | | Stage 2 UI target |
-| Merchant portal — queue refresh | < 500 ms | | Stage 2 UI target |
+| WDP Portal — Merchant mode — queue list load | < 1 second | | Stage 2 UI target |
+| WDP Portal — Merchant mode — queue case list load | < 2 seconds | | Stage 2 UI target |
+| WDP Portal — Merchant mode — dispute detail load | < 2 seconds | | Stage 2 UI target |
+| WDP Portal — Merchant mode — queue refresh | < 500 ms | | Stage 2 UI target |
 | Dispute list — page load | < 5 seconds | P95 | Stage 2 UI alert threshold |
 | Dispute list — search API | < 10 seconds | P95 | Stage 2 UI alert threshold |
 
@@ -441,7 +441,7 @@ The v1.0 delivery guarantee claim "At-least-once; offset committed only after fu
 
 ## 6. Platform Risk Register
 
-This section documents confirmed gaps and risks. RISK-001 through RISK-023 were identified during the April 2026 component survey. RISK-024 through RISK-082 were added during the source-verification reconciliation pass. **RISK-083 through RISK-194 were added during the source-verification reconciliation pass against 16 additional components.**
+This section documents confirmed gaps and risks. RISK-001 through RISK-023 were identified during the April 2026 component survey. RISK-024 through RISK-082 were added during the source-verification reconciliation pass. **RISK-083 through RISK-194 were added during the source-verification reconciliation pass against 16 additional components.** **RISK-195 through RISK-200 were added in the 2026-05-06 post-baseline reconciliation against COMP-49 WDP Portal.**
 
 NFR targets for addressing these risks have not been set. Product team to define.
 
@@ -687,6 +687,19 @@ NFR targets for addressing these risks have not been set. Product team to define
 | RISK-193 | 🟡 | COMP-42 all six outbound dependencies have no read/connect timeout configured | RISK-001 platform pattern |
 | RISK-194 | 🟢 | COMP-42 predecessor lookup loads ALL channel_types for caseNumber, filters to BEN_EVENTS in memory — unbounded per-case query, no pagination, no LIMIT | Component file |
 
+###### COMP-49 WDP Portal
+
+*(Added 2026-05-06 in post-baseline reconciliation against COMP-49 source-verification.)*
+
+| Risk ID | Severity | Risk | Reference |
+|---|---|---|---|
+| RISK-195 | 🟠 | COMP-49 OPS super-user UI bypass — `WdpUtilService.canUserPerformDisputeAction()` returns `{canPerform: true}` unconditionally for any OPS_USER. Combined with DEC-018 (no server-side RBAC on COMP-24), there is no gate at either UI or backend layer. Any authenticated OPS user can take any dispute action — including the eleven More Actions — regardless of case state, queue assignment, or business-rule eligibility. **Highest-impact finding from COMP-49 audit.** | DEC-018 — amplified; ADR-CAND-NEW-A |
+| RISK-196 | 🟠 | COMP-49 `console.log` / `console.error` / `console.debug` statements (~120+) are not stripped from production builds, including in auth-handling paths. PII / token / case-data leakage to browser DevTools console. | ADR-CAND-NEW-B |
+| RISK-197 | 🟠 | COMP-49 UI permissions fetched from `/display-code/privileges` once at app bootstrap and cached in `WdpSharedService` for the full session. Mid-session permission revocation is not honoured until logout. | ADR-CAND-NEW-C |
+| RISK-198 | 🟠 | COMP-49 accepts full PAN at three input forms across both modes: Filter Disputes (both), Filter Fax Dispute (Ops), Update Transaction Search (Ops). Encrypted in transit; decrypted PAN held in AG Grid memory only — no client-side persistence — but the input-layer surface is in PCI scope. | DEC-019 — PARTIAL |
+| RISK-199 | 🟡 | COMP-49 — five previously undocumented More Actions surfaced in source: Reverse, Issuer Reversal, Issuer Accept, Convert to Partial DTP, Update Transaction. Each carries its own form, payload, and backend effect. Audit and risk assessment of the previously undocumented actions required. *Note: COMP-49 source file rates this 🔴 HIGH; rated 🟡 MEDIUM here per change-log specification — gap is medium until per-action audit completes.* | ADR-CAND-NEW-D |
+| RISK-200 | 🟢 | COMP-49 `v-correlation-id` header is timestamp-derived UUID, not cryptographically random. Predictable. Used for trace correlation, not security. | Component file |
+
 ##### 6.1.C Pattern Extensions (existing rows extended with newly-audited confirmations)
 
 The following existing risk rows had their **affected-components list extended** during this reconciliation pass. No new RISK IDs assigned — the underlying finding is unchanged, only the scope.
@@ -706,7 +719,7 @@ The following existing risk rows had their **affected-components list extended**
 
 #### Reconciliation summary (Phase 3)
 
-- **Rows added:** 110 new RISK rows (RISK-083 through RISK-091 platform-wide; RISK-093 through RISK-194 component-specific).
+- **Rows added:** 110 new RISK rows in Phase 3 main pass (RISK-083 through RISK-091 platform-wide; RISK-093 through RISK-194 component-specific). Plus 6 additional rows in 2026-05-06 post-baseline reconciliation (RISK-195 through RISK-200, all COMP-49 WDP Portal). **Total: 116.**
 - **Rows promoted:** RISK-010 promoted from 🟠 to 🔴 to reflect DEC-021 scope expansion.
 - **Rows extended:** RISK-001, 012, 013, 024, 025, 040, 050, 076, 077 (affected-components list).
 - **Rows withdrawn:** None in this pass.
@@ -854,6 +867,15 @@ The 6-column delta (`fax_match`, `fax_report`, `trans_detail`, `auth_detail`, `s
 
 ---
 
+**RISK-195: COMP-49 OPS super-user UI bypass amplifies DEC-018**
+**Severity:** 🟠 HIGH | **Reference:** DEC-018 — amplified; ADR-CAND-NEW-A
+
+`WdpUtilService.canUserPerformDisputeAction()` (`wdp.util.service.ts:44-46`) returns `{canPerform: true}` unconditionally for any OPS_USER, with no inspection of action type, case state, queue assignment, or per-action permissions. Combined with DEC-018 (CaseActionService COMP-24 has no server-side RBAC), there is no enforcement gate at either UI or backend layer for OPS_USER. Any authenticated OPS user can invoke any dispute action — including the eleven More Actions — regardless of business state.
+
+This is the highest-impact finding from the COMP-49 source-verification audit. Whether the unconditional `true` is intentional (treating OPS as a trusted superuser) or a defect to remediate is captured as **ADR-CAND-NEW-A** and is flagged as top-priority for architect resolution.
+
+---
+
 ### 6.7 Medium and Low Risk Details (Phases 2 and 3)
 
 For completeness, all Phase 2 and Phase 3 MEDIUM and LOW risks are recorded with sufficient detail in the summary table at Section 6.1. Component-specific narrative is captured in the relevant component file (WDP-COMP-NN-*.md) and in WDP-HANDOVER.md "Component-Specific Source-Verified Findings".
@@ -902,6 +924,7 @@ Navigation aid for finding all risks affecting a given component.
 | COMP-41 ThirdPartyNotificationConsumer | | RISK-024, 025, 040, 055, 080 | |
 | COMP-42 BENConsumer | | RISK-025 | RISK-024 (extends), RISK-040 (extends), **RISK-192, 193, 194** |
 | COMP-43 CoreNotificationConsumer | | RISK-024, 025, 035, 036, 037, 057, 058, 059, 060, 077 | |
+| COMP-49 WDP Portal (Merchant + Ops modes) | | | **RISK-195, 196, 197, 198, 199, 200** |
 | COMP-51 CaseExpiryProcessor (NEW) | | | RISK-013 (extends), RISK-024 (extends), RISK-077 (extends), RISK-089, RISK-090, RISK-091 |
 
 ---

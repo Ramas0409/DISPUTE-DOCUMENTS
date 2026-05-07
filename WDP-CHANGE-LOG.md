@@ -64,7 +64,7 @@ This log is the audit trail of *what was reconciled when*, not a duplicate store
 
 | Date | Derivatives rebuilt | Entries consumed | Notes |
 |------|---------------------|------------------|-------|
-| *(no reconciliation sessions yet — first session against post-baseline entries)* | | | |
+| 2026-05-06 | WDP-ARCHITECTURE, WDP-COMP-INDEX, WDP-NFRS, WDP-DECISIONS, WDP-HANDOVER | COMP-42 (2026-04-30); COMP-49 + COMP-50 (2026-05-06) | First reconciliation session post-baseline. 6 RISK rows added (RISK-195–200); 6 ADR-CAND raised (ADR-CAND-060–065); DEC-018 amplified by COMP-49 OPS UI super-user bypass; DEC-019 (4) UI input-layer PARTIAL exception added. Architect open questions on COMP-49+50 captured but unresolved — top priority: ADR-CAND-060 OPS bypass remediation strategy. |
 
 ---
 
@@ -72,32 +72,7 @@ This log is the audit trail of *what was reconciled when*, not a duplicate store
 
 *Each per-component chat appends a new block here at the end of Phase 2.*
 
-### 2026-04-30 · COMP-42 BENConsumer · documentation correction (post-baseline)
-
-**Entry type:** Documentation correction — not a component-update pass and not a version transition. The component file `WDP-COMP-42-BEN-CONSUMER.md` is already correct; this entry tracks an inconsistency in `WDP-ARCHITECTURE.md` that should have been caught during the v2.2 reconciliation.
-
-**Source:** Discovered during v2.2 baseline approval review (cross-check between §7.4 and §8.4 of `WDP-ARCHITECTURE.md`).
-
-**Platform-level findings:**
-- §7.4 BEN Consumer correctly describes BEN delivery as Kafka publish to a BEN-owned AWS MSK cluster, with separate SASL/JAAS credentials. v2.2 reconciliation rewrote this section.
-- §8.4 Notification Targets carries forward v1.0's incorrect "Webhook" label in two places: the Mermaid node `BEN[BEN\nWebhook]` and the Notification Targets table row labelling BEN's protocol as "Webhook." v2.2 reconciliation marked §8 as unchanged, so the v1.0 label was inherited verbatim from v2.1.
-- The v2.2 baseline document is internally inconsistent: §7.4 and §8.4 disagree on BEN's delivery protocol.
-- Likely siblings: any §6, §11.1, or §12 reference that mentions BEN's delivery mechanism may carry the same stale label and needs a sweep.
-
-**Affected derivatives:**
-| Document | Section | Change required |
-|----------|---------|-----------------|
-| WDP-ARCHITECTURE.md | §8.4 Mermaid node | Replace `BEN\nWebhook` with a label reflecting Kafka delivery to BEN-owned MSK |
-| WDP-ARCHITECTURE.md | §8.4 Notification Targets table — BEN row, "Protocol" column | Replace `Webhook` with `Kafka publish (BEN-owned MSK)` or similar |
-| WDP-ARCHITECTURE.md | §6 / §7 / §11.1 / §12 | Sweep for sibling references that may still carry the stale "Webhook" label |
-
-**Candidate ADRs surfaced:** None — documentation correction, not architectural change.
-
-**Deviation flags:** None.
-
-**Open questions raised for architect:** None — the architectural fact (BEN-via-Kafka) is settled per COMP-42 source verification and was correctly captured in §7.4 and §12. Documentation needs to catch up in §8.4.
-
-**Resolution path:** Fold into the next reconciliation pass that touches COMP-42 source verification or §8 architectural review. If no such pass is scheduled within a reasonable window, run a targeted §8 / BEN-references sweep as a standalone reconciliation.
+*(none — last reconciliation session 2026-05-06; see Reconciliation Markers above and Reconciled Archive below)*
 
 ---
 
@@ -105,7 +80,17 @@ This log is the audit trail of *what was reconciled when*, not a duplicate store
 
 *Compressed entries from completed reconciliation sessions, in reverse-chronological order.*
 
-*(none yet — first reconciliation session will populate this section)*
+### 2026-05-06 · COMP-49 + COMP-50 WDP Portal · v1.0 → v3.0 (joint, structural consolidation)
+
+WDP Portal documentation consolidated from two separate component files into one canonical file (`WDP-COMP-49-WDP-PORTAL.md`), with `WDP-COMP-50-OPS-PORTAL.md` retained as a stub pointer per the permanent-numbering convention. Source-verified findings: COMP-49 + COMP-50 are a single Angular 19 SPA running in Merchant and Ops modes (not two applications); three user types confirmed (`MERCHANT_USER`, `OPS_USER`, `PB_USER`); OPS-mode UI bypass at `WdpUtilService.canUserPerformDisputeAction()` amplifies DEC-018 (top-priority architect resolution); LFT export threshold corrected to > 200 records (not 5,001–25,000); five previously undocumented More Actions surfaced; Defend has three contest modes; Administration is NAP-only; Fax Queue is two distinct sections (Fax Matching + Fax Analytics).
+
+**Platform record:** RISK-195 through RISK-200 (`WDP-NFRS.md` §6.1.B); ADR-CAND-060 through ADR-CAND-065 (`WDP-DECISIONS.md` §"Phase 3 — post-baseline candidates"); DEC-018 amplification + DEC-019 (4) UI input-layer PARTIAL exception. **Architect open questions captured but unresolved:** OPS-bypass remediation (intentional vs remediate); production `console.*` stripping; mid-session permission refresh strategy; per-action audit of 5 new More Actions; org-specific UI customisation pattern (Macy's); ratification of canonical-file-with-stub documentation convention. **Full audit detail:** `WDP-COMP-49-WDP-PORTAL.md`.
+
+---
+
+### 2026-04-30 · COMP-42 BENConsumer · documentation correction (post-baseline)
+
+BEN delivery mechanism was mislabelled in `WDP-ARCHITECTURE.md` §8.4 as "Webhook" — corrected to Kafka publish to BEN-owned MSK cluster, consistent with §7.4 prose and §12 inventory. Mermaid node label and Notification Targets table row both updated. **No new RISK or ADR-CAND raised; documentation correction only.** **Full audit detail:** `WDP-COMP-42-BEN-CONSUMER.md`.
 
 ---
 

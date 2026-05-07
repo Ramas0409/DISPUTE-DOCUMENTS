@@ -103,13 +103,13 @@ WDP-ARCHITECTURE.md first, then WDP-DECISIONS.md.
 | Status | Count | Details |
 |--------|-------|---------|
 | ✅ COMPLETE (architect-confirmed) | 0 | |
-| 📝 DRAFT 🔍 (source-verified, architect confirmation pending) | 38 | COMP-01, 02, 03, 04, 05, 06, 07, 08, 09, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 32, 35, 36, 37, 39, 40, 41, 42, 43, 51 |
+| 📝 DRAFT 🔍 (source-verified, architect confirmation pending) | 40 | COMP-01, 02, 03, 04, 05, 06, 07, 08, 09, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 32, 35, 36, 37, 39, 40, 41, 42, 43, 49, 50, 51 |
 | 📝 DRAFT (Copilot CLI analysis, source-verification pending) | 4 | COMP-29, 31, 34, 38 |
 | 📋 PENDING (enterprise-owned, lower priority) | 1 | COMP-10 DM Mainframe |
 | ⬜ NOT STARTED | 6 | COMP-33 (OrgManagementService — no repo found), COMP-44 (EDIAConsumer — planned), COMP-45, COMP-46, COMP-47 (File Generation — planned next sprint), COMP-48 (NYCEFileGenerationProcessor — planned) |
-| 🔲 UI — separate action item | 2 | COMP-49 WDP Merchant Portal, COMP-50 WDP Ops Portal |
+| 🔲 UI — separate action item | 0 | (none — COMP-49/50 promoted to DRAFT 🔍 v3.0 May 2026) |
 
-**Component migration status.** All 51 components are registered. 38 of 51 have undergone source-verified correction passes against their production repositories. All carry "📝 DRAFT 🔍 — architect confirmation pending" status. Architect confirmation is the next gate for these 38 components.
+**Component migration status.** All 51 components are registered. 40 of 51 have undergone source-verified correction passes against their production repositories. All carry "📝 DRAFT 🔍 — architect confirmation pending" status. Architect confirmation is the next gate for these 40 components.
 
 ### Tier 4 — Workflow Documents
 
@@ -221,6 +221,8 @@ Do not contradict these without explicit confirmation from Ram.
 - **** COMP-21 ChargebackService `/actuator/prometheus` requires JWT — NOT in security whitelist (corrected from prior draft).
 - **** COMP-19 / COMP-20 liveness/readiness probe paths end in `livez` / `readyz` (with `z`), not `liver` / `lives` / `ready` as v1.0 stated.
 - **** COMP-29 / COMP-35 / COMP-30 / others — `/actuator/prometheus` JWT-protected pattern confirmed widespread; **scrape-side configuration must carry JWT or whitelisting needs platform-wide remediation.**
+- **** **COMP-49 WDP Portal user types are three, not two:** `MERCHANT_USER`, `OPS_USER`, and `PB_USER`. Assigned at runtime by `WdpSharedService` based on DNS hostname plus IDP firm name. `PB_USER` is the Worldpay-internal `us_worldpay_fis_int` firm authenticated via merchant DNS — distinct from `MERCHANT_USER` and from `OPS_USER`.
+- **** **COMP-49 OPS super-user UI bypass amplifies DEC-018:** `WdpUtilService.canUserPerformDisputeAction()` (`wdp.util.service.ts:44-46`) returns `{canPerform: true}` unconditionally for any `OPS_USER`, with no inspection of action / case state / queue / per-action permissions. Combined with DEC-018 (no server-side RBAC at COMP-24 CaseActionService), there is no enforcement gate at either UI or backend layer for OPS_USER. RISK-195 / ADR-CAND-060 — top-priority architect resolution required.
 
 ### Kafka — Platform-Wide Patterns
 
@@ -268,6 +270,7 @@ Do not contradict these without explicit confirmation from Ram.
 - **🔴 DEC-021 wrong-TM scope expansion — COMP-02 UAMS:** previously documented as a one-method offence (`saveChildWithMerchant`). Source verification confirms **7 methods across 4 NAP tables** use `wdpTransactionManager` instead of `napTransactionManager` — `saveChildWithMerchant`, `createEntity`, `updateEntity`, `updateMerchantRelationships`, `deleteMerchantByParent`, `deleteChildEntity`, `deleteParentEntity`. Affects `nap_parent_entity`, `nap_child_entity`, `nap_merchant`, `nap_entity_rel`. Same severity class as DEC-019.
 - **🔴 DEC-021 second offender — COMP-30 UserQueueSkillService:** service-level `@Transactional` on `createQueue`/`updateQueue` binds to `@Primary usTransactionManager` — UK writes to `nap.queues`, `nap.queue_criterion`, `nap.user_queue` are NOT covered by the outer TX. Same root cause class as COMP-02.
 - DEC-020 (Accepted Risk) — no idempotency on case creation (COMP-23). Formally recorded.
+- **** **DEC-019 UI input-layer PARTIAL exception (COMP-49):** WDP Portal accepts full PAN at three input forms across both modes — Filter Disputes (both), Filter Fax Dispute (Ops), Update Transaction Search (Ops). Encrypted in transit; decrypted to AG Grid memory only — no client-side persistence. Input-layer surface in PCI scope. Materially distinct from DEC-019 (1) and (2) (PAN-clear at rest in DB) and from (3) (CVV at rest in error tables/logs). RISK-198 — architect decision required (accept as PARTIAL or remediate).
 
 ### Key Confirmed Platform Facts
 
@@ -287,9 +290,16 @@ Do not contradict these without explicit confirmation from Ram.
 - **** **`minReadySeconds` misplacement** is a platform-wide pattern. Eight components confirmed with the defect: COMP-03, 04 (untouched), COMP-08, COMP-09, COMP-12, COMP-25, COMP-26, COMP-28, COMP-34, COMP-40. `minReadySeconds: 30` is placed under `spec.template.spec` instead of `spec` — silently ignored by Kubernetes. Candidate for platform-wide remediation pass.
 - **`v-correlation-id` regenerated-per-call anti-pattern** — confirmed in COMP-17 (write half) and COMP-51 (read half) of the Case Expiry Subsystem. End-to-end audit trail across the 4–5 calls per record cannot be reconstructed from headers alone. Same anti-pattern likely exists in other components — platform-wide remediation candidate.
 - **** **Case Expiry Subsystem confirmed:** COMP-17 (writer half — Kafka consumer maintaining `wdp.case_expiry`) + COMP-51 (reader half — scheduled batch acting on past-due rows). They share `wdp.case_expiry` as their coordination surface with **no row-level lock, no version column, no SELECT FOR UPDATE**. Race possible.
+- **** **COMP-49 + COMP-50 are a single Angular 19 SPA, not two applications.** Single `wdp-portal` repository, single build artifact, two runtime modes — Merchant (via Akamai → API Gateway) and Ops (direct → API Gateway). Mode identity derived from DNS hostname plus IDP firm name; `EnvironmentService` selects `apiBaseUrl` per host. No separate build, no compile-time flag, no distinct entry point.
+- **** **COMP-49 documentation consolidated:** `WDP-COMP-49-WDP-PORTAL.md` is the canonical file covering both modes. `WDP-COMP-50-OPS-PORTAL.md` is retained as a stub pointer per the permanent-numbering convention — no component number reused or removed.
+- **** **COMP-49 Disputes Section export threshold is > 200 records** (or `isAlwaysLFTExport=true`), at which point export is asynchronous via Large File Transfer (LFT). Synchronous CSV is returned up to 200 records. Prior platform docs stating "5,001–25,000 threshold" are incorrect.
+- **** **COMP-49 Administration Section is NAP-only** (Ops mode). v1.0 statement that Administration applied to "both portals on all platforms" was incorrect.
+- **** **COMP-49 Fax Queue is two distinct sections, not one** — Fax Matching and Fax Analytics. Both are Ops-mode-only and CORE-only. Backed by COMP-29 FaxQueueService.
+- **** **COMP-49 More Actions surface has eleven sub-types**, not the smaller v1.0 list: Accept, Contest, Reopen, Pre-Arbitration, Arbitration, Compliance Case, Pre-Compliance, Reverse, Issuer Reversal, Issuer Accept, Convert to Partial DTP, Update Transaction. **Five are previously undocumented** (Reverse, Issuer Reversal, Issuer Accept, Convert to Partial DTP, Update Transaction) — audit and governance pending. RISK-199 / ADR-CAND-063.
+- **** **COMP-20 ContestService supports three contest modes** (surfaced in COMP-49 UI as "Defend"): `SELF_ASSISTANCE` (merchant submits directly), `WORLDPAY_ASSISTANCE` (Worldpay ops prepares response on merchant's behalf), `RETRIEVAL_RESPONSE` (retrieval-request response, distinct from chargeback contest). Mode determines which questionnaire is presented and which downstream submission path is taken.
 
 ### Enterprise Shared Services (not WDP owned)
-- Akamai — CDN and edge security (Merchant Portal only)
+- Akamai — CDN and edge security (WDP Portal Merchant mode only)
 - APIGEE — B2B API gateway for external merchants
 - IDP — enterprise OAuth 2.0 identity provider (SunGard for NAP)
 - Sterling Mailbox — universal file aggregation hub

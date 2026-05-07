@@ -54,7 +54,8 @@ a Kubernetes Deployment or CronJob, a UI application.
 - UI sections within a portal (Disputes Section, Queues Section,
   etc.) — these are functional areas within a portal application,
   not separate deployables. Documented as sections within the
-  relevant portal component file (WDP-COMP-49 or WDP-COMP-50).
+  portal component file (WDP-COMP-49 — single canonical file;
+  COMP-50 is a stub pointer to COMP-49).
 
 **Special note on FileAcknowledgementProcessor:**
 Sections 2.3.4 and 5.3.2 in WDP-COMPONENTS.md both describe
@@ -568,7 +569,7 @@ source of permission-shape divergence between endpoints.
 
 **29 — FaxQueueService**
 Manages full lifecycle of inbound fax documents received from merchants. Backend
-for the Fax Queue section of the WDP Ops Portal. Writes to legacy MS SQL Server
+for the Fax Queue section of WDP Portal (Ops mode). Writes to legacy MS SQL Server
 (dbo.IncomingFaxes) and audit records to WDP PostgreSQL (WDP.FAX_ACTION). Also
 bundles an eViewer License Management proxy as a secondary controller group.
 Provides three reporting endpoints including CSV email delivery.
@@ -843,20 +844,23 @@ S3 /outbound/pinNetworks/ for ControlM to transfer to Sterling → DM Mainframe
 
 | # | Component | Type | Prod Status | Doc Status | File |
 |---|-----------|------|-------------|------------|------|
-| 49 | WDP Merchant Portal | UI Application | ✅ Production | 🔲 UI — separate action | WDP-COMP-49-MERCHANT-PORTAL.md |
-| 50 | WDP Ops Portal | UI Application | ✅ Production | 🔲 UI — separate action | WDP-COMP-50-OPS-PORTAL.md |
+| 49 | WDP Portal (Merchant + Ops modes) | UI Application | ✅ Production | 📝 DRAFT 🔍 v3.0 | WDP-COMP-49-WDP-PORTAL.md |
+| 50 | WDP Portal — Ops mode (documented inside COMP-49) | UI Application | ✅ Production | 📝 DRAFT 🔍 v3.0 (stub) | WDP-COMP-50-OPS-PORTAL.md |
 
-**49 — WDP Merchant Portal**
-Merchant-facing UI. Allows merchants to view disputes, take actions, submit
-evidence, and manage their organisation and users. Routes through Akamai for
-CDN and edge security. Includes Disputes, User Management, and Org Management
-sections. Dashboard section planned.
+**49 — WDP Portal (Merchant + Ops modes)**
+Single Angular SPA serving both merchant and operations users from one
+repository and one build artifact. Merchant mode routes through Akamai
+for CDN and edge security; Ops mode connects directly to API Gateway.
+Three user types: MERCHANT_USER, OPS_USER, and PB_USER (PaymentsBuilder
+embedded). Sections include Disputes, Queues (Ops only), User Management,
+Org Management, and Dashboard (planned). COMP-49 is the canonical
+documentation file; COMP-50 is a stub pointer.
 
-**50 — WDP Ops Portal**
-Internal operations-facing UI. Allows WDP operations teams to manage disputes,
-configure queues, manage users and organisations. Connects directly to API
-Gateway — does not route through Akamai. Includes Disputes, Queues, User
-Management, and Org Management sections. Dashboard section planned.
+**50 — WDP Portal — Ops mode (documented inside COMP-49)**
+Stub pointer entry. Operational documentation lives in COMP-49. The
+COMP-50 number is retained because Ops mode is materially distinct from
+Merchant mode (different network path, different user type, different
+section set).
 
 ---
 
@@ -899,19 +903,19 @@ same as COMP-07/08/09).
 | Status | Count | Components |
 |--------|-------|------------|
 | ✅ COMPLETE (individual file created and confirmed) | 0 | (COMP-13 reverted to DRAFT after source-verification surfaced 3 latent runtime bugs) |
-| 📝 DRAFT 🔍 (source-verified, architect confirmation pending) | 38 | COMP-01, 02, 03, 04, 05, 06, 07, 08, 09, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 32, 35, 36, 37, 39, 40, 41, 42, 43, 51 |
+| 📝 DRAFT 🔍 (source-verified, architect confirmation pending) | 40 | COMP-01, 02, 03, 04, 05, 06, 07, 08, 09, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 32, 35, 36, 37, 39, 40, 41, 42, 43, 49, 50, 51 |
 | 📝 DRAFT (Copilot CLI analysis, source-verification pending) | 4 | COMP-29, 31, 34, 38 |
 | 📋 PENDING (enterprise-owned, lower priority) | 1 | COMP-10 DM Mainframe |
 | ⬜ NOT STARTED | 6 | COMP-33 (OrgManagementService — no repo found), COMP-44 (EDIAConsumer — planned), COMP-45, COMP-46, COMP-47 (File Generation — planned next sprint), COMP-48 (NYCEFileGenerationProcessor — planned) |
-| 🔲 UI — separate action item | 2 | COMP-49 WDP Merchant Portal, COMP-50 WDP Ops Portal |
+| 🔲 UI — separate action item | 0 | (none — COMP-49/50 promoted to DRAFT 🔍 v3.0 May 2026) |
 
 **Phase 1, 2, and 3 (source-verification) progress:**
 - All 51 components are registered.
-- 38 of 51 have undergone source-verified correction passes against their repositories.
+- 40 of 51 have undergone source-verified correction passes against their repositories.
 - Remaining 4 source-verifications are pending (COMP-29, 31, 34, 38).
 - No component has yet been architect-confirmed. The "✅ COMPLETE" criterion (architect-confirmed) is the next gate for all 38 source-verified components.
 
-**Remaining audit work:** COMP-29, 31, 34, 38 (DRAFT awaiting source-verification); COMP-10 (PENDING enterprise); COMP-33 (no repo); COMP-44/45/46/47/48 (planned features); COMP-49/50 (UI — separate action).
+**Remaining audit work:** COMP-29, 31, 34, 38 (DRAFT awaiting source-verification); COMP-10 (PENDING enterprise); COMP-33 (no repo); COMP-44/45/46/47/48 (planned features).
 
 ---
 
@@ -921,11 +925,11 @@ same as COMP-07/08/09).
 |------------------------------|---------------|
 | Part 3 — Kafka Event Bus (3.1, 3.2) | WDP-KAFKA.md |
 | Part 6 — Acquiring Platform Integrations (6.1–6.5) | WDP-INTEGRATIONS.md |
-| Part 7.3 — Disputes Section (UI) | WDP-COMP-49 and WDP-COMP-50 |
-| Part 7.4 — Queues Section (UI) | WDP-COMP-50 (Ops Portal only) |
-| Part 7.5 — User Management Section (UI) | WDP-COMP-49 and WDP-COMP-50 |
-| Part 7.6 — Org Management Section (UI) | WDP-COMP-49 and WDP-COMP-50 |
-| Part 7.7 — Dashboard Section (UI, Planned) | WDP-COMP-49 and WDP-COMP-50 |
+| Part 7.3 — Disputes Section (UI) | WDP-COMP-49 (canonical; covers both modes) |
+| Part 7.4 — Queues Section (UI) | WDP-COMP-49 (Ops mode only) |
+| Part 7.5 — User Management Section (UI) | WDP-COMP-49 (canonical; covers both modes) |
+| Part 7.6 — Org Management Section (UI) | WDP-COMP-49 (canonical; covers both modes) |
+| Part 7.7 — Dashboard Section (UI, Planned) | WDP-COMP-49 (canonical; covers both modes) |
 | Appendix — Copilot CLI Question Sets | WDP-COMP-TEMPLATE.md (as usage guidance) |
 
 ---

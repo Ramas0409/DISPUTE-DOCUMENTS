@@ -23,6 +23,8 @@ Decisions are grouped into four tiers:
 
 **v2.2 reconciliation:** Deviation maps for DEC-001, DEC-002, DEC-003, DEC-005, DEC-014, DEC-016, DEC-019, DEC-020, DEC-021, DEC-023 enriched with audit findings from the 18-entry source-verification pass. **DEC-008 narrative correction** (DEK rotation is days, not 6 hours). **DEC-019 expanded** to include CVV-at-rest as a third confirmed exception. **DEC-021 scope expansion** from 1 method to 7 methods + COMP-30 added as second offender. **No new DEC numbers introduced in v2.2** — new findings recorded as Candidate ADRs in Section "Candidate ADRs from Reconciliation Pass" pending architect promotion (37 new candidates, ADR-CAND-023 through ADR-CAND-059).
 
+**Post-baseline reconciliation (2026-05-06):** COMP-49 WDP Portal source-verification pass. **DEC-018 amplified** by COMP-49 OPS UI super-user bypass at `WdpUtilService.canUserPerformDisputeAction()` (top-priority architect resolution required). **DEC-019 expanded** to include UI input-layer exception (COMP-49 — three forms accept full PAN, encrypted in transit, decrypted to AG Grid memory only). **6 additional candidate ADRs** added (ADR-CAND-060 through ADR-CAND-065).
+
 ---
 
 ## Decision Registry
@@ -45,8 +47,8 @@ Decisions are grouped into four tiers:
 | DEC-014 | Resilience4j for Circuit Breaking | | ⛔ VOID — evidence base extended to 38 source-verified components | Oct 2025 |
 | DEC-016 | Database Error Table as Consumer DLQ | 2 | ⚠️ Refined — writers expanded; EXPIRY_BATCH terminal-write-only flagged | April 2026 |
 | DEC-017 | BusinessRulesProcessor Reads Rules Directly from DB | 2 | ✅ Active | April 2026 |
-| DEC-018 | RBAC Not Enforced in CaseActionService — Accepted Risk | 2 | ⚠️ Risk Accepted | April 2026 |
-| DEC-019 | Clear PAN Written on Standard Case Creation — Accepted Risk | 1 | ⚠️ Risk Accepted — **CVV-at-rest exception (COMP-04 + COMP-05)** | April 2026 |
+| DEC-018 | RBAC Not Enforced in CaseActionService — Accepted Risk | 2 | ⚠️ Risk Accepted — **amplified by COMP-49 OPS UI super-user bypass** | April 2026 |
+| DEC-019 | Clear PAN Written on Standard Case Creation — Accepted Risk | 1 | ⚠️ Risk Accepted — **CVV-at-rest exception (COMP-04 + COMP-05); UI input-layer PARTIAL exception (COMP-49)** | April 2026 |
 | DEC-020 | No Idempotency on Case Creation — Accepted Risk | 2 | ⚠️ Risk Accepted — deviation map extended | April 2026 |
 | DEC-021 | UAMS Wrong Transaction Manager — Known Defect | | 🔴 Defect — **scope expanded: 7 methods in COMP-02 + COMP-30 second offender** | April 2026 |
 | DEC-022 | removeItemFromQueueDisabled Operational Safety Switch | 2 | ✅ Active | April 2026 |
@@ -372,6 +374,8 @@ Direct synchronous Kafka publish remains the dominant producer pattern in WDP. T
 
 ⚠️ **Note:** COMP-02 UAMS confirmed second offender of the **programmatic-only RBAC posture** — no method-level Spring Security annotations; programmatic-only authorization with regression risk on every new endpoint. See ADR-CAND-053 for sibling-class formalisation.
 
+⚠️ **Note (2026-05-06) — UI-layer amplification at COMP-49 WDP Portal.** `WdpUtilService.canUserPerformDisputeAction()` (`wdp.util.service.ts:44-46`) returns `{canPerform: true}` unconditionally for any OPS_USER, with no inspection of action type, case state, queue assignment, or per-action permissions. Combined with the absence of server-side RBAC in COMP-24 (this DEC), there is no enforcement gate at either UI or backend layer for OPS_USER. Any authenticated OPS user can invoke any dispute action — including the eleven More Actions — regardless of business state. Whether the unconditional `true` is intentional (treating OPS as a trusted superuser) or a defect to remediate is captured as ADR-CAND-060 and is flagged top-priority. See RISK-195.
+
 ---
 
 ### DEC-019: Clear PAN and CVV Storage — Accepted Risk (DEC-004 Exception)
@@ -400,6 +404,18 @@ This is a **NEW MATERIAL DEFICIENCY** under PCI-DSS 3.2.1 Requirement 3.2 (prohi
 - **Document approved exception** with compensating controls.
 
 This is **structurally distinct from PAN-clear** (DEC-019 (1) and (2)) because PCI-DSS does permit encrypted PAN storage with controls, but PCI-DSS does NOT permit CVV storage in any form post-authorisation. Encryption does not make CVV-at-rest compliant.
+
+**(4) PARTIAL — UI input layer in PCI scope (COMP-49, 2026-05-06):**
+
+COMP-49 WDP Portal accepts full PAN at three input forms across both Merchant and Ops modes:
+- Filter Disputes (both modes)
+- Filter Fax Dispute (Ops mode only)
+- Update Transaction Search (Ops mode only)
+
+PAN is encrypted in transit and decrypted to AG Grid memory only — there is no client-side persistence (no localStorage, sessionStorage, IndexedDB, or cookie write of PAN). The input-layer surface, however, is in PCI scope. This is materially distinct from (1) and (2) (clear PAN at rest in database) and from (3) (CVV stored in error tables and logs) — but warrants recording as a DEC-019 deviation because it expands the inventory of components handling clear PAN, even transiently.
+
+**Risk:** RISK-198 (🟠 HIGH).
+**Decision:** Architect decision required — accept as PARTIAL exception or remediate (e.g. tokenised entry / virtual keypad / restrict input forms to last-4). No dedicated candidate ADR raised; this deviation map entry is the architectural record.
 
 **Related — COMP-21 in-flight PAN surface (RISK-051):** *(unchanged)*
 
@@ -587,6 +603,17 @@ The following candidates emerged from source-verification reconciliation. None a
 | **ADR-CAND-058** | **🟢 LOW** | **COMP-22 Kafka publish disablement attribution — capture commit `c29018cd` rationale (Shringi Nitin, 2025-08-08, PR #93)** | **COMP-22** | RISK-021 (existing, refresh) |
 | **ADR-CAND-059** | **🟡 MEDIUM** | **COMP-04 GUARPAY7 → TIER5 silent mapping — downstream consumers cannot distinguish GUARPAY5 from GUARPAY7** | **COMP-04** | **RISK-119** |
 
+#### Phase 3 — post-baseline candidates (2026-05-06, COMP-49 WDP Portal reconciliation)
+
+| Candidate ID | Severity | Title | Affected components | Linked RISK(s) |
+|--------------|----------|-------|---------------------|----------------|
+| **ADR-CAND-060** | **🟠 HIGH** | **OPS super-user UI bypass amplifying DEC-018 — `WdpUtilService.canUserPerformDisputeAction()` returns unconditional `{canPerform: true}` for OPS_USER. Intentional (trusted-OPS posture) or remediate (per-action permissions at UI + server-side RBAC at COMP-24)? Top priority** | **COMP-49** | **RISK-195** |
+| **ADR-CAND-061** | **🟠 HIGH** | **Production `console.*` stripping — Webpack/Angular CLI build-pipeline remediation pass** | **COMP-49** | **RISK-196** |
+| **ADR-CAND-062** | **🟠 HIGH** | **Mid-session permission refresh strategy — periodic poll, server-push, or accept logout-only revocation** | **COMP-49** | **RISK-197** |
+| **ADR-CAND-063** | **🟡 MEDIUM** | **Five new More-Actions surface (Reverse, Issuer Reversal, Issuer Accept, Convert to Partial DTP, Update Transaction) — audit each for risk and document governance** | **COMP-49** | **RISK-199** |
+| **ADR-CAND-064** | **🟡 MEDIUM** | **Org-specific UI customisation pattern (Macy's hardcoding) — generalise to tenant framework or accept named-customer carve-outs** | **COMP-49** | Component file |
+| **ADR-CAND-065** | **🟢 LOW** | **Documentation convention — canonical-file-with-stub pattern for single-codebase-multiple-component-numbers (precedent: COMP-49 / COMP-50). Ratify as platform convention if pattern recurs** | **COMP-49, COMP-50** *(precedent)* | Documentation policy |
+
 ---
 
 ### Detailed candidate ADR — ADR-CAND-023: CVV-at-rest exception (PCI-DSS 3.2.1)
@@ -722,6 +749,30 @@ Kubernetes silently ignores the misplaced field. The intended 30-second rolling-
 - **(b) Per-component fix as part of normal deployment cycle** — slower, but lower coordination cost.
 
 **Recommendation:** (a). The cost is low (template change + lint rule) and the benefit is significant (rolling-update protection actually applied). Lint rule is essential — without it the pattern will be re-introduced by the next manifest copy-paste.
+
+---
+
+### Detailed candidate ADR — ADR-CAND-060: OPS super-user UI bypass amplifying DEC-018
+
+**Severity:** 🟠 HIGH (architect may upgrade to 🔴 CRITICAL pending decision)
+**Status:** Candidate — architect decision required (top priority)
+
+**Context:** `WdpUtilService.canUserPerformDisputeAction()` (`wdp.util.service.ts:44-46`) is the UI-layer permission gate for all dispute actions in COMP-49 WDP Portal. For any user whose `userType === 'OPS_USER'`, the method returns `{canPerform: true}` unconditionally — without inspecting action type, case state, queue assignment, or per-action permissions loaded at bootstrap.
+
+Combined with DEC-018 (no server-side RBAC enforcement on COMP-24 CaseActionService), there is no enforcement gate at either UI or backend layer for OPS_USER. Any authenticated OPS user can invoke any dispute action — including the eleven More Actions (Accept, Contest, Reopen, Pre-Arbitration, Arbitration, Compliance Case, Pre-Compliance, Reverse, Issuer Reversal, Issuer Accept, Convert to Partial DTP, Update Transaction) — regardless of business state, whose case it is, or what queue it's assigned to.
+
+**Blast radius:** every dispute action surface for every OPS user. The UI offers no protection; the backend offers no protection.
+
+**Highest-impact finding from the COMP-49 source-verification audit.**
+
+**Options:**
+- **(a) Document approved exception** — formalise the trusted-OPS-superuser posture as intentional. OPS users are trusted internal staff with auditable access. The trade-off is accepting that any compromised OPS account or rogue insider has unconditional dispute action authority. Pair with strong audit logging (`WDP.AUDIT_TRAIL_DM`) and mandatory MFA on OPS DNS.
+- **(b) Remediate at UI layer only** — replace the unconditional `true` with a real per-action permission check. UI gating remains advisory (DEC-018 still leaves the backend open) but reduces accidental misuse. Easier than (c) but still leaves the trusted-channel gap.
+- **(c) Remediate end-to-end** — UI per-action checks AND server-side RBAC enforcement at COMP-24. Reverses DEC-018. Higher cost but closes the gap definitively.
+
+**Recommendation:** Architect decision. (a) is defensible if OPS trust posture is genuinely accepted at the platform level — but should be a deliberate decision, not the current default-by-omission. (b) is a partial fix that leaves the deeper gap. (c) is the end-state if WDP is to claim role-level enforcement on the OPS surface.
+
+**Severity note:** filed as 🟠 HIGH in WDP-NFRS (RISK-195) using the source-verification convention. The original COMP-49 audit framing labels this 🔴 — architect may elect to upgrade RISK-195 to 🔴 CRITICAL once option choice (a/b/c) is made.
 
 ---
 
