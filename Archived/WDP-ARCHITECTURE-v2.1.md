@@ -1,6 +1,9 @@
 # WDP-ARCHITECTURE.md
 **Worldpay Dispute Platform — Architecture Reference**
-*Version: 2.2 — Baseline*
+*Version: 2.1 | Reconciled: 2026-04-25*
+*Source: v2.0 (April 2026) + 2026-04-18/23/24/25 source-verification reconciliation*
+
+*v2.1 reconciliation scope: minor topology-level clarifications only. The 20 component-file audits surfaced primarily component-level findings recorded in WDP-NFRS.md v2.1 and WDP-DECISIONS.md v2.1. Architecture-level changes are limited to: (a) ChargebackService externally-exposed scope and serial-under-load footnote, (b) BEN delivery mechanism corrected to Kafka publish, (c) JustAI scope split between COMP-21 inbound and COMP-41 outbound, (d) Card Network Direct API Calls AMEX/DISCOVER + MC CHI silent no-op + NAP-publish split-brain note, (e) Data Storage note for COMP-37 unique pattern, (f) Resilience pattern strengthened with COMP-21 38-sites evidence, (g) Component Status Registry updated.*
 
 ---
 
@@ -23,9 +26,12 @@
 
 ## Knowledge Base Navigation
 
-This document covers platform-level topology, principles, and deployment context. It is the starting point — not the complete picture.
+This document covers platform-level topology, principles, and deployment
+context. It is the starting point — not the complete picture.
 
-For deeper detail, use the documents below. Claude searches all project files simultaneously, so these cross-references help orient every response toward the right source of truth.
+For deeper detail, use the documents below. Claude searches all project
+files simultaneously, so these cross-references help orient every response
+toward the right source of truth.
 
 | Question type | Go to |
 |---------------|-------|
@@ -38,6 +44,19 @@ For deeper detail, use the documents below. Claude searches all project files si
 | What does WDP integrate with externally? | WDP-INTEGRATIONS.md |
 | What are the performance and resilience constraints? | WDP-NFRS.md |
 | What is the current work position and session context? | WDP-HANDOVER.md |
+
+**Document status as of 2026-04-25:**
+- WDP-ARCHITECTURE.md — ✅ Current v2.1 (this document)
+- WDP-COMP-INDEX.md — 🔄 v2.0 — pending v2.1 reconciliation (status updates for 20 components)
+- WDP-KAFKA.md — ✅ Current v2.1 (reconciled 2026-04-25)
+- WDP-DB.md — ✅ Current v2.1 (reconciled 2026-04-25)
+- WDP-FLOW-INDEX.md — ✅ Skeleton (11 flows identified, none documented yet)
+- WDP-COMP-[NN]-*.md — 📋 40 DRAFT (20 source-verified between 2026-04-18 and 2026-04-25; architect confirmation pending), 1 COMPLETE, 6 NOT STARTED, 3 special status
+- WDP-DECISIONS.md — ✅ Current v2.1 (deviation maps enriched, 22 candidate ADRs added)
+- WDP-INTEGRATIONS.md — ✅ Current v2.1 (JustAI scope corrected, COMP-21 added, Cert eAPI added)
+- WDP-NFRS.md — ✅ Current v2.1 (60 new RISK rows added, RISK-009 withdrawn)
+- WDP-HANDOVER.md — ✅ Current v3.1 (reconciled 2026-04-25)
+- WDP-CHANGE-LOG.md — Active append-only log; 20 entries reconciled 2026-04-25
 
 ---
 
@@ -69,7 +88,6 @@ Five principles govern every design decision in WDP:
 
 **Common processing paths over special cases.** Where acquiring platforms or card networks have unique integration patterns today, the architectural direction is to migrate them to the common inbound and outbound processing paths over time. NAP is the primary example of this migration in progress.
 
-
 ---
 
 ## 2. System Context
@@ -82,7 +100,7 @@ WDP interacts with four categories of external actors:
 
 **Acquiring Platforms** are the financial platforms that hold merchant accounts and are responsible for money movement when a dispute is resolved. WDP receives dispute events from acquiring platforms and delivers dispute outcomes back to them. Current acquiring platforms are NAP, CORE, LATAM, and VAP.
 
-**Merchants & Operations Teams** interact with WDP through WDP Portal — a single Angular SPA that runs in Merchant mode (merchant-facing) and Ops mode (operations-facing) — to view disputes, take actions, manage queues, and submit evidence and responses.
+**Merchants & Operations Teams** interact with WDP through the Merchant Portal and the Ops Portal to view disputes, take actions, manage queues, and submit evidence and responses.
 
 **External Notification & Intelligence Systems** receive dispute lifecycle events from WDP. These include SignifyD and JustAI for fraud intelligence, BEN for merchant notifications, and the enterprise EDIA streaming platform for acquiring platform integrations.
 
@@ -146,8 +164,8 @@ graph LR
     end
 
     subgraph UI_ACCESS["UI & Access Layer"]
-        MP[WDP Portal\nMerchant Mode]
-        OP[WDP Portal\nOps Mode]
+        MP[Merchant Portal]
+        OP[Ops Portal]
         AK[Akamai]
         APIGEE[APIGEE]
         AGW[API Gateway]
@@ -249,54 +267,37 @@ Regardless of the inbound path, all dispute events converge at `chbk_outbox_row`
 
 ⚠️ Full list of file-only networks and their acquiring platform mapping to be documented in the File Content Classification section (Section 5.4 — pending).
 
-
 ---
 
 ## 3. UI & Access Layer
 
 ### 3.1 Portal UIs & Major UI Sections
 
-WDP exposes a single Angular SPA that runs in two distinct runtime modes — Merchant and Ops — both deployed on AWS EKS. The two modes share a single repository and a single build artifact; mode identity is derived from DNS hostname plus IDP firm name combination, with `EnvironmentService` selecting `apiBaseUrl` per host. There is no separate build, no compile-time flag, and no distinct entry point.
+WDP exposes two portal UIs, both running on AWS EKS:
 
-**Merchant mode** is the merchant-facing surface. Traffic routes through Akamai for CDN and edge security before reaching the WDP API Gateway.
+**WDP Merchant Portal** is the merchant-facing UI. It allows merchants to view their disputes, take actions, submit evidence, and manage their organisation and users. Traffic routes through Akamai for CDN and edge security before reaching the WDP API Gateway.
 
-**Ops mode** is the internal operations surface. It connects directly to the WDP API Gateway — it does not route through Akamai.
+**WDP Ops Portal** is the internal operations-facing UI. It allows WDP operations teams to manage disputes, configure queues, manage users and organisations, and monitor dispute processing. Ops Portal connects directly to the WDP API Gateway — it does not route through Akamai.
 
-**User types.** Three distinct user types are assigned at runtime by `WdpSharedService`:
-- `MERCHANT_USER` — external merchant users via merchant DNS.
-- `OPS_USER` — internal Worldpay operations users via Ops DNS.
-- `PB_USER` — Worldpay-internal users (`us_worldpay_fis_int` firm) authenticated via merchant DNS, distinct from MERCHANT_USER.
+**Major UI sections by portal:**
 
-**Documentation note.** COMP-49 and COMP-50 share documentation. `WDP-COMP-49-WDP-PORTAL.md` is the canonical file covering both modes; `WDP-COMP-50-OPS-PORTAL.md` is a stub pointer.
+| UI Section | Merchant Portal | Ops Portal |
+|---|---|---|
+| Disputes | ✅ | ✅ |
+| Queues | ❌ | ✅ |
+| User Management | ✅ | ✅ |
+| Org Management | ✅ | ✅ |
+| Dashboard | 🔴 Planned | 🔴 Planned |
 
-**Major UI sections by mode:**
+**Disputes Section** is the primary working area. It provides dispute search, dispute detail view, and all dispute actions including accept, contest, evidence submission, and notes.
 
-| UI Section | Merchant | Ops | Platform Scope |
-|---|---|---|---|
-| Disputes | ✅ | ✅ | All |
-| Queues | ❌ | ✅ | All |
-| User Management | ✅ | ✅ | All |
-| Org Management | ✅ | ✅ | All |
-| Administration | ❌ | ✅ | NAP only |
-| Fax Matching | ❌ | ✅ | CORE only |
-| Fax Analytics | ❌ | ✅ | CORE only |
-| Card Authorization History | ❌ | ✅ | CORE only |
-| Card Settlement | ❌ | ✅ | CORE + PIN |
-| Card Dispute History | ❌ | ✅ | CORE + PIN |
-| Dashboard | 🔴 Planned | 🔴 Planned | All |
-| Automations | 🔴 Planned | 🔴 Planned | All |
-
-**Disputes Section** is the primary working area. It provides dispute search, dispute detail view, and all dispute actions including accept, contest (Defend), evidence submission, and notes. Dispute search export returns synchronously up to 200 records; above that threshold (or when `isAlwaysLFTExport=true`) the export is asynchronous via Large File Transfer.
-
-**Queues Section** (Ops mode only) provides queue-based workload management for operations teams. Cases are routed to queues based on configurable skill-based routing rules. Operators work through disputes assigned to their queues.
+**Queues Section** (Ops Portal only) provides queue-based workload management for operations teams. Cases are routed to queues based on configurable skill-based routing rules. Operators work through disputes assigned to their queues. Also includes Fax Queue functionality for ops teams to act on merchant faxes.
 
 **User Management Section** allows administrators to manage users within their organisation — creating, modifying, and deactivating users and managing their roles and permissions.
 
 **Org Management Section** allows administrators to manage organisational hierarchies, configure merchant accounts, and manage org-level settings and routing rules.
 
-**Platform-specific Ops sections.** Several Ops-mode sections are scoped to specific acquiring platforms: Administration (NAP only), Fax Matching and Fax Analytics (CORE only, backed by COMP-29 FaxQueueService), Card Authorization History (CORE only), Card Settlement and Card Dispute History (CORE + PIN). These reflect platform-specific operational workflows rather than platform-wide capability.
-
-**Dashboard Section** and **Automations Section** are 🔴 Planned — left-nav entries are commented out in source; not yet developed.
+**Dashboard Section** 🔴 Planned — will provide dispute analytics and insights to merchants and operations teams. Not yet developed.
 
 ### 3.2 APIGEE (B2B / System-to-System)
 
@@ -312,7 +313,7 @@ APIGEE is responsible for:
 
 ### 3.3 API Gateway
 
-The WDP API Gateway is the single internal entry point for all requests from all paths — WDP Portal Merchant mode, Ops mode, and B2B. It is responsible for:
+The WDP API Gateway is the single internal entry point for all requests from all paths — Merchant Portal, Ops Portal, and B2B. It is responsible for:
 
 - **Authentication** — validates JWT tokens issued by the shared IDP for all incoming requests
 - **Authorization** — calls UserAccessManagementService to verify the caller has permission to perform the requested action
@@ -320,13 +321,13 @@ The WDP API Gateway is the single internal entry point for all requests from all
 
 ```mermaid
 graph LR
-    subgraph MERCHANT_PORTAL["Merchant Mode Path"]
-        MP[WDP Portal\nMerchant Mode]
+    subgraph MERCHANT_PORTAL["Merchant Portal Path"]
+        MP[WDP Merchant Portal]
         AK1[Akamai\nCDN & Edge Security]
     end
 
-    subgraph OPS_PORTAL["Ops Mode Path"]
-        OP[WDP Portal\nOps Mode]
+    subgraph OPS_PORTAL["Ops Portal Path"]
+        OP[WDP Ops Portal]
     end
 
     subgraph B2B_PATH["B2B / System-to-System Path"]
@@ -352,13 +353,6 @@ graph LR
     AGW --> SVCS
 ```
 
-
-⚠️ **Gap — CORE/VAP/LATAM gateway-level authorization absent.** No CORE platform value exists in API Gateway source code. CORE, VAP, and LATAM platform requests receive **no role-level or case-level authorization at the gateway layer**. NAP and PIN requests are routed through the case-level authorization filter (UAMS / CHAS); CORE/VAP/LATAM bypass it entirely. Architect decision required — see WDP-DECISIONS.md ADR-CAND-029.
-
-⚠️ **Resilience gap — blocking RestTemplate on Netty event-loop.** API Gateway uses Spring Cloud Gateway on Netty (a reactive non-blocking framework), but `CaseNumberFilter` invokes UAMS and CHAS using **blocking `RestTemplate` on Netty event-loop threads with no timeout**. A single degraded auth service can exhaust all gateway threads. Blast radius: the entire gateway. See WDP-NFRS.md RISK-093 and WDP-DECISIONS.md ADR-CAND-028.
-
-⚠️ **Listen port `8082`.**
-
 ### 3.4 Authentication & Authorization
 
 **IDP (Identity Provider)** is the shared enterprise OAuth 2.0 identity infrastructure. It issues JWT tokens consumed by the API Gateway for all user and service authentication.
@@ -369,23 +363,7 @@ graph LR
 - Merchant data is isolated by merchant_id at both API and database levels
 - Operations users have tiered permissions — actions available depend on their assigned role
 
-⚠️ **UAMS — 4-path summary:**
-1. **NAP `POST /authorize`** — case-level authorization for NAP requests (3-layer model: consumer authorization → entity-class gate → entity-value lookup).
-2. **Entity CRUD** — six write endpoint families across `nap_parent_entity`, `nap_child_entity`, `nap_merchant`, `nap_entity_rel`. Application-level SELECT-then-INSERT only; no DB UNIQUE visible. ⚠️ **DEC-021 wrong-TM scope expansion (RISK-010 promoted 🟠→🔴):** 7 methods write to NAP-schema tables under `wdpTransactionManager` instead of `napTransactionManager`. See WDP-DECISIONS.md DEC-021.
-3. **SunGard IdP user-lifecycle proxy** — two firm-routed instances (`Merchant_Fraud_Disputes` → MFD; else → standard `US_Merchant`). See WDP-INTEGRATIONS.md §6.1.
-4. **AWS S3 bulk onboarding** — direct write to `${wdp_entity_file}` bucket, key prefix `RECEIVED/{ENV}/`, hardcoded `eu-west-2` region. ⚠️ **No downstream parser identified** — open question. See WDP-INTEGRATIONS.md §7.2.
-
-⚠️ **CHAS — 9 endpoints.** V2 controller adds three endpoints: `POST /{platform}/v2/merchant/entitytype` (paginated), `GET /{platform}/v2/merchant/orgentity/{orgId}`, `GET /{platform}/v2/merchant/defaultentity/{orgId}`. **Scope is PIN+CORE** (`RequestValidator.validatePlatform` accepts both). The data API surface serves both PIN and CORE platform consumers.
-
-⚠️ **`validateOrgId()` finding:** Method is documented as commented-out, **and the method body is itself absent** from `RequestValidator` — remediation cannot be done by uncomment alone; reimplementation required. See RISK-012, ADR-CAND-029-class.
-
-⚠️ **Internal firm bypass scope:** Bypass (`iss` contains `us_worldpay_fis_int`) applies to **BOTH** `/authorize` AND `/entity-authorize` — both share `AuthorizationServiceImpl.authorizeEntity`. Plus partial-bypass on `POST /{platform}/merchant/entitytype` (V1 and V2): internal callers skip JWT `iqentities` extraction and use `orgId` from request body directly.
-
-⚠️ **COMP-04 unauthenticated SecurityConfig.** All COMP-04 NAPDisputeEventService endpoints are unauthenticated at app level — SecurityConfig whitelist is `/**`. Auth relies entirely on Ingress / network controls. See WDP-NFRS.md RISK-115 and WDP-DECISIONS.md ADR-CAND-031.
-
-⚠️ **COMP-22 internal-firm enforcement is application-layer (not Spring Security).** `contains` check on JWT `iss` claim against literal `us_worldpay_fis_int`. `ForbiddenException` constructor uses `HttpStatus.UNAUTHORIZED` but global handler returns 403 — constructor's status code is dead. See RISK-138.
-
-⚠️ **3-layer authorization model.** Both COMP-02 UAMS and COMP-03 CHAS implement the same shape: (1) Spring Security JWT validation, (2) internal-firm bypass on `iss` substring `us_worldpay_fis_int`, (3) entity-scope check against the platform-specific relationship table. Same constants, same shape, two implementations. Candidate to formalise as a platform pattern — see ADR-CAND-038.
+⚠️ **NOTE:** Detailed UserAccessManagementService behaviour to be confirmed and updated. Current documentation is provisional.
 
 ---
 
@@ -402,8 +380,6 @@ These services handle all actions that can be taken on a dispute case. They are 
 **ContestService** processes merchant decisions to contest a dispute. It makes a direct synchronous API call to Visa or MasterCard to submit the contest. After a successful contest call it publishes two categories of events to `internal-integration-events`:
 - NAP dispute events across all networks — for NAP Outcome Processor to notify NAP-DPS
 - Visa dispute events across all acquiring platforms — for VisaResponseQuestionnaire to retrieve and attach the Visa questionnaire to the dispute case
-
-ContestService supports three contest modes, surfaced in the merchant UI as "Defend": `SELF_ASSISTANCE` (merchant submits the response directly), `WORLDPAY_ASSISTANCE` (Worldpay operations team prepares the response on behalf of the merchant), and `RETRIEVAL_RESPONSE` (retrieval-request response, distinct from a chargeback contest). The mode determines which questionnaire is presented and which downstream submission path is taken.
 
 **ChargebackService** is the **sole externally-exposed WDP REST API** and the primary merchant-facing and partner-facing gateway, available to merchant systems via APIGEE → Akamai. It supports both read operations (case search, case detail, activity search, document retrieval) and action operations (contest, accept, add note, change owner, document upload). Two partner identities are coded for the simplified-authorization flow: SignifyD and JustAI (consumer name `JUSTTAI`, double-T spelling in source — active in production). After receiving outbound notifications, third-party systems (SignifyD, BEN, JustAI) call back ChargebackService for full dispute details and actions.
 
@@ -429,12 +405,11 @@ ContestService supports three contest modes, surfaced in the merchant UI as "Def
 
 ### 4.3 Queue & Workflow Services
 
-**FaxQueueService** handles fax communications sent by merchants to WDP. Operations teams act on merchant faxes through this service. Available to Ops mode (OPS_USER) only.
+**FaxQueueService** handles fax communications sent by merchants to WDP. Operations teams act on merchant faxes through this service. Available to Ops Portal users only.
 
 ⚠️ **Detailed fax functionality to be covered in a dedicated section under Queues during component-level documentation.**
 
 **UserQueueSkillService** manages the relationship between users, queues, and skills. It determines which queues a user can access and which cases within those queues are eligible for that user based on their assigned skills.
-
 
 ### 4.4 Rules & Configuration Services
 
@@ -442,17 +417,11 @@ ContestService supports three contest modes, surfaced in the merchant UI as "Def
 
 **RulesService** manages additional configuration rules for dispute routing, queue assignment, and case handling behaviour. It works alongside BusinessRulesService to provide the full rules configuration capability of the platform.
 
-⚠️ **RulesService (COMP-32) — pure read-only.** Zero writes, zero Kafka, zero PAN, zero outbound REST/HTTP, zero `@Transactional` mutations. Hosts 14 active REST endpoints + 2 controller-disabled endpoints with full backing code intact (`/documentType`, `/eventRule` — abandon-or-re-enable decision pending; ADR-CAND-050). 14 active endpoints map 1:1 to 14 distinct `@Cacheable` cache names backed by Spring's default `ConcurrentMapCacheManager`. ⚠️ **Production migration kill-switch (RISK-164 / ADR-CAND-049):** `/actionrules` `migrationStatus="N"` is an **undocumented production migration kill-switch** — when triggered, every UI action is blocked for the affected case. Not in any runbook.
-
 ### 4.5 Organisation & User Management Services
 
-**OrgManagementService** manages organisational hierarchies within WDP. Component documentation deferred — GitHub repository not found.
+**OrgManagementService** manages organisational hierarchies within WDP. It handles merchant account configuration, org-level settings, and routing rule configuration at the organisation level.
 
-**CoreHierarchyAuthorizationService (COMP-03 CHAS)** enforces authorization based on the organisational hierarchy. **9 REST endpoints** across two controllers. `RequestValidator.validatePlatform` accepts **both PIN and CORE** — the data API surface serves both PIN- and CORE-platform consumers. Internal firm bypass (`iss` contains `us_worldpay_fis_int`) applies to both `/authorize` and `/entity-authorize`; partial-bypass on `POST /{platform}/merchant/entitytype` (V1 and V2). See §3.4 for full scope and known gaps (`validateOrgId` method body absent).
-
-**UserAccessManagementService (COMP-02 UAMS)** — 4-path summary in §3.4. Authorization fail-mode on nap-DB outage is platform-wide NAP halt: every NAP request returns 500 → API Gateway 403 fail-closed (RISK-098).
-
-⚠️ **UserQueueSkillService (COMP-30) — DEC-021 second offender.** Service-level `@Transactional` on `createQueue`/`updateQueue` binds to `@Primary usTransactionManager` because `jakarta.transaction.Transactional` default-bean-selection silently picks `@Primary`. UK writes to `nap.queues`, `nap.queue_criterion`, `nap.user_queue` are NOT covered by the outer TX. Same root cause class as COMP-02 — see WDP-DECISIONS.md DEC-021 + ADR-CAND-033 (multi-datasource binding contract).
+**CoreHierarchyAuthorizationService** enforces authorization based on the organisational hierarchy. It ensures users can only act on cases and data that belong to their own org hierarchy.
 
 ### 4.6 Platform Integration Services
 
@@ -462,16 +431,11 @@ For other acquiring platforms, enrichment works differently:
 - **LATAM and VAP** — CaseCreationConsumer calls those platform APIs directly
 - **NAP** — NAP-DPS pre-enriches dispute events before sending to WDP, so no additional enrichment call is needed
 
-
 ### 4.7 Supporting Services
 
-**EncryptionService (COMP-35)** is the sole component authorised to handle plaintext PAN data in WDP. It encrypts PANs at the point of ingestion and provides decryption only to authorised callers. No other service stores or processes raw cardholder data. Full details are covered in Section 10.1.
+**EncryptionService** is the sole component authorised to handle plaintext PAN data in WDP. It encrypts PANs at the point of ingestion and provides decryption only to authorised callers. No other service stores or processes raw cardholder data. Full details are covered in Section 10.1.
 
-⚠️ **DEK rotation interval is days,** configured via `${dek_rotation_interval_days}`. See WDP-DECISIONS.md DEC-008.
-
-⚠️ **EncryptionService is a single global dependency for all PAN ingestion (RISK-170).** COMP-07 / COMP-08 / COMP-09 / COMP-11 all call EncryptionService for PAN encrypt; COMP-43 for HPAN decrypt. Outage halts all four ingestion paths. HA posture is an open architectural question.
-
-**TokenService (COMP-36)** is the centralised JWT token management service. ⚠️ **Read-only on Redis** — performs HGET only; zero write operations exist anywhere in the wdp-idp-token-service repository. The `wdpinternalidptoken:token` Redis hash is populated by an UNKNOWN EXTERNAL COMPONENT not present in any audited WDP repo. External writer identity is an open question. Two-layer cache: AWS ElastiCache Redis (primary) + Spring in-memory OAuth2 store (secondary). Falls through to IDP `client_credentials` grant only on full cache miss.
+**TokenService** is the centralised JWT token management service. All WDP consumers and batch jobs call TokenService to obtain JWT tokens for making API calls. TokenService caches tokens in AWS ElastiCache and refreshes from IDP only when expired. This eliminates the need for every component to implement its own IDP integration.
 
 **APILogService** provides API-level audit logging across the platform. It captures all inbound API calls for audit, compliance, and operational troubleshooting purposes.
 
@@ -485,25 +449,7 @@ For other acquiring platforms, enrichment works differently:
 
 **IBM DB2** is the CORE platform enterprise database. WDP has one writer (COMP-43 CoreNotificationConsumer, sole writer to BC schema) and two read-only consumers (COMP-03 CHAS, COMP-34 MerchantTransactionService).
 
-
-⚠️ **Storage pattern note — non-standard datasource patterns.** Multiple components confirmed with non-standard datasource patterns within the Aurora model:
-- **COMP-37 DocumentManagementService** — only WDP component using AWS S3 and DynamoDB as primary data stores. Also has two PostgreSQL datasources (NAP and WDP) for desk-blanking column-level updates. The S3 + DynamoDB + dual-PostgreSQL pattern is unique to COMP-37.
-- **COMP-22 DisputeService** — HikariCP pools unconfigured on both datasources; Spring Boot defaults apply (`maximumPoolSize=10`).
-- **COMP-26 QuestionnaireService** — uses `DriverManagerDataSource` (no HikariCP, no application-tier pool). Every JPA call opens a new JDBC connection. Architect decision pending — ADR-CAND-042.
-- **COMP-32 RulesService** — uses `DataSourceBuilder.create().build()` with no explicit pool tuning on either of two PostgreSQL datasources.
-- **COMP-30 UserQueueSkillService** — dual-datasource design with `ukTransactionManager` (UK / nap) and `usTransactionManager` (US / wdp, `@Primary`). DEC-021 second offender — see §4.5.
-- **COMP-02 UAMS** — also writes to AWS S3 directly (separate from COMP-37 path) for bulk onboarding. Hardcoded `eu-west-2` region. See §11.1 / WDP-INTEGRATIONS.md §7.2.
-
-These patterns should not be replicated without explicit architectural review.
-
-⚠️ **Outbox writers — `wdp.outgoing_event_outbox` is a 5-channel shared outbox:**
-- EXPIRY_EVENTS (COMP-17, `WCSEEXPC`)
-- GP_EVENTS (COMP-41, `WNEC`)
-- BEN_EVENTS (COMP-42, `WBENC`)
-- CORE_EVENTS (COMP-43, `PCSECRTC`)
-- EXPIRY_BATCH (COMP-51, `WCSEEXPB`) — ⚠️ terminal-write-only with no consumer identified — see §10.2
-
-⚠️ **Case Expiry Subsystem coordination surface.** `wdp.case_expiry` is shared between COMP-17 (writer half — Kafka consumer maintaining the table) and COMP-51 (reader half — scheduled batch acting on past-due rows). Coordination is **operational-only — no row-level lock, no version column, no SELECT FOR UPDATE**. See WDP-DECISIONS.md ADR-CAND-027.
+⚠️ **Storage pattern note (added 2026-04-23):** COMP-37 DocumentManagementService is the **only WDP component** using AWS S3 and DynamoDB as primary data stores. It also has two PostgreSQL datasources (NAP and WDP) for desk-blanking column-level updates. The S3 + DynamoDB + dual-PostgreSQL pattern is unique to COMP-37 and should not be replicated without explicit architectural review.
 
 ---
 
@@ -611,27 +557,6 @@ From **WPG:**
 **NAPDisputeDeclineBatch** is a special case specific to NAP disputes. It polls the Visa API to fetch issuer-declined dispute events for NAP disputes and surfaces them to merchants through WDP Core.
 
 ⚠️ **PLANNED WORK** — The NAP inbound path will be migrated to the common inbound processing path. NAPDisputeEventProcessor will be updated to write to `chbk_outbox_row`, allowing CaseCreationConsumer to handle NAP case creation uniformly alongside all other acquiring platforms.
-
-⚠️ **COMP-04 enrichment chain — alternative, not sequential.** The chain is:
-- CaseManagement is tried first
-- FraudSwitch only runs when CaseManagement returns null
-- DisplayCodeService only runs on the GUARPAY1 / GUARPAY4 + fraudIndemnified branch
-
-Bypass condition (`enrichment_failure=true OR function_code=603`) is honoured **only on POST `/event`**. Case-update and outcome paths do not pass through `EventBusinessValidator.validateRequest`. The `enrichmentFailure` field on the outbound `NapEvent` is a **pass-through copy** of the inbound flag — COMP-04 never sets it itself.
-
-⚠️ **NAP path has TWO REST surfaces for manual operator reprocessing:**
-- **COMP-05 NAPDisputeEventProcessor** — JWT-authenticated `POST /event` for inbound NAP error reprocessing (Ops mode access path).
-- **COMP-39 NAPOutcomeProcessor** — JWT-authenticated `POST /event` for outbound NAP error reprocessing.
-
-Both endpoints drive the same business pipeline as the Kafka path with **no per-record locking**. A manual reprocess POST and a Kafka prior-error scan can race on the same record. See ADR-CAND-037.
-
-🔴 **MATERIAL DEFICIENCY — CVV-at-rest in NAP path.** PCI-DSS 3.2.1 deficiency:
-- **COMP-04** logs CVV via Lombok-generated `NapEvent.toString()` at INFO before Kafka publish.
-- **COMP-05** persists CVV at rest in `NAP.DISPUTE_EVENT_CONSUMER_ERROR.C_CVV` and inside `C_KAFKA_EVENT` raw JSON.
-
-Together these constitute a CVV-on-disk path. Architect decision required (remediate or document approved exception). See WDP-NFRS.md RISK-084 / WDP-DECISIONS.md ADR-CAND-023 / WDP-INTEGRATIONS.md §2.4.
-
-🔴 **Cross-component shared error-table consumption hazard.** `NAP.DISPUTE_EVENT_CONSUMER_ERROR` has **four writers**: COMP-05 (primary), COMP-23 (NAP create path blind-merge), COMP-24 (NAP conditional outbox), COMP-39 (outbound NAP write). Discriminator: `C_ACQ_PLATFORM` + `C_EVENT_TYPE`. Both COMP-05 and COMP-39 prior-error scans query without `C_EVENT_TYPE` filter — rows written by either consumer (plus COMP-23 / COMP-24) may be reprocessed through the wrong outbound pipeline. See RISK-085 / ADR-CAND-024.
 
 ### 5.2 Card Network Batch Path
 
@@ -860,7 +785,6 @@ Confirm whether file-only networks (Discover, Amex, PIN Networks etc.) send issu
 ⚠️ **FOLLOW-UP REQUIRED — Visa & MasterCard issuer document retrieval:**
 WDP makes direct API calls to Visa and MasterCard to retrieve issuer documents. Confirm at which processing stage this occurs (CaseCreationConsumer or BusinessRulesProcessor) and which component makes the API call.
 
-
 ---
 
 ## 6. Kafka Event Bus
@@ -976,7 +900,7 @@ Carries dispute events that require business rule evaluation and enrichment. Con
 
 | Attribute | Value |
 |---|---|
-| Publishers | COMP-12 Scheduler4, COMP-15, COMP-23, COMP-24, COMP-25, COMP-37 (six confirmed) |
+| Publisher | ⚠️ To be confirmed at component-level |
 | Consumer | BusinessRulesProcessor |
 | Partition key | merchant_id |
 | Purpose | Async business rule execution on dispute events |
@@ -988,7 +912,7 @@ Carries case expiry events. Consumed by CaseExpiryUpdateConsumer which updates c
 |---|---|
 | Publisher | NotificationOrchestrator |
 | Consumer | CaseExpiryUpdateConsumer |
-| Partition key | Pass-through `RECEIVED_KEY` from upstream COMP-18 (consumer-side variable name `caseNumber`). See WDP-DECISIONS.md DEC-003 deviation map. |
+| Partition key | ⚠️ To be confirmed at component-level |
 | Purpose | Case expiry lifecycle management |
 
 #### Outbound Topics
@@ -1066,14 +990,7 @@ Will carry dispute outcome events in EDIA enterprise format for consumption by N
 | `external-request-events` | edia-consumer-group | EDIA Consumer 🔴 Planned |
 | `core-request-events` | core-notification-consumer-group | CoreNotificationConsumer |
 
-
-⚠️ **`wdp.outgoing_event_outbox` 5-channel shared outbox** — see §4.8. Channels: EXPIRY_EVENTS (COMP-17), GP_EVENTS (COMP-41), BEN_EVENTS (COMP-42), CORE_EVENTS (COMP-43), EXPIRY_BATCH (COMP-51, terminal-write-only). See WDP-DECISIONS.md DEC-002 refinement.
-
-⚠️ **COMP-04 partition-key per-endpoint variation:** `merchantId` on case-update and outcome paths; `cardAcceptorCodeId` on POST `/event` (new-dispute path) only. See WDP-DECISIONS.md DEC-003 deviation map.
-
-⚠️ **CommonErrorHandler list — 11 components.** Empty anonymous `CommonErrorHandler{}` registered platform-wide on multiple consumers. Combined with `ErrorHandlingDeserializer` and pre-ACK, deserialisation exceptions are silently swallowed. Confirmed on: COMP-05, 14, 15, 16, 17, 18, 39, 40, 41, 42, 43. See WDP-NFRS.md RISK-025 and WDP-DECISIONS.md ADR-CAND-003.
-
-⚠️ **COMP-22 DisputeService is NOT a Kafka producer at runtime.** Wired but commented out (commit `c29018cd`, 2025-08-08). No in-source rationale.
+⚠️ Consumer group names are provisional and may require minor corrections at component-level documentation.
 
 ---
 
@@ -1142,17 +1059,6 @@ BusinessRulesProcessor consumes from the `business-rules` topic and applies conf
 
 CaseExpiryUpdateConsumer consumes from the `case-action-events (expiry)` topic and updates case expiry status in WDP Core. Updates case expiry status only — no further downstream processing is triggered.
 
-
-⚠️ **Case Expiry Subsystem.** This is a logical sub-grouping rather than a new layer in the topology:
-
-**Writer half — COMP-17 CaseExpiryUpdateConsumer.** Kafka consumer on `case-action-events`; consumes deadline-update events from COMP-18 NotificationOrchestrator (Filter 1 EXPIRY_EVENT routing) and maintains `wdp.case_expiry` (upsert on event arrival; closure-delete on cancellation).
-
-**Reader half — COMP-51 CaseExpiryProcessor.** Standalone Spring Batch Deployment in `gcp-case-expiry-processor-batch`. Trigger is a Spring `@Scheduled` cron (NOT a Kubernetes CronJob). Scans `wdp.case_expiry` for past-due rows; calls 7 distinct upstream services (IDP, Case Action, Case Management, Expiry Rules, Update Action, Accept, Add Action). Hand-rolled retry mechanism via `wdp.case_expiry.i_retry_count` (max 3); after exhaustion, writes a row to `wdp.outgoing_event_outbox` with `channel_type=EXPIRY_BATCH`, `created_by=WCSEEXPB`, `status=ERROR` direct.
-
-⚠️ **Two architectural risks in the subsystem:**
-- **Shared-write race on `wdp.case_expiry`** — COMP-17 and COMP-51 share the table with no row-level lock, no version column, no SELECT FOR UPDATE. See ADR-CAND-027.
-- **EXPIRY_BATCH outbox is terminal-write-only** — COMP-12 Scheduler3 reads only FAILED and PENDING_DEFERRED, so COMP-51's `status=ERROR` rows have **no platform consumer**. See ADR-CAND-026.
-
 ### 7.3 Outbound Integration Consumers
 
 #### NotificationOrchestrator
@@ -1189,13 +1095,6 @@ VisaResponseQuestionnaire consumes from `internal-integration-events` and retrie
 - Calls Visa API to retrieve the questionnaire
 - Calls DocumentManagementService to store questionnaire document in S3 and metadata in DynamoDB
 
-
-⚠️ **Manual reprocess REST endpoint surface.** COMP-39 hosts JWT-authenticated `POST /event` for manual NAP outbound error reprocessing (Ops mode access path). The manual reprocessing surface is hosted by **COMP-39, not COMP-05**. See §5.1 for the COMP-05 inbound reprocess sibling.
-
-⚠️ **NAP-DPS authentication gap (RISK-179).** COMP-39 sets no Authorization header on outbound NAP-DPS calls; no client certificate is loaded. `napcacrt.jks` is an unreferenced orphan in the COMP-39 repo. Authentication is handled outside the component at Ingress / service mesh / network layer — pending team confirmation.
-
-⚠️ **COMP-39 sole `@KafkaListener` on `internal-integration-events`.** Therefore COMP-39 is **NOT** the consumer of COMP-24's `${kafka.topic}` ActionEvent topic; that consumer remains unidentified.
-
 ### 7.4 Notification Consumers
 
 #### ThirdPartyNotificationConsumer
@@ -1207,13 +1106,13 @@ Consumes from `external-request-events` and delivers dispute events to third-par
 | SignifyD | REST API | ✅ Production | Calls ChargebackService for dispute details and actions |
 | JustAI (outbound) | REST API | 🔴 Planned — not in COMP-41 codebase | Will call ChargebackService for dispute details (when implemented) |
 
-⚠️ **JustAI scope.** JustAI is **planned only for outbound notification in COMP-41** — no JustAI reference exists in the COMP-41 codebase. Spring Retry imports are present but dead. JustAI **is active for inbound partner identification in COMP-21** ChargebackService — partners are identified at auth time via the JWT `entitlement_params` consumer name (`SIGNIFYD`, `JUSTTAI`).
+⚠️ **JustAI scope clarification (2026-04-25):** JustAI is **planned only for outbound notification in COMP-41** — no JustAI reference exists in the COMP-41 codebase. Spring Retry imports are present but dead. JustAI **is active for inbound partner identification in COMP-21** ChargebackService — partners are identified at auth time via the JWT `entitlement_params` consumer name (`SIGNIFYD`, `JUSTTAI`). The v1.0 statement that "JustAI is planned" was over-broad.
 
 #### BEN Consumer
 
 Consumes from `external-request-events` and **publishes dispute lifecycle notifications to a BEN-owned AWS MSK Kafka cluster** (separate from WDP's MSK, with its own SASL/JAAS credentials). Merchants enrolled in BEN receive notifications via BEN and call back ChargebackService (COMP-21) to get dispute case details and act on disputes.
 
-⚠️ **BEN delivery mechanism.** BEN notification is delivered via Kafka publish to a BEN-owned MSK cluster — not REST or webhook. WDP has no visibility into BEN cluster health.
+⚠️ **(2026-04-25) Delivery mechanism corrected:** v1.0 described BEN delivery as "via webhook." The actual delivery is **Kafka publish to a BEN-owned MSK cluster** — there is no REST or webhook call to BEN. WDP has no visibility into BEN cluster health.
 
 #### EDIA Consumer 🔴 Planned
 
@@ -1231,13 +1130,6 @@ Acquiring platforms that will consume via EDIA:
 Consumes from `core-request-events (DB2)` and delivers dispute outcome notifications to the CORE acquiring platform via DB2. CORE is a WDP-owned acquiring platform with a direct connection, currently bypassing EDIA.
 
 ⚠️ **Future consideration** — CORE's direct DB2 connection may be migrated to the EDIA route as EDIA adoption matures.
-
-
-⚠️ **BEN Consumer (COMP-42) refinements:**
-- Confirmed **fourth writer of `wdp.outgoing_event_outbox`** (`channel_type=BEN_EVENTS`, `created_by=WBENC`).
-- BEN Product REST API is a companion contract alongside the BEN MSK Kafka publish — `Bearer ${ben_product_license}` static license-key auth, Spring Retry 3 × 1000ms, no timeout. See WDP-INTEGRATIONS.md §4.3.
-- Outbound BEN partition key is `merchantId` from `CaseSearchResponse` — DEC-003 compliant.
-- PUBLISHED-orphan crash window Step 4 → Step 13 — same class as RISK-040 (COMP-41 Signifyd). See RISK-192.
 
 ---
 
@@ -1292,7 +1184,7 @@ graph LR
 - NAP dispute contest events across all networks — consumed by NAP Outcome Processor to notify NAP-DPS
 - Visa dispute contest events across all acquiring platforms — consumed by VisaResponseQuestionnaire
 
-⚠️ **AMEX / DISCOVER and MC CHI silent no-op note:**
+⚠️ **(2026-04-23) AMEX / DISCOVER and MC CHI silent no-op note:**
 
 The Section 8.1 diagram shows AMEX and DISCOVER as Visa/MC siblings, but in practice **AcceptService has no implementation path for either network** — both fall through to `log.warn` with no card-network call. Similarly, **MC CHI on both NAP and PIN platforms** is a silent no-op in `MasterCardServiceImpl.accept` (only PAB and ARB invoke an MCM call).
 
@@ -1487,9 +1379,6 @@ graph LR
 |---|---|---|---|
 | DiscoverHybrid | Network response file | NetworkResponseFileProcessor | On-premise File Transfer Batch pulls via SFTP from S3 `/outbound/discoverHybrid/` → deposits to NAS on RMO servers |
 
-
-⚠️ **COMP-22 SFG SFTP NAP fallback path.** Distinct from the file-generation outbound path described in §8.5 — used by COMP-22 DisputeService for NAP-platform document delivery when the primary REST upload to DocumentManagementService fails. Fully `@Async` end-to-end; HTTP 200 returned to caller before SFTP write completes. Filename collision risk. See WDP-INTEGRATIONS.md §6.5 / WDP-NFRS.md RISK-133, RISK-134.
-
 ---
 
 ## 9. Acquiring Platform Integration
@@ -1585,7 +1474,7 @@ NAP is the acquiring platform with the most complex integration pattern. It curr
 - Outbound: NAP Outcome Processor to migrate from direct API to EDIA route
 - Goal: NAP processing fully uniform with all other acquiring platforms
 
-⚠️ **PIN/CORE migration filter is operational:** COMP-43 CoreNotificationConsumer is the live consumer of `core-request-events` and uses `migrationStatus = Y` to gate which events it processes — `platform = CORE` events are unconditionally processed; `platform = PIN` events are processed only when `migrationStatus = Y`. Other platforms (NAP, VAP, LATAM) are silently discarded at this consumer. This filter is operational, not aspirational.
+⚠️ **(2026-04-25) PIN/CORE migration filter is operational:** COMP-43 CoreNotificationConsumer is the live consumer of `core-request-events` and uses `migrationStatus = Y` to gate which events it processes — `platform = CORE` events are unconditionally processed; `platform = PIN` events are processed only when `migrationStatus = Y`. Other platforms (NAP, VAP, LATAM) are silently discarded at this consumer. This filter is operational, not aspirational.
 
 ### 9.4 LATAM Platform 🔴 In Progress
 
@@ -1635,7 +1524,6 @@ NotificationOrchestrator → external-request-events → EDIA Consumer (WDP owne
 | VAP | WDP calls VAP platform API directly | CaseCreationConsumer → VAP API |
 | NAP | Pre-enriched by NAP-DPS before sending to WDP | No enrichment call needed |
 
-
 ---
 
 ## 10. Cross-Cutting Concerns
@@ -1657,7 +1545,7 @@ graph LR
         HMAC[HMAC-SHA256\nHPAN generation\ndeterministic non-reversible]
         AES[AES-256-GCM\nEPAN generation\nreversible]
         MAP[(EPAN to HPAN\nmapping table)]
-        DEK[DEK cache\nrotation interval days]
+        DEK[DEK cache\n6 hour window]
     end
 
     subgraph KMS["AWS KMS"]
@@ -1725,32 +1613,18 @@ WDP uses two tokens generated from every PAN, each serving a different purpose:
 | Key | Type | Storage | Rotation |
 |---|---|---|---|
 | Customer Master Key (CMK) | AWS KMS | FIPS 140-2 Level 3 HSM | Every 30 days |
-| Data Encryption Key (DEK) | In-memory | EncryptionService cache | Days (configured via `${dek_rotation_interval_days}`) |
+| Data Encryption Key (DEK) | In-memory | EncryptionService cache | Every 6 hours |
 | HMAC Key | Secret | AWS Secrets Manager | TBD |
 
-**DEK caching:** EncryptionService caches the DEK in memory; rotation interval is configured via `${dek_rotation_interval_days}` (days, not hours). If AWS KMS is unavailable, EncryptionService can continue operating using the cached DEK for the configured interval before forced failure.
+**DEK caching:** EncryptionService caches the DEK in memory for 6 hours. If AWS KMS is unavailable, EncryptionService can continue operating for up to 6 hours using the cached DEK before forced failure.
 
 ⚠️ Full EncryptionService details deferred to component-level documentation.
 
-⚠️ **Decrypt `@Transactional` brackets KMS network call.** COMP-35 holds a Hikari connection during the KMS round-trip on every decrypt request. Pool-exhaustion risk under sustained decrypt load + KMS slowdown. See RISK-172 / ADR-CAND-035.
-
-⚠️ **Multi-pod DEK rotation race.** No distributed lock; concurrent COMP-35 pods may attempt rotation simultaneously. Source code carries an explicit comment acknowledging this. See RISK-173 / ADR-CAND-036.
-
-🔴 **MATERIAL DEFICIENCY — CVV-at-rest in COMP-04 + COMP-05.** PCI-DSS 3.2.1 Requirement 3.2 prohibits CVV storage after authorisation **regardless of encryption status**. Two confirmed paths:
-- **COMP-04** logs CVV via Lombok `NapEvent.toString()` at INFO before Kafka publish.
-- **COMP-05** persists CVV at rest in `NAP.DISPUTE_EVENT_CONSUMER_ERROR` (`C_CVV` column AND `C_KAFKA_EVENT` JSON).
-
-Together these constitute a CVV-on-disk path. **Encryption does not make CVV-at-rest compliant.** Architect decision required. See RISK-084 / ADR-CAND-023 / DEC-019 (third confirmed exception class — alongside DEC-019 (1) PostgreSQL clear PAN COMP-23 and DEC-019 (2) DB2 clear PAN COMP-43).
-
-⚠️ **COMP-04 base64 file content in logs.** `UploadDocumentRequest.toString()` (Lombok) surfaces full base64 file content at controller entry. Same family as the CVV finding but distinct subject. See RISK-116 / ADR-CAND-032.
-
-⚠️ **COMP-04 unauthenticated SecurityConfig — `/**` whitelist.** All endpoints unauthenticated at app level; auth relies entirely on Ingress / network controls. See §3.4.
-
 ### 10.2 Resilience Patterns
 
-⚠️ **NOTE:** WDP does not implement circuit breakers or fallback mechanisms. DEC-014 (Resilience4j) is formally ⛔ VOID — confirmed absent across all 38 source-verified components. See WDP-DECISIONS.md DEC-014.
+⚠️ **NOTE:** WDP does not implement circuit breakers or fallback mechanisms. DEC-014 (Resilience4j) is formally ⛔ VOID — confirmed absent across all 40 component files. See WDP-DECISIONS.md v2.1.
 
-⚠️ **Strengthened evidence:** COMP-21 ChargebackService alone has **38 unprotected outbound call sites** across 12 target applications, all on a single shared `RestTemplate` with no pool, no connect timeout, no read timeout, no retry, no circuit breaker. Strongest single-component evidence for the platform-wide DEC-014 void.
+⚠️ **(2026-04-25) Strengthened evidence:** COMP-21 ChargebackService alone has **38 unprotected outbound call sites** across 12 target applications, all on a single shared `RestTemplate` with no pool, no connect timeout, no read timeout, no retry, no circuit breaker. Strongest single-component evidence for the platform-wide DEC-014 void.
 
 If circuit breakers are introduced in a future hardening sprint, a new ADR must be raised.
 
@@ -1762,29 +1636,21 @@ Resilience in WDP is currently built around three patterns:
 - Per-consumer outbox tables track processing state and idempotency keys
 - Deduplication keys at every processing boundary
 
+⚠️ **(2026-04-25) Distinct silent-loss class:** Empty anonymous `CommonErrorHandler{}` is registered platform-wide on multiple consumers (COMP-14, 15, 16, 17, 18, 39, 41, 42, 43). Combined with `ErrorHandlingDeserializer` and pre-ACK, deserialisation exceptions and unhandled application exceptions are silently swallowed — a *distinct* silent-loss class from the pre-ACK offset window. See WDP-NFRS.md RISK-025.
+
 **Retry & Backoff:**
 - Spring Retry (`@Retryable`) is the sole active retry mechanism, present in a subset of components only — typically 3 attempts with fixed delay. Components without `@Retryable` make a single attempt; failure propagates immediately.
 - Permanent failures (400, 404, auth failures) are recorded as errors and not retried.
 
-⚠️ **Dead retry imports:** COMP-41 imports `@Retryable`/`@Backoff` but never applies them at runtime. Class names containing "Retry" describe custom try/catch, not the framework.
+⚠️ **(2026-04-25) Dead retry imports:** COMP-41 imports `@Retryable`/`@Backoff` but never applies them at runtime. Class names containing "Retry" describe custom try/catch, not the framework.
 
 **Error Tracking via Outbox / Error Tables:**
 - Each consumer maintains its own outbox or error table (DEC-016)
 - All error states are recoverable and auditable in nominal cases
 
-⚠️ **Orphan-path gaps:** PUBLISHED-status orphan rows on `wdp.outgoing_event_outbox` and `wdp.bre_orchestration_outbox` have no automatic re-drive mechanism — Scheduler3/4 read only FAILED/PENDING_DEFERRED rows. COMP-41 has three distinct PUBLISHED-orphan paths (RISK-040 extends RISK-015); COMP-43 has a silent-loss window between ACK and FAILED-write (RISK-036). Manual operator runbook required pending OQ-COMP41-1.
+⚠️ **(2026-04-25) Orphan-path gaps:** PUBLISHED-status orphan rows on `wdp.outgoing_event_outbox` and `wdp.bre_orchestration_outbox` have no automatic re-drive mechanism — Scheduler3/4 read only FAILED/PENDING_DEFERRED rows. COMP-41 has three distinct PUBLISHED-orphan paths (RISK-040 extends RISK-015); COMP-43 has a silent-loss window between ACK and FAILED-write (RISK-036). Manual operator runbook required pending OQ-COMP41-1.
 
 ⚠️ Per-consumer outbox table details deferred to component-level documentation.
-
-⚠️ **Strengthened evidence base.** DEC-014 VOID is confirmed across all 38 source-verified components. Components confirmed: COMP-01 (blocking RestTemplate on Netty event-loop), COMP-02 (bare RestTemplate for IdP and S3), COMP-03 (no JDBC query timeout on either datasource), COMP-04 (3 RestTemplate instances all default-constructor; one shadowed locally), COMP-05, COMP-06, COMP-22 (HikariCP and Tomcat at defaults), COMP-25 (no RestTemplate bean — `new RestTemplate()` per call), COMP-26, COMP-30, COMP-32, COMP-35 (KMS round-trip in `@Transactional`), COMP-39, COMP-42, COMP-51. See WDP-DECISIONS.md DEC-014 evidence list.
-
-⚠️ **Empty `CommonErrorHandler{}` — 11 components.** Confirmed on: COMP-05, 14, 15, 16, 17, 18, 39, 40, 41, 42, 43. Distinct silent-loss class from pre-ACK offset window. See RISK-025 / ADR-CAND-003.
-
-⚠️ **`minReadySeconds` platform-wide misplacement (RISK-083 / ADR-CAND-030).** Ten components confirmed to place `minReadySeconds: 30` under `spec.template.spec` instead of `spec` — silently ignored by Kubernetes. Affected: COMP-03, 05, 08, 09, 12, 25, 26, 28, 34, 40. The intended rolling-update stability gate is not actually applied. Pattern is a copy-paste-class defect — likely replicated across other WDP manifests not yet audited. DevOps remediation pass + manifest-lint rule recommended.
-
-⚠️ **Hand-rolled retry counter persistence pattern.** Multiple components use hand-rolled retry counters persisted to source tables instead of Spring Retry framework. COMP-51 increments `wdp.case_expiry.i_retry_count` (max 3); COMP-07/08/09 use similar patterns on `chbk_outbox_row.retry_count`. Spring Retry on classpath but unused in COMP-51. See ADR-CAND-055.
-
-⚠️ **EXPIRY_BATCH outbox terminal-write-only (RISK-090).** COMP-51 writes `status=ERROR` rows to `wdp.outgoing_event_outbox` with `channel_type=EXPIRY_BATCH`. COMP-12 Scheduler3 reads only FAILED and PENDING_DEFERRED — these rows have no platform consumer. Architect decision required (define consumer or accept as audit-only). See ADR-CAND-026.
 
 ### 10.3 Observability
 
@@ -1792,23 +1658,13 @@ Resilience in WDP is currently built around three patterns:
 
 Prometheus scrapes all services. Grafana provides operational dashboards. CloudWatch monitors AWS-managed resources. Distributed traces are propagated via a correlation ID header across all synchronous call chains.
 
-⚠️ **`v-correlation-id` propagation gaps confirmed across multiple components:**
-- **COMP-01** — always null; `RequestCorrelation.setId()` never called; `ThreadLocal` incompatible with reactive WebFlux threading model.
-- **COMP-17** — not propagated on IDP token call (only on case-search call).
-- **COMP-22** — not propagated on any outbound REST call. Interceptor places it in MDC for local logs only.
-- **COMP-51** — generates a fresh random UUID per outbound REST call (anti-pattern). End-to-end audit trail across the 4–5 calls per record cannot be reconstructed from headers alone.
-
-End-to-end distributed tracing is broken at multiple service boundaries. Platform-wide remediation candidate — see RISK-089 / ADR-CAND-044, ADR-CAND-054.
-
-⚠️ **Kafka-path MDC enrichment gap.** Multiple Kafka consumers have no MDC enrichment (COMP-17, 18, 40, 43, 51). HTTP path uses `HttpInterceptor`; Kafka path has no equivalent. Per-message log correlation depends entirely on OTel agent context. See ADR-CAND-057.
-
-⚠️ **`/actuator/prometheus` JWT-protection widespread.** Confirmed on COMP-21, COMP-25, COMP-29, COMP-35. Scrape-side configuration must carry JWT or platform-wide whitelisting needed. See RISK-140 (COMP-25-specific).
-
 ### 10.4 PCI-DSS & Compliance
+
+⚠️ **NOTE:** Compliance framework details to be verified and updated. Current documentation is provisional.
 
 | Framework | Scope | Status |
 |---|---|---|
-| PCI-DSS 3.2.1 | Full platform — all cardholder data flows | ✅ Active — ⚠️ **MATERIAL DEFICIENCY:** see RISK-084 (CVV at rest in COMP-05 + CVV in logs in COMP-04). Architect decision pending — see DEC-019 (third confirmed exception) and ADR-CAND-023. |
+| PCI-DSS 3.2.1 | Full platform — all cardholder data flows | ✅ Active |
 | SOC 2 Type II | Security, availability, processing integrity | ✅ Active |
 | GDPR | Data subject rights, data privacy, right to erasure | ✅ Active |
 | CCPA | California resident data rights | ✅ Active |
@@ -1858,20 +1714,13 @@ Object storage used for multiple purposes across the platform:
 Receives S3 event notifications when files land in the S3 `/inbound` bucket. Triggers FileProcessor to begin processing each arriving file.
 
 **AWS KMS (Key Management Service)**
-Manages the Customer Master Key (CMK) used to encrypt Data Encryption Keys (DEKs) that protect PAN data. Uses FIPS 140-2 Level 3 validated hardware security modules. DEK rotation interval is **days** via `${dek_rotation_interval_days}`. EncryptionService (COMP-35) is the sole KMS caller — see WDP-INTEGRATIONS.md §6.2.
+Manages the Customer Master Key (CMK) used to encrypt Data Encryption Keys (DEKs) that protect PAN data. Uses FIPS 140-2 Level 3 validated hardware security modules.
 
 **AWS ElastiCache**
-ElastiCache Redis hosts the `wdpinternalidptoken:token` JWT token cache. **TokenService (COMP-36) is read-only on Redis** — performs HGET only; zero write operations exist anywhere in COMP-36 source. The Redis hash is populated by an UNKNOWN EXTERNAL COMPONENT not present in any audited WDP repo. External writer identity is an open question (RISK-class informational). Two-layer cache pattern: ElastiCache Redis (primary) + in-memory OAuth2 store (secondary).
+Used by TokenService for JWT token caching. Stores JWT tokens obtained from IDP and serves them to consumers and batch jobs without requiring a new IDP call for every request.
 
 **AWS Secrets Manager**
-Stores the HMAC key used for HPAN generation. Sole caller COMP-35, startup-only. See WDP-INTEGRATIONS.md §6.9.
-
-⚠️ **AWS S3 region inconsistency.** Three different region values confirmed across S3-using components:
-- COMP-37 (DocumentManagementService) — region unspecified in source (assumes `us-east-1`)
-- COMP-11 (FileProcessor) — `S3ClientConfiguration` hardcodes `us-east-2`
-- COMP-02 (UAMS) — bulk onboarding `${wdp_entity_file}` bucket hardcodes `eu-west-2`
-
-Platform-primary region per §11 / WDP-NFRS Section 5.6 is `us-east-1`. Architect decision pending on whether the `eu-west-2` and `us-east-2` instances are intentional regional choices or copy-paste drift.
+Stores the HMAC key used for HPAN generation.
 
 ⚠️ Detailed infrastructure configuration — instance sizes, broker counts, replica counts, storage provisioning, retention settings — to be documented in dedicated infrastructure documentation.
 
@@ -1961,14 +1810,13 @@ graph LR
     FTB --> NAS
 ```
 
-
 ---
 
 ## 12. Component Status Registry
 
 This section provides a single reference table covering all WDP components with their current production status. Use this as the definitive source for understanding what is live, what is planned, and what is in progress.
 
-⚠️ **Source-verification status:** **38 of 51 components** have undergone source-verified correction passes. Detailed component-by-component status is maintained in **WDP-COMP-INDEX.md** (51 components total; 4 audit-pending — COMP-29, 31, 34, 38). The tables below show production-deployment status only.
+⚠️ **(2026-04-25) Source-verification status:** 20 of the 40 DRAFT component files have undergone source-verified correction passes between 2026-04-18 and 2026-04-25. Detailed component-by-component status (vX.Y DRAFT — source-verified [date], architect confirmation pending) is maintained in **WDP-COMP-INDEX.md** (pending v2.1 reconciliation). The tables below show production-deployment status only — they are unchanged at the topology level by the v2.1 reconciliation.
 
 **Status legend:**
 - ✅ Production — component is live and in production
@@ -1982,18 +1830,18 @@ This section provides a single reference table covering all WDP components with 
 
 | Component | Status | Notes |
 |---|---|---|
-| WDP Portal (Merchant + Ops modes) | ✅ Production | Single Angular SPA, two runtime modes — see §3.1 |
-| WDP Portal — Ops mode (stub) | ✅ Production | Documented inside COMP-49 |
-| Disputes Section | ✅ Production | Both modes |
-| Queues Section | ✅ Production | Ops mode only |
-| User Management Section | ✅ Production | Both modes |
-| Org Management Section | ✅ Production | Both modes |
+| WDP Merchant Portal | ✅ Production | |
+| WDP Ops Portal | ✅ Production | |
+| Disputes Section | ✅ Production | Both portals |
+| Queues Section | ✅ Production | Ops Portal only |
+| User Management Section | ✅ Production | Both portals |
+| Org Management Section | ✅ Production | Both portals |
 | Dashboard Section | 🔴 Planned | Dispute analytics for merchants — not yet developed |
-| Akamai | ✅ Production | CDN & edge security — Merchant mode and B2B path |
+| Akamai | ✅ Production | CDN & edge security — Merchant Portal and B2B path |
 | APIGEE | ✅ Production | B2B / system-to-system path only |
-| API Gateway | ✅ Production | Single entry point — ⚠️ **CORE/VAP/LATAM gateway-level authorization absent (RISK-class)**; ⚠️ blocking RestTemplate on Netty event-loop (RISK-093) |
+| API Gateway | ✅ Production | Single entry point for all traffic |
 | IDP | ✅ Production | Shared enterprise OAuth 2.0 |
-| UserAccessManagementService | ✅ Production | ⚠️ **DEC-021 wrong-TM scope expanded to 7 methods (RISK-010 🔴)**; 4-path summary in §3.4 / §4.5 |
+| UserAccessManagementService | ✅ Production | ⚠️ Detailed behaviour to be confirmed |
 
 ---
 
@@ -2001,26 +1849,26 @@ This section provides a single reference table covering all WDP components with 
 
 | Component | Status | Notes |
 |---|---|---|
-| AcceptService | ✅ Production | ⚠️ NAP split-brain on MC CHI / AMEX / DISCOVER (RISK-028 / ADR-CAND-001) |
+| AcceptService | ✅ Production | |
 | ContestService | ✅ Production | |
-| ChargebackService | ✅ Production | Externally exposed via APIGEE; 38 unprotected outbound call sites |
-| **DisputeService** | ✅ Production | ⚠️ **Confirmed source-verified zero writes** — Kafka producer wired but commented out (commit `c29018cd`) |
+| ChargebackService | ✅ Production | Externally exposed via APIGEE |
+| DisputeService | ✅ Production | |
 | CaseManagementService | ✅ Production | |
 | CaseActionService | ✅ Production | |
-| NotesService | ✅ Production | ⚠️ **Mid-batch Kafka orphan deterministic split-brain (RISK-139)** |
-| **QuestionnaireService** | ✅ Production | ⚠️ **No `@Transactional` posture; `DriverManagerDataSource`; ADR-CAND-042 / 043** |
-| DocumentManagementService | ✅ Production | 6th publisher of `business-rules` |
+| NotesService | ✅ Production | |
+| QuestionnaireService | ✅ Production | |
+| DocumentManagementService | ✅ Production | |
 | CaseSearchService | ✅ Production | |
-| **DisplayCodeService** | ✅ Production | ⚠️ Permission-shape divergence between `/search` (11 flags) and `/privileges` (17 flags) — RISK-149 |
-| FaxQueueService | ✅ Production | Ops mode only — fax detail section pending |
-| **UserQueueSkillService** | ✅ Production | ⚠️ **DEC-021 second offender (RISK-class HIGH)** |
+| DisplayCodeService | ✅ Production | |
+| FaxQueueService | ✅ Production | Ops Portal only — fax detail section pending |
+| UserQueueSkillService | ✅ Production | |
 | BusinessRulesService | ✅ Production | Rule management only — does not execute rules |
-| **RulesService** | ✅ Production | ⚠️ **Pure read-only confirmed; `migrationStatus="N"` undocumented prod kill-switch (RISK-164 / ADR-CAND-049)** |
-| OrgManagementService | ✅ Production | GitHub repo not found |
-| CoreHierarchyAuthorizationService | ✅ Production | ⚠️ **9 endpoints; PIN+CORE scope; `validateOrgId` method body absent** |
+| RulesService | ✅ Production | |
+| OrgManagementService | ✅ Production | |
+| CoreHierarchyAuthorizationService | ✅ Production | |
 | MerchantTransactionService | ✅ Production | CORE enrichment only |
-| **EncryptionService** | ✅ Production | ⚠️ **DEK rotation interval days**; single global dependency for all PAN ingestion (RISK-170); KMS-in-`@Transactional` (RISK-172) |
-| **TokenService** | ✅ Production | ⚠️ **Read-only on Redis** (zero write ops); external writer of `wdpinternalidptoken:token` unknown |
+| EncryptionService | ✅ Production | Sole PAN handler |
+| TokenService | ✅ Production | JWT management via ElastiCache |
 | APILogService | ✅ Production | |
 
 ---
@@ -2034,11 +1882,10 @@ This section provides a single reference table covering all WDP components with 
 | S3 /inbound | ✅ Production | Source-specific folders per inbound source |
 | S3 /staging | ✅ Production | Evidence and issuer documents |
 | S3 /outbound | ✅ Production | Target-specific folders per outbound target |
-| S3 Documents | ✅ Production | Evidence documents (via COMP-37) |
-| **S3 UAMS bulk onboarding (`eu-west-2`)** | ✅ Production | ⚠️ Distinct from S3 Documents path; COMP-02 direct caller; no downstream parser identified |
-| **AWS ElastiCache** | ✅ Production | ⚠️ **TokenService is read-only on Redis** |
-| **AWS KMS** | ✅ Production | CMK for PAN encryption — ⚠️ DEK rotation interval days |
-| **AWS Secrets Manager** | ✅ Production | ⚠️ Sole caller COMP-35, startup-only |
+| S3 Documents | ✅ Production | Evidence documents |
+| AWS ElastiCache | ✅ Production | JWT token cache for TokenService |
+| AWS KMS | ✅ Production | CMK for PAN encryption |
+| AWS Secrets Manager | ✅ Production | HMAC key storage |
 
 ---
 
@@ -2046,14 +1893,14 @@ This section provides a single reference table covering all WDP components with 
 
 | Component | Status | Notes |
 |---|---|---|
-| NAPDisputeEventService | ✅ Production | ⚠️ Migration planned to common path; ⚠️ **`/**` whitelist unauthenticated; CVV in logs (RISK-115, RISK-114)** |
-| NAPDisputeEventProcessor | ✅ Production | ⚠️ Migration planned; ⚠️ **CVV at rest (RISK-084)**; manual reprocess REST surface confirmed |
-| NAPDisputeDeclineBatch | ✅ Production | Decommission-scoped |
+| NAPDisputeEventService | ✅ Production | ⚠️ Migration planned to common path |
+| NAPDisputeEventProcessor | ✅ Production | ⚠️ Migration planned to write to chbk_outbox_row |
+| NAPDisputeDeclineBatch | ✅ Production | NAP-specific — polls Visa for issuer-declined events |
 | VisaDisputeBatch | ✅ Production | Polls multiple Visa queues every 2 minutes |
 | FirstChargebackBatch | ✅ Production | Polls MasterCard for first chargeback events |
 | CaseFillingBatch | ✅ Production | Polls MasterCard for subsequent dispute events |
 | FileProcessor | ✅ Production | Triggered by SQS — processes all inbound files |
-| InboundDisputeEventScheduler | ✅ Production | Polls outbox tables — 5 schedulers, 5-channel relay |
+| InboundDisputeEventScheduler | ✅ Production | Polls chbk_outbox_row every 2 minutes |
 | FileAcknowledgementProcessor | ✅ Production | Generates ACK files for Meijer, Walmart, CapitalOne |
 
 ---
@@ -2063,12 +1910,9 @@ This section provides a single reference table covering all WDP components with 
 | Component | Status | Notes |
 |---|---|---|
 | chbk_outbox_row | ✅ Production | Central outbox — all inbound paths converge here |
-| **wdp.outgoing_event_outbox** | ✅ Production | ⚠️ **5-channel shared outbox**: EXPIRY_EVENTS, GP_EVENTS, BEN_EVENTS, CORE_EVENTS, **EXPIRY_BATCH (terminal-write-only — no consumer)** |
-| wdp.bre_orchestration_outbox | ✅ Production | Shared by COMP-12 Scheduler4 and COMP-18 |
 | file_job | ✅ Production | File-level processing status tracker |
 | file_evidence | ✅ Production | Evidence document metadata + S3 staging path |
-| **wdp.file_generation_event** | ✅ Production | ⚠️ Sole writer COMP-18 |
-| **wdp.case_expiry** | ✅ Production | ⚠️ **Case Expiry Subsystem coordination surface (COMP-17 writer half + COMP-51 reader half)**; no row-level lock |
+| file_notifications | ✅ Production | Triggers file-based outbound generation |
 
 ---
 
@@ -2080,13 +1924,12 @@ This section provides a single reference table covering all WDP components with 
 | nap-dispute-events | ✅ Production | |
 | new-case-events | ✅ Production | |
 | case-evidence-events | ✅ Production | |
-| **business-rules** | ✅ Production | ⚠️ **6 confirmed publishers**: COMP-12 Scheduler4, COMP-15, COMP-23, COMP-24, COMP-25, COMP-37 |
+| business-rules | ✅ Production | Publisher to be confirmed |
 | outgoing-events | ✅ Production | |
 | internal-integration-events | ✅ Production | |
-| case-action-events (expiry) | ✅ Production | Cert env uses distinct topic |
+| case-action-events (expiry) | ✅ Production | |
 | external-request-events | ✅ Production | |
 | core-request-events (DB2) | ✅ Production | |
-| **BEN-owned MSK cluster topic** | ✅ Production | ⚠️ Separate cluster — not WDP MSK; COMP-42 publishes; distinct SASL credentials |
 | EDIA events | 🔴 Planned | Enterprise Kafka topic on EDIA platform |
 
 ---
@@ -2098,15 +1941,14 @@ This section provides a single reference table covering all WDP components with 
 | CaseCreationConsumer | ✅ Production | Does not handle NAP disputes currently |
 | EvidenceConsumer | ✅ Production | |
 | BusinessRulesProcessor | ✅ Production | Makes direct DB calls — does not call BusinessRulesService |
-| **CaseExpiryUpdateConsumer (COMP-17)** | ✅ Production | ⚠️ **Writer half of Case Expiry Subsystem** |
+| CaseExpiryUpdateConsumer | ✅ Production | Updates case expiry status only |
 | NotificationOrchestrator | ✅ Production | Routes by business logic in code |
-| **NAP Outcome Processor (COMP-39)** | ✅ Production | ⚠️ Migration planned to EDIA route; ⚠️ **Manual reprocess REST endpoint confirmed; NAP-DPS auth gap (RISK-179)** |
-| VisaResponseQuestionnaire | ✅ Production | ⚠️ allocarb iteration partial-failure (RISK-185) |
-| ThirdPartyNotificationConsumer | ✅ Production | Delivers to SignifyD via REST API; ⚠️ JustAI planned only for outbound |
-| **BEN Consumer** | ✅ Production | ⚠️ **Kafka publish to BEN-owned MSK cluster**; 4th writer of `wdp.outgoing_event_outbox` |
+| NAP Outcome Processor | ✅ Production | ⚠️ Migration planned to EDIA route |
+| VisaResponseQuestionnaire | ✅ Production | |
+| ThirdPartyNotificationConsumer | ✅ Production | Delivers to SignifyD and JustAI via REST API |
+| BEN Consumer | ✅ Production | Delivers to BEN via webhook |
 | EDIA Consumer | 🔴 Planned | WDP owned — converts to EDIA enterprise format |
-| CoreNotificationConsumer | ✅ Production | Delivers to CORE via DB2; clear PAN exception (RISK-035) |
-| **CaseExpiryProcessor (COMP-51)** | ✅ Production | ⚠️ **Reader half of Case Expiry Subsystem; not a Kafka consumer (Spring Batch)** |
+| CoreNotificationConsumer | ✅ Production | Delivers to CORE via DB2 |
 
 ---
 
@@ -2126,12 +1968,11 @@ This section provides a single reference table covering all WDP components with 
 
 | Target | Status | Integration |
 |---|---|---|
-| SignifyD | ✅ Production | REST API via ThirdPartyNotificationConsumer; also a partner identity in COMP-21 inbound |
-| **JustAI (inbound partner identity in COMP-21)** | ✅ Production | REST HTTPS — active in COMP-21 source as `JUSTTAI` consumer name |
-| **JustAI (outbound notification target in COMP-41)** | 🔴 Planned | Not in COMP-41 codebase; Spring Retry imports dead |
-| **BEN** | ✅ Production | ⚠️ **Kafka publish to BEN-owned MSK cluster**; separate SASL/JAAS credentials |
+| SignifyD | ✅ Production | REST API via ThirdPartyNotificationConsumer |
+| JustAI | ✅ Production | REST API via ThirdPartyNotificationConsumer |
+| BEN | ✅ Production | Webhook via BEN Consumer |
 | CORE | ✅ Production | DB2 via CoreNotificationConsumer |
-| NAP | 🔴 Planned (via EDIA) | Currently direct API via COMP-39 |
+| NAP | 🔴 Planned | Via EDIA platform |
 | LATAM | 🔴 Planned | Via EDIA platform |
 | VAP | 🔴 Planned | Via EDIA platform |
 
@@ -2161,6 +2002,8 @@ This section provides a single reference table covering all WDP components with 
 
 ### 12.12 Planned Work Summary
 
+A consolidated list of all planned work items across the platform:
+
 | # | Item | Section | Type |
 |---|---|---|---|
 | 1 | Dashboard Section (UI) | 3.1 | New feature |
@@ -2175,51 +2018,39 @@ This section provides a single reference table covering all WDP components with 
 | 10 | AMEX/Discover SFTP outbound | 8.5 | New integration |
 | 11 | Circuit breaker strategy evaluation | 10.2 | Architectural decision |
 | 12 | CORE DB2 → EDIA migration | 9.2 | Future consideration |
-| **13** | **CVV-at-rest remediation (COMP-04 + COMP-05)** | **10.1 / 10.4** | **🔴 PCI-DSS material deficiency — architect decision pending (ADR-CAND-023)** |
-| **14** | **EXPIRY_BATCH outbox consumer definition (COMP-51)** | **4.8 / 7.2** | **Architectural decision (ADR-CAND-026)** |
-| **15** | **Case Expiry Subsystem coordination (COMP-17 + COMP-51 shared write)** | **4.8 / 7.2** | **Architectural decision (ADR-CAND-027)** |
-| **16** | **DEC-021 scope expansion remediation (COMP-02 7 methods + COMP-30 second offender)** | **3.4 / 4.5** | **🔴 Defect remediation (ADR-CAND-025, ADR-CAND-033)** |
-| **17** | **CORE/VAP/LATAM gateway-level authorization gap remediation** | **3.3 / 3.4** | **🔴 Architectural decision (ADR-CAND-029)** |
-| **18** | **COMP-04 unauthenticated SecurityConfig — Spring Security JWT or document infrastructure-layer-only auth** | **3.4 / 5.1** | **🔴 Architectural decision (ADR-CAND-031)** |
-| **19** | **COMP-01 blocking RestTemplate on Netty — migrate to WebClient or accept** | **3.3 / 10.2** | **🔴 Architectural decision (ADR-CAND-028)** |
-| **20** | **`minReadySeconds` platform-wide remediation pass + manifest-lint rule** | **10.2 / 11** | **DevOps remediation (ADR-CAND-030)** |
 
 ---
 
 ## Open Discussion Points & Follow-Ups
 
-The following items have been flagged during the architecture review and require further discussion or confirmation.
+The following items have been flagged during the architecture review and require further discussion or confirmation. Several entries have been marked ✅ resolved by the 2026-04-18 to 2026-04-25 source-verification reconciliation pass.
 
 | # | Topic | Section | Priority | Status |
 |---|---|---|---|---|
 | 1 | Discover vs DiscoverHybrid — detailed file flow differences | 5.4 | High | Open |
 | 2 | Amex vs AmexHybrid — detailed file flow differences | 5.4 | High | Open |
-| 3 | File content classification per source | 5.4 | High | Open |
+| 3 | File content classification per source — dispute events only, merchant response docs, issuer docs, combined | 5.4 | High | Open |
 | 4 | Acknowledgement file rules — which sources require ACK and which do not | 5.4 | High | Open |
 | 5 | S3 folder key structure and naming conventions per source and target | 5.4 | Medium | Open |
 | 6 | File-only network issuer documents — confirm if sent in separate files via DM Mainframe | 5.3 | Medium | Open |
 | 7 | Visa & MasterCard issuer document retrieval — confirm at which processing stage and which component | 5.3 / 7 | High | Open |
-| 8 | Circuit breaker strategy — evaluate and document as future architectural decision | 10.2 | Medium | Open — see ADR-CAND-007 (No K8s probes — same hardening sprint) |
-| 9 | Fax functionality — dedicated section needed under Queues | 4.3 | Medium | Open |
-| 10 | CORE DB2 → EDIA migration — capture as open architectural decision | 9.2 | Low | Open |
-| 11 | Observability tooling — document in dedicated operational architecture pass | 10.3 | Medium | Partial — WDP-OBSERVABILITY-ARCHITECTURE.md exists; not yet integrated into Section 10.3 |
-| 12 | NAP CB911 migration timeline and completion criteria | 9.3 | Medium | Open |
-| 13 | AcceptService NAP split-brain (MC CHI / AMEX / DISCOVER) | 8.1 | High | Open — ADR-CAND-001 |
-| 14 | COMP-43 DB2 clear PAN — extend DEC-019 or remediate? | 4.8 | High | Open — ADR-CAND-004 |
-| 15 | COMP-12 production replica count > 1 produces guaranteed duplicate Kafka publishes | 11 | High | Open — RISK-038 |
-| 16 | **CVV-at-rest in COMP-04 logs + COMP-05 error tables — PCI-DSS 3.2.1 material deficiency** | **5.1 / 10.1 / 10.4** | **🔴 HIGH** | **Open — ADR-CAND-023; architect decision required** |
-| 17 | **Cross-component shared error-table consumption hazard on `NAP.DISPUTE_EVENT_CONSUMER_ERROR` — uniform decision required for COMP-05 + COMP-39 prior-error scans** | **5.1 / 7.3** | **🔴 HIGH** | **Open — ADR-CAND-024** |
-| 18 | **EXPIRY_BATCH outbox channel terminal-write-only — define consumer or accept as audit-only sink** | **4.8 / 7.2** | **🔴 HIGH** | **Open — ADR-CAND-026** |
-| 19 | **Case Expiry Subsystem coordination — shared write to `wdp.case_expiry` between COMP-17 (writer) and COMP-51 (reader) with no row-level lock** | **4.8 / 7.2** | **MEDIUM** | **Open — ADR-CAND-027** |
-| 20 | **DEC-021 scope expansion remediation — 7 wrong-TM methods in COMP-02 + COMP-30 second offender. Multi-datasource service-level `@Transactional` binding contract.** | **3.4 / 4.5** | **🔴 HIGH** | **Open — ADR-CAND-025, ADR-CAND-033** |
-| 21 | **CORE/VAP/LATAM gateway-level authorization gap — these platform types receive no authorization at gateway** | **3.3 / 3.4** | **🔴 HIGH** | **Open — ADR-CAND-029** |
-| 22 | **COMP-04 unauthenticated SecurityConfig (`/**` permitAll) — Spring Security JWT or document infrastructure-layer-only auth** | **3.4 / 5.1** | **🔴 HIGH** | **Open — ADR-CAND-031** |
-| 23 | **COMP-01 blocking `RestTemplate` on Netty event-loop with no timeouts — migrate to `WebClient` or accept latency floor** | **3.3 / 10.2** | **🔴 HIGH** | **Open — ADR-CAND-028** |
-| 24 | **`minReadySeconds` platform-wide misplacement (10 components confirmed) — DevOps remediation pass + manifest-lint rule** | **10.2 / 11** | **🟠 HIGH** | **Open — ADR-CAND-030** |
-| 25 | **TokenService Redis hash external writer identity** — `wdpinternalidptoken:token` is populated by an unknown component | **4.7 / 11.1** | **MEDIUM** | **Open — team confirmation needed** |
-| 26 | **AWS S3 region inconsistency — three different region values across components (`us-east-1` default, `us-east-2` COMP-11, `eu-west-2` COMP-02)** | **11.1** | **MEDIUM** | **Open** |
-| 27 | **`v-correlation-id` propagation gaps (COMP-01, 17, 22, 51) — distributed tracing broken at multiple service boundaries** | **10.3** | **MEDIUM** | **Open — ADR-CAND-044, ADR-CAND-054** |
+| 8 | Circuit breaker strategy — evaluate and document as future architectural decision | 10.2 | Medium | Open — see WDP-DECISIONS.md ADR-CAND-007 candidate (No K8s probes — same hardening sprint) |
+| 9 | business-rules topic publisher — confirm which component publishes | 6.2 | — | ✅ Resolved 2026-04-25 — six confirmed publishers (COMP-12 Scheduler4, COMP-15, COMP-23, COMP-24, COMP-25, COMP-37). COMP-14 confirmed NOT a publisher. |
+| 10 | case-action-events partition key — confirm merchant_id or case_id | 6.2 | Low | ✅ Resolved 2026-04-25 — pass-through `RECEIVED_KEY` from upstream COMP-18 (consumer-side variable name `caseNumber`). See WDP-DECISIONS.md DEC-003 deviation map. |
+| 11 | Consumer group names — confirm exact names at component level | 6.3 | Low | ✅ Resolved across 9 reconciled consumers. See WDP-KAFKA.md v2.1. |
+| 12 | UserAccessManagementService — detailed behaviour to be confirmed | 3.4 | Medium | Open |
+| 13 | Fax functionality — dedicated section needed under Queues | 4.3 | Medium | Open |
+| 14 | CORE DB2 → EDIA migration — capture as open architectural decision | 9.2 | Low | Open |
+| 15 | Observability tooling — document in dedicated operational architecture pass | 10.3 | Medium | Partial — WDP-OBSERVABILITY-ARCHITECTURE.md exists; not yet integrated into Section 10.3 |
+| 16 | Compliance frameworks — verify and update current list | 10.4 | Medium | ✅ Captured in WDP-NFRS.md v2.1 Section 3 |
+| 17 | Per-consumer outbox tables — document at component level | 7 | High | ✅ Captured in WDP-DB.md v2.1 Section 4 |
+| 18 | NAP CB911 migration timeline and completion criteria | 9.3 | Medium | Open |
+| 19 | AcceptService NAP split-brain (MC CHI / AMEX / DISCOVER) — fail-close, accept-and-document, or remediate? | 8.1 | High | Open — same severity class as DEC-019/020. ADR-CAND-001 in WDP-DECISIONS.md. |
+| 20 | COMP-43 DB2 clear PAN — extend DEC-019 or remediate? | 4.8 | High | Open — architect decision required. RISK-035, ADR-CAND-004. |
+| 21 | COMP-12 production replica count — replicas > 1 produces guaranteed duplicate Kafka publishes | 11 | High | Open — confirmation pending from deployment team. RISK-038. |
 
 ---
 
 *This document contains architecture-level content only. Implementation details, database schemas, configuration values, code patterns, and deployment specifications are maintained separately at component level.*
+
+*v2.1 reconciled 2026-04-25 — minor topology-level clarifications: ChargebackService externally-exposed scope and serial-under-load footnote; BEN delivery mechanism corrected (Kafka, not webhook); JustAI scope split between COMP-21 inbound and COMP-41 outbound; AMEX/DISCOVER + MC CHI silent no-op + NAP-publish split-brain note in Section 8.1; COMP-37 unique storage pattern note in Section 4.8; Resilience pattern strengthened with COMP-21 evidence and orphan-path gaps; Open Discussion Points partially resolved.*

@@ -1,6 +1,6 @@
 # WDP-FLOW-INDEX.md
 **Worldpay Dispute Platform — Workflow Document Index**
-*Version: 1.0 SKELETON | April 2026*
+*Version: 1.1*
 
 ---
 
@@ -105,7 +105,62 @@ Each workflow file follows this structure:
 
 | ID | Workflow | Trigger | Acquiring Platforms | Networks | Doc Status | File |
 |----|----------|---------|--------------------|---------|----|------|
-| FLOW-11 | Case Expiry | Timer fires → expired cases auto-closed | All | All | ⬜ NOT STARTED | WDP-FLOW-CASE-EXPIRY.md |
+| FLOW-11 | Case Expiry — Subsystem Lifecycle | COMP-18 publishes to `case-action-events` when an action's expiry data changes; COMP-17 maintains `wdp.case_expiry`; COMP-51 scans and acts on past-due deadlines | All | All | ⬜ NOT STARTED | WDP-FLOW-CASE-EXPIRY.md |
+
+---
+
+## Per-Flow Authoring Notes
+
+*Notes accumulated from component-level audits that should be captured
+when each flow document is authored. These are NOT a replacement for the
+flow document — they are inputs for the eventual author.*
+
+### FLOW-07 Merchant Contest — Visa contest end-to-end variant
+
+When the Visa contest end-to-end flow document is authored, capture the
+following partial-success behaviour explicitly:
+
+- **Path:** COMP-21 ChargebackService (merchant API) → COMP-20 ContestService
+  (publishes to `internal-integration-events`) → COMP-40 VisaResponseQuestionnaire
+  (consumes events with non-null `visaResponseIds`; calls Visa RTSI to retrieve
+  questionnaire) → COMP-37 DocumentManagementService (stores questionnaire in
+  S3 + DynamoDB).
+- **Partial-success on `allocarb` loops:** when the Visa response contains
+  multiple `visaResponseIds`, COMP-40 iterates per ID. Failure on any one ID
+  partially completes the loop — the consumer pre-ACKs (DEC-005 deviation),
+  so retry is **not automatic**. Failure semantics on partial loops must be
+  documented when the flow is authored.
+- **Silent-discard behaviour:** COMP-40 silently discards events without
+  `visaResponseIds` (e.g. AcceptService events that share the same topic).
+  This filtering must be diagrammed at the consumer boundary.
+
+### FLOW-11 Case Expiry — Subsystem Lifecycle
+
+When this flow is authored, capture the following confirmed participant
+chain and shared-state risks:
+
+- **Trigger chain:** dispute action expiry data updated → COMP-18
+  NotificationOrchestrator publishes to `case-action-events` Kafka topic →
+  COMP-17 CaseExpiryUpdateConsumer consumes and upserts/deletes
+  `wdp.case_expiry` rows → COMP-51 CaseExpiryProcessor scheduled batch reads
+  `wdp.case_expiry`, calls Case Action / Case Management / Expiry Rules APIs,
+  and acts via one of three terminal APIs (Update Action / Accept / Add
+  Action).
+- **Failure path:** COMP-51 retry-exhausted failures land in
+  `wdp.outgoing_event_outbox` with `channel_type=EXPIRY_BATCH` and
+  `created_by=WCSEEXPB`, status=ERROR direct (no PUBLISHED→FAILED transition).
+- **🔴 Shared-state risk:** COMP-17 and COMP-51 both write to
+  `wdp.case_expiry` with **no row-level lock, no version column, no
+  SELECT FOR UPDATE**. Race possible on `i_retry_count` overwrite and
+  mid-flight upsert during chunk processing. The flow document must
+  diagram this coordination gap explicitly.
+- **🔴 Outbox terminal-write-only gap:** EXPIRY_BATCH rows have **no
+  identified downstream consumer** — COMP-12 Scheduler3 reads only FAILED /
+  PENDING_DEFERRED, so COMP-51's status=ERROR rows are not picked up.
+  The flow document must mark this as an unresolved architect decision.
+- **Replicas=1 OPERATIONAL ONLY:** no `@SchedulerLock`, no advisory lock —
+  concurrency safety relies entirely on K8s `replicas: 1` (DEC-023 pattern,
+  same posture as COMP-07 / COMP-08 / COMP-09 polling batches).
 
 ---
 
@@ -130,6 +185,7 @@ Document flows in this order — highest architectural value first:
 
 3. **FLOW-07 Merchant Contest** — highest merchant value action.
    Triggers the most downstream components across the platform.
+   *(Visa contest end-to-end variant — see authoring notes above.)*
 
 4. **FLOW-02 Dispute Inbound Visa Batch** — origin of all Visa
    disputes. Foundational for CORE and PIN platforms.
@@ -151,8 +207,10 @@ Document flows in this order — highest architectural value first:
 10. **FLOW-10 ACK Generation** — outbound ACK file generation
     for all four merchant types.
 
-11. **FLOW-11 Case Expiry** — operational flow, lower priority
-    than dispute lifecycle flows.
+11. **FLOW-11 Case Expiry — Subsystem Lifecycle** — operational
+    flow. Now has confirmed three-component participant chain
+    (COMP-18 → COMP-17 → COMP-51) and two 🔴 HIGH risks worth
+    surfacing in the flow document — see authoring notes above.
 
 ---
 
@@ -170,15 +228,17 @@ When LATAM and VAP integrations go to production, add:
 
 ## Adding New Workflow Documents (Protocol)
 
-1. Assign the next FLOW-ID number (current last: 11)
+1. Assign the next FLOW-ID number (current last: 11; reserved 12–14 for
+   variant flows above)
 2. Add a row to the registry table above
 3. Create the file using the structure described in this document
 4. Cross-reference the relevant WDP-COMP-[NN]-*.md files in step 4
    of the workflow document
 5. Update this index with the new doc status once complete
+6. Append a Pending Entry to WDP-CHANGE-LOG.md if the new flow surfaces
+   any new platform-level facts (deviation flags, integration contracts)
 
 ---
 
-*Last updated: April 2026*
 *Current workflow count: 11 core flows identified, 0 documented*
-*Next available FLOW ID: 12*
+*Next available FLOW ID: 15 (12–14 reserved for variant flows)*

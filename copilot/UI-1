@@ -1,0 +1,234 @@
+You are a senior Angular architect performing a deep-dive source code audit on the `wdp-portal` repository. We already have a research report covering Sections 1-15. Before generating component-level documentation, run the following targeted queries to fill gaps. Execute each command and return the raw output.
+
+---
+
+## PART A — MISSING COMPONENT DETAILS
+
+### A1. Get full selector + file path for every component not yet confirmed
+find src -name "*.component.ts" | xargs grep -l "selector:" | sort > /tmp/all_components.txt && wc -l /tmp/all_components.txt && cat /tmp/all_components.txt
+
+### A2. Extract selector name + class name for all 187 components
+grep -rn "selector:\s*'" src --include="*.component.ts" | sed "s/.*selector: '//;s/'.*//" | sort
+
+### A3. Find all @Input() and @Output() for every component
+grep -rn "@Input\(\)\|@Output\(\)" src --include="*.component.ts" -A 1 | grep -v "^--$"
+
+### A4. Find all Angular signals used (signal(), computed(), effect())
+grep -rn "signal(\|computed(\|effect(\|toSignal(" src --include="*.ts" | grep -v "node_modules"
+
+---
+
+## PART B — SERVICES & DEPENDENCY INJECTION
+
+### B1. List all injectable services with their providedIn scope
+grep -rn "@Injectable" src --include="*.service.ts" -A 2 | grep -v "^--$"
+
+### B2. List all service files and their public method signatures
+grep -rn "public \|  [a-zA-Z]\+(" src --include="*.service.ts" | grep -v "constructor\|private\|protected\|node_modules"
+
+### B3. Find all BehaviorSubject / ReplaySubject / Subject declarations
+grep -rn "BehaviorSubject\|ReplaySubject\|new Subject" src --include="*.ts" | grep -v "node_modules"
+
+### B4. Find all signal() state declarations
+grep -rn "= signal(" src --include="*.ts" | grep -v "node_modules"
+
+---
+
+## PART C — ROUTING & GUARDS
+
+### C1. Dump all route files completely
+cat src/app/app.routes.ts
+cat src/app/routing/wdp/wdp.routes.ts
+cat src/app/routing/disputes/disputes.routes.ts
+cat src/app/routing/administration/administration.routes.ts
+cat src/app/routing/queues/queues.routes.ts
+cat src/app/routing/fax/fax.routes.ts
+
+### C2. List all canActivate / canDeactivate guards referenced in routes
+grep -rn "canActivate\|canDeactivate\|canLoad\|canMatch" src --include="*.ts" | grep -v "node_modules"
+
+### C3. Find WdpChildRouteGuard implementation
+find src -name "wdp-child-route.guard.ts" | xargs cat
+
+---
+
+## PART D — MODELS & INTERFACES
+
+### D1. List all TypeScript interfaces and their fields
+grep -rn "^export interface\|^  [a-zA-Z]\+[?]:" src --include="*.model.ts" --include="*.interface.ts"
+
+### D2. List all enums and their values
+grep -rn "^export enum\|  [A-Z_]\+ =" src --include="*.ts" | grep -v "node_modules"
+
+### D3. Get full content of user.ts model
+cat src/app/shared/models/user.ts
+
+### D4. Get full content of service-def.constants.ts (API endpoint definitions)
+cat src/app/shared/constants/service-def.constants.ts
+
+### D5. Get full content of wdp-shared.constants.ts
+cat src/app/shared/constants/wdp-shared.constants.ts
+
+---
+
+## PART E — VALIDATION RULES
+
+### E1. Get full ValidationRules object
+find src -name "validation-rules*" | xargs cat
+grep -rn "ValidationRules\|filterFormSidePanel\|faxAnalytics\|UpdateTransaction" src --include="*.ts" | grep -v "node_modules"
+
+### E2. List all Validators.compose() blocks
+grep -rn "Validators.compose\|Validators.required\|Validators.pattern\|Validators.min\|Validators.max" src --include="*.ts" | grep -v "node_modules"
+
+---
+
+## PART F — API SERVICE LAYER
+
+### F1. Get full content of base.service.ts (correlation ID, interceptor base)
+find src -name "base.service.ts" | xargs cat
+
+### F2. List all HTTP method calls (get/post/put/delete) across all services
+grep -rn "this\.http\.\|this\.get(\|this\.post(\|this\.put(\|this\.delete(" src --include="*.service.ts" | grep -v "node_modules"
+
+### F3. Get full content of wdp.util.service.ts (feature permission checks)
+cat src/app/shared/services/wdp.util.service.ts
+
+### F4. Get full content of wdp.shared.service.ts (user type determination)
+cat src/app/shared/services/wdp.shared.service.ts
+
+### F5. Get full content of environment.service.ts
+cat src/app/shared/services/environment.service.ts
+
+---
+
+## PART G — INTERCEPTORS & AUTH
+
+### G1. Get full HTTP interceptor files
+cat src/app/idp-auth/http-401-error-interceptor.ts
+find src -name "*interceptor*" | xargs cat
+
+### G2. Get full idp-auth.service.ts
+cat src/app/idp-auth/idp-auth.service.ts
+
+### G3. Get full idp-auth-token-store.service.ts
+cat src/app/idp-auth/idp-auth-token-store.service.ts
+
+### G4. Get full auth-config.service.ts
+cat src/app/core/auth/auth-config.service.ts
+
+---
+
+## PART H — TEMPLATES & UI PATTERNS
+
+### H1. Find all *ngIf / @if usage patterns (conditional rendering logic)
+grep -rn "\*ngIf=\|@if (" src --include="*.html" | grep -v "node_modules"
+
+### H2. Find all (click) event bindings across templates
+grep -rn "(click)=" src --include="*.html" | grep -v "node_modules"
+
+### H3. Find all reactive form declarations (FormGroup, FormBuilder)
+grep -rn "FormGroup\|FormBuilder\|new FormControl\|this\.fb\.group" src --include="*.ts" | grep -v "node_modules"
+
+### H4. Find all toast/notification trigger calls
+grep -rn "showToast\|toast\.\|messageService\|ToastService" src --include="*.ts" | grep -v "node_modules"
+
+---
+
+## PART I — AG GRID SPECIFICS
+
+### I1. Get full dispute-list-grid.config.ts (all 67+ column definitions)
+cat src/app/features/disputes/dispute-list/dispute-list-grid.config.ts
+
+### I2. Find all ColDef / columnDefs declarations across grids
+grep -rn "ColDef\|columnDefs\|field:\s*'" src --include="*.ts" --include="*.config.ts" | grep -v "node_modules"
+
+### I3. Find all AG Grid cell renderer registrations
+grep -rn "cellRenderer\|cellRendererParams\|CellRendererComp" src --include="*.ts" | grep -v "node_modules"
+
+---
+
+## PART J — PIPE & DIRECTIVE INVENTORY
+
+### J1. List all custom pipes
+find src -name "*.pipe.ts" | xargs grep -l "@Pipe" | sort
+grep -rn "@Pipe\|transform(" src --include="*.pipe.ts"
+
+### J2. List all custom directives
+find src -name "*.directive.ts" | xargs grep -l "@Directive" | sort
+grep -rn "@Directive\|selector\[" src --include="*.directive.ts"
+
+---
+
+## PART K — ERROR HANDLING & TOAST CONSTANTS
+
+### K1. Get all toast message constants
+grep -rn "SUCCESS_MESSAGE\|ERROR_MESSAGE\|TOAST_MESSAGE\|PLEASE_TRY\|WENT_WRONG" src --include="*.ts" --include="*.constants.ts" | grep -v "node_modules"
+
+### K2. Find all error handler implementations
+grep -rn "catchError\|handleError\|throwError" src --include="*.ts" | grep -v "node_modules"
+
+---
+
+## PART L — LAZY LOADING & BUNDLE STRUCTURE
+
+### L1. Check for any lazy-loaded routes
+grep -rn "loadChildren\|loadComponent" src --include="*.ts" | grep -v "node_modules"
+
+### L2. Check app.config.ts for providers
+cat src/app/app.config.ts
+
+### L3. Get angular.json build config
+cat angular.json | grep -A 5 "fileReplacements\|outputPath\|budgets"
+
+---
+
+## PART M — MISSING SECTIONS FROM REPORT
+
+### M1. Find dispute-quick-view component (not fully documented)
+find src -path "*dispute-quick-view*" | xargs cat
+
+### M2. Find add-note-modal component (not fully documented)
+find src -path "*add-note-modal*" | xargs cat
+
+### M3. Find advance-action component (not documented)
+find src -path "*advance-action*" | xargs cat
+
+### M4. Find reverse component (not documented)
+find src -path "*reverse*" --include="*.component.ts" | xargs cat
+
+### M5. Find org-detail component (not documented)
+find src -path "*org-detail*" | xargs cat
+
+### M6. Find leftnav.service.ts (menu items, feature gating)
+cat src/app/shared/services/leftnav.service.ts
+
+### M7. Find encryption.service.ts (PAN decrypt)
+cat src/app/shared/services/encryption.service.ts
+
+### M8. Find display-code service
+find src -name "*display-code*" | xargs cat
+
+---
+
+## PART N — i18n / TRANSLATION KEYS
+
+### N1. List all translation key files
+find src -name "*.json" -path "*/i18n/*" | sort
+find src -name "*.json" -path "*/assets/*" | sort
+
+### N2. Find all translate.instant() or | translate pipe usages
+grep -rn "translate.instant\|| translate" src --include="*.ts" --include="*.html" | wc -l
+
+---
+
+## PART O — UNIT TEST COVERAGE HINTS
+
+### O1. List all spec files
+find src -name "*.spec.ts" | sort | wc -l
+
+### O2. Find any describe/it blocks mentioning key components
+grep -rn "describe\('DisputeList\|describe\('DisputeDetail\|describe\('Accept\|describe\('Defend" src --include="*.spec.ts"
+
+---
+
+Return all output verbatim. Do not summarize. Tag each section result with its section header (e.g., ## A1 OUTPUT, ## A2 OUTPUT) so results can be parsed per section.

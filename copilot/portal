@@ -1,0 +1,765 @@
+You are auditing the WDP UI components COMP-49 (WDP Merchant Portal) and
+COMP-50 (WDP Ops Portal) in the repository wdp-portal. Both portals are
+served from this single repository — switched by user role and URL. A prior
+pass produced DRAFT architecture documents from a product walkthrough,
+never from source. Your job is to CONFIRM OR CORRECT every item listed
+under "ALREADY DOCUMENTED" by reading the code and config directly, and to
+CLOSE every item listed under "GAPS TO FILL" the same way.
+
+Produce a SINGLE structured research report covering both portals,
+organised under the section headings below. For every claim, cite the file
+path and line range you read it from. Where source does not show the
+answer, state that explicitly and label it "not determinable from source".
+Do NOT guess. Do NOT summarise without evidence. Do NOT use the
+ALREADY DOCUMENTED block as a substitute for source — treat it as
+hypotheses to verify.
+
+The report must distinguish per-portal differences explicitly. Where a
+finding applies to only one portal, label it [MERCHANT ONLY] or [OPS ONLY].
+Where a finding is shared, label it [BOTH].
+
+──────────────────────────────────────────────────────────────────────────
+DELIVERABLE CONTRACT — read this before you start writing
+──────────────────────────────────────────────────────────────────────────
+
+Sections 3, 3b, 3c, 4, 5, 6, 7, 8, 9, 10, 12 are LOAD-BEARING. Each must
+be fully populated with file:line citations OR fully labelled "not
+determinable from source" with the reason. A report missing detail in any
+of these sections is incomplete and must be re-run.
+
+Sections 3b (Action Catalogue), 3c (UI Data Surface), 4 (Multi-IDP),
+5 (Roles & Entitlements), 6 (Region Behaviour), 8 (Backend Dependency
+Surface), 9 (PCI-Relevant Field Inventory) are the most-likely-to-be-
+compressed sections. Do NOT compress them. The engineer reading this
+report must be able to reconstruct each section from the report alone,
+without re-reading source.
+
+Read every component / view / page file in the source tree before producing
+the screen catalogue (Section 3). Every file matching the framework's
+component pattern (e.g. *.component.ts, *.tsx, *.vue, *.svelte — whichever
+applies) must be accounted for in the inventory. If the count of components
+in your inventory does not match the count of component files on disk, the
+report is incomplete.
+
+──────────────────────────────────────────────────────────────────────────
+ALREADY DOCUMENTED — confirm or correct (do NOT re-document from scratch)
+──────────────────────────────────────────────────────────────────────────
+
+For each item below, output either:
+  (a) "Still accurate — <file>:<lines>"
+  (b) "CORRECTION — claim says X / source shows Y at <file>:<lines>"
+
+A1. Both portals served from this single repository, switched by user role
+    and URL.
+A2. Merchant Portal accessed via Akamai → API Gateway. Ops Portal accessed
+    direct to API Gateway (no Akamai).
+A3. Neither portal performs JWT validation, case-level authorization, or
+    persistent storage. Neither publishes to or consumes from Kafka.
+A4. Authentication is OAuth 2.0 / OIDC redirect to enterprise IDP.
+A5. Merchant Portal sections: Disputes, User Mgmt, Org Mgmt, Dashboard
+    (planned).
+A6. Ops Portal sections: Disputes, Queues, User Mgmt, Org Mgmt, Fax Queue,
+    Dashboard (planned). Queues and Fax Queue are Ops-only.
+A7. Disputes section UI behaviours:
+    - Disputes List: Status / Case Owner / Filter / Sort / Columns / Export
+      / Items per page / Actions column.
+    - Quick View opens by mouse click only on row, reads cached UI data, no
+      API call. Enter/Space do NOT open Quick View.
+    - Click case number → navigate to Dispute Details.
+    - Filter Panel right drawer.
+    - Sort menu: Due Days / Due Date / Dispute Amount / Reason Code, with
+      Reset Sort.
+    - Columns menu: visibility, re-order via drag, Reset Columns.
+    - Default columns: Case No., Status, Due Days, Dispute Cycle, Reason
+      Code, Scheme, Amount, Dispute Currency, ARN, Refunded, Actions
+      (pinned right).
+    - Case Lock modal blocks all write actions; user dismisses with Okay.
+    - Export tiers: ≤5,000 in-UI; 5,001–25,000 backend file; >25,000 must
+      refine.
+    - Export filename: Dispute-Search-Results-YYYY-MM-DD.
+    - Export scopes: This Page / All Results / Selected.
+A8. Dispute Details two-column layout:
+    - Left tabs: Case Details (Dispute Information / Transaction
+      Information / Merchant Information sub-sections), Card Dispute
+      History, Card Transaction History.
+    - Right tabs: Progress, Actions, Notes, Documents (view-only — uploads
+      happen inside Defend flow only).
+A9. Accept action: confirmation modal with mandatory acknowledgment
+    checkbox. Blocked if case locked.
+A10. Defend two modes:
+    - Mode 1: Full Service Response — Questions step → Documents step →
+      Notes step → Submit.
+    - Mode 2: Add Response Documents — Documents step → Notes step →
+      Submit.
+A11. Visa questionnaire fields: Amount Type (Full or Split) plus comments.
+A12. Evidence file rules: tiff/tif/pdf/jpeg/jpg/png; ≤5 MB; filename A-Z,
+     0-9, hyphen, underscore, no spaces; ≤80 chars including extension.
+A13. Refresh icon: re-fetches all case detail from backend, no cache.
+A14. [OPS ONLY] More Actions menu: Full Charge to Merchant, Full Write Off,
+     Split Action, Advance Action, Route to Queue, Escalate to Supervisor.
+A15. [OPS ONLY] Queue Dashboard: two-panel — left rail queue list with
+     pill counts and search; right pane case grid for selected queue.
+A16. [OPS ONLY] Start Queue button: opens first case in queue directly in
+     Dispute Details.
+A17. [OPS ONLY] Dispute Details in Queue context: Accept hidden/disabled,
+     Escalate to Supervisor available, all other tabs available.
+A18. [OPS ONLY] Logical queue creation UI is NOT implemented. Current
+     logical queues are DB-seeded.
+
+A19. Backend dependency hypotheses — confirm or correct each:
+    - Disputes List search → CaseSearchService POST /{platform}/cases/search
+    - Display codes (labels, dropdowns) → DisplayCodeService
+        POST /merchant/gcp/display-code/search
+    - UI tab permissions → DisplayCodeService
+        GET /merchant/gcp/display-code/privileges
+    - Accept action → AcceptService
+        POST /{platform}/cases/{caseNumber}/accept
+    - Defend questionnaire (Visa) → QuestionnaireService
+        POST /merchant/gcp/questionnaire/visa/{stage}
+    - Defend questionnaire (non-Visa) → QuestionnaireService
+        POST /merchant/gcp/questionnaire/{responseType}
+    - Defend document upload → DisputeService
+        POST /{platform}/cases/{caseNumber}/documents
+    - Defend submit → ContestService
+        POST /{platform}/cases/{caseNumber}/contest
+    - Notes view → NotesService
+        GET /merchant/gcp/notes/{platform}/case/{caseNumber}
+    - Notes add → NotesService
+        POST /merchant/gcp/notes/{platform}/case/{caseNumber}
+    - Documents view → DocumentManagementService
+        GET /{platform}/documents/{caseNumber}
+    - [OPS ONLY] Full Charge / Full Write Off / Split Action / Advance
+        Action / Route to Queue → CaseActionService
+        PUT /{platform}/case/{caseNumber}/action
+    - [OPS ONLY] Queue counts → CaseSearchService GET /{region}/queues
+    - [OPS ONLY] Queue case list → CaseSearchService
+        POST /{region}/queues/search
+    - [OPS ONLY] Queue case detail → CaseSearchService
+        POST /{region}/queues/case-details
+    - [OPS ONLY] Fax Queue → FaxQueueService /merchant/gcp/fax-queue/*
+
+A20. Sections C/D/E (User Mgmt, Org Mgmt, Fax Queue) are not yet
+     documented. Treat these as GAPS, not "ALREADY DOCUMENTED" — see
+     GAPS TO FILL items 30, 31, 32.
+
+──────────────────────────────────────────────────────────────────────────
+GAPS TO FILL — answer from source
+──────────────────────────────────────────────────────────────────────────
+
+1.  Frontend tech stack — framework, language, state management, routing,
+    build tool, target browsers.
+2.  Repository structure — how the same repo produces two portals
+    (separate apps, single app with role-based routing, build flag,
+    runtime feature gating, code-split bundles, distinct main entry
+    points).
+3.  Multi-IDP capability — does the portal integrate with one IDP or many?
+    Discovery mechanism (email-domain, URL subdomain, region default,
+    picker page, first-only). Per-IDP integration matrix as deliverable,
+    not a derivation. If only one IDP is configured, state explicitly
+    "only one IDP is configured in source — multi-IDP claim cannot be
+    verified".
+4.  Per-IDP claim normalisation — handling of `groups` vs `roles` vs
+    `app_roles` vs `wp_entitlements`; `region` vs `geo` vs `tenant`;
+    `sub` vs `oid` vs `email`. Normalisation layer or absence.
+5.  OIDC flow type per IDP — auth code + PKCE / implicit / hybrid /
+    device. Per-IDP scopes, audience, redirect URIs, single-logout
+    posture.
+6.  JWT / token storage — localStorage / sessionStorage / cookie /
+    IndexedDB / in-memory. Refresh strategy. Logout token-clear behaviour.
+    Identify with file:line — locate the OIDC library config and any
+    localStorage / sessionStorage / document.cookie / IndexedDB writes
+    that reference token / access / refresh / bearer / authorization.
+7.  Role catalogue — every role string referenced anywhere in source,
+    with at least one file:line per role.
+8.  Role × action matrix — rows = every role, columns = every distinct UI
+    action across both portals. Cells: ALLOW / DENY / READ-ONLY /
+    NOT-VISIBLE. Each cell cited to a file:line that shows the actual
+    gating mechanism — route guard, structural directive, template
+    binding, service-level entitlement check, or HTTP-interceptor scope
+    attachment. File:line of a documentation comment is NOT acceptable.
+9.  Entitlement-sourcing audit — JWT claim direct, /userinfo call,
+    DisplayCodeService /privileges call, hybrid? If hybrid, what is
+    cached and for how long, and what is the refresh strategy?
+10. Super-user / break-glass detection — any role string that bypasses
+    normal gating (`ROOT`, `SUPERADMIN`, wildcard `*`, etc.).
+11. UI vs backend authorisation posture — single statement of "UI gating
+    is advisory" vs "UI gating is enforced server-side" with evidence.
+12. Anonymous / unauthenticated path detection — any route reachable
+    without a valid session.
+13. Region determination mechanism — JWT claim, URL subdomain, URL path
+    prefix, build flag, explicit user picker, per-IDP region default.
+    With file:line.
+14. Regional feature matrix — rows = every screen / feature / action,
+    columns = every supported region, cells = AVAILABLE / NOT AVAILABLE
+    / DIFFERENT (with description).
+15. Regional form-field differences — fields appearing only in one
+    region, different labels per region, different validation per region,
+    different default values per region.
+16. Regional backend routing — per outbound API call, which region's
+    backend host, and how the host is selected.
+17. Regional IDP routing — which IDP serves which region.
+18. Backend dependency surface — exhaustive. Every distinct base URL
+    referenced anywhere in source; every HttpClient / fetch / axios call
+    site; every API service abstraction. Group by backend host, count
+    distinct endpoints per host.
+19. CORS / outbound header posture — every custom outbound header
+    (X-Correlation-ID, X-Region, custom auth headers) that requires
+    backend allow-list tolerance.
+20. PCI-relevant field rendering — exhaustive grep for: pan, cardNumber,
+    cvv, expiry, cardholder, track1, track2, magstripe, cvc,
+    accountNumber, socialSecurity, dob, ssn, secret, key, credential,
+    password — rendered into the DOM, accepted as form input, or passed
+    in a request body. Per occurrence, file:line + form context.
+21. Clear PAN handling — does the portal use the `fullPan` flag from
+    DisplayCodeService /privileges? If so, where, and is the rendered
+    PAN ever logged or persisted client-side?
+22. Console-logging posture in production builds — is console.* stripped
+    in prod? Any console.* in security-sensitive paths (auth, token,
+    PCI-relevant forms)? File:line.
+23. Mobile-platform targets — capacitor.config.ts, capacitor.config.json,
+    ios/, android/, cordova.json, Capacitor / Cordova plugins in
+    package.json. State present or absent.
+24. K8s deployment manifests — Deployment, Service, Ingress, HPA, PDB,
+    topology spread, probes, ports, replica count, resource limits and
+    requests, OTel agent injection. If manifests are not in this repo,
+    state "not in repo" and list what IS in the repo (Dockerfile, nginx
+    config, etc.).
+25. Per-scheme questionnaire field catalogue — what does source contain
+    for Mastercard, Amex, Discover, and any other schemes beyond Visa?
+26. Card Dispute History tab — fields, data source, API call.
+27. Card Transaction History tab — fields, data source, API call.
+28. Backend async export status UI — does any UI exist for the
+    5,001–25,000 async export path?
+29. Case lock detection strategy — page load, action attempt, polling,
+    websocket. With file:line.
+30. User Management section — full screen catalogue, forms, role-modify
+    actions, backing services.
+31. Org Management section — full screen catalogue, forms, hierarchy
+    operations, backing services.
+32. Fax Queue section (Ops only) — full screen catalogue, fax claim /
+    view / reject / discard / status update flows, backing FaxQueueService
+    endpoints called.
+33. UserQueueSkillService endpoints used by Ops Portal — confirm User
+    Management / Queue Management / User View / LFT Report endpoint
+    groups are called from the portal, and from which screens.
+34. BusinessRulesService queue rules endpoint — exact endpoint the
+    portal calls for queue rule lookups.
+35. Async export backend endpoint — which backend service handles the
+    5,001–25,000 request.
+36. Escalate to Supervisor — what it does, which roles see it, where
+    escalations route. Confirm if implemented or stub.
+37. Dead role detection — any role string that exists in the role
+    catalogue but produces no UI behaviour difference vs another role.
+38. Inactive-endpoint usage — confirm portal does NOT call known-inactive
+    endpoints, e.g. CaseSearchService GET /queue/{queueName} (returns
+    HTTP 405).
+39. Environment configuration loading — compile-time environment.ts vs
+    runtime-injected JSON. Where IDP URL, backend base URLs, region
+    defaults come from. With file:line.
+40. Single sign-out posture per IDP — front-channel, back-channel, none.
+41. HTTP interceptor logic — token attachment, region header, retry on
+    401, token refresh, correlation-ID. With file:line.
+42. Per-portal feature gating mechanism — how the same codebase decides
+    "this is the Merchant Portal" vs "this is the Ops Portal".
+
+──────────────────────────────────────────────────────────────────────────
+REPORT STRUCTURE — use these section headings, in this order
+──────────────────────────────────────────────────────────────────────────
+
+SECTION 1 — TECHNOLOGY STACK & REPOSITORY STRUCTURE
+  1a. Framework, language, build tool, package manager, target browsers.
+  1b. State management library, router, HTTP client, component library.
+  1c. Per-portal build / feature gating mechanism. Cite the mechanism
+      with file:line.
+  1d. Environment configuration loading — compile-time vs runtime
+      injection. Where IDP URL, backend base URLs, region defaults come
+      from. File:line.
+  1e. Production build pipeline — Dockerfile, nginx config, CDN
+      deployment posture.
+
+SECTION 2 — DEPLOYMENT MANIFESTS
+  Kubernetes manifest inventory: Deployment, Service, Ingress, HPA, PDB,
+  topology spread, liveness/readiness/startup probes, ports exposed,
+  replica count, memory and CPU limits/requests, rolling update strategy,
+  OTel agent injection, Logstash sidecar.
+
+  If K8s manifests are NOT in this repo, state "not in repo" for this
+  entire section and explicitly list what IS in the repo (Dockerfile,
+  nginx config, application config files, etc.).
+
+SECTION 3 — SCREEN INVENTORY & USER FLOWS  [LOAD-BEARING]
+
+  Per portal (Merchant + Ops), per screen:
+    - Route path
+    - Purpose (1 line)
+    - Data on load — every API call fired on mount, including conditional
+      calls (fired only if user has role X, region Y, etc.)
+    - Loading / empty / error states — distinct from each other
+    - Role / region gating that hides or alters this screen
+    - Browser-back, deep-link, and shareable-URL behaviour for this screen
+
+  Cover every screen — every component / view / page file in source.
+  Do NOT compress.
+
+  Explicitly cover:
+    - Disputes List (both portals — note Ops differences inline)
+    - Dispute Details (both — note Ops-only More Actions inline)
+    - Defend flow Mode 1 + Mode 2 (every step, every back / next / cancel)
+    - Accept modal
+    - [OPS] Queue Dashboard
+    - [OPS] Dispute Details in Queue Context
+    - [OPS] Fax Queue (every screen)
+    - User Management section (every screen)
+    - Org Management section (every screen)
+    - Card Dispute History tab
+    - Card Transaction History tab
+
+──────────────────────────────────────────────────────────────────────
+SECTION 3b — ACTION CATALOGUE  [LOAD-BEARING — exhaustive]
+──────────────────────────────────────────────────────────────────────
+
+  Produce a per-screen action catalogue. One row per action, no grouping,
+  no summary rows.
+
+  An "action" is ANY of the following:
+    - Button click (including disabled-state buttons — list separately
+      with the condition that disables them)
+    - Menu item selection (top nav, kebab, context menu, right-click)
+    - Link click that changes route or opens a modal / drawer / panel
+    - Form submit (each form is one action; sub-field validation is not)
+    - Form field interaction that triggers an API call, navigation, or
+      state change visible to the user (autocomplete, async validation,
+      debounced search, type-ahead)
+    - Checkbox / toggle / radio selection that changes behaviour
+    - Dropdown / select / date-picker / time-picker selection
+    - File upload trigger (each accepted source — drag-drop, file-picker,
+      paste, camera — counts separately)
+    - File download / export trigger
+    - Tab switch
+    - Row click, row double-click, row expand / collapse, row hover (if
+      hover triggers a panel or API call)
+    - Bulk selection (checkbox on header, checkbox per row, shift-select)
+    - Bulk action triggered from selection
+    - Sort change, column show / hide, column re-order (drag), column
+      width change (drag), column reset
+    - Filter apply, filter clear, filter save, filter load
+    - Pagination — next, previous, page-jump, items-per-page
+    - Refresh / re-fetch trigger
+    - Modal open trigger AND every action inside the modal (confirm,
+      cancel, dismiss, close, X-click, backdrop-click, Esc-key)
+    - Toast / banner action (e.g. "Undo", "View", "Dismiss")
+    - Keyboard shortcut — every keyboard handler in source. Note
+      explicitly whether Enter / Space / Esc / Tab / Arrow keys are
+      handled per screen (existing claim: Quick View does NOT open on
+      Enter / Space — confirm or correct).
+    - Drag-and-drop (column re-order is one example; check for others —
+      file drag-drop, row drag-drop, kanban-style drag).
+    - Copy-to-clipboard, paste handler.
+    - Print trigger.
+    - Help / info / tooltip popover (if it fires an API call or shows
+      non-trivial content; pure-static tooltips can be omitted).
+    - Polling / websocket / SSE subscription start and stop. (Existing
+      open question: case-lock detection mechanism — polling vs
+      on-action — must be answered as part of this catalogue.)
+    - Auto-save / debounced-save trigger.
+    - Logout / session-expiry handler.
+
+  For each action, the row must contain:
+    | # | Screen | Action label (UI text or aria-label) | Trigger
+    (click / keypress / drag / etc.) | Handler file:line | What it does
+    (1 line) | API call fired (Y / N — endpoint if Y) | Disabled-state
+    condition (file:line) | Role / region gating (file:line of the
+    gating mechanism) | Confirmation required (Y / N — modal flow if Y)
+    | Error display path (toast / inline / modal / page) |
+    Portal scope ([MERCHANT] / [OPS] / [BOTH]) |
+
+  Disabled, hidden, and not-rendered are distinct states — the catalogue
+  must distinguish them. A button that is rendered-but-disabled is
+  different from a button that is not in the DOM at all; the gating
+  mechanisms are different and both matter for RBAC analysis (Section 5).
+
+  If two actions share the same handler but have different UI surfaces
+  (e.g. Accept-from-row vs Accept-from-detail-page), they are two rows.
+  If a single button does different things based on role, region, or
+  case state, list each behaviour as a separate row with the gating
+  condition.
+
+──────────────────────────────────────────────────────────────────────
+SECTION 3c — UI DATA SURFACE  [LOAD-BEARING — exhaustive]
+──────────────────────────────────────────────────────────────────────
+
+  Produce a per-portal structural inventory. One row per item, no
+  grouping, no "etc.", no "and more". Every entry labelled [MERCHANT] /
+  [OPS] / [BOTH].
+
+  Sub-sections 3c.1 through 3c.10 below are independent tables — each
+  must be populated independently. An item that appears in two tables
+  (e.g. a Status dropdown is both a filter field and a dropdown with an
+  option list) must be listed in both, with cross-reference.
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.1 — GRID COLUMNS
+
+  For every data grid in source: Disputes List, Queue case grid, Notes
+  list, Actions list, Documents list, Fax queue grid, User Management
+  grid, Org Management grid, plus any others you discover. Per grid,
+  enumerate every column definition.
+
+    | # | Grid | Column label (UI text) | Field key | Data type |
+    Default visible (Y/N) | Default position (1-based) | Sortable (Y/N)
+    | Resizable (Y/N) | Backend source (API path → response field) |
+    Format / transformation (file:line) | Portal scope |
+
+  Existing claim to confirm or correct: Merchant Portal default columns
+  are Case No., Status, Due Days, Dispute Cycle, Reason Code, Scheme,
+  Amount, Dispute Currency, ARN, Refunded, Actions (pinned right). Open
+  question: does the Ops Portal grid carry additional columns? If yes,
+  list them; if no, state explicitly.
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.2 — FILTER FIELDS
+
+  For every filter panel in source. Default-section and advanced-section
+  filters are listed separately — same panel, two table sections.
+
+    | # | Filter panel (Disputes List / Queue case grid / Fax queue /
+    etc.) | Section (default / advanced) | Filter label | Field key |
+    Input type (text / multi-select / single-select / date-range /
+    numeric-range / currency-paired / boolean / etc.) | Option source
+    if select (hardcoded file:line / DisplayCodeService domain / other
+    API) | Validation rules (file:line) | Default value | Cleared by
+    Reset (Y/N) | Portal scope |
+
+  Existing claim to confirm or correct: default filters include Business
+  Unit, Case Number, Report Date, Due Date, Due Days, Currency,
+  Min/Max Dispute Amount (paired with Currency), Status, Reason Code,
+  Scheme, Dispute Cycle, Dispute Actions, Case Owner, Case Liability.
+  Advanced filters listed as Issuer BIN, PAN last 4, network refs, MCC,
+  sequences, "additional merchant/OPS fields" — that last phrase is a
+  gap. Enumerate every advanced filter field present in source. State
+  which advanced fields are visible to MERCHANT vs OPS.
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.3 — SORT OPTIONS
+
+  For every sortable grid in source.
+
+    | # | Grid | Sort field label | Field key | Direction options
+    (asc / desc / both) | Default sort (Y/N) | Reset Sort returns to
+    (file:line) | Portal scope |
+
+  Existing claim to confirm or correct: documented sort fields are Due
+  Days, Due Date, Dispute Amount, Reason Code. Confirm no other sortable
+  fields exist; if more do, list them.
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.4 — DROPDOWN / SELECT OPTION LISTS
+
+  Every distinct dropdown / select / autocomplete with its complete
+  option list. Includes status pickers, scheme pickers, queue pickers,
+  write-off-reason pickers, action-type pickers, currency pickers, etc.
+  "Loaded from API" is acceptable as the source — but the API endpoint
+  and the domain name must be cited.
+
+    | # | Where used (screen + field) | Option label | Option value |
+    Source (hardcoded file:line / DisplayCodeService domain / other API
+    endpoint) | Display order | Default selected | Role / region gating
+    per option (file:line) | Portal scope |
+
+  If a single dropdown sources its options from DisplayCodeService, list
+  the domain name and link to the live option set in a separate
+  "DisplayCodeService domains used by this portal" sub-table — do not
+  hand-enumerate a snapshot of values from a backend response.
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.5 — TABS AND SUB-NAVIGATION
+
+  Every primary nav item, every tab, every sub-tab, every accordion
+  header, every drawer, every panel-switcher. Per-screen.
+
+    | # | Parent screen | Tab / nav label | Tab order | Always visible
+    (Y/N) | Visibility condition (file:line) | Renders component (file
+    path) | Portal scope |
+
+  Existing claim to confirm or correct: Dispute Details left tabs are
+  Case Details, Card Dispute History, Card Transaction History; right
+  tabs are Progress, Actions, Notes, Documents. Confirm no other tabs
+  exist on the detail screen.
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.6 — FORM FIELDS
+
+  Every form in source. Per form, every field. Multi-step forms (Defend
+  flow) — list each step's fields separately.
+
+    | # | Form / step | Field label | Field type (text / textarea /
+    select / date / file / checkbox / radio / etc.) | Required (Y/N) |
+    Validation rules (regex / min / max / custom — file:line) | Default
+    value | Placeholder text | Conditional visibility (file:line) | Help
+    text / tooltip | Backend payload field name | Portal scope |
+
+  Existing claim to confirm or correct: Visa questionnaire fields are
+  Amount Type (Full or Split) plus comments. Confirm and list every
+  field for every other scheme present in source (Mastercard, Amex,
+  Discover, etc.). Confirm Accept modal carries an acknowledgment
+  checkbox and list every field on the modal. Confirm More Actions
+  forms (Full Charge to Merchant, Full Write Off, Split Action, Advance
+  Action, Route to Queue, Escalate to Supervisor) carry the fields
+  documented in the existing draft and list any additional fields.
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.7 — ACTION MENUS (KEBABS, OVERFLOWS, CONTEXT MENUS)
+
+    | # | Where (screen + row context) | Menu item label | Cross-ref to
+    3b action # | Visibility condition (file:line) | Disabled condition
+    (file:line) | Portal scope |
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.8 — STATUS / CHIP / PILL VALUES
+
+  Every distinct value rendered as a status chip, badge, pill, or tag.
+  Includes case status, dispute cycle, action status, queue type, fax
+  queue status, user role chip, etc.
+
+    | # | Field / context | Distinct value (UI text) | Backing code
+    (raw value) | Color / style class | Source (DisplayCodeService
+    domain / hardcoded file:line) | Portal scope |
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.9 — USER-VISIBLE MESSAGE STRINGS
+
+  Every distinct toast, banner, inline error, modal title, modal body,
+  empty-state message, loading message, validation message, confirmation
+  prompt. Verbatim text.
+
+    | # | Trigger (screen + condition) | Display surface (toast / banner
+    / inline / modal title / modal body / page) | Severity (success /
+    info / warn / error / neutral) | Message text (verbatim, including
+    punctuation) | Source file:line | Portal scope |
+
+  ────────────────────────────────────────────────────────────────────
+
+  3c.10 — PAGINATION & BULK CONTROLS
+
+    | # | Grid | Page-size options (verbatim list) | Default page size |
+    Navigation controls present (first / prev / next / last / jump) |
+    Bulk-select pattern (per-row checkbox / header checkbox /
+    shift-click) | Bulk actions available when selection active
+    (cross-ref to 3b) | Portal scope |
+
+SECTION 4 — MULTI-IDP AUTHENTICATION  [LOAD-BEARING]
+  4a. Per-IDP integration matrix — one IDP per row, columns: issuer URL,
+      client ID, OIDC flow type, scopes, redirect URI, audience,
+      single-logout posture. Populate the matrix or state explicitly
+      "only one IDP is configured in source — multi-IDP claim cannot be
+      verified".
+  4b. IDP discovery mechanism. File:line.
+  4c. Per-IDP claim normalisation — handling of groups vs roles vs
+      app_roles vs wp_entitlements; region vs geo vs tenant; sub vs oid
+      vs email.
+  4d. JWT / token storage — File:line of the storage write. Refresh
+      strategy. Logout token-clear behaviour.
+  4e. HTTP interceptor logic — token attachment, region header, retry
+      on 401, refresh, correlation-ID. Per interceptor, file:line.
+  4f. Anonymous / unauthenticated path detection.
+
+SECTION 5 — USER ROLES AND ENTITLEMENTS  [LOAD-BEARING]
+  5a. Role catalogue — every role string referenced anywhere in source,
+      with at least one file:line per role.
+  5b. Role × action matrix — rows = every role, columns = every distinct
+      UI action across both portals. Cells: ALLOW / DENY / READ-ONLY /
+      NOT-VISIBLE. Each cell cited to a file:line of an executable
+      gating mechanism — NOT a documentation comment.
+  5c. Build separate matrices for entitlements vs scopes vs groups if
+      those are independent dimensions. State explicitly if only one
+      dimension exists.
+  5d. Entitlement-sourcing audit — JWT claim direct, /userinfo call,
+      DisplayCodeService /privileges call, hybrid? If hybrid, what is
+      cached and for how long, and what is the refresh strategy?
+  5e. Super-user / break-glass detection.
+  5f. Dead role detection — any role string in the catalogue that
+      produces no UI behaviour difference vs another role.
+  5g. UI-vs-backend authorisation posture — single statement of "UI
+      gating is advisory" vs "UI gating is enforced server-side" with
+      evidence.
+
+SECTION 6 — REGION BEHAVIOUR  [LOAD-BEARING]
+  6a. Region determination mechanism. File:line.
+  6b. Regional feature matrix — rows = every screen / feature / action,
+      columns = every supported region, cells = AVAILABLE / NOT
+      AVAILABLE / DIFFERENT (with description).
+  6c. Regional form-field differences — fields appearing only in one
+      region, different labels, different validation, different default
+      values. Per occurrence, file:line.
+  6d. Regional backend routing — per outbound API call, which region's
+      backend host, and how the host is selected.
+  6e. Regional IDP routing — which IDP serves which region.
+  6f. Regional regex inventory — every regex validator in source,
+      flagged where regional differences exist (postcode/ZIP, sort
+      code/routing number, IBAN/account number, phone, currency, date
+      format, national ID).
+
+SECTION 7 — UI BEHAVIOUR DECISION POINTS
+  7a. Case lock detection strategy — page load / action attempt /
+      polling / websocket. File:line.
+  7b. Quick View cache mechanism — what is cached, where, invalidation
+      strategy.
+  7c. Refresh icon behaviour — confirm full re-fetch with no cache,
+      file:line.
+  7d. Export tier dispatch — how the UI decides UI-export vs backend
+      file vs reject. File:line.
+  7e. Defend flow state machine — step navigation, validation gates,
+      submit dispatch.
+  7f. Per-scheme questionnaire — what schemes are present in source
+      beyond Visa, with field catalogues.
+  7g. Card Dispute History tab — fields, data source, API call.
+  7h. Card Transaction History tab — fields, data source, API call.
+  7i. Backend async export status UI — present or absent.
+  7j. Escalate to Supervisor — what it does, where it routes, role
+      gating.
+
+SECTION 8 — BACKEND DEPENDENCY SURFACE  [LOAD-BEARING]
+  8a. Exhaustive inventory of every distinct base URL referenced
+      anywhere in source. Per host: count of distinct endpoints, sample
+      endpoints, where the host string is configured.
+  8b. Per outbound API call: endpoint, method, payload structure,
+      headers, query params, response shape, every distinct status code
+      and the UI behaviour per code, timeout, retry, which screen
+      triggers it, region routing, role requirement.
+  8c. Form-field → API-payload mapping — every form, every field, every
+      transformation, every conditional rule, every default value, every
+      client-side validation rule, every API-response-to-screen mapping,
+      every dead-consumed field.
+  8d. Inactive-endpoint usage — confirm portal does NOT call
+      CaseSearchService GET /queue/{queueName} (returns HTTP 405). If
+      it IS called, flag as defect.
+  8e. CORS / outbound header posture — every custom outbound header
+      that requires backend allow-list tolerance.
+
+SECTION 9 — PCI-RELEVANT FIELD INVENTORY  [LOAD-BEARING]
+  9a. Sensitive-field grep — every occurrence of: pan, cardNumber, cvv,
+      expiry, cardholder, track1, track2, magstripe, cvc, accountNumber,
+      socialSecurity, dob, ssn, secret, key, credential, password —
+      rendered into the DOM, accepted as form input, or passed in a
+      request body. Per occurrence, file:line + form context.
+  9b. Clear PAN handling — does the portal use the `fullPan` flag from
+      DisplayCodeService /privileges? If so, where, and is the rendered
+      PAN ever logged or persisted client-side?
+  9c. CSV / bulk upload forms — any form accepting file upload that
+      could carry sensitive content. PAN/MID search forms.
+  9d. PCI scope statement — based on the inventory above, state PCI-IN
+      or PCI-OUT for each portal with evidence. This is a deliverable,
+      not an inference.
+
+SECTION 10 — OBSERVABILITY & PRODUCTION POSTURE
+  10a. Console-logging in production builds — is console.* stripped?
+       Any console.* in security-sensitive paths? File:line.
+  10b. Error tracking integration (Sentry, Datadog RUM, etc.) — present
+       or absent.
+  10c. Performance instrumentation — Web Vitals, custom marks.
+  10d. Mobile-platform targets — capacitor.config.*, ios/, android/,
+       cordova.json, plugins. State present or absent.
+  10e. Service worker / offline behaviour — present or absent.
+
+SECTION 11 — PLANNED & INCOMPLETE WORK
+  11a. Commented-out screens, components, routes — what they did, why.
+  11b. Unused dependencies in package.json — declared imports with no
+       call site.
+  11c. Feature flags active in production — exact flag names, behaviour,
+       default value if env var unset.
+  11d. TODO / FIXME references — file:line and verbatim text.
+  11e. Stub screens / components returning fixed content.
+  11f. Items implied by the ALREADY DOCUMENTED block above (A1–A20) but
+       absent from source. List explicitly.
+
+SECTION 12 — CONFIDENCE ASSESSMENT
+  For EACH of Sections 1 through 11, state:
+    - Confidence: High / Medium / Low
+    - Basis: direct source reading / inferred from pattern /
+      not determinable from source alone
+
+SECTION 13 — ITEMS NOT VERIFIABLE FROM SOURCE
+  Every claim from the ALREADY DOCUMENTED block (A1–A20) that you could
+  neither confirm nor contradict from source. These will need follow-up
+  from the team or runtime observation.
+
+──────────────────────────────────────────────────────────────────────────
+OUTPUT RULES
+──────────────────────────────────────────────────────────────────────────
+
+- Cite file paths and line ranges for every concrete claim. Format:
+  <relative/path>:Lstart-Lend
+- State "not determinable from source" for any item the code does not
+  reveal — do NOT guess.
+- Use plain Markdown. No code blocks except when quoting a short
+  annotation, config value, or DDL fragment.
+- No narrative preamble. Start at Section 1.
+- Target correctness over completeness. If a section confirms an
+  ALREADY DOCUMENTED claim, "Still accurate — <file>:<lines>" is
+  acceptable.
+- Do NOT invent file paths, screen names, route paths, API endpoints,
+  IDP names, role strings, or regional behaviours.
+- For every section labelled [LOAD-BEARING] above (3, 3b, 3c, 4, 5, 6,
+  8, 9): do NOT compress. The engineer must be able to reconstruct each
+  section from the report alone, without re-reading source. A vague or
+  summary-style answer in any load-bearing section is incomplete and
+  the report must be re-run.
+- For every cell in the role × action matrix, the file:line citation
+  must be either: a route guard configuration, a structural directive
+  (*ngIf / *appHasRole / equivalent), a template-binding expression,
+  a service-level entitlement check, or an HTTP-interceptor logic block.
+  The file:line must show the actual gating mechanism — not a comment.
+- For every per-portal finding, label [MERCHANT ONLY] / [OPS ONLY] /
+  [BOTH]. Unlabelled findings are ambiguous and the report must be
+  re-run.
+- For Section 3: if the count of screens in your inventory does not
+  match the count of component / page / view files on disk, the
+  inventory is incomplete and must be re-run.
+- For Section 3b: the action-catalogue row count must be reconciled
+  against the count of event handlers in source. Run:
+    grep -rE '\((click|keydown|keyup|keypress|change|submit|input|
+      focus|blur|drop|dragover|dragstart|paste|copy|wheel|
+      contextmenu|mouseenter|mouseleave)\)=' src/ \
+      --include='*.html' --include='*.tsx' --include='*.jsx' \
+      --include='*.vue' --include='*.svelte' \
+    + a parallel grep for addEventListener and on* prop bindings in
+      component classes / functional components.
+  If the catalogue row count is materially less than this count, the
+  catalogue is incomplete and must be re-run. State the two counts
+  side-by-side at the top of Section 3b. (Some handlers are internal —
+  e.g. dragover on a drop zone where dragstart is the user-visible
+  action — note these as "internal handler, not a user action" with
+  the reasoning, rather than dropping them silently.)
+- Section 3c sub-tables must each be reconciled against a source-tree
+  enumeration:
+    3c.1 (columns) — every file declaring a column set / table column
+      definition / DisplayedColumns / column model.
+    3c.2 (filters) — every reactive-form / form-group / filter-model
+      file used by a filter panel.
+    3c.4 (dropdowns) — grep `<option`, `<mat-option`, `<ng-option`,
+      `<Select`, `<MenuItem`, or framework equivalent across `src/`.
+    3c.5 (tabs) — every tab / nav-item declaration.
+    3c.6 (forms) — every form-group / Formik-form / form-config
+      declaration.
+    3c.9 (messages) — every i18n key file plus inline string literals
+      passed to toast / snackbar / alert APIs.
+  At the top of each sub-table, state the source-tree count and the
+  table row count side-by-side. If the table count is materially less
+  than the source count, the sub-table is incomplete and must be
+  re-run.
+- For every row in 3c.1 through 3c.10, the [PORTAL SCOPE] column is
+  mandatory. Unlabelled rows are ambiguous and the report must be
+  re-run.
+- For Section 8a: if the count of distinct base URLs in your inventory
+  is less than the count returned by `grep -rE 'https?://'` of the
+  source tree (excluding node_modules and tests), the inventory is
+  incomplete and must be re-run.
