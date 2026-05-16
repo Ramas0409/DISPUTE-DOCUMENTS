@@ -1,6 +1,6 @@
 # WDP-HANDOVER.md
 **Worldpay Dispute Platform — Architecture Session Handover**
-*Version: 3.2*
+*Version: 3.3*
 
 ---
 
@@ -82,19 +82,19 @@ WDP-ARCHITECTURE.md first, then WDP-DECISIONS.md.
 | Document | Status | Notes |
 |----------|--------|-------|
 | WDP-ARCHITECTURE.md | ✅ Current — v2.2 | Baseline. 27 Open Discussion Points captured for architect decision. |
-| WDP-DECISIONS.md | ✅ Current — v2.2 | 23 active DECs. 37 candidate ADRs (ADR-CAND-023 through ADR-CAND-059) awaiting architect promotion. |
+| WDP-DECISIONS.md | ✅ Current — v2.3 | 23 active DECs. **44 candidate ADRs** (ADR-CAND-023 through ADR-CAND-072) awaiting architect promotion. **v2.3 (2026-05-15):** DEC-001 PARTIAL added for COMP-16; DEC-014 amplification by COMP-18 DMS retry; 7 new ADR-CANDs (066–072). |
 | WDP-INTEGRATIONS.md | ✅ Current — v2.2 | All external contracts reconciled. |
-| WDP-NFRS.md | ✅ Current — v2.2 | RISK-001 through RISK-194. |
-| WDP-HANDOVER.md | ✅ Current — v3.2 | This file. |
-| WDP-CHANGE-LOG.md | ✅ Current | Baseline established. Pending Entries currently empty. |
+| WDP-NFRS.md | ✅ Current — v2.3 | RISK-001 through RISK-219. **v2.3 (2026-05-15):** RISK-201–218 (COMP-16 v1.3); RISK-219 (COMP-18 v2.1); RISK-015/076/083 extended with COMP-16. |
+| WDP-HANDOVER.md | ✅ Current — v3.3 | This file. |
+| WDP-CHANGE-LOG.md | ✅ Current | Baseline established. **Pending Entries empty after 2026-05-15 reconciliation** (COMP-16 v1.3 + COMP-18 v2.1 consumed; see Reconciled Archive). |
 
 ### Tier 2 — Reference Indexes
 
 | Document | Status | Notes |
 |----------|--------|-------|
-| WDP-COMP-INDEX.md | ✅ Current — v2.2 | All 51 components registered. 38 source-verified. |
-| WDP-KAFKA.md | ✅ Current — v2.2 | All Kafka topics, consumer groups, and outbox channels documented. |
-| WDP-DB.md | ✅ Current — v2.2 | All schema ownership reconciled. |
+| WDP-COMP-INDEX.md | ✅ Current — v2.3 | All 51 components registered. 38 source-verified. **v2.3 (2026-05-15):** COMP-16 row → v1.3; COMP-18 row → v2.1; narratives expanded for both. |
+| WDP-KAFKA.md | ✅ Current — v2.3 | All Kafka topics, consumer groups, and outbox channels documented. **v2.3 (2026-05-15):** COMP-16 DEC-001 PARTIAL + two-branch consumer; `WDP.bre_orchestration_outbox` writers now three. |
+| WDP-DB.md | ✅ Current — v2.3 | All schema ownership reconciled. **v2.3 (2026-05-15):** `WDP.bre_orchestration_outbox` writer row expanded with COMP-16 v1.3 detail; cross-datasource UK write window captured; schema-case caveat added; Section 4 shared-table severity escalated 🟡→🟠. |
 | WDP-FLOW-INDEX.md | ✅ Current — v1.1 | 11 flows identified, 0 documented. |
 | WDP-COMP-TEMPLATE.md | ✅ Created — v1.1 | Master template with 4 type blocks. |
 
@@ -119,17 +119,17 @@ No workflow files exist yet. 11 flows identified in WDP-FLOW-INDEX.md. Two "Per-
 
 ## Current Work Position
 
-**Phase:** Post-baseline. v2.2 documentation set is the stable platform baseline. The source-verification phase is complete for 38 of 51 components.
+**Phase:** Post-baseline. v2.2 documentation set was the stable platform baseline; **v2.3 reconciliation completed 2026-05-15** (COMP-16 BusinessRulesProcessor v1.1 → v1.3 forensic re-audit and COMP-18 NotificationOrchestrator v2.0 → v2.1 delta-audit). The source-verification phase remains complete for 38 of 51 components.
 
 **Active workstreams:**
 
-1. **Architect confirmation rounds** — promote 📝 DRAFT 🔍 component files to ✅ COMPLETE as architect signs off (38 components ready).
-2. **Architect ADR decisions** — 37 candidate ADRs (ADR-CAND-023 through ADR-CAND-059) await promotion to active DECs. Highest-stakes 11 candidates flagged in WDP-DECISIONS.md.
+1. **Architect confirmation rounds** — promote 📝 DRAFT 🔍 component files to ✅ COMPLETE as architect signs off (40 components ready, including COMP-16 v1.3 and COMP-18 v2.1 now).
+2. **Architect ADR decisions** — **44 candidate ADRs** (ADR-CAND-023 through ADR-CAND-072) await promotion to active DECs. Highest-stakes 11 from Phase 3 baseline flagged in WDP-DECISIONS.md; **7 new candidates from 2026-05-15 reconciliation** include ADR-CAND-066 (platform-wide REST `@Retryable` posture, triggered by COMP-18 DMS retry change) and ADR-CAND-070 (cross-datasource non-atomic UK write window on COMP-16).
 3. **Source-verification of remaining 4 components** — COMP-29, 31, 34, 38.
 4. **Workflow documentation** — author the 11 WDP-FLOW-*.md files identified in WDP-FLOW-INDEX.md.
 5. **Open architectural questions** — 27 platform-level discussion points captured in WDP-ARCHITECTURE.md for architect resolution.
 
-**Reconciliation rhythm going forward:** per-component chats append Pending Entries to WDP-CHANGE-LOG.md; reconciliation sessions consume Pending Entries and rebuild affected derivatives. See WDP-CHANGE-LOG.md for the workflow detail.
+**Reconciliation rhythm going forward:** per-component chats append Pending Entries to WDP-CHANGE-LOG.md; reconciliation sessions consume Pending Entries and rebuild affected derivatives. See WDP-CHANGE-LOG.md for the workflow detail. **Two reconciliations completed post-baseline:** 2026-05-06 (COMP-49 + COMP-50 joint consolidation) and 2026-05-15 (COMP-16 v1.3 + COMP-18 v2.1).
 
 ---
 
@@ -223,6 +223,7 @@ Do not contradict these without explicit confirmation from Ram.
 - **** COMP-29 / COMP-35 / COMP-30 / others — `/actuator/prometheus` JWT-protected pattern confirmed widespread; **scrape-side configuration must carry JWT or whitelisting needs platform-wide remediation.**
 - **** **COMP-49 WDP Portal user types are three, not two:** `MERCHANT_USER`, `OPS_USER`, and `PB_USER`. Assigned at runtime by `WdpSharedService` based on DNS hostname plus IDP firm name. `PB_USER` is the Worldpay-internal `us_worldpay_fis_int` firm authenticated via merchant DNS — distinct from `MERCHANT_USER` and from `OPS_USER`.
 - **** **COMP-49 OPS super-user UI bypass amplifies DEC-018:** `WdpUtilService.canUserPerformDisputeAction()` (`wdp.util.service.ts:44-46`) returns `{canPerform: true}` unconditionally for any `OPS_USER`, with no inspection of action / case state / queue / per-action permissions. Combined with DEC-018 (no server-side RBAC at COMP-24 CaseActionService), there is no enforcement gate at either UI or backend layer for OPS_USER. RISK-195 / ADR-CAND-060 — top-priority architect resolution required.
+- **** **COMP-16 JWT scope enforcement absent (v1.3, 2026-05-15):** Any trusted JWT fully authorises `PUT /event` admin endpoint — no scope claim check. Operational posture for the admin surface in production is an open question.
 
 ### Kafka — Platform-Wide Patterns
 
@@ -235,6 +236,12 @@ Do not contradict these without explicit confirmation from Ram.
 - **** **COMP-22 DisputeService is NOT a Kafka producer at runtime** — wired but commented out (commit `c29018cd` by Shringi Nitin (WP), 2025-08-08, message "code changes (#93)"). No in-source rationale.
 - **`wdp.outgoing_event_outbox` has FIVE writers**: COMP-17 (EXPIRY_EVENTS, `WCSEEXPC`), COMP-41 (GP_EVENTS, `WNEC`), COMP-42 (BEN_EVENTS, `WBENC`), COMP-43 (CORE_EVENTS, `PCSECRTC`), COMP-51 (EXPIRY_BATCH, `WCSEEXPB`). Each writer uses a distinct `channel_type` discriminator. **No DB-level UNIQUE constraint visible in any of the five repos** — DBA confirmation required.
 - `wdp.bre_orchestration_outbox` is shared between COMP-18 (`component=NOTIFICATION_ORCHESTRATOR` rows) and COMP-12 Scheduler4 (`component=BUSINESS_RULES` rows). PUBLISHED-status orphan rows have no automatic re-drive — manual intervention required.
+- **** **`WDP.bre_orchestration_outbox` has THREE writers (v1.3, 2026-05-15):** COMP-16 BusinessRulesProcessor (BUSINESS_RULES rows on Kafka consumer path — new in v1.3, persists per-event status PUBLISHED / SUCCESS / FAILED / ERROR / PENDING_DEFERRED / SKIPPED); COMP-18 NotificationOrchestrator (NOTIFICATION_ORCHESTRATOR rows); COMP-12 Scheduler4 (BUSINESS_RULES rows from outbox-relay retry path). Schema name annotated uppercase `WDP` while sibling tables are lowercase `wdp` — DBA confirmation pending. No `@UniqueConstraint` on `idempotency_id` confirmed in any of three repos.
+- **** **COMP-16 is a two-branch consumer on `business-rules` (v1.3, 2026-05-15):** Branch A (eventId non-null): pre-ACK before `processRulesEvent`. Branch B (eventId null): `processNewCaseActionEvent` persists `WDP.bre_orchestration_outbox` row first, then ACK, then `processRulesEvent`. Both branches at-most-once. Branch B adds application-level dedup on `idempotencyId + eventTimestamp` plus previous-event ordering guard — DEC-020 materially mitigated for COMP-16.
+- **** **COMP-18 DMS `@Retryable` exclude removed (v2.1, 2026-05-15):** `RestInvoker.callDMS` previously carried `@Retryable(exclude = RestTemplateCustomException.class)`. The exclude was silently removed in v2.1. HTTP 4xx/5xx from Document Management Service are now retried 3 × 2000ms instead of fast-failing. With concurrency=1, every DMS error event adds ~6 s of single-thread block to `outgoing-events` throughput. Amplifies DEC-014 VOID. Intent unconfirmed — RISK-219, ADR-CAND-066 raised.
+- **** **COMP-18 correlationId UUID propagation (v2.1, 2026-05-15):** `RequestCorrelation.setId(...)` now fires in the main listener flow. UUID assigned per event when inbound `correlationId` is blank, propagated by ModelMapper onto outbound Kafka payload BODIES (`case-action-events`, `core-request-events`, `external-request-events`). Headers and logback pattern unchanged — correlation is on the wire but not in log output. `RequestCorrelation.getId()` still has zero callers; partial-wiring pattern raised as ADR-CAND-067.
+- **** **COMP-18 Filter 4 fileType chain has SIX outcomes, not four (v2.1, 2026-05-15):** AMEX, AMEX_HYBRID, DISCOVER, DISCOVER_RMO, BJS_PLCC (when caseType=BJPLCC), ISSUER_DOCS (fall-through for ISSRDOC/ISSRQDOC). **Latent code defect:** DISCOVER non-hybrid branch is plain `if` (not `else if`); DISCOVER + hybridMerchant=true sets DISCOVER_RMO then immediately overwrites to DISCOVER. Architect intent confirmation required.
+- **** **COMP-18 mounts THREE K8s `secretRef`s (v2.1, 2026-05-15):** `{{ ingressTLSsecretName }}`, `wdp-outgoing-consumer-secrets`, `wdp-common-secrets`. The `wdp-common-secrets` reference is shared platform-wide — cross-component scan needed at next reconciliation.
 - **** **COMP-18 does NOT write to `wdp.outgoing_event_outbox`** — WDP-DB.md was incorrect on this point. Source grep confirms zero references.
 - **** COMP-12 InboundDisputeEventScheduler uses **mark-and-send within a single `@Transactional`** — broker ACK precedes TX commit. **At-least-once with duplicate-possible crash window** (NOT at-most-once). Consumer-side `idempotency-key` dedup is the contracted mitigation.
 - **** COMP-12 channelTypeTopicMap non-prod default keys: `EXPIRY_EVENTS`, `CORE_EVENTS`, `GP_EVENTS`, `BEN_EVENTS` (NOT `SEN_EVENTS`).
@@ -258,7 +265,7 @@ Do not contradict these without explicit confirmation from Ram.
 - DEC-001 (transactional outbox) — confirmed deviations:
   - COMP-04 (direct publish on HTTP thread) — confirmed source-verified
   - COMP-15 (synchronous publish inside `@Transactional` — ghost-event window)
-  - COMP-16 (direct synchronous publish, no outbox)
+  - **COMP-16 ⚠️ PARTIAL (v1.3, 2026-05-15 — flipped from DEVIATES):** `WDP.bre_orchestration_outbox` now exists as event-level status register. Kafka publishes still direct synchronous (no relay). Outbox FAILED row is recovery signal, not automatic re-drive. Cross-datasource non-atomic UK write window (RISK-203, ADR-CAND-070).
   - COMP-18 ⚠️ PARTIAL (uses `wdp.bre_orchestration_outbox` but no `@Transactional`; four distinct write points are independent auto-commits)
   - COMP-19 (direct synchronous publish; HTTP 500 on Kafka failure does not undo case action)
   - COMP-20 (direct synchronous publish)
@@ -271,6 +278,11 @@ Do not contradict these without explicit confirmation from Ram.
 - **🔴 DEC-021 second offender — COMP-30 UserQueueSkillService:** service-level `@Transactional` on `createQueue`/`updateQueue` binds to `@Primary usTransactionManager` — UK writes to `nap.queues`, `nap.queue_criterion`, `nap.user_queue` are NOT covered by the outer TX. Same root cause class as COMP-02.
 - DEC-020 (Accepted Risk) — no idempotency on case creation (COMP-23). Formally recorded.
 - **** **DEC-019 UI input-layer PARTIAL exception (COMP-49):** WDP Portal accepts full PAN at three input forms across both modes — Filter Disputes (both), Filter Fax Dispute (Ops), Update Transaction Search (Ops). Encrypted in transit; decrypted to AG Grid memory only — no client-side persistence. Input-layer surface in PCI scope. Materially distinct from DEC-019 (1) and (2) (PAN-clear at rest in DB) and from (3) (CVV at rest in error tables/logs). RISK-198 — architect decision required (accept as PARTIAL or remediate).
+- **** **COMP-16 cross-datasource non-atomic UK write window (v1.3, 2026-05-15):** UK message path writes `nap.br_case_audit_log` via `ukDataSource` and `WDP.bre_orchestration_outbox` via `wdpDataSource` in separate transactions on separate datasources. **Cannot be made atomic without XA / saga / datasource consolidation.** Partial-write window on every UK message. US path is single-datasource and `@Transactional`-bracketed (no risk on US). RISK-203 / ADR-CAND-070 — architect decision required.
+- **** **COMP-16 US migration guard commented out (v1.3, 2026-05-15):** NAP-side guard (`migrationStatus equalsIgnoreCase "Y"` → PUT DRAFT→OPEN) is live; US-side guard has been commented out — US path runs FCHG transition unconditionally. Intent unconfirmed (cleanup post-completion vs regression). RISK-204 / ADR-CAND-071 — architect intent confirmation required.
+- **** **COMP-16 UK `getIssuerDoc` missing `attachedIssueDoc` disjunct (v1.3, 2026-05-15):** US gates on `attachedIssueDoc` OR legacy condition; UK gates only on the legacy condition — UK silently skips issuer-doc retrieval in `attachedIssueDoc`-only configurations. RISK-205 / ADR-CAND-072 — behavioural defect or intentional UK-specific design.
+- **** **COMP-16 `applyRuleGroup` recursion has no cycle or depth guard (v1.3, 2026-05-15):** self-referencing rule group produces unbounded recursive loop. With consumer concurrency=1, single bad rule configuration stalls the whole consumer group. RISK-201 / ADR-CAND-068.
+- **** **COMP-16 singleton service instance-field state (v1.3, 2026-05-15):** per-message context held on Spring singleton fields. Safe only because concurrency=1 and admin REST is operationally unused. RISK-202 / ADR-CAND-069.
 
 ### Key Confirmed Platform Facts
 
@@ -407,6 +419,28 @@ This section carries **component-level** open questions. **Platform-level** open
 | Discover hybrid-merchant RE2/REPR special case — permanent regulatory rule or migration-era workaround? | COMP-51 OQ | Architect / regulatory confirmation |
 | HTTP 504 retry on POST endpoints (Accept, Add Action, Rules) — safe across all 7 upstream services? | COMP-51 risk | Architect / team confirmation |
 | Hardcoded user IDs `WCSEEXPB` (COMP-51) and `WCSEEXPC` (COMP-17) — confirm distinction is intentional | COMP-51 OQ | Confirm with platform user-ID registry |
+| **COMP-16 v1.3 — `applyRuleGroup` cycle / depth guard** — add depth limit and visited-set cycle detector, or accept the hazard with operational guardrails on rule configuration | COMP-16 v1.3 / RISK-201 / ADR-CAND-068 | Architect decision |
+| **COMP-16 v1.3 — singleton service instance-field state** — make services stateless (per-message context object) or formally enforce concurrency=1 as platform invariant | COMP-16 v1.3 / RISK-202 / ADR-CAND-069 | Architect decision |
+| **COMP-16 v1.3 — cross-datasource non-atomic UK write window** — accept partial-write window with operational compensation, consolidate datasource, or introduce XA / saga / outbox-only redesign | COMP-16 v1.3 / RISK-203 / ADR-CAND-070 | Architect decision |
+| **COMP-16 v1.3 — US migration guard commented out** — intentional (US migration complete) or regression? | COMP-16 v1.3 / RISK-204 / ADR-CAND-071 | Architect / developer confirmation |
+| **COMP-16 v1.3 — UK `getIssuerDoc` missing `attachedIssueDoc` disjunct** — align with US or document intentional UK-specific design? | COMP-16 v1.3 / RISK-205 / ADR-CAND-072 | Architect decision |
+| **COMP-16 v1.3 — Admin `PUT /event` runbook and production posture** — keep enabled in production or gate by profile? JWT scope check absent (any trusted JWT fully authorises) | COMP-16 v1.3 OQ | Operations / team confirmation |
+| **COMP-16 v1.3 — `WDP.bre_orchestration_outbox` schema-case `WDP` vs `wdp`** — entity annotation uppercase; sibling tables lowercase. Resolve via `\dn` on target database | COMP-16 v1.3 OQ | DBA confirmation |
+| **COMP-16 v1.3 — `WDP.bre_orchestration_outbox` `@UniqueConstraint` on `(idempotency_id, component)`** | COMP-16 v1.3 OQ | DBA confirmation via cluster DDL |
+| **COMP-16 v1.3 — `v-correlation-id` MDC propagation** — add MDC filter for inbound Kafka headers and outbound REST interceptor, or accept current header-only propagation | COMP-16 v1.3 OQ | Architect decision |
+| **COMP-16 v1.3 — `logstash_server_host_port` populated in production?** Secret value not in repo | COMP-16 v1.3 OQ | Environment config confirmation |
+| **COMP-16 v1.3 — Production values for env-injected Kafka consumer properties** (`max_poll_records`, `session_timeout_ms`, `heartbeat_interval_ms`, `max_poll_interval`) | COMP-16 v1.3 OQ | Environment config / team confirmation |
+| **COMP-16 v1.3 — US `mapRuleAction` silently drops `SKIP_STATUS_UPDATE`** — defect to fix or intentional US-specific behaviour? | COMP-16 v1.3 / RISK-207 | Architect decision |
+| **COMP-16 v1.3 — US `addUpdateCaseAction` unguarded `caseLiability` null** — robustness gap, defect to fix? | COMP-16 v1.3 / RISK-208 | Architect decision |
+| **COMP-16 v1.3 — US `validateChargeBack` 7 unreachable duplicate level-entity arms** — clean up; confirms NAP is authoritative | COMP-16 v1.3 / RISK-209 | Architect decision |
+| **COMP-16 v1.3 — UK exclusive `else-if` vs US independent `if` dispatch in `processRuleActions`** — intentional domain difference or defect? | COMP-16 v1.3 / RISK-211 | Architect decision |
+| **COMP-16 v1.3 — outbox-relay completion (full DEC-001)** — extend `WDP.bre_orchestration_outbox` to a true relay-publisher pattern? | COMP-16 v1.3 OQ | Architect decision |
+| **COMP-18 v2.1 — DMS retry posture intent** — was the `exclude=RestTemplateCustomException` removal intentional? If yes, ratify policy; if no, restore the exclude | COMP-18 v2.1 / RISK-219 / ADR-CAND-066 | Developer / architect confirmation; Claude Code follow-up on fresh repo clone for git blame |
+| **COMP-18 v2.1 — platform-wide REST `@Retryable` posture** — retry 5xx + idempotent 4xx only, fast-fail non-idempotent 4xx, or status quo? Cross-component audit needed (COMP-04, 16, 18, 39, 43) | COMP-18 v2.1 / RISK-219 / ADR-CAND-066 | Architect decision (platform-wide) |
+| **COMP-18 v2.1 — Filter 4 fileType DISCOVER overwrite defect** — intentional or restructure `if`/`else if` chain to give hybrid Discover merchants `DISCOVER_RMO`? | COMP-18 v2.1 OQ | Developer / architect confirmation |
+| **COMP-18 v2.1 — correlationId completion** — finish wiring (MDC.put + `%X` in pattern + outbound REST header propagation) or remove the now-dead writes? Same survey for COMP-14, 15, 17, 43 | COMP-18 v2.1 / ADR-CAND-067 | Developer / architect decision |
+| **COMP-18 v2.1 — `wdp-common-secrets` mount** — what does this secret contain? Which other components mount it? Cross-component verification | COMP-18 v2.1 OQ | Operations / platform team confirmation |
+| **OQ-3 RESOLVED (2026-05-15):** COMP-18 consumer timing parameters confirmed env-var passthrough only — no committed defaults at `application-prod.yml:7-10`. Production values remain external (K8s secret). | COMP-18 v2.1 | Resolved — values still external |
 
 ---
 

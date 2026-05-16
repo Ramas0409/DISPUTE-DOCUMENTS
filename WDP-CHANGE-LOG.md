@@ -65,6 +65,7 @@ This log is the audit trail of *what was reconciled when*, not a duplicate store
 | Date | Derivatives rebuilt | Entries consumed | Notes |
 |------|---------------------|------------------|-------|
 | 2026-05-06 | WDP-ARCHITECTURE, WDP-COMP-INDEX, WDP-NFRS, WDP-DECISIONS, WDP-HANDOVER | COMP-42 (2026-04-30); COMP-49 + COMP-50 (2026-05-06) | First reconciliation session post-baseline. 6 RISK rows added (RISK-195–200); 6 ADR-CAND raised (ADR-CAND-060–065); DEC-018 amplified by COMP-49 OPS UI super-user bypass; DEC-019 (4) UI input-layer PARTIAL exception added. Architect open questions on COMP-49+50 captured but unresolved — top priority: ADR-CAND-060 OPS bypass remediation strategy. |
+| 2026-05-15 | WDP-NFRS (v2.3), WDP-DECISIONS (v2.3), WDP-KAFKA (v2.3), WDP-DB (v2.3), WDP-COMP-INDEX (v2.3), WDP-HANDOVER (v3.3) | COMP-16 v1.3 (2026-05-15); COMP-18 v2.1 (2026-05-15) | Second reconciliation session post-baseline. **19 new RISK rows** (RISK-201–218 from COMP-16; RISK-219 from COMP-18); **7 new ADR-CANDs** (ADR-CAND-066–072); **DEC-001 flipped from ⛔ DEVIATES to ⚠️ PARTIAL for COMP-16** (event-level outbox `WDP.bre_orchestration_outbox` now exists, Kafka publish still direct synchronous, no relay); **DEC-014 VOID risk amplitude amplified** by COMP-18 DMS `@Retryable` exclude removal; **DEC-020 materially mitigated for COMP-16** (idempotencyId+eventTimestamp dedup + previous-event ordering guard). RISK-015 / RISK-076 / RISK-083 extended with COMP-16. OQ-3 RESOLVED (COMP-18 consumer timing env-var passthrough). **Highest-priority architect items:** ADR-CAND-066 (platform-wide REST `@Retryable` posture); ADR-CAND-070 (cross-datasource non-atomic UK write window on COMP-16); ADR-CAND-071 (US migration guard intent). ARCHITECTURE and INTEGRATIONS not touched — both entries declared "no change" at platform-topology level. |
 
 ---
 
@@ -72,13 +73,29 @@ This log is the audit trail of *what was reconciled when*, not a duplicate store
 
 *Each per-component chat appends a new block here at the end of Phase 2.*
 
-*(none — last reconciliation session 2026-05-06; see Reconciliation Markers above and Reconciled Archive below)*
+*(none — last reconciliation session 2026-05-15; see Reconciliation Markers above and Reconciled Archive below)*
 
 ---
 
 ## Reconciled Archive
 
 *Compressed entries from completed reconciliation sessions, in reverse-chronological order.*
+
+### 2026-05-15 · COMP-16 BusinessRulesProcessor · v1.1 DRAFT → v1.3 DRAFT (forensic re-audit)
+
+User-requested forensic behavioural re-audit prompted by material repository changes since 2026-04-18. `WDP.bre_orchestration_outbox` is now actively read+written as an event-level status register on the Kafka consumer path (statuses: PUBLISHED, SUCCESS, FAILED, ERROR, PENDING_DEFERRED, SKIPPED) — flips DEC-001 from ⛔ VOID to ⚠️ PARTIAL for COMP-16, but Kafka publishes remain direct synchronous (no relay). Two-branch Kafka consumer confirmed — Branch A (eventId non-null) is pre-ACK; Branch B (eventId null) is persist→ACK→process with new application-level dedup on `idempotencyId + eventTimestamp` plus previous-event ordering guard (DEC-020 materially mitigated). Five HIGH-severity new risks: `applyRuleGroup` recursion has no cycle/depth guard (RISK-201); singleton service instance-field state (RISK-202); cross-datasource non-atomic UK write window between `nap.br_case_audit_log` and `WDP.bre_orchestration_outbox` (RISK-203); US migration guard commented out, FCHG path runs unconditionally (RISK-204); UK `getIssuerDoc` missing `attachedIssueDoc` disjunct (RISK-205). 13 additional MEDIUM/LOW risks logged including `/actuator/prometheus` JWT requirement, US/UK dispatch asymmetries, dead code, and `INTEGER BETW` inverted bounds.
+
+**Platform record:** RISK-201 through RISK-218 (`WDP-NFRS.md` §6.1.B COMP-16 sub-section); ADR-CAND-068 through ADR-CAND-072 (`WDP-DECISIONS.md` Phase 3 candidates table); DEC-001 PARTIAL row in deviation map updated; DEC-020 row reworded to "DEVIATES, materially mitigated"; DEC-005 row reworded to "two-branch pre-ACK"; DEC-011 VOID re-confirmed (new outbox is event-state, not step-checkpointing); DEC-017 re-confirmed; RISK-015 (PUBLISHED orphan), RISK-076 (spring-boot-devtools in prod), RISK-083 (minReadySeconds misplaced) all extended with COMP-16. **Highest-priority architect items raised:** ADR-CAND-070 (cross-datasource non-atomic UK write — accept, consolidate datasource, or XA/saga); ADR-CAND-071 (US migration guard intent — cleanup or regression?). **Full audit detail:** `WDP-COMP-16-BUSINESS-RULES-PROCESSOR.md`.
+
+---
+
+### 2026-05-15 · COMP-18 NotificationOrchestrator · v2.0 DRAFT → v2.1 DRAFT (delta-audit)
+
+Delta-audit of `wp-mfd/wdp-outgoing-consumer` against the 2026-04-18 baseline. Only two source files changed in the working copy (`NotificationServiceImpl.java`, `RestInvoker.java`); architecture topology unchanged. Git history not recoverable on the audited clone — dating bounded by file mtime only. **One HIGH-severity finding:** DMS `@Retryable` lost `exclude=RestTemplateCustomException` — HTTP 4xx/5xx responses are now retried 3 × 2000ms instead of fast-failing; at consumer concurrency=1 this turns transient DMS error events into ~6 s of single-thread block per event on `outgoing-events`, amplifying DEC-014 VOID circuit-breaker gap (eventual flow outcome unchanged — message still lands at FAILED in outbox once retries exhausted; only throughput affected). Three lower-severity findings: correlationId UUID now propagated onto outbound Kafka payload BODIES via ModelMapper but not into log MDC (partial wiring — `RequestCorrelation.getId()` has zero callers); Filter 4 fileType resolution has six outcomes not four (AMEX, AMEX_HYBRID, DISCOVER, DISCOVER_RMO, BJS_PLCC, ISSUER_DOCS) with latent DISCOVER + hybridMerchant overwrite defect; three K8s `secretRef`s mounted (`{{ ingressTLSsecretName }}`, `wdp-outgoing-consumer-secrets`, `wdp-common-secrets`) not one as previously documented. Platform-wide implication: the `wdp-common-secrets` mount warrants cross-component scan at next reconciliation.
+
+**Platform record:** RISK-219 (`WDP-NFRS.md` §6.1.B COMP-18 sub-section); ADR-CAND-066 — platform-wide REST `@Retryable` exclude posture, triggered by COMP-18 (`WDP-DECISIONS.md`); ADR-CAND-067 — correlation ID write-side-without-read-side pattern, COMP-18 trigger with survey candidates COMP-14/15/17/43; DEC-014 VOID note amended for risk-amplitude amplification; DEC-001 / DEC-005 / DEC-020 postures unchanged for COMP-18. **Resolved open question:** OQ-3 (consumer timing parameters) — confirmed env-var passthrough only, production values still external. **Full audit detail:** `WDP-COMP-18-NOTIFICATION-ORCHESTRATOR.md`.
+
+---
 
 ### 2026-05-06 · COMP-49 + COMP-50 WDP Portal · v1.0 → v3.0 (joint, structural consolidation)
 

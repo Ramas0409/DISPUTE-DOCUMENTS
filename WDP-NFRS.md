@@ -1,6 +1,6 @@
 # WDP-NFRS.md
 **Worldpay Dispute Platform — Non-Functional Requirements**
-*Version: 2.2*
+*Version: 2.3*
 
 ---
 
@@ -13,7 +13,7 @@ NFRs are organised into five confirmed sections (Performance, Availability and R
 - Corrected the Kafka delivery guarantee claim (at-most-once, not at-least-once)
 - Added exception notes where confirmed component behaviour conflicts with a stated NFR
 
-**Section 6 — Platform Risk Register.** The v2.0 register documented 23 confirmed risks (RISK-001 through RISK-023). The v2.1 reconciliation appended RISK-024 through RISK-082 from the 20-entry source-verification audit and withdrew RISK-009. **The v2.2 reconciliation appends RISK-083 onwards from the 18-entry source-verification audit**, extends the platform-wide pattern rows (RISK-001, 010, 012, 013, 024, 025, 040, 050, 076, 077) with newly-confirmed components, and promotes RISK-010 from 🟠 to 🔴 to reflect the DEC-021 scope expansion.
+**Section 6 — Platform Risk Register.** The v2.0 register documented 23 confirmed risks (RISK-001 through RISK-023). The v2.1 reconciliation appended RISK-024 through RISK-082 from the 20-entry source-verification audit and withdrew RISK-009. The v2.2 reconciliation appended RISK-083 onwards from the 18-entry source-verification audit, extended the platform-wide pattern rows (RISK-001, 010, 012, 013, 024, 025, 040, 050, 076, 077) with newly-confirmed components, and promoted RISK-010 from 🟠 to 🔴 to reflect the DEC-021 scope expansion. The 2026-05-06 post-baseline reconciliation appended RISK-195 through RISK-200 against COMP-49 WDP Portal source-verification. **The v2.3 reconciliation (2026-05-15) appends RISK-201 through RISK-218 from the COMP-16 BusinessRulesProcessor forensic re-audit (v1.1 → v1.3) and RISK-219 from the COMP-18 NotificationOrchestrator delta-audit (v2.0 → v2.1)**, extends RISK-015 with COMP-16, and extends pattern rows RISK-076 and RISK-083 with COMP-16.
 
 **NFR targets:** Product team has not yet finalised NFR targets for the gaps documented in Section 6. Targets will be added once confirmed. Do not apply NFR targets from this document to architecture decisions without first confirming they are still current with the solution architect.
 
@@ -71,6 +71,8 @@ NFRs are organised into five confirmed sections (Performance, Availability and R
 ⚠️ EXCEPTION — **COMP-26 QuestionnaireService** uses `DriverManagerDataSource` (no HikariCP, no application-tier connection pool). Every JPA call opens a new JDBC connection — throughput is bounded by Postgres / PgBouncer accept rate. See RISK-147.
 
 ⚠️ EXCEPTION — **COMP-32 RulesService** uses `DataSourceBuilder.create.build` with no explicit pool tuning on either of two PostgreSQL datasources. Pool sizing is whatever Spring Boot defaults to. See RISK-163 (DB outage takes down all 14 endpoints simultaneously due to absent timeouts/retry/fallback).
+
+⚠️ EXCEPTION — **COMP-18 NotificationOrchestrator DMS retry amplification (v2.1, 2026-05-15).** `@Retryable` on `RestInvoker.callDMS` previously excluded `RestTemplateCustomException`; v2.1 silently removed the `exclude`, so HTTP 4xx/5xx now retries 3 × 2000ms instead of fast-failing. With consumer concurrency=1, every DMS error event adds up to ~6 s of single-thread block to `outgoing-events` throughput. See RISK-219.
 
 ---
 
@@ -135,7 +137,7 @@ All Stage 3 targets are from planning documents only. None have been measured.
 
 ⚠️ EXCEPTION — Pod availability for several long-running components is not measurable in the standard sense because they have no Kubernetes liveness, readiness, or startup probes. Hung pods are not evicted by kubelet. Affected (extended): COMP-07, COMP-08, COMP-09, COMP-11, COMP-12, COMP-14, COMP-17, COMP-39 (no startup), COMP-41, COMP-42 (no probes at all), COMP-43, COMP-51 (no probes at all). See RISK-024.
 
-⚠️ EXCEPTION — **`minReadySeconds` platform-wide misplacement.** Eight components confirmed to place `minReadySeconds: 30` under `spec.template.spec` instead of `spec` — silently ignored at runtime. Affected: COMP-03, COMP-05, COMP-08, COMP-09, COMP-12, COMP-25, COMP-26, COMP-28, COMP-34, COMP-40. The intended rolling-update stability gate is not actually applied. See RISK-083.
+⚠️ EXCEPTION — **`minReadySeconds` platform-wide misplacement.** Nine components confirmed to place `minReadySeconds: 30` under `spec.template.spec` instead of `spec` — silently ignored at runtime. Affected: COMP-03, COMP-05, COMP-08, COMP-09, COMP-12, COMP-16 *(added v1.3, 2026-05-15)*, COMP-25, COMP-26, COMP-28, COMP-34, COMP-40. The intended rolling-update stability gate is not actually applied. See RISK-083.
 
 ---
 
@@ -164,8 +166,8 @@ The v1.0 delivery guarantee claim "At-least-once; offset committed only after fu
 
 | Requirement | Confirmed Specification |
 |---|---|
-| Kafka consumer delivery guarantee | **At-most-once** on Kafka consumers (COMP-14/15/16/17/18/39/40/41/42/43). **At-least-once with duplicate-possible window** on COMP-12 outbox→Kafka relays (mark-and-send within `@Transactional`; broker ACK precedes TX commit). Consumer-side `idempotency-key` dedup is the contracted mitigation. ⚠️ COMP-05 added to the at-most-once list explicitly — pre-ACK confirmed in source. |
-| Retry mechanism for external calls | Spring Retry (`@Retryable`) — present in a subset of components only. Typically 3 attempts with fixed delay. COMP-34 has no retry. ⚠️ COMP-41 imports `@Retryable`/`@Backoff` but never applies them — class names containing "Retry" describe custom try/catch, not framework. ⚠️ COMP-42 spring-retry is transitive via spring-kafka — not declared in pom.xml; same risk class as COMP-41. ⚠️ COMP-51 hand-rolls retry via `i_retry_count` increment on `wdp.case_expiry`; spring-retry is on classpath but unused. |
+| Kafka consumer delivery guarantee | **At-most-once** on Kafka consumers (COMP-14/15/16/17/18/39/40/41/42/43). **At-least-once with duplicate-possible window** on COMP-12 outbox→Kafka relays (mark-and-send within `@Transactional`; broker ACK precedes TX commit). Consumer-side `idempotency-key` dedup is the contracted mitigation. ⚠️ COMP-05 added to the at-most-once list explicitly — pre-ACK confirmed in source. ⚠️ **COMP-16 v1.3 refinement (2026-05-15):** two-branch consumer — Branch A (eventId non-null) is pre-ACK before `processRulesEvent`; Branch B (eventId null) is `processNewCaseActionEvent` persist → ACK → `processRulesEvent`. Both branches at-most-once. Branch B adds application-level dedup on `idempotencyId + eventTimestamp` against `WDP.bre_orchestration_outbox` plus previous-event ordering guard — see RISK-011 mitigation note. |
+| Retry mechanism for external calls | Spring Retry (`@Retryable`) — present in a subset of components only. Typically 3 attempts with fixed delay. COMP-34 has no retry. ⚠️ COMP-41 imports `@Retryable`/`@Backoff` but never applies them — class names containing "Retry" describe custom try/catch, not framework. ⚠️ COMP-42 spring-retry is transitive via spring-kafka — not declared in pom.xml; same risk class as COMP-41. ⚠️ COMP-51 hand-rolls retry via `i_retry_count` increment on `wdp.case_expiry`; spring-retry is on classpath but unused. ⚠️ **COMP-16 v1.3 (2026-05-15):** `@EnableRetry` plus `@Retryable` on `CaseService` methods now active — `case.retry_count` / `case.retry_delay` env vars no longer dead. Other clients in COMP-16 still no retry. ⚠️ **COMP-18 v2.1 (2026-05-15):** `@Retryable` on `RestInvoker.callDMS` lost its `exclude=RestTemplateCustomException` — HTTP 4xx/5xx now retried instead of fast-failed. See RISK-219. |
 | Outbox retry — transient failures | At least 2 retry attempts tracked via `wdp.outgoing_event_outbox` status progression before terminal ERROR (COMP-43 pattern). Not universally implemented. ⚠️ Scheduler3 reads only FAILED and PENDING_DEFERRED rows — PUBLISHED orphans have no auto-redrive. See RISK-015 / RISK-040. ⚠️ COMP-51 EXPIRY_BATCH rows are written at `status=ERROR` direct (no PUBLISHED→FAILED transition); **no platform component is currently confirmed to read them**. See RISK-090. |
 | Notification channel isolation | Per-channel outbox table; failure in one channel (e.g. CORE_EVENTS) does not affect other channels (e.g. BEN, Signifyd). ⚠️ Now five channels confirmed: EXPIRY_EVENTS, GP_EVENTS, BEN_EVENTS, CORE_EVENTS, EXPIRY_BATCH. |
 | ACK generation success rate SLO | > 95% rolling 1 hour; alert at < 90% (CRITICAL) — ⚠️ measurement reliability depends on COMPLETED-transition contract (see Section 1.1) |
@@ -390,7 +392,7 @@ The v1.0 delivery guarantee claim "At-least-once; offset committed only after fu
 
 (Unchanged from v2.1.)
 
-⚠️ EXCEPTION — Several production component images ship `spring-boot-devtools` (COMP-23 confirmed; COMP-24 likely; **COMP-30 confirmed**). Dev-time class-path scanning may execute in production. See RISK-076.
+⚠️ EXCEPTION — Several production component images ship `spring-boot-devtools` (COMP-23 confirmed; COMP-24 likely; **COMP-30 confirmed**; **COMP-16 confirmed v1.3 — no `<scope>`, not `<optional>`, ships to prod**). Dev-time class-path scanning may execute in production. See RISK-076.
 
 ---
 
@@ -441,7 +443,7 @@ The v1.0 delivery guarantee claim "At-least-once; offset committed only after fu
 
 ## 6. Platform Risk Register
 
-This section documents confirmed gaps and risks. RISK-001 through RISK-023 were identified during the April 2026 component survey. RISK-024 through RISK-082 were added during the source-verification reconciliation pass. **RISK-083 through RISK-194 were added during the source-verification reconciliation pass against 16 additional components.** **RISK-195 through RISK-200 were added in the 2026-05-06 post-baseline reconciliation against COMP-49 WDP Portal.**
+This section documents confirmed gaps and risks. RISK-001 through RISK-023 were identified during the April 2026 component survey. RISK-024 through RISK-082 were added during the source-verification reconciliation pass. **RISK-083 through RISK-194 were added during the source-verification reconciliation pass against 16 additional components.** **RISK-195 through RISK-200 were added in the 2026-05-06 post-baseline reconciliation against COMP-49 WDP Portal.** **RISK-201 through RISK-219 were added in the 2026-05-15 post-baseline reconciliation against COMP-16 BusinessRulesProcessor (v1.3 forensic re-audit) and COMP-18 NotificationOrchestrator (v2.1 delta-audit).**
 
 NFR targets for addressing these risks have not been set. Product team to define.
 
@@ -475,7 +477,7 @@ NFR targets for addressing these risks have not been set. Product team to define
 | RISK-012 | 🟠 | validateOrgId commented out — **** method body absent; remediation cannot be done by uncomment alone | COMP-03 | DEC-018 (related) |
 | RISK-013 | 🟡 | Polling batch replica constraint has no automated enforcement — extended to include **COMP-06** | COMP-06, 07, 08, 09, 51 | DEC-023 |
 | RISK-014 | 🟡 | removeItemFromQueueDisabled has no automated state check | COMP-07, COMP-08 | DEC-022 |
-| RISK-015 | 🟡 | bre_orchestration_outbox PUBLISHED orphan rows | COMP-12, COMP-18 | Component file |
+| RISK-015 | 🟡 | bre_orchestration_outbox PUBLISHED orphan rows — *extended 2026-05-15 to include COMP-16 as third writer of `WDP.bre_orchestration_outbox`; Scheduler3 still reads only FAILED and PENDING_DEFERRED* | COMP-12, COMP-16, COMP-18 | Component file |
 | RISK-016 | 🟡 | NAPOutcomeProcessor notesLookup commented out | COMP-39 | Component file |
 | RISK-017 | 🟡 | VisaResponseQuestionnaire additionalImagesList silently discarded | COMP-40 | Component file |
 | RISK-018 | 🟡 | AcceptService/ContestService — no rollback on Kafka publish failure | COMP-19, COMP-20 | DEC-001 deviation |
@@ -687,6 +689,39 @@ NFR targets for addressing these risks have not been set. Product team to define
 | RISK-193 | 🟡 | COMP-42 all six outbound dependencies have no read/connect timeout configured | RISK-001 platform pattern |
 | RISK-194 | 🟢 | COMP-42 predecessor lookup loads ALL channel_types for caseNumber, filters to BEN_EVENTS in memory — unbounded per-case query, no pagination, no LIMIT | Component file |
 
+###### COMP-16 BusinessRulesProcessor *(v1.3 forensic re-audit, 2026-05-15)*
+
+*Added 2026-05-15 in post-baseline reconciliation against COMP-16 v1.3 forensic re-audit. The pre-existing Phase 1 risks for COMP-16 (RISK-007, 008, 011, 020, 022) remain in scope unchanged; the rows below are additive.*
+
+| Risk ID | Severity | Risk | Reference |
+|---|---|---|---|
+| RISK-201 | 🔴 | COMP-16 `applyRuleGroup` rule-chain recursion has no cycle detection and no depth guard — a self-referencing rule group produces an unbounded recursive loop. With consumer concurrency=1, a single bad rule configuration stalls the entire consumer group | Component file |
+| RISK-202 | 🔴 | COMP-16 singleton service instance-field state — per-message processing context is held on Spring singleton fields rather than passed as a per-call parameter. Currently safe only because consumer concurrency=1 and the admin REST surface is operationally unused; any concurrency increase or REST exercise interleaves state across messages | Component file; mirrors latent platform-wide singleton-mutation hazard |
+| RISK-203 | 🔴 | COMP-16 cross-datasource non-atomic UK write — the UK audit-log write (`nap.br_case_audit_log`, `ukDataSource`) and the BRE outbox write (`WDP.bre_orchestration_outbox`, `wdpDataSource`) are not in the same transaction and **cannot be**, since they live on different datasources. Partial-write windows exist on every UK message. Architect decision required: accept or remediate via XA / saga / single-datasource consolidation | DEC-001 PARTIAL (new), DEC-020 PARTIAL |
+| RISK-204 | 🔴 | COMP-16 US migration guard commented out — the NAP-side guard (`migrationStatus equalsIgnoreCase "Y"` → PUT DRAFT→OPEN) is live; the US-side guard has been commented out in source and the US path runs the FCHG transition unconditionally. Whether this is intentional (US has migrated and no longer needs guarding) or a regression is unknown — architect decision required | Component file |
+| RISK-205 | 🔴 | COMP-16 UK `getIssuerDoc` missing `attachedIssueDoc` disjunct — the US implementation gates issuer-doc retrieval on `attachedIssueDoc` OR the legacy condition; UK gates only on the legacy condition. UK silently skips issuer-doc retrieval in `attachedIssueDoc`-only configurations. Behavioural defect or intentional UK-specific design — architect decision required | Component file |
+| RISK-206 | 🟡 | COMP-16 `/actuator/prometheus` requires JWT — endpoint exposed but not whitelisted in Spring Security; scraper without JWT fails silently. Same class as RISK-140 (COMP-25) and the wider observability gap | Same class as RISK-140 |
+| RISK-207 | 🟡 | COMP-16 US `mapRuleAction` silently drops `SKIP_STATUS_UPDATE` — the status-update skip list is built but the setter is never called on the returned object. Downstream consumers receive `null` where they should see the skip flag | Component file |
+| RISK-208 | 🟡 | COMP-16 US `addUpdateCaseAction` unguarded null on `caseLiability` — the NAP path null-guards the field; the US path does not. NPE on inbound events with `caseLiability=null` | Component file |
+| RISK-209 | 🟡 | COMP-16 US `validateChargeBack` has 7 unreachable duplicate level-entity arms with disagreeing getter assignments — defensive code that contradicts itself; confirms NAP is the authoritative source for these fields. Defect to clean up | Component file |
+| RISK-210 | 🟡 | COMP-16 shared latent NPE on `ISSUER_DOCUMENTS` recursion — recursion return value is discarded by the caller; if parent rules collection is null on the recursive return, subsequent code dereferences null. Latent in current production data, exposable by unusual rule configurations | Component file |
+| RISK-211 | 🟡 | COMP-16 UK exclusive `else-if` chain vs US independent `if` chain in `processRuleActions` — same set of rule-action types is dispatched mutually-exclusively on UK and additively on US. Intentional domain difference or defect — architect decision required | Component file |
+| RISK-212 | 🟡 | COMP-16 US platform null-handling — `platform.toUpperCase()` produces NPE if `platform` is null; NAP defaults to `"NAP"` and avoids the NPE. Latent until a US inbound event ships with null platform | Component file |
+| RISK-213 | 🟡 | COMP-16 concurrent admin REST + Kafka path for same case — no synchronisation. Singleton instance fields (see RISK-202) can interleave between the admin `PUT /event` thread and the Kafka listener thread when both target the same case | Compounds RISK-202 |
+| RISK-214 | 🟢 | COMP-16 `INTEGER BETW` inverted bound order — shared NAP+US latent bug; bounds passed to comparator are swapped, every `BETW` comparison returns false. Currently masked because no rule configuration uses `INTEGER BETW` | Component file |
+| RISK-215 | 🟢 | COMP-16 `mapAcceptRequest` builds a `Notes` collection that is never added to the outbound request — shared latent bug; the constructed notes are silently dropped | Component file |
+| RISK-216 | 🟢 | COMP-16 `OutgoingEvent.eventId` field declared on the model but never set anywhere in source — dead surface. Trap for future readers who assume the field is populated | Component file (hygiene) |
+| RISK-217 | 🟢 | COMP-16 `OutgoingEventUtil.convertEventRequestToJsonString` is a stub that returns null — dead method that any future caller will silently misuse | Component file (hygiene) |
+| RISK-218 | 🟢 | COMP-16 platform fall-through invisible to ops — when `platform` matches none of NAP / US / UK, the switch falls through with no log line, no metric, no SNOTE. LATAM and unknown-platform messages are silently lost | Component file |
+
+###### COMP-18 NotificationOrchestrator *(v2.1 delta-audit, 2026-05-15)*
+
+*Added 2026-05-15 in post-baseline reconciliation against COMP-18 v2.1 delta-audit. The pre-existing risks for COMP-18 (RISK-015 extended, RISK-025, RISK-077) remain in scope unchanged.*
+
+| Risk ID | Severity | Risk | Reference |
+|---|---|---|---|
+| RISK-219 | 🔴 | COMP-18 DMS `@Retryable` lost `exclude=RestTemplateCustomException` — HTTP 4xx/5xx responses from Document Management Service are now retried 3 × 2000ms instead of fast-failing. With consumer concurrency=1, every DMS error event adds up to ~6 s of single-thread block to `outgoing-events` throughput. **Amplifies the existing DEC-014 VOID circuit-breaker gap.** Whether the `exclude` removal was intentional is open — Claude Code follow-up scheduled to recover git blame on a fresh clone | DEC-014 amplification; ADR-CAND pending — platform-wide REST retry posture |
+
 ###### COMP-49 WDP Portal
 
 *(Added 2026-05-06 in post-baseline reconciliation against COMP-49 source-verification.)*
@@ -714,14 +749,15 @@ The following existing risk rows had their **affected-components list extended**
 | **RISK-025** Empty `CommonErrorHandler` silent swallow | Extended to include COMP-05, COMP-40, COMP-42. Now 10 components confirmed. |
 | **RISK-040** PUBLISHED-orphan paths | Extended to COMP-42 BEN_EVENTS via RISK-192 (same class as the COMP-41 paths). |
 | **RISK-050** Empty Logstash secret | Extended pattern to COMP-30 `logback-spring.xml` absent from repo (RISK-161). |
-| **RISK-076** `spring-boot-devtools` in production | Extended to include COMP-30 confirmed. |
+| **RISK-076** `spring-boot-devtools` in production | Extended to include COMP-30 confirmed; **COMP-16 confirmed v1.3 (2026-05-15)** — no `<scope>`, not `<optional>`, ships to prod. |
 | **RISK-077** Outbox rows carry no Kafka-coordinate columns | Extended pattern: now five outbox writers (COMP-17, 41, 42, 43, 51) all confirm no Kafka-coordinate columns. |
+| **RISK-083** `minReadySeconds` misplaced under `spec.template.spec` | Extended to include **COMP-16 confirmed v1.3 (2026-05-15)** — same copy-paste defect as COMP-25, 28, 34, 08. Pattern now confirmed on eleven components. |
 
 #### Reconciliation summary (Phase 3)
 
-- **Rows added:** 110 new RISK rows in Phase 3 main pass (RISK-083 through RISK-091 platform-wide; RISK-093 through RISK-194 component-specific). Plus 6 additional rows in 2026-05-06 post-baseline reconciliation (RISK-195 through RISK-200, all COMP-49 WDP Portal). **Total: 116.**
+- **Rows added:** 110 new RISK rows in Phase 3 main pass (RISK-083 through RISK-091 platform-wide; RISK-093 through RISK-194 component-specific). Plus 6 additional rows in 2026-05-06 post-baseline reconciliation (RISK-195 through RISK-200, all COMP-49 WDP Portal). Plus 19 additional rows in 2026-05-15 post-baseline reconciliation (RISK-201 through RISK-218 from COMP-16 v1.3 forensic re-audit; RISK-219 from COMP-18 v2.1 delta-audit). **Total: 135.**
 - **Rows promoted:** RISK-010 promoted from 🟠 to 🔴 to reflect DEC-021 scope expansion.
-- **Rows extended:** RISK-001, 012, 013, 024, 025, 040, 050, 076, 077 (affected-components list).
+- **Rows extended:** RISK-001, 012, 013, 015 *(extended 2026-05-15 — COMP-16 added)*, 024, 025, 040, 050, 076 *(extended 2026-05-15 — COMP-16 added)*, 077, 083 *(extended 2026-05-15 — COMP-16 added)* (affected-components list).
 - **Rows withdrawn:** None in this pass.
 - **New ADR candidates surfaced (most urgent):**
   - RISK-084 — CVV-at-rest exception decision (PCI-DSS 3.2.1)
@@ -729,6 +765,9 @@ The following existing risk rows had their **affected-components list extended**
   - RISK-086 — DEC-021 wrong-TM scope expansion (now 7 methods, 2 offenders)
   - RISK-090 — EXPIRY_BATCH terminal-write-only consumer decision
   - RISK-091 — Case Expiry Subsystem coordination (COMP-17 ↔ COMP-51 shared write)
+  - **RISK-203 — cross-datasource non-atomic UK write on COMP-16 (architect decision: accept or remediate)**
+  - **RISK-204 — COMP-16 US migration guard commented out (architect intent confirmation)**
+  - **RISK-219 — platform-wide REST `@Retryable` exclude posture (HTTP 4xx vs 5xx retry policy)**
 
 ---
 
@@ -876,6 +915,66 @@ This is the highest-impact finding from the COMP-49 source-verification audit. W
 
 ---
 
+**RISK-201: COMP-16 applyRuleGroup recursion has no cycle or depth guard**
+**Severity:** 🔴 CRITICAL | **Reference:** Component file
+
+COMP-16 BusinessRulesProcessor's rule-chain dispatch recursively resolves nested rule groups via `applyRuleGroup`. There is no visited-set tracking, no maximum depth bound, and no cycle detector. A rule group that references itself (directly or transitively) produces an unbounded recursive call.
+
+**Blast radius is amplified by the consumer concurrency invariant.** COMP-16 runs Kafka consumer concurrency=1 per pod (Spring default — `setConcurrency` never called); a stack-overflowing thread does not isolate to a single message. The whole consumer group for the pod stalls until the thread is reaped, and any in-flight rule-evaluation state held on singleton fields (see RISK-202) is left in an indeterminate state.
+
+**Mitigations to consider:** add a depth limit (e.g. 32 levels) at the dispatcher boundary with explicit log + SNOTE on breach; maintain a per-message visited-set of rule group IDs and short-circuit on revisit; or accept the hazard with operational guardrails on rule configuration (rule-author tooling that prevents self-reference at write time).
+
+---
+
+**RISK-203: COMP-16 cross-datasource non-atomic UK write window**
+**Severity:** 🔴 CRITICAL | **Reference:** DEC-001 PARTIAL (new), DEC-020 PARTIAL
+
+COMP-16's UK message path writes to two datasources within a single logical processing step:
+- The UK audit log row goes to `nap.br_case_audit_log` via `ukDataSource`
+- The BRE orchestration outbox row goes to `WDP.bre_orchestration_outbox` via `wdpDataSource`
+
+These two writes are **not in the same transaction and cannot be** — they live on physically different datasources, and there is no XA coordinator, no saga compensator, and no two-phase commit. A failure between the two writes leaves an audit row without a corresponding outbox row (or vice versa) on every UK message.
+
+Whether this is acceptable depends on the contract the architect wants to honour. If the audit log is the system of record for "rule applied", then a missing outbox row is a recovery problem (the event was applied but the downstream is not driven). If the outbox is the system of record, the audit log can silently outpace the outbox.
+
+**Architect decision required:** accept the partial-write window with documented operational compensation; consolidate the two writes onto a single datasource; or introduce XA / saga / outbox-only design for the UK path.
+
+This risk does not exist on the US path, where both writes go to the WDP datasource and are bracketed by `@Transactional`.
+
+---
+
+**RISK-204: COMP-16 US migration guard commented out**
+**Severity:** 🔴 CRITICAL | **Reference:** Component file
+
+COMP-16 contains two parallel migration-guard branches, one for NAP and one for US. The NAP-side guard reads `migrationStatus equalsIgnoreCase "Y"` and, on match, executes PUT DRAFT→OPEN. The US-side equivalent has been commented out in source, and the US path now runs the FCHG transition unconditionally.
+
+Two interpretations are possible:
+1. **Intentional** — the US migration is complete and the guard is no longer needed; the comment is overdue cleanup.
+2. **Regression** — the guard was removed during a refactor and US is now silently running the post-migration path for events that should still take the pre-migration path.
+
+The source carries no commit message, no `TODO`, and no `@deprecated` annotation. The forensic re-audit cannot disambiguate without architect or developer confirmation.
+
+**Architect decision required:** confirm whether US migration is complete platform-wide. If yes, remove the dead code. If no, restore the guard. This is captured as a Claude Code follow-up at COMP-16's next pass.
+
+---
+
+**RISK-219: COMP-18 DMS `@Retryable` exclude removal amplifies DEC-014 VOID**
+**Severity:** 🔴 CRITICAL | **Reference:** DEC-014 amplification; ADR-CAND pending — platform-wide REST retry posture
+
+COMP-18 NotificationOrchestrator's `RestInvoker.callDMS` previously carried `@Retryable(exclude = RestTemplateCustomException.class)`. The `exclude` was silently removed in the v2.1 working copy. `RestTemplateCustomException` is the wrapper for HTTP 4xx and 5xx responses from Document Management Service. The removed exclude means those responses are now retried 3 × 2000ms with fixed backoff instead of fast-failing.
+
+**The amplification is single-thread.** COMP-18 runs Kafka consumer concurrency=1, so every DMS error event adds up to ~6 seconds of single-thread block to the `outgoing-events` topic before the listener moves on. With sustained DMS instability, throughput degrades proportionally to the error rate.
+
+**The amplification is also DEC-014-related.** WDP has no Resilience4j circuit breakers (DEC-014 VOID, platform-wide). Without a circuit breaker to fail fast when DMS health is poor, the retry-on-error posture turns transient DMS degradation into a throughput collapse on COMP-18. The two gaps compound.
+
+**Two architect decisions intersect here:**
+1. Was the `exclude` removal intentional? If yes, the policy "retry HTTP 4xx and 5xx" should be ratified as an explicit decision (not silently inherited from a removed exclusion). If no, the exclude should be restored.
+2. Should WDP adopt a platform-wide retry posture for REST clients — for instance, retry 5xx and idempotent 4xx (e.g. 408, 429), fast-fail on non-idempotent 4xx? COMP-18 is the trigger for the platform discussion. Captured as ADR-CAND.
+
+The eventual flow outcome on DMS error is unchanged — the message still lands at FAILED in the outbox once retries are exhausted, and the Step 7e escalation runs. Only throughput is amplified. But the throughput floor of `outgoing-events` is now hostage to DMS error rate.
+
+---
+
 ### 6.7 Medium and Low Risk Details (Phases 2 and 3)
 
 For completeness, all Phase 2 and Phase 3 MEDIUM and LOW risks are recorded with sufficient detail in the summary table at Section 6.1. Component-specific narrative is captured in the relevant component file (WDP-COMP-NN-*.md) and in WDP-HANDOVER.md "Component-Specific Source-Verified Findings".
@@ -901,9 +1000,9 @@ Navigation aid for finding all risks affecting a given component.
 | COMP-13 FileAcknowledgementProcessor | | RISK-056 | RISK-088 |
 | COMP-14 CaseCreationConsumer | | RISK-024, 025, 072, 082 | |
 | COMP-15 EvidenceConsumer | | RISK-002, 025, 029, 030, 081 | |
-| COMP-16 BusinessRulesProcessor | RISK-007, 008, 011, 020, 022 | RISK-025 | |
+| COMP-16 BusinessRulesProcessor | RISK-007, 008, 011, 020, 022 | RISK-025 | RISK-015 (extended), RISK-076 (extended), RISK-083 (extended), **RISK-201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218** |
 | COMP-17 CaseExpiryUpdateConsumer | | RISK-024, 025, 031, 045, 077, 079 | RISK-089, RISK-091 |
-| COMP-18 NotificationOrchestrator | RISK-015 | RISK-025, 077 | |
+| COMP-18 NotificationOrchestrator | RISK-015 (extended) | RISK-025, 077 | **RISK-219** |
 | COMP-19 AcceptService | RISK-018 | RISK-028, 044 | |
 | COMP-20 ContestService | RISK-018 | RISK-044 (likely shared) | |
 | COMP-21 ChargebackService | | RISK-026, 027, 049, 050, 051, 070, 071 | |

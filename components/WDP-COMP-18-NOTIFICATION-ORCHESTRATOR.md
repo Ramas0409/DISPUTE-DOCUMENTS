@@ -1,7 +1,8 @@
 # WDP-COMP-18 — NotificationOrchestrator
 **Worldpay Dispute Platform — Component Reference**
-*Version: 2.0 DRAFT | April 2026 — source-verified 2026-04-18*
+*Version: 2.1 DRAFT | May 2026 — delta-audit-verified 2026-05-15*
 *Repository: `wp-mfd/wdp-outgoing-consumer` | Architect-confirmed: PENDING*
+*Supersedes v2.0 (2026-04-18). See change-log entry for 2026-05-15 COMP-18.*
 
 ---
 
@@ -19,8 +20,17 @@
 | **Repository** | `wp-mfd/wdp-outgoing-consumer` |
 | **Framework** | Spring Boot 3.5.7 / Java 17 / Spring Kafka |
 | **Status** | ✅ Production |
-| **Doc status** | 📝 DRAFT — source-verified 2026-04-18, architect confirmation pending |
+| **Doc status** | 📝 DRAFT — delta-audit-verified 2026-05-15, architect confirmation pending |
 | **Sections present** | Core \| Block B (Kafka Consumer) \| Block C (Kafka Producer) |
+
+---
+
+## Audit history
+
+| Date | Version | Nature | Files touched in repo since prior audit |
+|------|---------|--------|------------------------------------------|
+| 2026-04-18 | v2.0 DRAFT | Full source audit against `wp-mfd/wdp-outgoing-consumer` (Copilot CLI baseline → Claude Code verification). Established line-cited baseline. | n/a (baseline) |
+| 2026-05-15 | v2.1 DRAFT | Delta audit — only `NotificationServiceImpl.java` and `RestInvoker.java` had mtime > baseline. Four findings (one HIGH, two MEDIUM, one LOW). Git history not recoverable. | `NotificationServiceImpl.java`, `RestInvoker.java` |
 
 ---
 
@@ -36,6 +46,8 @@ An outbox table (`WDP.bre_orchestration_outbox`, `component = NOTIFICATION_ORCHE
 
 This component also writes to `wdp.file_generation_event` to stage requests for downstream file-based output batch components (CapitalOne Response, Dialogu Issuer, NetworkResponse, NYCE-planned). For `ACTION_CREATED` events where no document names are pre-populated, the component makes a conditional REST call to Document Management Service (DMS) to retrieve them before writing.
 
+A per-event correlation UUID is assigned in the listener path (since v2.1 — see Audit history). It propagates onto outbound Kafka payload bodies via `PublishedNotificationEvent.correlationId` but is NOT yet in log output (no MDC wiring, no `%X` token in logback pattern).
+
 **What it does NOT do**
 
 - Does not publish to `internal-integration-events` — that topic is published exclusively by AcceptService (COMP-19) and ContestService (COMP-20).
@@ -45,6 +57,7 @@ This component also writes to `wdp.file_generation_event` to stage requests for 
 - Does not handle PAN data — no PAN fields are present on `NotificationEvent`, `PublishedNotificationEvent`, or any owned entity.
 - Does not implement circuit breakers — Resilience4j is absent from the codebase (DEC-014 VOID platform-wide).
 - Does not use Spring Batch — no batch dependency in `pom.xml`; all processing is per-message on the Kafka listener thread.
+- Does not write the per-event correlationId to log output despite generating one — the populated `RequestCorrelation` ThreadLocal has no readers and the logback pattern contains no MDC token.
 
 ---
 
@@ -54,7 +67,7 @@ This component also writes to `wdp.file_generation_event` to stage requests for 
 flowchart TD
     IN([outgoing-events<br/>Kafka topic]) --> S1
 
-    S1["Step 1 — Consume & wrap<br/>NotificationMessageEvent envelope<br/>Captures: RECEIVED_KEY,<br/>idempotency-key, event-timestamp"]
+    S1["Step 1 — Consume & wrap<br/>NotificationMessageEvent envelope<br/>Captures: RECEIVED_KEY,<br/>idempotency-key, event-timestamp<br/>+ assign correlationId UUID<br/>(v2.1)"]
 
     S1 --> S2{"Step 2<br/>eventId null?"}
 
@@ -71,7 +84,7 @@ flowchart TD
     S3B -->|"Found — status≠PUBLISHED<br/>SUCCESS/FAILED/ERROR"| DUP_OTHER["Set errorOccured=true"]
     DUP_OTHER --> ACK
 
-    S3B -->|"Not found<br/>(new event)"| S3C["Step 3c — Derive targetAction<br/>4 filter methods:<br/>filterExpiryEventInfo<br/>filterCoreEvent<br/>filterExternalEvent<br/>filterFileGenerationEvent"]
+    S3B -->|"Not found<br/>(new event)"| S3C["Step 3c — Derive targetAction<br/>4 filter methods (order immaterial):<br/>filterExternalEvent<br/>filterCoreEvent<br/>filterExpiryEventInfo<br/>filterFileGenerationEvent"]
 
     S3C --> S3D["Step 3d — INSERT outbox<br/>status=PUBLISHED<br/>component=NOTIFICATION_ORCHESTRATOR<br/>retry_count=0<br/>target_action=derived"]
 
@@ -95,7 +108,7 @@ flowchart TD
     S6_DEC -->|"Non-empty, no ERROR"| BLK_DEF["UPDATE current row<br/>status=PENDING_DEFERRED<br/>publishOutgoingEvent NOT called"]
     BLK_DEF --> END_BLK_D([End])
 
-    S7["Step 7 — publishOutgoingEvent<br/>Sequential chain 7a→7b→7c→7d<br/>Each: pass-through if action<br/>absent from targetAction"]
+    S7["Step 7 — publishOutgoingEvent<br/>Sequential chain 7a→7b→7c→7d<br/>(fixed order by apiName)<br/>Each: pass-through if action<br/>absent from targetAction"]
 
     S7 --> S7A{"EXPIRY_EVENT<br/>in targetAction?"}
     S7A -->|"No"| S7B
@@ -131,9 +144,9 @@ flowchart TD
     IDP -->|"Exception"| FERR1["errorOccured=true<br/>FILE_GENERATION_EVENT retained<br/>skip INSERT"]
     FERR1 --> S7E
 
-    IDP -->|"Success"| DMS["Call Document Mgmt Service<br/>GET documents<br/>@Retryable 3 × 2000ms<br/>(no @Recover)"]
+    IDP -->|"Success"| DMS["Call Document Mgmt Service<br/>GET documents<br/>@Retryable 3 × 2000ms<br/>retryFor=Exception (no exclude — v2.1)<br/>(no @Recover)"]
 
-    DMS -->|"Retry exhausted<br/>(exception thrown)"| FERR2["errorOccured=true<br/>errorReason set<br/>skip INSERT"]
+    DMS -->|"Retry exhausted<br/>(includes HTTP 4xx/5xx<br/>since v2.1 — see DELTA 3-1)"| FERR2["errorOccured=true<br/>errorReason set<br/>skip INSERT"]
     FERR2 --> S7E
 
     DMS -->|"Empty list<br/>(after retries)"| FERR3["errorOccured=true<br/>errorReason=no valid name<br/>skip INSERT"]
@@ -167,6 +180,10 @@ flowchart TD
 - **No ACK deferral path exists.** The `acknowledgment.acknowledge()` call is unconditional at the single call site, executed after Step 3d and before any Step 7 activity. If Steps 1–3d throw, ACK is skipped and the event will be redelivered. Any throw from Step 4 onwards leaves the offset already committed.
 
 - **DMS empty-list response is treated as an error**, not as a zero-row INSERT. The file_generation_event write is skipped; `errorOccured=true`; `errorReason` set; retry escalation follows.
+
+- **DMS retry posture amplifies the IDP/DMS single-thread block (since v2.1).** Prior to 2026-05-15, `RestTemplateCustomException` was excluded from retry — HTTP 4xx/5xx fast-failed. The exclusion has been removed from the `@Retryable` annotation, so HTTP error responses are now retried 3 × 2000ms before falling through to `errorOccured=true`. Combined with concurrency=1, the consumer thread now blocks for up to an additional ~6 seconds per DMS HTTP-error event. Eventual flow outcome unchanged (Step 7e FAILED, retry escalation).
+
+- **Filter invocation order in Step 3c is functionally immaterial.** Each filter independently calls `add()` on the `targetAction` list. The actual outbound publish order is fixed by the apiName state-machine (Expiry → Core → External → File) regardless of derivation order.
 
 ### Routing Decision — targetAction Derivation (Step 3c detail)
 
@@ -204,10 +221,22 @@ Four independent filter methods build the `targetAction` list. A single event ca
 Within gate — **Sub-condition A (ISSUER_DOCS):**
 - `eventType = DOC_ATTACHED` AND `type IN {ISSRDOC, ISSRQDOC}` AND `caseNetwork NOT IN {AMEX, PRIVATELABEL, COBRAND}` → fileType = `ISSUER_DOCS`
 
-Within gate — **Sub-condition B (RESPONSE_DOCS by network):**
-- `eventType = ACTION_CREATED` AND `(disputeStage + actionCode) IN { RE2+REPR, PAB+MDCL, REQ+RRSP, ARB+MDCL }` AND `documentIndicator = Y` AND `caseNetwork NOT IN {MASTERCARD, MAESTRO, VISA}` → fileType set by network resolution (AMEX vs AMEX_HYBRID, DISCOVER vs DISCOVER_RMO based on `hybridMerchant` flag)
+Within gate — **Sub-condition B (network-resolved fileType):**
 
-*(Corrected from v1.0 DRAFT: stage+action set uses `REPR` not `REFR`.)*
+Triggered by `eventType = ACTION_CREATED` AND `(disputeStage + actionCode) IN { RE2+REPR, PAB+MDCL, REQ+RRSP, ARB+MDCL }` AND `documentIndicator = Y` AND `caseNetwork NOT IN {MASTERCARD, MAESTRO, VISA}`.
+
+fileType is then derived by network/type:
+
+| Condition | Resolved fileType |
+|---|---|
+| `caseNetwork = AMEX` AND `hybridMerchant = true` | `AMEX_HYBRID` |
+| `caseNetwork = AMEX` (non-hybrid) | `AMEX` |
+| `caseNetwork = DISCOVER` AND `hybridMerchant = true` | `DISCOVER_RMO` (⚠️ see latent bug below) |
+| `caseNetwork = DISCOVER` (non-hybrid) | `DISCOVER` |
+| `caseType = BJPLCC` (only if caseNetwork ≠ DISCOVER) | `BJS_PLCC` |
+| `type IN {ISSRDOC, ISSRQDOC}` (only if caseNetwork ≠ DISCOVER and not BJPLCC) | `ISSUER_DOCS` |
+
+⚠️ **Latent logic defect (added to Defects section below):** the `DISCOVER` branch and the subsequent `BJPLCC` / `ISSRDOC` branches are structured as separate `if` statements (not `else if`) chained off the DISCOVER check, with the practical consequences that (i) `DISCOVER + hybridMerchant=true` is set to `DISCOVER_RMO` then immediately overwritten to `DISCOVER`, and (ii) the `BJS_PLCC` and `ISSUER_DOCS` fall-through branches are only reachable when `caseNetwork ≠ DISCOVER`. Not a v2.0→v2.1 architectural change — flagged for developer confirmation.
 
 ---
 
@@ -230,11 +259,13 @@ Within gate — **Sub-condition B (RESPONSE_DOCS by network):**
 | `wdp.file_generation_event` | PostgreSQL JPA INSERT | Table | Stage file-gen requests for downstream file batches | errorOccured=true; outbox → FAILED |
 | `WDP.bre_orchestration_outbox` | PostgreSQL JPA read + write | Table | Idempotency lookup, previous-event guard, processing-state tracking | Exception caught; ACK not reached if before Step 4; after Step 4 → falls through to Step 7e FAILED |
 | IDP Token Service | REST GET (cluster-internal) | `/merchant/gcp/idp-token/token` | Bearer token for DMS call (Step 7d only) | `WebServiceException` propagates; errorOccured=true; file write skipped |
-| Document Management Service (COMP-37) | REST GET (cluster-internal) | `/merchant/gcp/document-management/{platform}/documents/{caseNumber}` | Fetch document names for FILE_GENERATION_EVENT when `ACTION_CREATED` with empty `documentNameList` | `@Retryable` 3 attempts / 2000ms fixed delay; no `@Recover`; on exhaustion errorOccured=true, file write skipped |
+| Document Management Service (COMP-37) | REST GET (cluster-internal) | `/merchant/gcp/document-management/{platform}/documents/{caseNumber}` | Fetch document names for FILE_GENERATION_EVENT when `ACTION_CREATED` with empty `documentNameList` | `@Retryable` 3 attempts / 2000ms fixed delay; `retryFor=Exception` with **no exclude** (since v2.1 — DELTA 3-1); no `@Recover`; on exhaustion errorOccured=true, file write skipped |
 
 **Outbound REST headers:** DMS call carries `Authorization: Bearer <idp-token>`, `v-correlation-id: <idempotencyId>`, `idempotency-key: <idempotencyId>`, plus content/accept JSON. IDP call carries only `Content-Type`/`Accept` — no correlation header.
 
 **Outbound Kafka headers (all three topics):** `KafkaHeaders.KEY` (pass-through of inbound RECEIVED_KEY), `event-timestamp` (pass-through), `idempotency-key` (pass-through of inbound `idempotencyId`). No correlation header on Kafka publishes.
+
+**Outbound Kafka payload (since v2.1):** All three outbound payloads now carry a non-null `correlationId` field in the message **body** (not header). UUID is assigned in the listener path if the inbound event did not already carry one. ModelMapper propagates it onto `PublishedNotificationEvent`.
 
 ---
 
@@ -279,14 +310,14 @@ No DDL, Flyway, Liquibase, or `schema.sql` exists in this repository. Whether a 
 | Readiness probe | ✅ Configured — same path/port/params as liveness | |
 | Startup probe | ❌ Not configured | |
 | Actuator exposure | Default only (`health`, `info`) | `management.endpoints.web.exposure.include` not set — no custom exposure. |
-| Observability | OpenTelemetry Java agent (annotation-injected) + Spring Actuator + Logstash (`LogstashTcpSocketAppender` → `${LOGSTASH_SERVER_HOST_PORT}`) | |
+| Observability | OpenTelemetry Java agent (annotation-injected) + Spring Actuator + Logstash (`LogstashTcpSocketAppender` → `${LOGSTASH_SERVER_HOST_PORT}`) | Logback pattern carries no MDC token — per-event correlationId is not in log output despite being assigned (v2.1). |
 | Port | 8082 | Container and service both 8082. Servlet context path `/merchant/gcp/outgoing-event`. |
 | Kafka consumer concurrency | 1 thread | Spring default — `setConcurrency()` not called. |
 | `max.poll.records` | `${max_poll_records}` env var — **no YAML default** | Startup fails if env var absent. |
 | `max.poll.interval.ms` | `${max_poll_interval}` env var — **no YAML default** | Startup fails if env var absent. |
 | `session.timeout.ms`, `heartbeat.interval.ms` | Env vars — no defaults | Same. |
 | `fetch.min.bytes`, `fetch.max.wait.ms` | Not set | Kafka client defaults apply. |
-| K8s Secret | `wdp-outgoing-consumer-secrets` | Mounted via envFrom. |
+| K8s Secrets mounted | Three `envFrom: secretRef` mounts: `{{ ingressTLSsecretName }}` (TLS chain), `wdp-outgoing-consumer-secrets` (component-specific), `wdp-common-secrets` (shared-platform) | Documentation correction from v2.0: `wdp-common-secrets` was previously omitted. Verified at `resources.yml:56-62`. |
 
 ### Active Production Feature Flags
 
@@ -319,12 +350,14 @@ Both flags have **no Java default** (`@Value` with no fallback) and **no YAML de
 | `wdp.bre_orchestration_outbox` used as idempotency and state store | DEC-001 — ⚠️ PARTIAL | Outbox exists but no `@Transactional` on writes; Kafka offset committed between outbox INSERT and Kafka publishes (see DEC-005). |
 | Offset committed AFTER outbox INSERT, BEFORE Kafka publishes and file_generation_event write | DEC-005 — ⛔ CONFIRMED DEVIATION | 🔴 HIGH. Recovery after crash between ACK and Step 7e depends entirely on COMP-12 Scheduler4 — which does NOT re-drive PUBLISHED rows. PUBLISHED-status orphan rows are only recoverable manually. |
 | Message key on all three outbound topics is pass-through of inbound `RECEIVED_KEY` | DEC-003 — ⛔ DEVIATION | No `merchantId` reference anywhere in source. Key identity entirely inherited from upstream COMP-16 publish key. |
-| No Resilience4j circuit breakers on any outbound dependency | DEC-014 — ⛔ VOID platform-wide | IDP Token Service has no timeout, no retry, no breaker — unbounded thread-block risk on any IDP latency. |
+| No Resilience4j circuit breakers on any outbound dependency | DEC-014 — ⛔ VOID platform-wide | IDP Token Service has no timeout, no retry, no breaker — unbounded thread-block risk on any IDP latency. DMS retry block amplified since v2.1 — see DMS retry posture note. |
 | `CommonErrorHandler` is a no-op empty anonymous implementation | Local decision | Deserialisation failures produce a null payload; NullPointerException caught by outer try/catch; offset behaviour is Spring-Kafka-internal and not fully determinable from source. Consistent characterisation: event silently lost with no DLT and no alerting. |
 | No `@Transactional` on any service method | Local decision | Each DB write is an independent auto-commit. No rollback possible across write boundaries. Four distinct outbox write points (3a ERROR, 3d PUBLISHED, 6 ERROR/PENDING_DEFERRED, 7e SUCCESS/FAILED) are all independent transactions. |
 | Previous-event guard is two-stage (SQL selects all rows per case, Java filters in-memory) | Local decision | Scales poorly for long-lived cases — entire case history loaded per event. |
 | `retry_count > 2` auto-escalates FAILED → ERROR | Local decision | Only fires when UPDATE status is being written as FAILED; SUCCESS writes do not touch retry_count. ERROR is a terminal state with no automatic re-drive path. |
 | Plain `RestTemplate` with `SimpleClientHttpRequestFactory` — no pool, no timeouts | Local decision — ⚠️ risk | New socket per call; no keep-alive pool; TCP OS-level timeout only. |
+| **DMS `@Retryable` retries on all `Exception` subtypes including HTTP error envelopes (v2.1)** | Local decision — ⚠️ risk amplification | The previous `exclude=RestTemplateCustomException` attribute has been removed. DMS HTTP 4xx/5xx responses are now retried 3 × 2000ms before fast-failing to `errorOccured=true`. Adds up to ~6s single-thread block per DMS error event on top of the no-timeout IDP risk. |
+| Per-event correlation UUID assigned in listener path (v2.1) | Local decision | UUID generated if inbound `correlationId` blank; pushed into `RequestCorrelation` ThreadLocal; populated onto `PublishedNotificationEvent.correlationId`. **Not propagated to logback MDC.** Read-side wiring (`RequestCorrelation.getId()` callers, `%X` in pattern) absent — correlation visible on outbound Kafka payload bodies only. |
 
 ---
 
@@ -335,6 +368,7 @@ Both flags have **no Java default** (`@Value` with no fallback) and **no YAML de
 | 🔴 HIGH | **DEC-005 violation** — offset committed before Kafka publishes and before the file_generation_event write | Any crash between ACK (Step 4) and Step 7e leaves an outbox row at `PUBLISHED` with empty `publishedAction`. Kafka will not redeliver. COMP-12 Scheduler4 reads only FAILED/PENDING_DEFERRED rows — **not PUBLISHED**. Row is permanently orphaned without manual intervention. |
 | 🔴 HIGH | **PUBLISHED-status orphan gap** — no automatic re-drive | Same crash window as above. No in-component recovery job, no startup sweep, no @Scheduled method. Manual runbook required; runbook owner not identified. (Captured as platform RISK-015.) |
 | 🔴 HIGH | **IDP Token Service — no timeout configured** | Default `RestTemplate` with no connect/read timeout. IDP slowness blocks the single consumer thread indefinitely. With concurrency=1, one hung IDP call stalls all `outgoing-events` processing for that replica. |
+| 🔴 HIGH | **DMS retry amplification (v2.1)** | Removal of `exclude=RestTemplateCustomException` means HTTP 4xx/5xx now triggers `@Retryable` instead of fast-failing. Worst-case per-event block on DMS error increases by up to ~6s. With concurrency=1, downstream DMS instability now degrades `outgoing-events` throughput proportionally. Compounds the IDP no-timeout risk. |
 | 🟠 MEDIUM-HIGH | **Silent deserialisation loss + no-op CommonErrorHandler** | Malformed payloads produce null events and swallowed NPEs. No DLT, no alerting, no audit row. Event is skipped without trace. |
 | 🟡 MEDIUM | **DEC-003 deviation** — partition key identity unconfirmed | Message key is pass-through from inbound `outgoing-events`. Whether downstream consumers receive merchantId-scoped ordering depends entirely on COMP-16's publish key. If COMP-16 does not use merchantId, ordering guarantees on all three outbound topics are undefined. Cross-component deviation — already documented on COMP-12, COMP-15, COMP-22, COMP-25, COMP-41, COMP-42. |
 | 🟡 MEDIUM | **Previous-event guard — unbounded in-memory filter** | Step 6 SQL returns ALL outbox rows for a caseNumber; filtering is in-memory Java. For long-lived cases with large event histories, memory pressure and latency per event grow unboundedly. |
@@ -342,9 +376,18 @@ Both flags have **no Java default** (`@Value` with no fallback) and **no YAML de
 | 🟡 MEDIUM | **Single-threaded consumer + undefined replica count** | Throughput capped at one event at a time per replica. Replica count is an XL Deploy placeholder. If replicas > 1, concurrent processing of the same idempotencyId across replicas depends on Kafka consumer group partition-assignment + outbox SELECT-then-INSERT. No `@Transactional`, no `SELECT FOR UPDATE`, no advisory lock — replica race window exists. |
 | 🟡 MEDIUM | **DEC-014 violation** — no Resilience4j anywhere | Platform-wide VOID. Dependency failures do not trip a breaker; slow failures repeat and block the consumer thread. |
 | 🟡 MEDIUM | **Duplicate PUBLISHED re-entry overwrites existing row** | A re-delivered message with a PUBLISHED idempotency match still flows through Step 7e and issues a SUCCESS update on the existing row, overwriting `updated_at`, `retry_count`, and `error_code`. Safe at-most-once (no re-publish) but audit-trail impact. |
+| 🟡 MEDIUM | **Filter 4 `DISCOVER + hybridMerchant` latent code defect (v2.1)** | The chain at the fileType resolution branches uses `if` instead of `else if`, with two effects: (a) `DISCOVER_RMO` is set then immediately overwritten to `DISCOVER` for the hybrid case; (b) the `BJS_PLCC` and `ISSUER_DOCS` fall-through branches are only reachable when `caseNetwork ≠ DISCOVER`. Architectural impact: hybrid Discover merchants receive the non-hybrid fileType — downstream file producers may not differentiate Discover RMO content. Flagged for developer confirmation; not present as a documented architectural decision. |
 | 🟢 LOW | **Schema annotation inconsistency** `WDP` vs `wdp` across entities | Functionally harmless on standard PostgreSQL identifier folding, but fragile and inconsistent. |
-| 🟢 LOW | **Dead code** — `findByIdempotencyIdAndComponent` repository method, `HttpInterceptor` class, `RequestCorrelation` ThreadLocal (set but never read), unused `httpclient` dependency in pom.xml | No runtime risk; noise in codebase. MDC correlation is effectively not wired anywhere — log lines do not carry per-event correlation context. |
+| 🟢 LOW | **Dead code with one mitigation since v2.1** — `findByIdempotencyIdAndComponent` repository method (unused); `HttpInterceptor` class (not registered in any `WebMvcConfigurer`); `RequestCorrelation` ThreadLocal now **set in main flow** but `getId()` has zero callers and logback pattern carries no `%X`; unused `httpclient` dependency in pom.xml | No runtime risk; correlation UUID flows to outbound Kafka payload body but not to log output. MDC wiring still incomplete. |
 | 🟢 LOW | **No startup probe configured** | Liveness and readiness probes present. Startup probe absent — on slow start (long JVM warm-up) liveness may trip before application is ready. `initialDelaySeconds=120` provides some cushion. |
+
+---
+
+## Defects (latent code-level findings, not architectural decisions)
+
+| Defect | Location | Effect | Action |
+|--------|----------|--------|--------|
+| Filter 4 fileType resolution chain — DISCOVER overwrite | `NotificationServiceImpl.java` `fileType` resolution branches | `DISCOVER + hybridMerchant=true` is assigned `DISCOVER_RMO` then immediately overwritten to `DISCOVER` in the next plain `if`. The `BJS_PLCC` and `ISSUER_DOCS` fall-through outcomes are only reachable when `caseNetwork ≠ DISCOVER`. | Developer confirmation requested. If intentional, document as architectural decision; if not, restructure to `else if` chain. |
 
 ---
 
@@ -352,14 +395,16 @@ Both flags have **no Java default** (`@Value` with no fallback) and **no YAML de
 
 - **EDIA route for NAP outbound:** Filter 3 already routes `platform=NAP` with `migrationStatus=Y` to `external-request-events` (EDIA Consumer path). Code is live — awaiting downstream COMP-44 EDIA Consumer to be built.
 - **CORE migration completion:** `coreMigration=true` is the master gate for routing CORE platform events to `case-action-events`, `core-request-events`, and `file_generation_event`. Full enablement brings CORE onto this component's routing paths.
-- **Dead code to remove:** `findByIdempotencyIdAndComponent`, `HttpInterceptor` class, `RequestCorrelation` ThreadLocal, `org.apache.httpcomponents:httpclient` dependency in pom.xml. Two unused imports in `FileGenerationEventServiceImpl`.
-- **MDC correlation not wired.** `HttpInterceptor` puts MDC but is never registered. `NotificationServiceImpl` does not call `MDC.put`. Log lines lack per-event correlation context despite `v-correlation-id` being propagated on outbound REST.
-- ⚠️ **OPEN QUESTION:** Production values of `coreMigration` and `disputesAPIMigration`. Routing table changes significantly depending on these values. Team confirmation required.
-- ⚠️ **OPEN QUESTION:** Production replica count. Any value > 1 activates the SELECT-then-INSERT race window across replicas.
-- ⚠️ **OPEN QUESTION:** Owner of manual re-drive runbook for PUBLISHED-status orphan rows. RISK-015 captured at platform level but runbook not identified.
-- ⚠️ **OPEN QUESTION:** Production values of `max_poll_records`, `max_poll_interval`, `session_timeout_ms`, `heartbeat_interval_ms` — all env-var passthroughs with no defaults.
-- ⚠️ **OPEN QUESTION:** UNIQUE constraint on `wdp.bre_orchestration_outbox(idempotency_id, component, event_timestamp)` — DBA confirmation required; no DDL in this repo.
-- ⚠️ **OPEN QUESTION:** Upstream COMP-16 publish key on `outgoing-events`. Determines whether DEC-003 deviation is `caseNumber`-scoped or otherwise.
+- **Dead code to remove or wire in:** `findByIdempotencyIdAndComponent` (unused), `HttpInterceptor` (not registered into any `WebMvcConfigurer`), `org.apache.httpcomponents:httpclient` dependency. `RequestCorrelation.setId` is now called from the main listener flow (v2.1) but `getId()` has zero callers — either wire it into log MDC + outbound REST headers or remove the write-side too.
+- **MDC correlation incomplete (v2.1 progression):** v2.1 added `RequestCorrelation.setId(...)` in the listener path and propagated `correlationId` onto outbound Kafka payload bodies via ModelMapper. Two pieces still missing for end-to-end correlation: (a) `MDC.put(...)` at the listener boundary so logback emits the value, (b) `%X{correlationId}` in the logback pattern. Until both land, correlation is visible on the wire but not in logs.
+- ⚠️ **OPEN QUESTION:** Production values of `coreMigration` and `disputesAPIMigration`. Routing table changes significantly depending on these values. Team confirmation required. (OQ-1)
+- ⚠️ **OPEN QUESTION:** Production replica count. Any value > 1 activates the SELECT-then-INSERT race window across replicas. (OQ-2)
+- ✅ **CLOSED in v2.1 (OQ-3):** `max_poll_records`, `max_poll_interval`, `session_timeout_ms`, `heartbeat_interval_ms` — confirmed env-var passthrough with no committed defaults at `application-prod.yml:7-10`. Production values still external (K8s secret).
+- ⚠️ **OPEN QUESTION:** UNIQUE constraint on `wdp.bre_orchestration_outbox(idempotency_id, component, event_timestamp)` — DBA confirmation required; no DDL in this repo. (OQ-4)
+- ⚠️ **OPEN QUESTION:** Upstream COMP-16 publish key on `outgoing-events`. Determines whether DEC-003 deviation is `caseNumber`-scoped or otherwise. Cross-repo — not auditable here. (OQ-5)
+- ⚠️ **OPEN QUESTION:** Schema annotation `WDP` vs `wdp` cluster resolution. DBA confirmation. (OQ-6)
+- ⚠️ **OPEN QUESTION:** Owner of manual re-drive runbook for PUBLISHED-status orphan rows (RISK-015). Confirmed no in-code recovery exists (`@Scheduled`, `CommandLineRunner`, `ApplicationRunner`, `@PostConstruct`, `@RestController` — zero hits in repo). Operations team confirmation. (OQ-7)
+- ⚠️ **OPEN QUESTION:** Spring Kafka null-payload + no-op `CommonErrorHandler` offset commit sequencing. Framework-level. (OQ-8)
 
 ---
 
@@ -413,14 +458,16 @@ Key fields used in routing and writes:
 | `caseNumber` | String | Written to outbox `i_case`; previous-event guard query key |
 | `actionSequence` | String | Written to outbox `i_action_seq`; written to `file_generation_event` |
 | `caseNetwork` | String | Filter 4 exclusion conditions and fileType derivation |
+| `caseType` | String | Filter 4 Sub-condition B — `BJPLCC` triggers `BJS_PLCC` fileType |
 | `disputeStage`, `actionCode` | String | Filter 4 sub-condition B gate |
 | `documentIndicator` | String | Filter 4 sub-condition B gate — must be `Y` |
 | `documentNameList` | List | Filter 4 — if empty on `ACTION_CREATED`, triggers DMS REST call. **Also published on `PublishedNotificationEvent` when set.** |
 | `type` | String | Filter 4 sub-conditions — ISSRDOC, ISSRQDOC detection |
-| `hybridMerchant` | Boolean | Filter 4 — fileType AMEX_HYBRID vs AMEX, DISCOVER_RMO vs DISCOVER |
+| `hybridMerchant` | Boolean | Filter 4 — fileType AMEX_HYBRID vs AMEX, DISCOVER_RMO vs DISCOVER (⚠️ DISCOVER_RMO subject to latent defect — see Defects) |
 | `networkCaseId` | String | Written to `wdp.file_generation_event.c_ntwk_case_id` only |
 | `idempotencyId` | String | Outbox idempotency lookup key; forwarded as `idempotency-key` header; used as REST `v-correlation-id` |
 | `eventTimeStamp` | String | Outbox idempotency lookup key; forwarded as `event-timestamp` header |
+| `correlationId` | String | **v2.1:** UUID assigned in listener if blank; stored in `RequestCorrelation` ThreadLocal; copied onto outbound `PublishedNotificationEvent` body by ModelMapper |
 
 **On processing failure**
 
@@ -433,7 +480,7 @@ Key fields used in routing and writes:
 | Previous-event guard failure (Step 6) | Exception caught in `processKafkaNotificationEvent` outer catch; errorOccured=true; outbox UPDATE to FAILED | ✅ Yes — already committed at Step 4 |
 | Kafka publish failure (Step 7a-7c) | Per-method catch; errorOccured=true; action retained in `targetAction`; flow continues to next sub-step; Step 7e writes FAILED; `retry_count > 2` escalates to ERROR | ✅ Yes |
 | IDP Token Service failure (Step 7d IDP call) | `WebServiceException` propagates up through DMS call; caught in `insertInfoToFileGenerationEventTable`; errorOccured=true; file write skipped; Step 7e writes FAILED | ✅ Yes |
-| DMS retry exhaustion (Step 7d DMS call) | `@Retryable` 3 attempts / 2000ms fixed delay; `retryFor=Exception`, `exclude=RestTemplateCustomException`; no `@Recover`; on exhaustion exception propagates; caught; errorOccured=true; file write skipped | ✅ Yes |
+| DMS retry exhaustion (Step 7d DMS call) — **v2.1 posture** | `@Retryable` 3 attempts / 2000ms fixed delay; `retryFor=Exception`, **no `exclude` attribute** (removed in v2.1); no `@Recover`; HTTP 4xx/5xx now retried instead of fast-failed; on exhaustion exception propagates; caught; errorOccured=true; file write skipped. Worst-case single-thread block ~6s on persistent DMS errors. | ✅ Yes |
 | DMS returns empty list (Step 7d) | Treated as error — errorOccured=true, errorReason set; file INSERT skipped entirely (not a zero-row INSERT) | ✅ Yes |
 | file_generation_event INSERT failure (Step 7d write) | Exception caught in `insertInfoToFileGenerationEventTable`; errorOccured=true; FILE_GENERATION_EVENT retained in targetAction | ✅ Yes |
 | Consumer halt | Never — outer try/catch in `KafkaConsumer.listener()` swallows all exceptions and the listener continues | — |
@@ -456,6 +503,8 @@ Key fields used in routing and writes:
 
 **Headers forwarded on all outbound publishes:** `event-timestamp` (from inbound), `idempotency-key` (from inbound `idempotencyId`). No correlation-id header on Kafka publishes.
 
+**Payload bodies (v2.1):** All three outbound payloads now carry a non-null `correlationId` field on the body. UUID assigned in listener path if inbound `NotificationEvent.correlationId` was blank, then propagated by ModelMapper onto `PublishedNotificationEvent`. This is a body-level addition, not a header change — the header set is unchanged.
+
 ⚠️ **DEC-003 note:** The Kafka message key on all three outbound topics is pass-through of inbound `KafkaHeaders.RECEIVED_KEY`. No `merchantId` reference exists anywhere in source. Partition-key identity is entirely inherited from what COMP-16 BusinessRulesProcessor sets when publishing to `outgoing-events`.
 
 **Unused producer settings:** `retries`, `delivery.timeout.ms`, `request.timeout.ms`, `linger.ms`, `batch.size` are not configured — Kafka client defaults apply.
@@ -474,7 +523,7 @@ Key fields used in routing and writes:
 | **Triggered by** | Filter 1 routing table (platform/eventType/migrationStatus/coreMigration combinations) |
 | **Consumed by** | COMP-17 CaseExpiryUpdateConsumer |
 
-**Payload notes:** `PublishedNotificationEvent` — 28 fields mapped via `ModelMapper` from `NotificationEvent`. Fields **absent** from the published payload: `idempotencyId`, `hybridMerchant`, `networkCaseId`, `eventId`, `targetAction`, `publishedAction`, `errorOccured`, `errorReason`, `fileType`, `eventTimeStamp`. Field `documentNameList` **is present** on `PublishedNotificationEvent` and is published if set (corrected from v1.0 DRAFT).
+**Payload notes:** `PublishedNotificationEvent` — 28 fields mapped via `ModelMapper` from `NotificationEvent`. Fields **absent** from the published payload: `idempotencyId`, `hybridMerchant`, `networkCaseId`, `eventId`, `targetAction`, `publishedAction`, `errorOccured`, `errorReason`, `fileType`, `eventTimeStamp`. Field `documentNameList` **is present** on `PublishedNotificationEvent` and is published if set. Field `correlationId` **is present** and is now populated for every event (v2.1).
 
 **On failure:** Exception caught; `errorOccured=true`; `EXPIRY_EVENT` retained in `targetAction`; outbox written FAILED at Step 7e; `retry_count` incremented; escalates to ERROR after `retry_count > 2`.
 
@@ -492,7 +541,7 @@ Key fields used in routing and writes:
 | **Triggered by** | platform=PIN (any) or platform=CORE with coreMigration=true — Filter 2 routing table |
 | **Consumed by** | COMP-43 CoreNotificationConsumer |
 
-**Payload notes:** Same `PublishedNotificationEvent` instance as the other two outbound topics. Platform=CORE events only reach this topic when `coreMigration=true`. Platform=PIN events always reach this topic regardless of flag.
+**Payload notes:** Same `PublishedNotificationEvent` instance as the other two outbound topics. Platform=CORE events only reach this topic when `coreMigration=true`. Platform=PIN events always reach this topic regardless of flag. Body carries populated `correlationId` (v2.1).
 
 **On failure:** Same pattern as `case-action-events`.
 
@@ -510,11 +559,11 @@ Key fields used in routing and writes:
 | **Triggered by** | platform=PIN, or platform=CORE with disputesAPIMigration=true, or platform=NAP with migrationStatus=Y — Filter 3 routing table |
 | **Consumed by** | COMP-41 ThirdPartyNotificationConsumer, COMP-42 BENConsumer, COMP-44 EDIAConsumer (🔴 Planned) |
 
-**Payload notes:** Single `PublishedNotificationEvent` publish — this component applies no secondary routing. The NAP route via EDIA Consumer is a planned future path; currently NAP outcomes also flow via `internal-integration-events` (AcceptService / ContestService → NAPOutcomeProcessor).
+**Payload notes:** Single `PublishedNotificationEvent` publish — this component applies no secondary routing. The NAP route via EDIA Consumer is a planned future path; currently NAP outcomes also flow via `internal-integration-events` (AcceptService / ContestService → NAPOutcomeProcessor). Body carries populated `correlationId` (v2.1).
 
 **On failure:** Same pattern as `case-action-events`.
 
 ---
 
 *End of WDP-COMP-18-NOTIFICATION-ORCHESTRATOR.md*
-*Version 2.0 DRAFT — source-verified 2026-04-18 — architect confirmation pending.*
+*Version 2.1 DRAFT — delta-audit-verified 2026-05-15 — architect confirmation pending.*

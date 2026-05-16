@@ -6,7 +6,7 @@ WDP-HANDOVER.md, WDP-COMP-INDEX.md,
 WDP-COMP-TEMPLATE.md, WDP-ARCHITECTURE.md,
 WDP-DECISIONS.md, WDP-KAFKA.md, WDP-DB.md
 
-Today's component: 41 — ThirdPartyNotificationConsumer
+Today's component: 18 — NotificationOrchestrator
 
 ━━━ PHASE 1 — Generate Claude Code prompt ━━━
 
@@ -223,7 +223,7 @@ REFERENCE DOCUMENT PROVIDED
 ═══════════════════════════════════════════════════════════════════════
 
 Alongside this prompt you are given the existing DRAFT component
-document: WDP-COMP-07-VISA-DISPUTE-BATCH.md.
+document: WDP-COMP-18-NOTIFICATION-ORCHESTRATOR.md.
 
 Treat this document as a set of HYPOTHESES to verify against source,
 NOT as ground truth. It was extracted by a prior pass and may contain

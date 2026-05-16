@@ -1,6 +1,6 @@
 # WDP-COMP-INDEX.md
 **Worldpay Dispute Platform — Master Component Registry**
-*Version: 2.2*
+*Version: 2.3*
 
 
 ---
@@ -82,6 +82,8 @@ is a cross-reference, not a separate service.
 - 🔲 UI — tracked as separate action item
 
 **v2.2 source-verification status:** 38 of 51 components carry the 🔍 marker. The corresponding source-verification dates are listed in the Reconciliation Tracker section below. Architect confirmation is the next gate for all 38.
+
+**v2.3 update (2026-05-15):** **COMP-16 BusinessRulesProcessor** forensic re-audit (v1.1 → v1.3 DRAFT 🔍) and **COMP-18 NotificationOrchestrator** delta-audit (v2.0 → v2.1 DRAFT 🔍). Both components remain in DRAFT 🔍 status — architect confirmation still pending. No change to component count. Platform-level impact captured in WDP-NFRS.md (RISK-201–219), WDP-DECISIONS.md (DEC-001 PARTIAL for COMP-16; DEC-014 amplification for COMP-18; ADR-CAND-066–072), WDP-KAFKA.md, and WDP-DB.md. See WDP-CHANGE-LOG.md Reconciled Archive (2026-05-15 entry pending after this reconciliation completes).
 
 ---
 
@@ -303,9 +305,9 @@ COMPLETED transition. Candidate ADR-CAND-017.
 |---|-----------|------|-------------|------------|------|
 | 14 | CaseCreationConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT 🔍 v2.0 | WDP-COMP-14-CASE-CREATION-CONSUMER.md |
 | 15 | EvidenceConsumer | Kafka Consumer + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v1.1 | WDP-COMP-15-EVIDENCE-CONSUMER.md |
-| 16 | BusinessRulesProcessor | Kafka Consumer + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v1.1 | WDP-COMP-16-BUSINESS-RULES-PROCESSOR.md |
+| 16 | BusinessRulesProcessor | Kafka Consumer + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v1.3 *(2026-05-15)* | WDP-COMP-16-BUSINESS-RULES-PROCESSOR.md |
 | 17 | CaseExpiryUpdateConsumer | Kafka Consumer | ✅ Production | 📝 DRAFT 🔍 v1.1 | WDP-COMP-17-CASE-EXPIRY-CONSUMER.md |
-| 18 | NotificationOrchestrator | Kafka Consumer + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v2.0 | WDP-COMP-18-NOTIFICATION-ORCHESTRATOR.md |
+| 18 | NotificationOrchestrator | Kafka Consumer + Kafka Producer | ✅ Production | 📝 DRAFT 🔍 v2.1 *(2026-05-15)* | WDP-COMP-18-NOTIFICATION-ORCHESTRATOR.md |
 
 **14 — CaseCreationConsumer**
 Primary case creation component for all non-NAP dispute events. Consumes
@@ -335,7 +337,7 @@ no upload (4 doc types).
 ⚠️ **V3 PATCH ghost-upload (RISK-030):** failed
 ownership-transfer leaves V3 Core with the document and WDP DB unmarked.
 
-**16 — BusinessRulesProcessor**
+**16 — BusinessRulesProcessor** *(repository: wdp-business-rules-processor; v1.3 forensic re-audit 2026-05-15)*
 Kafka consumer that executes configured business rules against dispute events.
 The execution engine — distinct from BusinessRulesService which manages rule
 definitions. Reads rules directly from Aurora PostgreSQL (no API call to
@@ -343,6 +345,37 @@ BusinessRulesService). Publishes processed events to outgoing-events and
 conditionally to internal-integration-events (UK/NAP path). Pre-ACK
 (DEC-005 deviation). ⚠️ DEC-011 BRE step checkpointing NOT implemented
 aspirational design only.
+⚠️ **v1.3 — two-branch consumer:** Branch A (eventId non-null) pre-ACK
+before `processRulesEvent`; Branch B (eventId null) `processNewCaseActionEvent`
+persists `WDP.bre_orchestration_outbox` row → ACK → `processRulesEvent`.
+Both branches at-most-once.
+⚠️ **DEC-001 flips from ⛔ DEVIATES to ⚠️ PARTIAL.** `WDP.bre_orchestration_outbox`
+now exists as event-level status register (PUBLISHED / SUCCESS / FAILED / ERROR /
+PENDING_DEFERRED / SKIPPED). Kafka publishes still direct synchronous — no relay.
+PUBLISHED orphans have no automatic re-drive (Scheduler4 reads FAILED/PENDING_DEFERRED only) — extends RISK-015 with COMP-16 as third writer.
+⚠️ **DEC-020 materially mitigated.** `processNewCaseActionEvent` performs
+application-level dedup on `idempotencyId + eventTimestamp`; `processRulesEvent`
+runs previous-event ordering guard against the outbox.
+⚠️ **🔴 Cross-datasource non-atomic UK write window (RISK-203, ADR-CAND-070):**
+UK audit log (`nap.br_case_audit_log`, `ukDataSource`) and outbox
+(`WDP.bre_orchestration_outbox`, `wdpDataSource`) cannot be in same transaction
+— different datasources, no XA, no saga. Partial-write window on every UK message.
+⚠️ **🔴 `applyRuleGroup` recursion has no cycle or depth guard (RISK-201,
+ADR-CAND-068):** self-referencing rule group produces unbounded loop; with
+concurrency=1, single bad rule stalls the whole consumer group.
+⚠️ **🔴 Singleton service instance-field state (RISK-202, ADR-CAND-069):**
+per-message context held on Spring singleton fields; safe only because
+concurrency=1 and admin REST is operationally unused.
+⚠️ **🔴 US migration guard commented out (RISK-204, ADR-CAND-071):** NAP-side
+guard live; US-side commented out, runs FCHG path unconditionally. Architect
+intent confirmation required.
+⚠️ **🔴 UK `getIssuerDoc` missing `attachedIssueDoc` disjunct (RISK-205,
+ADR-CAND-072):** US gates on `attachedIssueDoc` OR legacy; UK gates only on
+legacy — UK silently skips issuer-doc retrieval in `attachedIssueDoc`-only
+configurations.
+⚠️ `spring-boot-devtools` ships to prod (RISK-076 extended); `minReadySeconds`
+misplaced under `spec.template.spec` (RISK-083 extended); `/actuator/prometheus`
+requires JWT (RISK-206). See WDP-NFRS.md RISK-201–218 for full COMP-16 risk row.
 
 **17 — CaseExpiryUpdateConsumer**
 Consumes from case-action-events (expiry) topic and maintains wdp.case_expiry
@@ -363,7 +396,7 @@ unrecoverable on every successful execution path.
 lock, no version column, no SELECT FOR UPDATE. Race possible between
 COMP-17 upsert and COMP-51 retry-counter UPDATE.
 
-**18 — NotificationOrchestrator** *(repository: wp-mfd/wdp-outgoing-consumer)*
+**18 — NotificationOrchestrator** *(repository: wp-mfd/wdp-outgoing-consumer; v2.1 delta-audit 2026-05-15)*
 Central outbound routing component. Consumes from outgoing-events topic and
 fans out to up to four simultaneous outputs via four independent filter methods.
 Publishes to case-action-events, core-request-events, and external-request-events.
@@ -377,7 +410,28 @@ distinct write points (3a ERROR, 3d PUBLISHED, 6 ERROR/PENDING_DEFERRED,
 7e SUCCESS/FAILED) are independent auto-commits. PUBLISHED orphan rows have
 no automatic re-drive (Scheduler4 reads only FAILED/PENDING_DEFERRED).
 ⚠️ Confirmed NOT a writer of `wdp.outgoing_event_outbox` (corrected from
-v2.0 — zero references in source).
+v2.0 — zero references in source; v2.1 re-confirmed via repo grep).
+⚠️ **🔴 v2.1 — DMS `@Retryable` lost `exclude=RestTemplateCustomException`
+(RISK-219, ADR-CAND-066):** HTTP 4xx/5xx from Document Management Service
+now retried 3 × 2000ms instead of fast-failing. With concurrency=1, every
+DMS error event adds ~6 s of single-thread block to `outgoing-events` throughput.
+**Amplifies DEC-014 VOID circuit-breaker gap.** Architect decision pending —
+platform-wide REST `@Retryable` exclude posture.
+⚠️ **v2.1 — `RequestCorrelation.setId(...)` now fires in main listener flow
+(ADR-CAND-067):** UUID assigned per event; propagated by ModelMapper onto
+outbound Kafka payload BODIES. Headers and logback pattern unchanged —
+correlation is on the wire but not in log output. `RequestCorrelation.getId()`
+still has zero callers; partial-wiring pattern worth surveying for at COMP-14, 15, 17, 43.
+⚠️ **v2.1 — Filter 4 fileType resolution has six outcomes, not four:**
+AMEX, AMEX_HYBRID, DISCOVER, DISCOVER_RMO, BJS_PLCC (when caseType=BJPLCC),
+ISSUER_DOCS (fall-through for ISSRDOC/ISSRQDOC). Latent code defect — DISCOVER
+non-hybrid branch is plain `if` (not `else if`); DISCOVER + hybridMerchant=true
+sets DISCOVER_RMO then immediately overwrites to DISCOVER. Architect decision
+required on intent.
+⚠️ **v2.1 — Three K8s `secretRef`s mounted, not one:** `{{ ingressTLSsecretName }}`,
+`wdp-outgoing-consumer-secrets`, `wdp-common-secrets`. The `wdp-common-secrets`
+reference is shared platform-wide — cross-component scan needed at next
+reconciliation.
 
 ---
 
@@ -914,6 +968,10 @@ same as COMP-07/08/09).
 - 40 of 51 have undergone source-verified correction passes against their repositories.
 - Remaining 4 source-verifications are pending (COMP-29, 31, 34, 38).
 - No component has yet been architect-confirmed. The "✅ COMPLETE" criterion (architect-confirmed) is the next gate for all 38 source-verified components.
+
+**Phase 3 follow-up audits (post-baseline):**
+- **2026-05-06:** COMP-49 + COMP-50 WDP Portal joint structural consolidation (v1.0 → v3.0). Source-verified.
+- **2026-05-15:** COMP-16 BusinessRulesProcessor forensic re-audit (v1.1 → v1.3 DRAFT 🔍). COMP-18 NotificationOrchestrator delta-audit (v2.0 → v2.1 DRAFT 🔍). Both reconciled into NFRS, DECISIONS, KAFKA, DB, and CHANGE-LOG.
 
 **Remaining audit work:** COMP-29, 31, 34, 38 (DRAFT awaiting source-verification); COMP-10 (PENDING enterprise); COMP-33 (no repo); COMP-44/45/46/47/48 (planned features).
 

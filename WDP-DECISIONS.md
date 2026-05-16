@@ -1,6 +1,6 @@
 # WDP-DECISIONS.md
 **Worldpay Dispute Platform — Architecture Decisions**
-*Version: 2.2*
+*Version: 2.3*
 
 ---
 
@@ -25,17 +25,19 @@ Decisions are grouped into four tiers:
 
 **Post-baseline reconciliation (2026-05-06):** COMP-49 WDP Portal source-verification pass. **DEC-018 amplified** by COMP-49 OPS UI super-user bypass at `WdpUtilService.canUserPerformDisputeAction()` (top-priority architect resolution required). **DEC-019 expanded** to include UI input-layer exception (COMP-49 — three forms accept full PAN, encrypted in transit, decrypted to AG Grid memory only). **6 additional candidate ADRs** added (ADR-CAND-060 through ADR-CAND-065).
 
+**Post-baseline reconciliation (2026-05-15):** COMP-16 BusinessRulesProcessor v1.3 forensic re-audit and COMP-18 NotificationOrchestrator v2.1 delta-audit. **DEC-001 deviation map updated:** COMP-16 row flips from ⛔ DEVIATES to ⚠️ PARTIAL (event-level outbox `WDP.bre_orchestration_outbox` now exists; Kafka publish remains direct synchronous, no relay; cross-datasource non-atomic window on UK path). **DEC-005 COMP-16 row reworded:** two-branch consumer (Branch A pre-ACK, Branch B persist→ACK→process; both at-most-once). **DEC-020 COMP-16 row reworded:** DEVIATES materially mitigated with new application-level dedup on `idempotencyId + eventTimestamp` plus previous-event ordering guard. **DEC-014 risk amplitude amplified** by COMP-18 DMS `@Retryable` exclude removal (HTTP 4xx/5xx now retried; single-thread block on concurrency=1). **DEC-016 outbox writers row updated** for `wdp.bre_orchestration_outbox` (COMP-16 added as third writer). **7 additional candidate ADRs** added (ADR-CAND-066 through ADR-CAND-072).
+
 ---
 
 ## Decision Registry
 
 | ID | Decision | Tier | Status | Date |
 |---|---|---|---|---|
-| DEC-001 | Transactional Outbox for Event Delivery | 1 | ⚠️ Corrected — deviation map updated | Oct 2025 |
+| DEC-001 | Transactional Outbox for Event Delivery | 1 | ⚠️ Corrected — deviation map updated; **COMP-16 row PARTIAL (2026-05-15)** | Oct 2025 |
 | DEC-002 | Single Outbox Table for Multiple Event Types | 2 | ⚠️ Refined — `wdp.outgoing_event_outbox` writers now 5 | Oct 2025 |
 | DEC-003 | Merchant-Scoped Kafka Partitioning | 2 | ⚠️ Corrected — deviation map updated (COMP-04 per-endpoint) | Oct 2025 |
 | DEC-004 | Encrypt PAN at the Ingestion Boundary | 1 | ⚠️ Corrected — column name + COMP-43 DB2 sibling; CVV scope clarified | Oct 2025 |
-| DEC-005 | At-Most-Once Delivery via Pre-Commit Offset | 2 | ⚠️ Reframed — deviation map updated | Oct 2025 |
+| DEC-005 | At-Most-Once Delivery via Pre-Commit Offset | 2 | ⚠️ Reframed — deviation map updated; **COMP-16 two-branch refinement (2026-05-15)** | Oct 2025 |
 | DEC-006 | Deferred Processing with Sequence Guard | 2 | ✅ Active (v1.6) | Oct 2025 |
 | DEC-007 | Two-Token PAN Strategy (HPAN + EPAN) | 1 | ✅ Active | Oct 2025 |
 | DEC-008 | AWS KMS for Key Management | 1 | ⚠️ Corrected — DEK rotation interval **days**, not 6 hours | Oct 2025 |
@@ -44,12 +46,12 @@ Decisions are grouped into four tiers:
 | DEC-011 | BRE Crash Recovery via Step Checkpointing | | ⛔ VOID — confirmed never implemented | Nov 2025 |
 | DEC-012 | Aurora PostgreSQL as Operational Database | 1 | ✅ Active | Oct 2025 |
 | DEC-013 | Kafka (AWS MSK) as Event Streaming Platform | 1 | ✅ Active | Oct 2025 |
-| DEC-014 | Resilience4j for Circuit Breaking | | ⛔ VOID — evidence base extended to 38 source-verified components | Oct 2025 |
+| DEC-014 | Resilience4j for Circuit Breaking | | ⛔ VOID — evidence base extended to 38 source-verified components; **risk amplitude amplified by COMP-18 DMS retry posture change (2026-05-15)** | Oct 2025 |
 | DEC-016 | Database Error Table as Consumer DLQ | 2 | ⚠️ Refined — writers expanded; EXPIRY_BATCH terminal-write-only flagged | April 2026 |
 | DEC-017 | BusinessRulesProcessor Reads Rules Directly from DB | 2 | ✅ Active | April 2026 |
 | DEC-018 | RBAC Not Enforced in CaseActionService — Accepted Risk | 2 | ⚠️ Risk Accepted — **amplified by COMP-49 OPS UI super-user bypass** | April 2026 |
 | DEC-019 | Clear PAN Written on Standard Case Creation — Accepted Risk | 1 | ⚠️ Risk Accepted — **CVV-at-rest exception (COMP-04 + COMP-05); UI input-layer PARTIAL exception (COMP-49)** | April 2026 |
-| DEC-020 | No Idempotency on Case Creation — Accepted Risk | 2 | ⚠️ Risk Accepted — deviation map extended | April 2026 |
+| DEC-020 | No Idempotency on Case Creation — Accepted Risk | 2 | ⚠️ Risk Accepted — deviation map extended; **COMP-16 materially mitigated (2026-05-15)** | April 2026 |
 | DEC-021 | UAMS Wrong Transaction Manager — Known Defect | | 🔴 Defect — **scope expanded: 7 methods in COMP-02 + COMP-30 second offender** | April 2026 |
 | DEC-022 | removeItemFromQueueDisabled Operational Safety Switch | 2 | ✅ Active | April 2026 |
 | DEC-023 | Polling Batch Replica Count Fixed at 1 | 2 | ⚠️ Refined — extended to include COMP-06, COMP-51 | April 2026 |
@@ -163,7 +165,7 @@ graph TD
 | Table | Owner / relay | Event types |
 |---|---|---|
 | `wdp.chbk_outbox_row` | COMP-12 InboundDisputeEventScheduler (Scheduler1 — relay) | Chargeback events from COMP-07, COMP-08, COMP-09, COMP-11; status transitions from COMP-14, COMP-15 |
-| `wdp.bre_orchestration_outbox` | COMP-12 Scheduler 4 (relay) | BRE triggers (component=BUSINESS_RULES) and notification orchestration triggers (component=NOTIFICATION_ORCHESTRATOR) — shared table, routed by discriminator |
+| `wdp.bre_orchestration_outbox` | COMP-12 Scheduler 4 (relay) | BRE triggers (component=BUSINESS_RULES) and notification orchestration triggers (component=NOTIFICATION_ORCHESTRATOR) — shared table, routed by discriminator. **Writers: COMP-16 (v1.3, added 2026-05-15 — per-event status register on Kafka consumer path), COMP-18 (NOTIFICATION_ORCHESTRATOR rows). Reader: COMP-12 Scheduler4.** Schema name uppercase `WDP` while sibling tables (`wdp.CASE`, `wdp.ACTION`, etc.) are lowercase `wdp` — DBA confirmation of actual deployed schema pending. |
 | `wdp.outgoing_event_outbox` | COMP-12 Scheduler3 (relay) | EXPIRY_EVENTS (COMP-17), GP_EVENTS (COMP-41), **BEN_EVENTS (COMP-42)**, CORE_EVENTS (COMP-43), **EXPIRY_BATCH (COMP-51, terminal-write-only ⚠️ no consumer)** |
 | `wdp.file_evidence` | COMP-12 Scheduler5 (read-only error report) | Evidence file tracking only |
 
@@ -178,7 +180,7 @@ graph TD
 | **COMP-04 NAPDisputeEventService** ** | `nap-dispute-events` | Direct publish on HTTP thread — no outbox. Source-verified: `kafkaTemplate.send(...).get` blocking call inside `@Retryable`. Events lost between enrichment and broker ACK are unrecoverable. | ⛔ DEVIATES |
 | **COMP-06 NAPDisputeDeclineBatch** | (no Kafka publish) | Direct REST POST to Case Actions API on the IDCL creation path — no outbox row written. Successful Case Actions POST followed by Spring Batch step-completion failure leaves action created externally but step incomplete. | ⛔ DEVIATES (severity-dampened) |
 | COMP-15 EvidenceConsumer | business-rules | Synchronous publish inside `@Transactional` via `kafkaTemplate.send(...).get` blocking on the future. Ghost-event window. | ⛔ DEVIATES |
-| COMP-16 BusinessRulesProcessor | outgoing-events, internal-integration-events | Direct synchronous publish — no outbox. | ⛔ DEVIATES |
+| COMP-16 BusinessRulesProcessor | outgoing-events, internal-integration-events | ⚠️ **PARTIAL (v1.3, 2026-05-15)** — `WDP.bre_orchestration_outbox` now exists as event-level status register. Kafka publishes still direct synchronous (no relay). Outbox FAILED row is recovery signal, not automatic re-drive. **Cross-datasource non-atomic UK write window:** UK audit log (`nap.br_case_audit_log`, `ukDataSource`) and outbox (`WDP.bre_orchestration_outbox`, `wdpDataSource`) cannot be in the same transaction — different datasources, no XA, no saga. See RISK-203, ADR-CAND-070. | ⚠️ PARTIAL |
 | COMP-18 NotificationOrchestrator | case-action-events, core-request-events, external-request-events | ⚠️ **PARTIAL** — `wdp.bre_orchestration_outbox` used as outbox, but **zero `@Transactional` annotations**. Four distinct write points are independent auto-commits. PUBLISHED orphans no automatic re-drive. | ⚠️ PARTIAL |
 | COMP-19 AcceptService | internal-integration-events | Direct synchronous publish — no outbox. State permanently inconsistent on Kafka final failure. | ⛔ DEVIATES |
 | COMP-20 ContestService | internal-integration-events | Direct synchronous publish — no outbox. | ⛔ DEVIATES |
@@ -254,7 +256,7 @@ Direct synchronous Kafka publish remains the dominant producer pattern in WDP. T
 |---|---|---|
 | COMP-14 CaseCreationConsumer | new-case-events | Pre-ACK at `KafkaConsumer.java:38` precedes processing at `:43` |
 | COMP-15 EvidenceConsumer | case-evidence-events | Pre-ACK |
-| COMP-16 BusinessRulesProcessor | business-rules | Pre-ACK at `KafkaConsumer.java:38`; processing at `:41` |
+| COMP-16 BusinessRulesProcessor | business-rules | **Two-branch consumer (v1.3, 2026-05-15).** Branch A (eventId non-null): pre-ACK precedes `processRulesEvent`. Branch B (eventId null): `processNewCaseActionEvent` persist → ACK → `processRulesEvent`. Both branches at-most-once. Branch B adds application-level dedup on `idempotencyId + eventTimestamp` against `WDP.bre_orchestration_outbox` plus previous-event ordering guard. Concurrency=1 per replica (Spring default — `setConcurrency` never called). |
 | COMP-17 CaseExpiryUpdateConsumer | case-action-events | Pre-ACK with poison-message rebalance loop hazard |
 | COMP-18 NotificationOrchestrator | outgoing-events | Mid-flow ACK — single ACK call site after Step 3d outbox INSERT, before all Step 7 publishes |
 | COMP-39 NAPOutcomeProcessor | internal-integration-events | Pre-ACK *(confirmed: single `@KafkaListener`; therefore NOT consumer of COMP-24's `${kafka.topic}` ActionEvent topic)* |
@@ -304,10 +306,10 @@ Direct synchronous Kafka publish remains the dominant producer pattern in WDP. T
 |---|---|---|
 | `NAP.DISPUTE_EVENT_CONSUMER_ERROR` | **Four writers confirmed:** COMP-05 (primary, `OUT_*` event types from this component), COMP-23 (NAP create path blind-merge), COMP-24 (NAP conditional outbox), **COMP-39** (manual reprocess + outbound NAP write — `OUT_SRV118`, `OUT_SRV117`). Discriminator: `C_ACQ_PLATFORM` (`"NAP"` constant) + `C_EVENT_TYPE`. | 🔴 **Cross-component shared-table consumption hazard (RISK-085 / ADR-CAND-024)** — both COMP-05 and COMP-39 prior-error scans query without `C_EVENT_TYPE` filter; rows written by either consumer (plus COMP-23 / COMP-24) may be reprocessed through the wrong outbound pipeline. |
 | `wdp.outgoing_event_outbox` (5-channel) | COMP-17 (EXPIRY_EVENTS), COMP-41 (GP_EVENTS), COMP-42 (BEN_EVENTS), COMP-43 (CORE_EVENTS), COMP-51 (EXPIRY_BATCH — terminal-write-only) | Single relay (COMP-12 Scheduler3); see DEC-002 refinement |
-| `wdp.bre_orchestration_outbox` | COMP-18 (NOTIFICATION_ORCHESTRATOR rows), COMP-12 Scheduler4 (BUSINESS_RULES rows) | Shared, routed by component discriminator |
+| `wdp.bre_orchestration_outbox` | **Three writers: COMP-16 (v1.3, added 2026-05-15 — `BUSINESS_RULES` rows on Kafka consumer path), COMP-18 (NOTIFICATION_ORCHESTRATOR rows), COMP-12 Scheduler4 (BUSINESS_RULES rows from outbox-relay retry path).** Shared, routed by component discriminator. **Statuses observed:** PUBLISHED, SUCCESS, FAILED, ERROR, PENDING_DEFERRED, SKIPPED. | COMP-16 writes drive a per-event status register on the Kafka listener path; UK message path crosses datasources non-atomically with `nap.br_case_audit_log` (see RISK-203). DBA confirmation pending on schema-case `WDP` vs `wdp` and on `@UniqueConstraint` on `idempotency_id`. |
 | `wdp.chbk_outbox_row` | COMP-14 (status transitions only — no row INSERT), COMP-15 (status transitions) | |
 | **`NAP.BUSINESS_RULE_CONSUMER_ERROR`** ** | COMP-05 (additional) | Fourth NAP-schema error table for COMP-05; not in v1.0 |
-| REST SNOTE via NotesService (no DB table) | COMP-16 BusinessRulesProcessor | Weaker error-visibility — if SNOTE REST call also fails, error is silently lost |
+| **REST SNOTE via NotesService + `WDP.bre_orchestration_outbox` (v1.3)** | COMP-16 BusinessRulesProcessor | **Dual error capture (v1.3, 2026-05-15):** orchestrator catches Accept-path failures and persists outbox FAILED row alongside SNOTE write. SNOTE remains the primary visibility surface for operations; outbox row is the structured recovery signal. If both fail, error is silently lost. |
 
 ⚠️ **Orphan-path gaps:**
 - **PUBLISHED-status orphans on `wdp.outgoing_event_outbox`** are invisible to COMP-12 Scheduler3 if Scheduler3 reads only FAILED and PENDING_DEFERRED. COMP-41 has three distinct PUBLISHED-orphan paths; COMP-43 has a silent-loss window between ACK and FAILED-write. **COMP-42 adds a fourth class:** PUBLISHED-orphan crash window Step 4 → Step 13 (same class as COMP-41).
@@ -323,6 +325,8 @@ Direct synchronous Kafka publish remains the dominant producer pattern in WDP. T
 ### DEC-017: BusinessRulesProcessor Reads Rules Directly from the Database
 
 [Content unchanged from v2.1.]
+
+⚠️ **Re-confirmation (2026-05-15):** COMP-16 v1.3 forensic re-audit confirms DEC-017 — BusinessRulesProcessor continues to read rules directly from the database via the `rule_group` / `rule_criterion` / `rule_action` family of tables (separate `nap.*` and `wdp.*` instances per platform). No caching layer added, no message-passing alternative introduced. The new `WDP.bre_orchestration_outbox` is event-state, not rule-state — DEC-017 is orthogonal and unchanged.
 
 ---
 
@@ -435,7 +439,7 @@ PAN is encrypted in transit and decrypted to AG Grid memory only — there is no
 | COMP-24 | captured by HttpInterceptor, forwarded to Kafka, no validation |
 | COMP-37 | propagated as outbound Kafka record header, never used for dedup |
 | COMP-15 | forwarded inbound to outbound; nulls pass through |
-| COMP-16 | passed through to outgoing event; not used for duplicate detection |
+| COMP-16 | **v1.3 update (2026-05-15) — DEVIATES, materially mitigated.** Pre-ACK gap unchanged. NEW: `processNewCaseActionEvent` performs application-level dedup on `idempotencyId + eventTimestamp` against `WDP.bre_orchestration_outbox`; `processRulesEvent` runs previous-event ordering guard. Outgoing-event header still passed through, not used for outbound dedup. |
 | COMP-17 | composite-key component on Path B only; Path A bypasses dedup |
 | **COMP-02** ** | 6 write endpoint families with no idempotency-key contract; application-level SELECT-then-INSERT only |
 | **COMP-04** ** | No application-level inbound idempotency at all; duplicate POSTs produce duplicate Kafka events; producer idempotence does not span separate inbound HTTP requests |
@@ -495,6 +499,8 @@ Affected NAP tables (4): `nap_parent_entity`, `nap_child_entity`, `nap_merchant`
 
 [Content unchanged from v2.1.]
 
+⚠️ **Re-confirmation (2026-05-15):** COMP-16 v1.3 forensic re-audit confirms DEC-011 remains VOID. The new `WDP.bre_orchestration_outbox` introduced in v1.3 is an **event-level status register**, not step checkpointing — it records PUBLISHED / SUCCESS / FAILED / ERROR / PENDING_DEFERRED / SKIPPED outcomes per event, but does not checkpoint the named processing steps of the original DEC-011 design. The two patterns are not interchangeable; recovery from a partial-step crash still has no automated mechanism.
+
 ---
 
 ### DEC-014: Resilience4j for Circuit Breaking ⛔ VOID
@@ -512,6 +518,10 @@ Affected NAP tables (4): `nap_parent_entity`, `nap_child_entity`, `nap_merchant`
 - COMP-41 imports `@Retryable` / `@Backoff` but never applies them (RISK-080).
 - COMP-42 spring-retry is transitive via spring-kafka — not declared in pom.xml (same risk class as COMP-41).
 - COMP-51 `spring-retry` is on classpath but **unused** — uses hand-rolled retry counter persistence on `wdp.case_expiry` (`i_retry_count`) instead. See ADR-CAND-055.
+
+⚠️ **Risk amplitude amplified (2026-05-15) — COMP-18 DMS `@Retryable` exclude removal.** COMP-18 `RestInvoker.callDMS` previously carried `@Retryable(exclude = RestTemplateCustomException.class)`. The `exclude` was silently removed in v2.1; HTTP 4xx/5xx from Document Management Service is now retried 3 × 2000ms instead of fast-failing. With consumer concurrency=1, every DMS error event adds up to ~6 seconds of single-thread block to the `outgoing-events` topic. Without a circuit breaker (DEC-014 VOID), the retry-on-error posture turns transient DMS degradation into a throughput collapse on COMP-18 — the two gaps compound. **The eventual flow outcome is unchanged** (message lands at FAILED in outbox; Step 7e escalation runs); only throughput is amplified. See RISK-219, ADR-CAND-066.
+
+⚠️ **Companion finding (2026-05-15) — COMP-16 v1.3 retry activation.** COMP-16 previously had `spring-retry` declared but unwired. v1.3 source confirms `@EnableRetry` plus `@Retryable` on `CaseService` methods are now active; `case.retry_count` / `case.retry_delay` env vars no longer dead. This is a different shape from COMP-18: a new retry policy switching ON on an internal CaseService client (not breaking anything), versus an exclude removed (changing existing behaviour). No DEC posture change — recorded for evidence-base completeness.
 
 ---
 
@@ -613,6 +623,13 @@ The following candidates emerged from source-verification reconciliation. None a
 | **ADR-CAND-063** | **🟡 MEDIUM** | **Five new More-Actions surface (Reverse, Issuer Reversal, Issuer Accept, Convert to Partial DTP, Update Transaction) — audit each for risk and document governance** | **COMP-49** | **RISK-199** |
 | **ADR-CAND-064** | **🟡 MEDIUM** | **Org-specific UI customisation pattern (Macy's hardcoding) — generalise to tenant framework or accept named-customer carve-outs** | **COMP-49** | Component file |
 | **ADR-CAND-065** | **🟢 LOW** | **Documentation convention — canonical-file-with-stub pattern for single-codebase-multiple-component-numbers (precedent: COMP-49 / COMP-50). Ratify as platform convention if pattern recurs** | **COMP-49, COMP-50** *(precedent)* | Documentation policy |
+| **ADR-CAND-066** | **🔴 HIGH** | **Platform-wide REST `@Retryable` exclude posture — retry HTTP 4xx vs 5xx policy** | **COMP-18** *(trigger; platform-wide implication)* | **RISK-219** |
+| **ADR-CAND-067** | **🟡 MEDIUM** | **Correlation ID write-side without read-side — UUID assigned and propagated on outbound messages but never reaches logs (MDC.put absent, `%X` in logback pattern absent, `RequestCorrelation.getId()` has zero callers)** | **COMP-18** *(trigger; survey COMP-14, 15, 17, 43 for same pattern at their next audits)* | Component file |
+| **ADR-CAND-068** | **🔴 HIGH** | **`applyRuleGroup` rule-chain recursion cycle / depth guard — add depth limit and visited-set, or accept the hazard with rule-author tooling guardrails** | **COMP-16** | **RISK-201** |
+| **ADR-CAND-069** | **🔴 HIGH** | **Singleton service instance-field state — make BRE services stateless (per-message context object) or formally enforce consumer concurrency=1 as a platform invariant** | **COMP-16** *(latent class — survey other singletons at next reconciliations)* | **RISK-202** |
+| **ADR-CAND-070** | **🔴 HIGH** | **Cross-datasource non-atomic UK write window on COMP-16 — accept partial-write window with documented operational compensation, consolidate the two writes onto a single datasource, or introduce XA / saga / outbox-only design for the UK path** | **COMP-16** | **RISK-203** |
+| **ADR-CAND-071** | **🔴 HIGH** | **COMP-16 US migration guard commented out — confirm whether US migration is complete platform-wide; if yes, remove dead code; if no, restore guard** | **COMP-16** | **RISK-204** |
+| **ADR-CAND-072** | **🔴 HIGH** | **UK `getIssuerDoc` missing `attachedIssueDoc` disjunct — align with US, or document intentional UK-specific design** | **COMP-16** | **RISK-205** |
 
 ---
 
@@ -776,6 +793,60 @@ Combined with DEC-018 (no server-side RBAC enforcement on COMP-24 CaseActionServ
 
 ---
 
+### Detailed candidate ADR — ADR-CAND-066: Platform-wide REST `@Retryable` exclude posture
+
+**Severity:** 🔴 HIGH — platform-wide retry policy decision
+**Status:** Candidate — architect decision required
+
+**Context:** COMP-18 NotificationOrchestrator's `RestInvoker.callDMS` previously carried `@Retryable(exclude = RestTemplateCustomException.class)`. The `exclude` was silently removed in v2.1 (2026-05-15). `RestTemplateCustomException` is the wrapper for HTTP 4xx and 5xx responses from Document Management Service. The removed exclude means those responses are now retried 3 × 2000ms with fixed backoff instead of fast-failing.
+
+The COMP-18 change is the trigger, but the underlying question is platform-wide: **WDP has no consistent retry-on-HTTP-error policy across REST clients.** Different components have made different ad-hoc choices about whether to retry 4xx (typically idempotency-sensitive client errors) and 5xx (typically transient server errors), and the absence of an `exclude` versus its presence is sometimes the only documentation of the decision.
+
+**Why it matters now:**
+- DEC-014 is VOID (no circuit breakers) platform-wide. Without a circuit breaker to fail fast when a downstream is unhealthy, retry-on-error compounds the latency tax — every retried call holds a single-thread slot (especially at consumer concurrency=1 in COMP-18) for the full retry backoff.
+- 4xx vs 5xx are not interchangeable from a retry standpoint. A 400 Bad Request will return the same 400 on retry; a 503 Service Unavailable might succeed on retry. A blanket retry-on-error policy retries both.
+- A 4xx on a mutation POST (e.g. 409 Conflict) often signals semantic state that retry cannot recover.
+
+**Options:**
+- **(a) Retry 5xx only; exclude 4xx by default.** Most defensible default. Aligns retry with transience semantics.
+- **(b) Retry 5xx + idempotent 4xx (408, 429); exclude all other 4xx.** More nuanced; honours backpressure (429) and idempotent-timeout (408) semantics.
+- **(c) Retry on no HTTP error wrapper class; require explicit per-client `exclude` removal as a documented decision.** Codifies the previous COMP-18 posture as the default — favours conservatism.
+- **(d) Status quo — accept the silent COMP-18 change** and ratify retry-on-4xx-and-5xx as the platform default.
+
+**Recommendation:** Architect decision. (b) is the technical recommendation; (c) is the governance recommendation. The two can co-exist: adopt (b) as the default retry classifier and (c) as the policy for departures.
+
+**Cross-component implication:** if a platform policy is adopted, every existing `@Retryable` annotation on REST clients across COMP-04, COMP-16 (new in v1.3), COMP-18, COMP-39, COMP-43, and any other component using spring-retry needs to be audited against the policy. Claude Code follow-up scheduled.
+
+---
+
+### Detailed candidate ADR — ADR-CAND-070: Cross-datasource non-atomic UK write window on COMP-16
+
+**Severity:** 🔴 HIGH
+**Status:** Candidate — architect decision required
+
+**Context:** COMP-16 BusinessRulesProcessor's UK message path writes to two datasources within a single logical processing step:
+- The UK audit log row goes to `nap.br_case_audit_log` via `ukDataSource`
+- The BRE orchestration outbox row goes to `WDP.bre_orchestration_outbox` via `wdpDataSource`
+
+These two writes **cannot be in the same transaction** — they live on physically different datasources, there is no XA coordinator, no saga compensator, and no two-phase commit. A failure between the two writes leaves an audit row without a corresponding outbox row (or vice versa) on every UK message.
+
+**Why the US path is safe and the UK path is not:** the US path writes both rows to the WDP datasource via `@Transactional`. The UK path's audit log target is in the NAP schema on a separate datasource, so the architectural symmetry breaks.
+
+**Why this matters now:** the new `WDP.bre_orchestration_outbox` is the structured recovery signal for COMP-16 — the FAILED row is what the operator runbook would scan to find broken messages. If the outbox row is missing but the audit log shows the message was processed, recovery is blind. If the audit log is missing but the outbox row exists, audit is blind. Either way, the system of record for "what happened on UK" depends on which datasource wrote first and which one failed.
+
+**Options:**
+- **(a) Accept the partial-write window** with documented operational compensation — periodic reconciliation job that diffs `nap.br_case_audit_log` against `WDP.bre_orchestration_outbox` and surfaces orphans for manual review. Lowest cost; relies on ops vigilance.
+- **(b) Consolidate the two writes onto a single datasource** — either move the UK audit log to the WDP datasource (requires NAP schema migration and contract negotiation with NAP team) or move the outbox to the NAP datasource (smaller scope, but couples WDP outbox to NAP schema lifecycle).
+- **(c) Introduce XA / two-phase commit** — `JtaTransactionManager` with both datasources as XA participants. Significant complexity, runtime cost, and operational risk. Generally not recommended in modern microservices but technically available.
+- **(d) Saga / outbox-pattern reversal** — write only to one datasource synchronously and project the other via a relay or event log. Larger refactor; conceptually clean.
+- **(e) Accept the risk as informational** — given that the UK path is the only one and traffic volume is presumably low, and the failure window is small, formally document that the audit + outbox can drift and that the orchestrator outbox is the authoritative state.
+
+**Recommendation:** Architect decision. (a) is the lowest-cost mitigation with no architectural change. (e) requires the architect to formally cap the consequences. (b) is the cleanest end-state but requires inter-team coordination.
+
+**Cross-architectural note:** this is the second cross-datasource non-atomic write window confirmed in WDP — DEC-021 (COMP-02 and COMP-30) is structurally similar (multi-datasource service-level `@Transactional` silently binding to `@Primary`). The two are distinct (DEC-021 is wrong-TM binding; this is two-TM separate-commit), but both are symptoms of a platform-wide lack of policy on multi-datasource boundaries. ADR-CAND-033 named "multi-datasource service-level `@Transactional` binding contract" should be expanded to cover this case.
+
+---
+
 ### Other candidate ADRs (summary only)
 
 For brevity, candidate ADRs not detailed above are listed in the table at the start of this section. Detailed analysis is captured in the relevant component file (WDP-COMP-NN-*.md) and in the corresponding RISK row in WDP-NFRS.md.
@@ -803,6 +874,10 @@ Six constraints from committed decisions limit what future stages can do without
 **🔴 NEW — EncryptionService is a single global dependency for all PAN ingestion paths.** COMP-07 / 08 / 09 / 11 all call COMP-35 for PAN encryption before persisting any chargeback or case record. COMP-35 outage halts all four ingestion paths simultaneously (RISK-170). HA posture for COMP-35 is an open question.
 
 **🔴 NEW — Multi-datasource components must declare explicit `transactionManager` attribute on every `@Transactional`.** Default-bean-selection silently binds to `@Primary`, which is the root cause of DEC-021 (COMP-02) and its second offender (COMP-30). ADR-CAND-033 formalises this as a platform contract.
+
+**🔴 NEW (2026-05-15) — Cross-datasource non-atomic writes are confirmed in COMP-16 (UK path), in addition to DEC-021 (COMP-02 / COMP-30).** ADR-CAND-070 captures the COMP-16 case explicitly. Distinct from DEC-021 (which is wrong-TM binding to a single datasource); this is two-TM separate-commit. Both classes are symptoms of the same gap: WDP has no platform policy for multi-datasource consistency. ADR-CAND-033 should expand to cover both classes.
+
+**⚠️ NEW (2026-05-15) — Platform-wide REST retry posture is unsettled.** COMP-18 v2.1 silently changed retry behaviour by removing an `exclude`. WDP has no consistent retry-on-HTTP-error policy across REST clients (4xx vs 5xx; idempotent vs non-idempotent). With DEC-014 VOID (no circuit breakers), the absence of a policy compounds blast-radius. ADR-CAND-066 raises the platform-wide question.
 
 ---
 
